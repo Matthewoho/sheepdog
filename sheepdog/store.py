@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS topics (
     topic_id         TEXT PRIMARY KEY,
     title            TEXT NOT NULL,
-    kind             TEXT,             -- bus | adopted（名册 managed）| known（名册 known，不投递）
+    kind             TEXT,             -- bus | adopted（名册 managed）| known（名册 known，不投递）| retired（被接手的前任）
     duty             TEXT,             -- 一句话职责 + 边界，纠偏时修改
     conversation_id  TEXT,
     state            TEXT NOT NULL,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS topics (
     retries          INTEGER DEFAULT 0,
     onboarded_at     TEXT,             -- adopted 会话收到 onboarding 的时间，只发一次
     receipt_missed   INTEGER DEFAULT 0,  -- adopted 会话回执超时次数（不重投）
+    spawned_at       TEXT,             -- 由 sheepdog spawn 新建的时间；名册 conversation_id 留空时以此为准
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -78,13 +80,32 @@ CREATE TABLE IF NOT EXISTS dispatches (
     receipt     TEXT,
     error       TEXT
 );
+
+-- 等别人回复（7.4）：对方回复优先归给登记的 topic；15/30 分钟提醒，60 分钟到期
+CREATE TABLE IF NOT EXISTS watches (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id     TEXT NOT NULL,
+    person_id    TEXT NOT NULL,
+    chat_id      TEXT,                 -- 空 = 对方在任何聊天里回复都算
+    note         TEXT,
+    started_at   TEXT NOT NULL,
+    nudged_15_at TEXT,
+    nudged_30_at TEXT,
+    closed_at    TEXT,
+    close_reason TEXT                  -- replied | expired | cancelled | topic_closed
+);
+CREATE INDEX IF NOT EXISTS idx_watch_person ON watches(person_id, closed_at);
 """
+
+# sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
+SYSTEM_CHAT = "sheepdog"
+SYSTEM_ID_PREFIX = "sd_"
 
 
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
     "messages": [("note", "TEXT")],
-    "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0")],
+    "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT")],
 }
 
 
@@ -217,14 +238,24 @@ class Store:
         with self.tx() as c:
             c.execute("UPDATE messages SET dispatch_state=? WHERE batch_id=?", (state, batch_id))
 
-    def forward_message(self, message_id: str, topic_id: str, tags: list[str], note: str) -> None:
+    def forward_message(self, message_id: str, topic_id: str, tags: list[str]) -> None:
         """转交：改归属并回到待推，由 Dispatcher 下一轮按目标会话的状态投递（同样受人类接管约束）。"""
         with self.tx() as c:
             c.execute(
                 """UPDATE messages SET route='dispatch', dispatch_state='pending', batch_id=NULL,
-                       topic_id=?, tags_json=?, note=? WHERE message_id=?""",
-                (topic_id, json.dumps(tags, ensure_ascii=False), note, message_id),
+                       topic_id=?, tags_json=? WHERE message_id=?""",
+                (topic_id, json.dumps(tags, ensure_ascii=False), message_id),
             )
+
+    def add_system_message(self, topic_id: str, reason: str, content: str, tags: list[str] | None = None) -> str:
+        """sheepdog 自己生成的待推消息，和 IM 消息一起按 topic 成批投递（同样受人类接管、排队约束）。"""
+        ts = datetime.now().astimezone()
+        mid = f"{SYSTEM_ID_PREFIX}{reason}_{uuid.uuid4().hex[:12]}"
+        m = Message(message_id=mid, chat_id=SYSTEM_CHAT, chat_name=SYSTEM_CHAT, chat_type=SYSTEM_CHAT,
+                    sender_id=SYSTEM_CHAT, sender_name=SYSTEM_CHAT, sender_type="system", content=content,
+                    msg_type="text", create_time=ts.isoformat(timespec="seconds"))
+        self.upsert_message(m, "dispatch", reason, tags or [], topic_id)
+        return mid
 
     def requeue_batch(self, batch_id: str) -> None:
         with self.tx() as c:
@@ -303,6 +334,41 @@ class Store:
     def finish_dispatch(self, batch_id: str, state: str, receipt: str = "", error: str = "") -> None:
         with self.tx() as c:
             c.execute("UPDATE dispatches SET state=?, receipt=?, error=? WHERE batch_id=?", (state, receipt, error, batch_id))
+
+    # ---------- watches ----------
+    def add_watch(self, topic_id: str, person_id: str, chat_id: str, note: str) -> int:
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO watches(topic_id,person_id,chat_id,note,started_at) VALUES(?,?,?,?,?)",
+                            (topic_id, person_id, chat_id or None, note, now_iso()))
+            return int(cur.lastrowid)
+
+    def get_watch(self, watch_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM watches WHERE id=?", (watch_id,)).fetchone()
+
+    def open_watches(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM watches WHERE closed_at IS NULL ORDER BY started_at, id").fetchall()
+
+    def list_watches(self, include_closed: bool = False, limit: int = 100) -> list[sqlite3.Row]:
+        where = "" if include_closed else "WHERE closed_at IS NULL"
+        return self.conn.execute(f"SELECT * FROM watches {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def match_watch(self, person_id: str, chat_id: str) -> sqlite3.Row | None:
+        """同一人有多条有效等待时取最新的一条。"""
+        if not person_id:
+            return None
+        return self.conn.execute(
+            """SELECT * FROM watches WHERE closed_at IS NULL AND person_id=? AND (chat_id IS NULL OR chat_id=?)
+               ORDER BY started_at DESC, id DESC LIMIT 1""",
+            (person_id, chat_id),
+        ).fetchone()
+
+    def update_watch(self, watch_id: int, **fields) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as c:
+            c.execute(f"UPDATE watches SET {cols} WHERE id=?", (*fields.values(), watch_id))
+
+    def close_watch(self, watch_id: int, reason: str) -> None:
+        self.update_watch(watch_id, closed_at=now_iso(), close_reason=reason)
 
     # ---------- 保留期清理 ----------
     def prune(self, retention_days: int) -> int:

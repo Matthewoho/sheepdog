@@ -25,6 +25,15 @@ def _app_data_dir() -> Path:
     return Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or Path.home() / ".gemini" / "antigravity")
 
 
+def conversation_dir(conversation_id: str) -> Path:
+    """会话目录：transcript 和会话产出的文档都在这里。"""
+    return _app_data_dir() / "brain" / conversation_id
+
+
+def transcript_path(conversation_id: str) -> Path:
+    return conversation_dir(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
+
+
 class AgentApiSink:
     name = "agentapi"
 
@@ -71,7 +80,7 @@ class AgentApiSink:
 
         agentapi 投递的消息在 transcript 里是 SYSTEM_MESSAGE，人类输入是 USER_INPUT，以此区分。
         """
-        p = _app_data_dir() / "brain" / conversation_id / ".system_generated" / "logs" / "transcript.jsonl"
+        p = transcript_path(conversation_id)
         if not p.exists():
             return None
         last: datetime | None = None

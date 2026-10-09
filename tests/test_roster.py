@@ -68,16 +68,20 @@ class FakeSink:
         self.sent: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []
         self.human: dict[str, datetime] = {}
+        # 调用顺序：("new", title) / ("send", cid)
+        self.log: list[tuple[str, str]] = []
 
     def available(self):
         return True, "ok"
 
     def new_conversation(self, title, prompt, model=""):
         self.created.append((title, prompt))
-        return "conv_test_bus"
+        self.log.append(("new", title))
+        return "conv_test_bus" if "总线" in title else f"conv_test_new{len(self.created)}"
 
     def send_message(self, cid, content):
         self.sent.append((cid, content))
+        self.log.append(("send", cid))
 
     def last_human_activity(self, cid):
         return self.human.get(cid)
@@ -128,8 +132,9 @@ class RosterValidationTest(unittest.TestCase):
 
     def test_example_file_is_valid(self):
         r = load_roster(REPO / "examples" / "roster.example.toml", required=True)
-        self.assertEqual(len(r.managed), 1)
-        self.assertEqual(len(r.sessions), 2)
+        self.assertEqual(len(r.managed), 2)
+        self.assertEqual(len(r.sessions), 3)
+        self.assertEqual([x.key for x in r.sessions if x.to_spawn], ["demo_handover"])
 
     def test_hash_ignores_formatting_but_tracks_content(self):
         a, b = parse_roster(roster_data()), parse_roster(roster_data())
@@ -405,7 +410,7 @@ class ForwardTest(Base):
         d.dispatch_once()
         last = self.sink.to("conv_test_alpha")[-1]
         self.assertIn("om_test_f2", last)
-        self.assertIn("转交说明：这是 Alpha 的需求", last)
+        self.assertIn("总线备注（不是主人原话）：这是 Alpha 的需求", last)
 
 
 class ReplyPrefixTest(unittest.TestCase):

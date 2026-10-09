@@ -56,7 +56,13 @@ sheepdog inbox                 # Inbox 按群汇总
 sheepdog inbox --chat 某群      # 查看某个群的 Inbox
 sheepdog sessions              # session 注册表与状态（mode、职责、负责的聊天、onboarding、未回执次数）
 sheepdog forward --topic tp_x --message-ids a,b --note "..."   # 总线把消息转交给 managed 会话
+sheepdog forward --topic tp_x --quote "主人原话" --note "总线补充"  # 主人在总线里的回答转达过去（原话与备注分开标注）
+sheepdog spawn --key k         # 名册里 conversation_id 留空的条目：新建会话（可接手前任：先发退休通知、再新建、转交接回执）
+sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，15/30 分钟提醒，1 小时到期
+sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
 ```
+
+会话之间的约定都写在它们收到的 prompt 里：拿不准就以 bot 身份私聊你（正文以 `🐕 [sheepdog·<会话>]` 开头，sheepdog 不会把它推回来）；等别人回复用 `sheepdog watch` 登记，不自己开定时任务；收到需求先问清属于哪个项目，回执 anchors 写 `project:<项目名>`，`sheepdog sessions` 会显示每个会话关联的项目。
 
 Agent 以你的身份对外发 IM 消息时，正文开头必须加代回前缀（`session.reply_prefix`，默认 `🐕 [Agent 代回] `）。这条规则写在总线 bootstrap、onboarding 和每批信号末尾；消息是各会话自己发的，sheepdog 只能靠 prompt 约束，做不到发送时强制。
 

@@ -33,3 +33,21 @@ mode = "known"
 conversation_id = "00000000-0000-4000-8000-000000000002"
 title = "示例：发布值守"
 duty = "发布与回滚的值守会话，主人直接在里面操作。"
+
+# 接手旧会话（7.2）：conversation_id 写成空字符串 = 由 sheepdog 新建（sheepdog spawn / init），
+# 新 id 只记在账本里，不回写本文件（sheepdog sessions 会显示两者差异）。
+# 有前任且 retire_predecessor = true：先给前任发退休通知（停巡检、不再对外发、提交交接回执），再新建接手会话；
+# 接手会话先完整读完前任 transcript 并回执，sheepdog 再把前任的交接回执原样转给它。
+[[session]]
+key = "demo_handover"
+mode = "managed"
+conversation_id = ""
+predecessor_conversation_id = "00000000-0000-4000-8000-000000000003"
+retire_predecessor = true
+title = "示例：周报整理（接手）"
+duty = "接手周报整理：汇总各群进展，周五起草周报。不负责对外发送。"
+
+[[session.chats]]
+chat_id = "oc_test_demo_weekly"
+name = "示例周报群"
+all_messages = false

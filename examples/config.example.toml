@@ -24,6 +24,8 @@ vip_sender_ids = []
 ignore_muted_chats = true
 dispatch_at_all = true
 dispatch_bot_p2p = false
+# 建议把「机器人 ↔ 你」的私聊放进来：会话拿不准时以 bot 身份私聊你，不应再被当成信号推回总线
+# （另外 bot 发的、正文以「🐕 [sheepdog·」开头的消息一律丢弃，reason = self_escalation）
 ignore_chat_ids = []
 watch_chat_ids = []
 # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）

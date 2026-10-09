@@ -5,6 +5,9 @@
 - managed：sheepdog 按聊天归属往里推消息（topic kind = adopted），永远不新建会话；
 - known：只登记给总线看，从不投递。
 
+managed 的 conversation_id 写成空字符串 = 还没建，由 `sheepdog spawn` / `init` 新建（7.2）；
+新建出来的 id 只记在 topics 表，不回写名册文件。可以带 predecessor_conversation_id 接手旧会话。
+
 校验失败抛 RosterError，调用方直接报错退出，不静默降级。
 """
 
@@ -22,7 +25,7 @@ KNOWN = "known"
 
 _KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
-                 "self_polling", "retire_self_polling", "chats"}
+                 "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages"}
 
 
@@ -50,7 +53,15 @@ class RosterSession:
     authority: str = ""
     self_polling: str = ""
     retire_self_polling: bool = False
+    # 有值 = 接手这个旧会话（7.2）；retire_predecessor = true 时先给旧会话发退休通知
+    predecessor_conversation_id: str = ""
+    retire_predecessor: bool = False
     chats: list[RosterChat] = field(default_factory=list)
+
+    @property
+    def to_spawn(self) -> bool:
+        """名册里 conversation_id 留空的 managed 条目：由 sheepdog 新建会话。"""
+        return self.mode == MANAGED and not self.conversation_id
 
     @property
     def topic_id(self) -> str:
@@ -79,6 +90,9 @@ class Roster:
 
     def owner_of(self, chat_id: str) -> tuple[RosterSession, RosterChat] | None:
         return self._owner.get(chat_id)
+
+    def by_key(self, key: str) -> RosterSession | None:
+        return next((s for s in self.sessions if s.key == key), None)
 
     def by_topic(self, topic_id: str) -> RosterSession | None:
         return next((s for s in self.sessions if s.topic_id == topic_id), None)
@@ -144,9 +158,18 @@ def parse_roster(data: dict) -> Roster:
             authority=_str(raw, "authority", where),
             self_polling=_str(raw, "self_polling", where),
             retire_self_polling=_bool(raw, "retire_self_polling", where),
+            predecessor_conversation_id=_str(raw, "predecessor_conversation_id", where),
+            retire_predecessor=_bool(raw, "retire_predecessor", where),
         )
-        if mode == MANAGED and not s.conversation_id:
-            raise RosterError(f"{where}: managed 会话必须有 conversation_id")
+        # 必须显式写出 conversation_id：漏写是笔误，报错；写成 "" 才表示「由 sheepdog 新建」
+        if mode == MANAGED and "conversation_id" not in raw:
+            raise RosterError(f"{where}: managed 会话必须有 conversation_id（要 sheepdog 新建就写 conversation_id = \"\"）")
+        if mode == KNOWN and (s.predecessor_conversation_id or s.retire_predecessor):
+            raise RosterError(f"{where}: known 会话不能有 predecessor_conversation_id / retire_predecessor")
+        if s.retire_predecessor and not s.predecessor_conversation_id:
+            raise RosterError(f"{where}: retire_predecessor = true 需要 predecessor_conversation_id")
+        if s.predecessor_conversation_id and s.conversation_id:
+            raise RosterError(f"{where}: 接手旧会话时 conversation_id 必须留空（由 sheepdog 新建接手会话）")
         raw_chats = raw.get("chats", [])
         if not isinstance(raw_chats, list):
             raise RosterError(f"{where}: chats 必须写成 [[session.chats]] 数组")
@@ -167,6 +190,12 @@ def parse_roster(data: dict) -> Roster:
             chat_owner[chat.chat_id] = key
             s.chats.append(chat)
         sessions.append(s)
+    # 前任不能同时还是名册里某个会话，否则既要退休又要投递
+    live_cids = {x.conversation_id: x.key for x in sessions if x.conversation_id}
+    for x in sessions:
+        if x.predecessor_conversation_id in live_cids:
+            raise RosterError(f"session key={x.key!r}: predecessor_conversation_id 仍登记在 "
+                              f"{live_cids[x.predecessor_conversation_id]!r}，先把旧条目删掉")
     return Roster(sessions)
 
 

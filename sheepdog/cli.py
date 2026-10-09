@@ -7,7 +7,10 @@
   sheepdog inbox-clear [--chat 群名 | --all]
   sheepdog init [--dry-run]       同步名册、没有总线就建、给未 onboarding 的 managed 会话发 onboarding
   sheepdog sessions               查看 session 注册表与状态（含名册 mode、职责、负责的聊天）
-  sheepdog forward --topic T --message-ids a,b [--note ...]   由总线调用，把消息转交给 managed 会话
+  sheepdog forward --topic T [--message-ids a,b] [--quote 主人原话] [--note 总线备注]   转交消息 / 转达主人原话
+  sheepdog spawn --key K [--dry-run]                     为名册里 conversation_id 留空的条目新建会话（可接手前任）
+  sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
+  sheepdog watches [--all]  /  sheepdog unwatch --id N
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -25,8 +28,9 @@ import time
 
 from . import __version__
 from .config import load_config
-from .engine import Collector, Dispatcher, forward_messages, write_receipt
+from .engine import RETIRED, Collector, Dispatcher, add_watch, forward_messages, write_receipt
 from .roster import Roster, RosterError, load_roster
+from .sink import SinkError
 from .sink.agentapi import AgentApiSink, DryRunSink
 from .source.lark import LarkCliSource
 from .store import Store
@@ -177,8 +181,35 @@ def cmd_init(args) -> int:
     print(f"总线: {rep['bus']}")
     if not rep["onboarding"]:
         print("onboarding: 名册里没有 managed 会话")
+    for tid, what in rep["spawn"].items():
+        print(f"spawn {tid}: {what}")
     for tid, what in rep["onboarding"].items():
         print(f"onboarding {tid}: {what}")
+    return 0
+
+
+def cmd_spawn(args) -> int:
+    cfg, store, _source, sink, roster = _build(args)
+    if args.dry_run:
+        print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
+    d = Dispatcher(cfg, store, sink, roster)
+    d.sync_roster()
+    try:
+        r = d.spawn(args.key)
+    except ValueError as e:
+        print(f"spawn 被拒绝: {e}", file=sys.stderr)
+        return 2
+    except SinkError as e:
+        print(f"spawn 失败: {e}", file=sys.stderr)
+        return 1
+    if r.get("skipped"):
+        print(f"跳过：{r['skipped']}")
+        return 0
+    if r.get("retire"):
+        print(f"前任退休通知：{r['retire']}")
+    print(f"已新建 {r['title']} -> {r['conversation_id']}（只记在账本，不回写名册）")
+    if r.get("read_batch"):
+        print(f"等待接手会话读完前任上下文并回执（批次 {r['read_batch']}），期间信号排队")
     return 0
 
 
@@ -200,13 +231,26 @@ def cmd_sessions(args) -> int:
         mode = _MODE.get(t["kind"], t["kind"] or "-")
         print(f"- {t['title']}  [{t['state']}]  mode={mode}  topic={t['topic_id']}  conversation={t['conversation_id'] or '-'}")
         print(f"  职责: {t['duty']}")
+        anchors = json.loads(t["anchors_json"] or "[]")
+        projects = [a.removeprefix("project:") for a in anchors if a.startswith("project:")]
+        if projects:
+            print(f"  关联项目: {'、'.join(projects)}")
         if t["kind"] in ("adopted", "known"):
             s = roster.by_topic(t["topic_id"])
             names = {c.chat_id: f"{c.name or c.chat_id}{'（全部）' if c.all_messages else ''}" for c in (s.chats if s else [])}
-            chats = [names.get(c, c) for c in json.loads(t["anchors_json"] or "[]") if c.startswith("oc_")]
+            chats = [names.get(c, c) for c in anchors if c.startswith("oc_")]
             print(f"  负责的聊天: {'、'.join(chats) or '-'}")
+            if s and (s.conversation_id or None) != t["conversation_id"]:
+                # 名册是人写的，运行态以账本为准；两者不一致时显示出来
+                rc = s.conversation_id or "（留空：由 sheepdog 新建）"
+                print(f"  名册 conversation: {rc}  账本: {t['conversation_id'] or '（尚未新建）'}"
+                      + (f"  spawn 于 {t['spawned_at']}" if t["spawned_at"] else ""))
+            if s and s.predecessor_conversation_id:
+                print(f"  前任: {s.predecessor_conversation_id}")
             if t["kind"] == "adopted":
                 print(f"  onboarded: {t['onboarded_at'] or '否'}  未回执: {t['receipt_missed'] or 0}")
+        if t["kind"] == RETIRED:
+            print(f"  交接回执: {'已转给接手会话' if not t['pending_batch_id'] else '等待中（批次 ' + t['pending_batch_id'] + '）'}")
         if t["summary"]:
             print(f"  进展: {t['summary']}")
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
@@ -229,11 +273,55 @@ def cmd_forward(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
     try:
-        ids = forward_messages(store, args.topic, args.message_ids.split(","), args.note)
+        ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote)
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
-    print(f"已转交 {len(ids)} 条到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
+    extra = "，附主人原话 / 总线备注" if args.quote or args.note else ""
+    print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    try:
+        wid = add_watch(store, args.topic, args.person, args.chat, args.note)
+    except ValueError as e:
+        print(f"登记被拒绝: {e}", file=sys.stderr)
+        return 2
+    print(f"已登记等待 #{wid}：对方回复会直接推给 {args.topic}；15/30 分钟提醒，60 分钟到期。取消：sheepdog unwatch --id {wid}")
+    return 0
+
+
+def cmd_watches(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    rows = store.list_watches(include_closed=args.all)
+    if not rows:
+        print("没有等待中的回复" if not args.all else "没有等待记录")
+    for w in rows:
+        state = f"已结束 {w['close_reason']} @ {w['closed_at']}" if w["closed_at"] else "等待中"
+        nudged = "/".join(m for m, k in (("15", "nudged_15_at"), ("30", "nudged_30_at")) if w[k]) or "-"
+        print(f"#{w['id']} [{state}] topic={w['topic_id']} person={w['person_id']} chat={w['chat_id'] or '任意'} "
+              f"开始 {w['started_at']} 已提醒 {nudged}")
+        if w["note"]:
+            print(f"  在等: {w['note']}")
+    return 0
+
+
+def cmd_unwatch(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    w = store.get_watch(args.id)
+    if not w:
+        print("没有这条等待", file=sys.stderr)
+        return 2
+    if w["closed_at"]:
+        print(f"#{args.id} 已结束（{w['close_reason']}）")
+        return 0
+    store.close_watch(args.id, "cancelled")
+    print(f"已取消等待 #{args.id}")
     return 0
 
 
@@ -287,9 +375,30 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("forward")
     sp.add_argument("--topic", required=True)
-    sp.add_argument("--message-ids", required=True, help="逗号分隔")
-    sp.add_argument("--note", default="", help="为什么转给它")
+    sp.add_argument("--message-ids", default="", help="逗号分隔；可以不带，只转达 --quote / --note")
+    sp.add_argument("--quote", default="", help="主人原话，投递时标成「主人原话（经总线转达）」")
+    sp.add_argument("--note", default="", help="总线备注，投递时标成「总线备注」")
     sp.set_defaults(func=cmd_forward)
+
+    sp = sub.add_parser("spawn")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本")
+    sp.set_defaults(func=cmd_spawn)
+
+    sp = sub.add_parser("watch")
+    sp.add_argument("--topic", required=True)
+    sp.add_argument("--person", required=True, help="对方 open_id")
+    sp.add_argument("--chat", default="", help="只认这个聊天里的回复；不填 = 任意聊天")
+    sp.add_argument("--note", default="", help="在等什么")
+    sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("watches")
+    sp.add_argument("--all", action="store_true", help="包括已结束的")
+    sp.set_defaults(func=cmd_watches)
+
+    sp = sub.add_parser("unwatch")
+    sp.add_argument("--id", type=int, required=True)
+    sp.set_defaults(func=cmd_unwatch)
 
     sp = sub.add_parser("receipt")
     sp.add_argument("--topic", required=True)
