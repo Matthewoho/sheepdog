@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-pilot"
+version = "0.1.0"
+description = "把 IM 消息信号路由到长期运行的 AI Agent session：私聊/@我 直推，群聊进 Inbox，按话题管理 session。"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+signal-pilot = "signal_pilot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["signal_pilot*"]

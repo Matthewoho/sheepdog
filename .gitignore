@@ -1,0 +1,20 @@
+# 运行数据与个人配置永远不进仓库
+/state/
+/config.toml
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+receipts/
+logs/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
