@@ -265,11 +265,12 @@ class Collector:
         return action
 
     def _close_watch(self, w, message_id: str, action: str) -> None:
-        # 被 hold 的回复没到等待的会话手里：等待不关，照常提醒 / 到期
+        """对方回复了（7.16）：等待进入 replied（候选），不关闭——回复可能只是寒暄；由会话 watch-done 确认。
+        被 hold 的回复没到等待的会话手里：状态不变，照常提醒 / 到期。"""
         if w is None or action == HOLD:
             return
-        self.store.close_watch(w["id"], "replied")
-        log.info("等待 #%s 收到回复 %s -> %s", w["id"], message_id, w["topic_id"])
+        self.store.mark_watch_replied(w["id"], message_id)
+        log.info("等待 #%s 收到回复 %s -> %s，等会话确认", w["id"], message_id, w["topic_id"])
 
     def _muted(self) -> set[str]:
         at = _parse(self.store.get_meta("muted_at"))
@@ -780,9 +781,12 @@ class Dispatcher:
             self.store.mark_batch_state(batch, "acked")
             fields = {"state": new_state, "pending_batch_id": None, "retries": 0,
                       "summary": receipt.get("summary", t["summary"])}
+            self._watches_after_receipt(t["topic_id"], batch, receipt.get("anchors") or [])
             if receipt.get("anchors"):
-                # 回执带来的锚点只作记录；聊天归属（oc_ 开头）只能由名册 / new-session 决定，回执改不了
-                extra = {a for a in receipt["anchors"] if isinstance(a, str) and not a.startswith("oc_")}
+                # 回执带来的锚点只作记录；聊天归属（oc_ 开头）只能由名册 / new-session 决定，回执改不了；
+                # watch_done:N 是确认等待用的，不存
+                extra = {a for a in receipt["anchors"]
+                         if isinstance(a, str) and not a.startswith(("oc_", "watch_done:"))}
                 anchors = sorted(set(json.loads(t["anchors_json"] or "[]")) | extra)
                 fields["anchors_json"] = json.dumps(anchors, ensure_ascii=False)
             self.store.update_topic(t["topic_id"], **fields)
@@ -802,8 +806,28 @@ class Dispatcher:
         self.store.set_meta("roster_notify_bus", "1")
         log.info("总线新开的会话 %s 已收掉（%s），聊天归属释放", topic_id, why)
 
+    def _watches_after_receipt(self, topic_id: str, batch_id: str, anchors: list) -> None:
+        """会话回执后处理它的等待（7.16）：anchors 里 watch_done:N → 关闭（done）；
+        回复随这个批次送达、但没被确认的 → 回到 waiting，从回复时间重新计时。"""
+        done = set()
+        for a in anchors:
+            if isinstance(a, str) and a.startswith("watch_done:") and a.removeprefix("watch_done:").isdigit():
+                done.add(int(a.removeprefix("watch_done:")))
+        for w in self.store.open_watches():
+            if w["topic_id"] != topic_id:
+                continue
+            if w["id"] in done:
+                self.store.close_watch(w["id"], "done")
+                log.info("等待 #%s 经回执确认已等到", w["id"])
+            elif w["status"] == "replied" and w["last_reply_message_id"]:
+                r = self.store.get_message(w["last_reply_message_id"])
+                if r is not None and r["batch_id"] == batch_id:
+                    self.store.reset_watch_waiting(w["id"])
+                    log.info("等待 #%s 的回复没被确认，回到 waiting", w["id"])
+
     def _miss(self, t, batch: str) -> None:
         """adopted 会话回执超时：只记一次未回执、回到可投递，不重投（避免往大上下文里重复灌消息）。"""
+        self._watches_after_receipt(t["topic_id"], batch, [])
         self.store.finish_dispatch(batch, "missed", error="回执超时（adopted 不重投）")
         self.store.mark_batch_state(batch, "missed")
         missed = (t["receipt_missed"] or 0) + 1
@@ -1301,7 +1325,10 @@ class Dispatcher:
             if w["topic_id"] not in live_topics:
                 self.store.close_watch(w["id"], "topic_closed")
                 continue
-            started = _parse(w["started_at"])
+            if w["status"] == "replied":
+                continue  # 对方回复了、等会话确认：提醒和到期都暂停（7.16）
+            # 计时起点：回到 waiting 的从最后一次回复时间算，否则从登记时间算
+            started = _parse(w["last_reply_at"]) or _parse(w["started_at"])
             if not started:
                 continue
             mins = (now - started).total_seconds() / 60

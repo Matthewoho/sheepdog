@@ -10,7 +10,7 @@
   sheepdog forward --topic T [--message-ids a,b] [--quote 主人原话] [--note 总线备注]   转交消息 / 转达主人原话
   sheepdog spawn --key K [--dry-run]                     为名册里 conversation_id 留空的条目新建会话（可接手前任）
   sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
-  sheepdog watches [--all]  /  sheepdog unwatch --id N
+  sheepdog watches [--all]  /  sheepdog unwatch --id N  /  sheepdog watch-done --id N（确认真等到了）
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
   sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
   sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
@@ -436,12 +436,33 @@ def cmd_watches(args) -> int:
     if not rows:
         print("没有等待中的回复" if not args.all else "没有等待记录")
     for w in rows:
-        state = f"已结束 {w['close_reason']} @ {w['closed_at']}" if w["closed_at"] else "等待中"
+        if w["closed_at"]:
+            state = f"已结束 {w['close_reason']} @ {w['closed_at']}"
+        elif w["status"] == "replied":
+            state = f"对方已回复、等会话确认（{w['last_reply_at']}，消息 {w['last_reply_message_id']}）"
+        else:
+            state = "等待中" + (f"（从 {w['last_reply_at']} 的回复重新计时）" if w["last_reply_at"] else "")
         nudged = "/".join(m for m, k in (("15", "nudged_15_at"), ("30", "nudged_30_at")) if w[k]) or "-"
         print(f"#{w['id']} [{state}] topic={w['topic_id']} person={w['person_id']} chat={w['chat_id'] or '任意'} "
               f"开始 {w['started_at']} 已提醒 {nudged}")
         if w["note"]:
             print(f"  在等: {w['note']}")
+    return 0
+
+
+def cmd_watch_done(args) -> int:
+    """会话确认真正等到了对方的回复（7.16）。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    w = store.get_watch(args.id)
+    if not w:
+        print("没有这条等待", file=sys.stderr)
+        return 2
+    if w["closed_at"]:
+        print(f"#{args.id} 已结束（{w['close_reason']}）")
+        return 0
+    store.close_watch(args.id, "done")
+    print(f"等待 #{args.id} 已确认等到，关闭")
     return 0
 
 
@@ -825,6 +846,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("acks")
     sp.add_argument("--open", action="store_true", help="只看还没撤的")
     sp.set_defaults(func=cmd_acks)
+
+    sp = sub.add_parser("watch-done")
+    sp.add_argument("--id", type=int, required=True)
+    sp.set_defaults(func=cmd_watch_done)
 
     sp = sub.add_parser("unwatch")
     sp.add_argument("--id", type=int, required=True)

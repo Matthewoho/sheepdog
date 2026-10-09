@@ -227,7 +227,7 @@ class WatchTest(Base):
     def reasons(self, reason):
         return self.store.conn.execute("SELECT * FROM messages WHERE reason=? ORDER BY first_seen", (reason,)).fetchall()
 
-    def test_reply_routed_to_watcher_and_closes(self):
+    def test_reply_routed_to_watcher_until_confirmed(self):
         wid = add_watch(self.store, "tp_alpha", "ou_test_bob", note="等 Bob 确认排期")
         # Bob 在一个不相干的免打扰群里回复：本该丢弃，等待优先
         self.poll([msg(message_id="om_test_bob1", chat_id="oc_test_muted", sender_id="ou_test_bob")],
@@ -236,7 +236,8 @@ class WatchTest(Base):
         self.assertEqual((r["route"], r["topic_id"]), ("dispatch", "tp_alpha"))
         self.assertIn(f"watch:{wid}", json.loads(r["tags_json"]))
         w = self.store.get_watch(wid)
-        self.assertEqual(w["close_reason"], "replied")
+        self.assertEqual((w["status"], w["closed_at"]), ("replied", None))  # 候选，等会话确认（7.16）
+        self.store.close_watch(wid, "done")  # 会话确认等到了
         # 等待结束后，Bob 再说话按常规路由
         self.poll([msg(message_id="om_test_bob2", chat_id="oc_test_muted", sender_id="ou_test_bob")],
                   muted={"oc_test_muted"})
@@ -250,7 +251,7 @@ class WatchTest(Base):
         self.poll([msg(message_id="om_test_c1", chat_id="oc_test_other", sender_id="ou_test_carol"),
                    msg(message_id="om_test_b1", chat_id="oc_test_other", sender_id="ou_test_bob")])
         self.assertEqual(self.row("om_test_b1")["topic_id"], "tp_alpha")
-        self.assertEqual(self.store.get_watch(new)["close_reason"], "replied")
+        self.assertEqual(self.store.get_watch(new)["status"], "replied")
         self.assertIsNone(self.store.get_watch(old)["closed_at"])
         self.assertIsNone(self.row("om_test_c1")["topic_id"])  # 不在指定聊天，不算
         self.assertIsNone(self.store.get_watch(scoped)["closed_at"])

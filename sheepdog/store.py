@@ -101,7 +101,10 @@ CREATE TABLE IF NOT EXISTS watches (
     nudged_15_at TEXT,
     nudged_30_at TEXT,
     closed_at    TEXT,
-    close_reason TEXT                  -- replied | expired | cancelled | topic_closed
+    close_reason TEXT,                 -- done（会话确认等到了）| expired | cancelled | topic_closed（旧数据可能是 replied）
+    status       TEXT,                 -- waiting（空同）| replied（对方回复了、等会话确认，提醒暂停）
+    last_reply_at TEXT,                -- 对方最近一次回复的时间；回到 waiting 后从这里重新计时
+    last_reply_message_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_watch_person ON watches(person_id, closed_at);
 
@@ -190,6 +193,7 @@ MIGRATIONS = {
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT")],
     "acks": [("identity", "TEXT")],
+    "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
 }
 
 
@@ -660,6 +664,13 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.tx() as c:
             c.execute(f"UPDATE watches SET {cols} WHERE id=?", (*fields.values(), watch_id))
+
+    def mark_watch_replied(self, watch_id: int, message_id: str) -> None:
+        self.update_watch(watch_id, status="replied", last_reply_at=now_iso(), last_reply_message_id=message_id)
+
+    def reset_watch_waiting(self, watch_id: int) -> None:
+        """回复没被确认：回到 waiting，提醒档位清零，从最后一次回复时间重新计时。"""
+        self.update_watch(watch_id, status="waiting", nudged_15_at=None, nudged_30_at=None)
 
     def close_watch(self, watch_id: int, reason: str) -> None:
         self.update_watch(watch_id, closed_at=now_iso(), close_reason=reason)

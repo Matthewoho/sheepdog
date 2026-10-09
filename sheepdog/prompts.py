@@ -118,7 +118,8 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         "anchors 会存进会话记录；`project:` 开头的条目在 `sheepdog sessions` 里显示为关联项目。",
         "### 等别人回复",
         f"`sheepdog watch --topic {topic_id} --person <对方 open_id> [--chat <chat_id>] [--note \"在等什么\"]`："
-        f"对方回复会直接推给你并结束等待；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
+        f"对方回复会直接推给你，等待暂停、等你确认：真等到了用 `sheepdog watch-done --id <id>` 或回执 anchors 写 "
+        f"`watch_done:<id>`，否则下次回执后恢复等待、从回复时间重新计时；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
     ]
     if bus:
@@ -341,8 +342,11 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "") -> str:
         lines.append(AGENT_SENDER_LABEL)
     if row["note"]:
         lines.append(row["note"])
-    if any(t.startswith("watch:") for t in tags):
-        lines.append("（这是你登记等待的回复，等待已结束）")
+    for t in tags:
+        if t.startswith("watch:"):
+            wid = t.removeprefix("watch:")
+            lines.append(f"（这是你登记等待 #{wid} 的人发来的。真等到了就 `sheepdog watch-done --id {wid}` 或回执 anchors 写 "
+                         f"`watch_done:{wid}`；没确认的话，下次回执后继续等待并从这次回复重新计时）")
     if banner:
         lines.append(banner)  # 警示在正文之前
     content = (row["content"] or "").strip()
