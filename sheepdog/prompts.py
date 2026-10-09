@@ -156,6 +156,32 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
     )
 
 
+# 规则同步（7.11）
+RULES_UPDATE_HEADER = "📌 规则已更新（以下为现行完整规则，取代之前的版本）"
+# 总线常驻规则算指纹时 {{roster}} 用这句占位：名册变化走「名册更新」，不触发整份规则重发
+ROSTER_HASH_STUB = "（名册另行同步，以最近一次「名册更新」为准）"
+
+
+def standing_rules_bus(pb: Playbook, plain_title: str, roster_text: str, overlay: str,
+                       remind: list[int], expire: int) -> str:
+    """总线的常驻规则：security.md + bus.md + common.md + overlay + 接口说明。"""
+    v = dict(session_title=plain_title, topic_id="tp_bus")
+    return _join(pb.render("security.md", **v), pb.render("bus.md", roster=roster_text, **v),
+                 pb.render("common.md", **v), overlay,
+                 interface_section("tp_bus", bus=True, remind=remind, expire=expire))
+
+
+def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], expire: int) -> str:
+    """专属会话的常驻规则：security.md + onboarding.md + common.md + 接口说明（不含 successor.md 这类一次性指令）。"""
+    v = dict(session_title=s.display_title, topic_id=s.topic_id)
+    return _join(pb.render("security.md", **v), _onboarding_body(pb, s), pb.render("common.md", **v),
+                 interface_section(s.topic_id, bus=False, remind=remind, expire=expire))
+
+
+def rules_update_message(rules: str) -> str:
+    return _join(f"[sheepdog] {RULES_UPDATE_HEADER}", rules)
+
+
 def _onboarding_body(pb: Playbook, s: RosterSession) -> str:
     v = dict(session_title=s.display_title, topic_id=s.topic_id)
     return pb.render(
@@ -284,8 +310,12 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
 
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
-                 roster_update: str = "", security: SecurityConfig | None = None) -> str:
-    parts = [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
+                 roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "") -> str:
+    parts = []
+    if rules_update:
+        # 规则变了：完整现行规则放在这批最前面（7.11）
+        parts += [f"{RULES_UPDATE_HEADER}", "", rules_update.strip(), "", "---", ""]
+    parts += [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
     parts += [_fmt_msg(r, security_banner(pb, r, security, session_title)) for r in rows]

@@ -17,6 +17,7 @@
   sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...] [--dry-run]
                                                          总线临时新开一个专属会话（只在账本里）
   sheepdog close-session --topic T                       收掉总线新开的会话
+  sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -287,6 +288,8 @@ def cmd_sessions(args) -> int:
     rows = store.list_topics()
     if not rows:
         print("暂无 session")
+    # 只用来算规则指纹，不投递
+    rules = Dispatcher(cfg, store, DryRunSink(), roster)
     for t in rows:
         mode = _MODE.get(t["kind"], t["kind"] or "-")
         print(f"- {t['title']}  [{t['state']}]  mode={mode}  topic={t['topic_id']}  conversation={t['conversation_id'] or '-'}")
@@ -323,6 +326,8 @@ def cmd_sessions(args) -> int:
             print(f"  交接回执: {'已转给接手会话' if not t['pending_batch_id'] else '等待中（批次 ' + t['pending_batch_id'] + '）'}")
         if t["summary"]:
             print(f"  进展: {t['summary']}")
+        if t["state"] != sm.CLOSED and (status := rules.rules_status(t)):
+            print(f"  规则: {status}")
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
     return 0
 
@@ -503,6 +508,24 @@ def cmd_new_session(args) -> int:
     return 0
 
 
+def cmd_push_rules(args) -> int:
+    cfg, store, _source, sink, roster, security = _build(args)
+    if args.dry_run:
+        print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
+    d = Dispatcher(cfg, store, sink, roster, security)
+    d.sync_roster()
+    try:
+        report = d.push_rules(args.topic or None)
+    except ValueError as e:
+        print(f"push-rules 被拒绝: {e}", file=sys.stderr)
+        return 2
+    if not report:
+        print("没有可发的会话")
+    for tid, what in report.items():
+        print(f"{tid}: {what}")
+    return 0
+
+
 def cmd_close_session(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -603,6 +626,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--note", default="", help="为什么开（会作为创建原因记下，并排进它的队列）")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
     sp.set_defaults(func=cmd_new_session)
+
+    sp = sub.add_parser("push-rules")
+    sp.add_argument("--topic", default="", help="不填 = 全部会话（含总线）")
+    sp.add_argument("--dry-run", action="store_true", help="只打印，不发、不写账本")
+    sp.set_defaults(func=cmd_push_rules)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
@@ -11,8 +12,9 @@ from . import session as sm
 from .config import Config
 from .models import Message
 from .playbook import Playbook
-from .prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, relay_content,
-                      retirement_prompt, roster_table, watch_message)
+from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
+                      relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
+                      standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, SELF, RouteContext, RouteDecision, message_bodies, route
@@ -572,10 +574,77 @@ class Dispatcher:
                                   self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes,
                                   open_dynamic_topics(self.store))
         cid = self.sink.new_conversation(t["title"], prompt, self.cfg.session.model)
-        self.store.update_topic(t["topic_id"], conversation_id=cid)
+        self.store.update_topic(t["topic_id"], conversation_id=cid, rules_hash=self.rules_hash(t))
         self.store.set_meta("roster_notify_bus", "0")
         log.info("新建 session %s -> %s", t["title"], cid)
         return self.store.get_topic(t["topic_id"])
+
+    # ---------- 规则同步（7.11） ----------
+    def _rules_session(self, t) -> RosterSession | None:
+        if t["kind"] == ADOPTED:
+            return self.roster.by_topic(t["topic_id"])
+        if t["kind"] == DYNAMIC:
+            chats = []
+            for a in json.loads(t["anchors_json"] or "[]"):
+                if a.startswith("oc_"):
+                    cid, _, flag = a.partition(":")
+                    chats.append(RosterChat(cid, "", flag == "all"))
+            return RosterSession(key=t["topic_id"].removeprefix("tp_"), mode=MANAGED, title=t["title"],
+                                 duty=t["duty"] or "", chats=chats)
+        return None
+
+    def standing_rules(self, t, for_hash: bool = False) -> str:
+        """该 topic 现行的常驻规则（每次现读 playbook）。总线算指纹时名册用占位，名册变化另走「名册更新」。"""
+        w = self.cfg.watch
+        if t["topic_id"] == BUS_TOPIC_ID:
+            roster_text = ROSTER_HASH_STUB if for_hash else roster_table(self.roster, open_dynamic_topics(self.store))
+            return standing_rules_bus(self.playbook, self.cfg.session.bus_title, roster_text,
+                                      self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes)
+        s = self._rules_session(t)
+        return standing_rules_managed(self.playbook, s, w.remind_minutes, w.expire_minutes) if s else ""
+
+    def rules_hash(self, t) -> str:
+        text = self.standing_rules(t, for_hash=True)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+    def rules_status(self, t) -> str:
+        if t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS:
+            return ""
+        if not t["rules_hash"]:
+            return "未记录（下一批带上完整规则）"
+        return "最新" if t["rules_hash"] == self.rules_hash(t) else "待更新（下一批带上完整规则）"
+
+    def push_rules(self, topic_id: str | None = None) -> dict[str, str]:
+        """不等新消息，立即给指定 / 全部会话发一次完整现行规则，并更新指纹。"""
+        if topic_id:
+            t = self.store.get_topic(topic_id)
+            if t is None:
+                raise ValueError(f"topic {topic_id} 不存在")
+            targets = [t]
+        else:
+            targets = [t for t in self.store.list_topics() if t["topic_id"] == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS]
+        report: dict[str, str] = {}
+        for t in targets:
+            tid = t["topic_id"]
+            if tid != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS:
+                report[tid] = f"跳过：{t['kind']} 会话不投递"
+            elif t["state"] == sm.CLOSED:
+                report[tid] = "跳过：已关闭"
+            elif not t["conversation_id"]:
+                report[tid] = "跳过：还没有会话"
+            elif t["kind"] == ADOPTED and not t["onboarded_at"]:
+                report[tid] = "跳过：还没 onboarding（onboarding 本身含现行规则）"
+            elif not (rules := self.standing_rules(t)):
+                report[tid] = "跳过：没有可发的规则"
+            else:
+                try:
+                    self.sink.send_message(t["conversation_id"], rules_update_message(rules))
+                except SinkError as e:
+                    report[tid] = f"失败：{e}"
+                    continue
+                self.store.update_topic(tid, rules_hash=self.rules_hash(t))
+                report[tid] = "已发送"
+        return report
 
     def send_onboarding(self, t) -> str:
         """给 adopted 会话发登记通知（只发一次）。作为一个不含消息的批次，等回执或超时后再投消息。"""
@@ -589,7 +658,7 @@ class Dispatcher:
         ts = now_iso()
         self.store.record_dispatch(bid, t["topic_id"], [])
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
-                                pending_batch_id=bid, dispatched_at=ts, onboarded_at=ts)
+                                pending_batch_id=bid, dispatched_at=ts, onboarded_at=ts, rules_hash=self.rules_hash(t))
         log.info("topic %s: 已发 onboarding %s", t["topic_id"], bid)
         return bid
 
@@ -617,9 +686,12 @@ class Dispatcher:
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
             inbox = [] if adopted else self.store.inbox_summary()
+            # 规则变了（或从没记录过指纹）：这批最前面带上完整现行规则（7.11）
+            new_hash = self.rules_hash(t)
+            rules_update = self.standing_rules(t) if new_hash and new_hash != t["rules_hash"] else ""
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
-                                  security=self.security)
+                                  security=self.security, rules_update=rules_update)
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
             self._fail(t, None, str(e))
@@ -628,6 +700,9 @@ class Dispatcher:
 
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
+        if rules_update:
+            self.store.update_topic(t["topic_id"], rules_hash=new_hash)
+            log.info("topic %s: 规则已更新，随批次 %s 送达", t["topic_id"], batch_id)
         ids = [r["message_id"] for r in rows]
         # 主人的回复已送到提问的会话：对应的「需要你定」标记已答
         for r in rows:
@@ -742,6 +817,7 @@ class Dispatcher:
         self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE)
         self.store.update_topic(topic_id, conversation_id=cid, spawned_at=ts, onboarded_at=ts, origin_note=note or None,
                                 anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False))
+        self.store.update_topic(topic_id, rules_hash=self.rules_hash(self.store.get_topic(topic_id)))
         self.store.set_meta("roster_notify_bus", "1")
         if ids or note:
             forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
@@ -778,7 +854,7 @@ class Dispatcher:
         ts = now_iso()
         # bootstrap 已含职责与规则，等同 onboarding
         fields = dict(conversation_id=cid, spawned_at=ts, onboarded_at=ts, pending_batch_id=None,
-                      state=sm.ACTIVE, retries=0)
+                      state=sm.ACTIVE, retries=0, rules_hash=self.rules_hash(t))
         if read_bid:
             # 「读完前任上下文」的回执作为一个不含消息的批次：回执前信号排队
             self.store.record_dispatch(read_bid, s.topic_id, [])

@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS topics (
     receipt_missed   INTEGER DEFAULT 0,  -- adopted 会话回执超时次数（不重投）
     spawned_at       TEXT,             -- 由 sheepdog spawn 新建的时间；名册 conversation_id 留空时以此为准
     origin_note      TEXT,             -- dynamic 会话的创建原因（new-session 的 --note）
+    rules_hash       TEXT,             -- 上次送达的常驻规则指纹（7.11）；为空 = 没记录，下一批带上完整规则
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -139,7 +140,7 @@ MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
                  ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
-               ("origin_note", "TEXT")],
+               ("origin_note", "TEXT"), ("rules_hash", "TEXT")],
 }
 
 

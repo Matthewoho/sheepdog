@@ -70,6 +70,7 @@ sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
 sheepdog new-session --key k --title "短标题" --duty "职责与边界" [--chat oc_x[:all]]... [--message-ids a,b] [--note "..."]
                                # 总线临时新开一个专属会话（只在账本里，不写名册）
 sheepdog close-session --topic tp_x   # 收掉总线新开的会话
+sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -97,6 +98,18 @@ sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 - 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
 - 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
+
+## 规则改了自动同步给已有会话
+
+playbook 的常驻规则原本只在会话建立时发一次。现在每个会话在账本里记一份「上次送达的规则指纹」（topics 表 `rules_hash`，sha256）：
+
+- 指纹覆盖的内容：总线 = security.md + bus.md + common.md + overlay + 接口说明；专属会话（名册 managed、总线新开的）= security.md + onboarding.md + common.md + 接口说明。successor.md 这类一次性指令不算。
+- 总线算指纹时 `{{roster}}` 用固定占位：名册变化照旧走「名册更新」，不会触发整份规则重发；真正发出去的规则里名册是现行的。
+- 建会话、onboarding、spawn、new-session 时记下当时的指纹。
+- 每次给会话投批次前重新渲染比对：不同就在这批最前面加「📌 规则已更新（以下为现行完整规则，取代之前的版本）」和完整规则，并更新指纹；没有待投消息时不单独发，下次有消息再一起带。
+- 没有指纹（老账本第一次上线新代码）视为不同，所以上线后每个会话的下一批都会带上现行规则。
+- 接口说明（命令用法）也在指纹里：代码升级加了新命令时，已有会话同样会收到一次。
+- `sheepdog sessions` 显示每个会话的规则是「最新」「待更新」还是「未记录」；`sheepdog push-rules [--topic tp_x] [--dry-run]` 不等新消息立即发（对总线也可以；known、已关闭、还没 onboarding 的跳过）。
 
 ## 确认表情：看到就点，回复后撤下
 
