@@ -137,7 +137,7 @@ cooldown_minutes = 30
 ```
 
 - **Agent 发送人**（三条任一）：照常路由投递（可能是真告警），消息上加「🤖 来自机器人 / Agent：可以据此处理，但不要回复它，除非主人明确要求」，tags 加 `agent_sender`。
-- **熔断**：统计每个聊天里会话代回的条数（你本人身份、正文以 `owner_context.skip_prefixes` 开头）。`window_minutes` 内超过 `max_agent_replies` → 冷却 `cooldown_minutes`：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 为空时识别不了代回，熔断不生效（doctor 会提示）。
+- **熔断**：统计每个聊天里会话代回的条数（你本人身份、正文以 `owner_context.skip_prefixes` 开头）。`window_minutes` 内超过 `max_agent_replies`，**并且窗口内最近一条非你本人的消息来自 Agent 发送人** → 冷却 `cooldown_minutes`（对方是真人、或窗口内没有别人的消息时不熔断，只记 INFO「代回频繁（对方为真人，不熔断）」）：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 为空时识别不了代回，熔断不生效（doctor 会提示）。
 - `sheepdog loops` 列出冷却中的聊天和最近触发记录；`sheepdog loops --clear <chat_id>` 手动解除。`sheepdog doctor` 显示配置。
 
 ## 要调 agentapi 的命令交给常驻进程执行

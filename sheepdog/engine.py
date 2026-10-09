@@ -184,7 +184,8 @@ class Collector:
                 self._cooling[e["chat_id"]] = until
 
     def _loop_check(self, m: Message) -> None:
-        """会话代回（主人身份、带代回前缀）计数：window 内超过 max_agent_replies → 该聊天冷却，并提示总线一次。"""
+        """会话代回（主人身份、带代回前缀）计数：window 内超过 max_agent_replies、且窗口内最近一条非主人消息
+        来自 Agent 发送人 → 该聊天冷却，并提示总线一次。对方是真人时不熔断，只记 INFO。"""
         lg, me = self.cfg.loop_guard, self.cfg.self_open_id
         prefixes = self.cfg.owner_context.skip_prefixes
         if not prefixes or m.chat_id in self.cfg.escalation.chat_ids:
@@ -204,8 +205,18 @@ class Collector:
                 n += 1
         if n <= lg.max_agent_replies:
             return
-        until = _now() + timedelta(minutes=lg.cooldown_minutes)
         name = m.chat_name or m.chat_id
+        # 7.14 补丁：只在对方是 Agent 时熔断——窗口内最近一条非主人消息来自 Agent 发送人；真人对话只记 INFO
+        latest = None
+        for r in self.store.others_in_chat(m.chat_id, me):
+            t = _parse(r["create_time"])
+            if t is not None and t.tzinfo is not None and t >= start:
+                latest = r
+                break
+        if latest is None or not self._is_agent(row_to_message(latest)):
+            log.info("代回频繁（对方为真人，不熔断）：%s（%s）%g 分钟内代回 %d 次", name, m.chat_id, lg.window_minutes, n)
+            return
+        until = _now() + timedelta(minutes=lg.cooldown_minutes)
         self.store.add_loop_event(m.chat_id, name, n, until.isoformat(timespec="seconds"))
         self._cooling[m.chat_id] = until
         log.warning("疑似循环：%s（%s）%g 分钟内代回 %d 次，暂停 %g 分钟", name, m.chat_id, lg.window_minutes, n,

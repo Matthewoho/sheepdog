@@ -387,6 +387,12 @@ class Store:
             "SELECT * FROM messages WHERE chat_id=? AND sender_id=? ORDER BY first_seen DESC LIMIT ?",
             (chat_id, self_open_id, limit)).fetchall()
 
+    def others_in_chat(self, chat_id: str, self_open_id: str, limit: int = 50) -> list[sqlite3.Row]:
+        """聊天里非主人发来的消息，按发送时间倒序（sheepdog 自己生成的不算）。"""
+        return self.conn.execute(
+            """SELECT * FROM messages WHERE chat_id=? AND sender_id != ? AND chat_type != 'sheepdog'
+               ORDER BY create_time DESC, first_seen DESC LIMIT ?""", (chat_id, self_open_id, limit)).fetchall()
+
     def add_loop_event(self, chat_id: str, chat_name: str, replies: int, until_iso: str) -> int:
         with self.tx() as c:
             cur = c.execute("INSERT INTO loop_events(chat_id,chat_name,triggered_at,replies,until) VALUES(?,?,?,?,?)",

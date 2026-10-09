@@ -114,6 +114,7 @@ class LoopGuardTest(Base):
         self.assertEqual(self.row("om_test_a2")["route"], "dispatch")
 
     def test_loops_cli_and_clear(self):
+        self.poll([self.agent("om_test_c_agent")])
         self.poll([self.reply(f"om_test_c{i}") for i in range(5)])
         cfg_file = Path(self.tmp.name) / "config.toml"
         cfg_file.write_text(f'self_open_id = "{ME}"\n', encoding="utf-8")
@@ -132,6 +133,36 @@ class LoopGuardTest(Base):
         self.assertIn("[已手动解除]", run("loops"))
         self.poll([self.agent("om_test_after")])
         self.assertEqual(self.row("om_test_after")["route"], "dispatch")
+
+    def human(self, mid, minutes=0):
+        return msg(message_id=mid, chat_id=LOOP, chat_name="循环群", sender_name="真人同事", sender_id="ou_test_person",
+                   mentions=[Mention(ME)], create_time=now(minutes))
+
+    def test_human_conversation_not_tripped(self):
+        self.poll([self.human("om_test_p1")])
+        with self.assertLogs("sheepdog", "INFO") as logs:
+            self.poll([self.reply(f"om_test_hr{i}") for i in range(6)])
+        self.assertEqual(self.store.open_loop_events(), [])
+        self.assertTrue(any("对方为真人，不熔断" in line for line in logs.output))
+        self.poll([self.human("om_test_p2")])
+        self.assertEqual(self.row("om_test_p2")["route"], "dispatch")  # 真人照常投递
+
+    def test_mixed_chat_uses_latest_other_sender(self):
+        # 先机器人、后真人：最近一条是真人 → 不熔断
+        self.poll([self.agent("om_test_m1", create_time=now(-3)), self.human("om_test_m2", minutes=-2)])
+        self.poll([self.reply(f"om_test_mr{i}") for i in range(5)])
+        self.assertEqual(self.store.open_loop_events(), [])
+        # 机器人又说话、成了最近一条 → 再代回就熔断
+        self.poll([self.agent("om_test_m3", create_time=now(-1))])
+        self.poll([self.reply("om_test_mr5")])
+        self.assertEqual(len(self.store.open_loop_events()), 1)
+        # 窗口外的机器人消息不算：只有窗口外的 Agent、没有窗口内的非主人消息 → 不熔断
+        self.store.clear_loop(LOOP)
+        self.store.conn.execute("DELETE FROM messages WHERE chat_id=? AND sender_id != ?", (LOOP, ME))
+        self.store.conn.commit()
+        self.poll([self.agent("om_test_m4", create_time=now(-60))])
+        self.poll([self.reply("om_test_mr6")])
+        self.assertEqual(self.store.open_loop_events(), [])
 
     def test_no_prefix_no_breaker(self):
         self.cfg.owner_context.skip_prefixes = []
