@@ -28,6 +28,7 @@ On top of routing:
 
 - **Roster.** Register agent sessions you already have (`managed`: sheepdog pushes to them; `known`: the bus knows they exist but never pushes). A retiring session can hand over to a new one, and the successor must read its predecessor's full transcript before starting.
 - **Bus session.** Receives everything without an owner, knows the whole roster, and forwards work to the right session, opening a new one when no session fits.
+- **Your own words as context.** What you say in a chat yourself (plus your edits, recalls and reactions) is passed to the session that owns it as background, so you and the agent don't talk past each other.
 - **Ask the human.** When a session is unsure, it DMs you through a bot. You can answer in the bus session or reply right in Lark. sheepdog verifies the reply came from your account and routes it back to the session that asked.
 - **Waiting on others.** A session registers a wait (`sheepdog watch`); the reply is routed straight back to it, with reminders at 15 / 30 minutes and a report to you at 60 (all configurable).
 - **Project anchoring.** Sessions ask which project a request belongs to and record it, so information doesn't scatter.

@@ -123,6 +123,31 @@ class EscalationConfig:
 
 
 @dataclass
+class OwnerContextConfig:
+    # 主人本人在聊天里的发言作为背景送给负责的会话（7.13）；默认关
+    enabled: bool = False
+    # 聊天没有名册 / 总线新开归属时，送给这么久内最近处理过该聊天的会话（含总线）
+    follow_hours: float = 24
+    # 正文以这些前缀开头的视为会话代回，不送
+    skip_prefixes: list[str] = field(default_factory=list)
+    # 主人对已投递消息点的表情（7.13 补充）：回看多久内投递过的消息、多久查一次（0 = 不查）
+    reaction_lookback_hours: float = 24
+    reaction_check_minutes: float = 5
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("[owner_context] enabled 必须是 true/false")
+        if isinstance(self.follow_hours, bool) or not isinstance(self.follow_hours, (int, float)) or self.follow_hours < 0:
+            raise ConfigError("[owner_context] follow_hours 必须是 >= 0 的数")
+        if not isinstance(self.skip_prefixes, list) or not all(isinstance(x, str) and x for x in self.skip_prefixes):
+            raise ConfigError("[owner_context] skip_prefixes 必须是非空字符串列表")
+        for k in ("reaction_lookback_hours", "reaction_check_minutes"):
+            v = getattr(self, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                raise ConfigError(f"[owner_context] {k} 必须是 >= 0 的数")
+
+
+@dataclass
 class BusConfig:
     # 总线每天（本地日历日）最多新开几个会话（7.10）；0 = 禁止总线新开
     max_new_sessions_per_day: int = 5
@@ -184,6 +209,7 @@ class Config:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     ack: AckConfig = field(default_factory=AckConfig)
     bus: BusConfig = field(default_factory=BusConfig)
+    owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -244,6 +270,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.watch, data.get("watch", {}))
         _apply(cfg.escalation, data.get("escalation", {}))
         _apply(cfg.bus, data.get("bus", {}))
+        _apply(cfg.owner_context, data.get("owner_context", {}))
         if isinstance(data.get("ack"), dict):
             _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
             cfg.ack.enabled = True
@@ -253,6 +280,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.escalation.validate()
     cfg.ack.validate()
     cfg.bus.validate()
+    cfg.owner_context.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

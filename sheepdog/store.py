@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tags_json      TEXT,
     topic_id       TEXT,
     dispatch_state TEXT,               -- pending | delivered | acked | failed | missed（adopted 回执超时）
+                                       -- | context（主人本人的发言作为背景已送达，不要回执）
     batch_id       TEXT,
     inbox_cleared  INTEGER DEFAULT 0,
     note           TEXT,               -- 未用（早期转交说明，转达改为 sheepdog 消息）
@@ -129,6 +130,17 @@ CREATE TABLE IF NOT EXISTS acks (
     error        TEXT                  -- 点或撤失败的原因
 );
 CREATE INDEX IF NOT EXISTS idx_ack_chat ON acks(chat_id, removed_at);
+
+-- 主人对已投递消息点的表情（7.13 补充）：报过的不重复报
+CREATE TABLE IF NOT EXISTS owner_reactions (
+    message_id   TEXT NOT NULL,
+    emoji_type   TEXT NOT NULL,
+    operator_id  TEXT NOT NULL,
+    reaction_id  TEXT,
+    seen_at      TEXT NOT NULL,
+    reported     INTEGER DEFAULT 0,    -- 0 = 首次检查时的基线，只记不报；1 = 已报给会话
+    PRIMARY KEY (message_id, emoji_type, operator_id)
+);
 
 -- 会话发起、要调 agentapi 的动作（7.12）：只有常驻进程能跨项目投递，其他进程只入队，由 run 每轮执行
 CREATE TABLE IF NOT EXISTS actions (
@@ -322,18 +334,62 @@ class Store:
         return mid
 
     def requeue_batch(self, batch_id: str) -> None:
+        # 主人本人的发言是背景，不随超时重投（7.13）
         with self.tx() as c:
-            c.execute("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=?", (batch_id,))
+            c.execute("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=? AND reason != 'owner_context'",
+                      (batch_id,))
+
+    def route_owner_context(self, message_id: str, topic_id: str, note: str) -> None:
+        """把主人本人的一条发言排给 topic 作背景（7.13）。"""
+        with self.tx() as c:
+            c.execute("""UPDATE messages SET route='dispatch', reason='owner_context', dispatch_state='pending',
+                             topic_id=?, note=? WHERE message_id=?""", (topic_id, note or None, message_id))
+
+    def delivered_since(self, since_iso: str, limit: int = 500) -> list[sqlite3.Row]:
+        """since 之后投递给会话的 IM 消息（不含 sheepdog 自己生成的、不含主人本人的背景）。"""
+        return self.conn.execute(
+            """SELECT DISTINCT m.* FROM messages m JOIN dispatches d ON d.batch_id = m.batch_id
+               WHERE m.route='dispatch' AND m.dispatch_state IN ('delivered','acked','missed')
+                 AND m.chat_type != 'sheepdog' AND m.reason != 'owner_context' AND d.sent_at >= ?
+               ORDER BY d.sent_at DESC LIMIT ?""", (since_iso, limit)).fetchall()
+
+    def owner_reaction_known(self, message_id: str, emoji_type: str, operator_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM owner_reactions WHERE message_id=? AND emoji_type=? AND operator_id=?",
+            (message_id, emoji_type, operator_id)).fetchone() is not None
+
+    def add_owner_reaction(self, message_id: str, emoji_type: str, operator_id: str, reaction_id: str,
+                           reported: bool) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT OR IGNORE INTO owner_reactions(message_id,emoji_type,operator_id,reaction_id,seen_at,reported)
+                         VALUES(?,?,?,?,?,?)""", (message_id, emoji_type, operator_id, reaction_id, now_iso(), int(reported)))
+
+    def ack_reaction_ids(self) -> set[str]:
+        """sheepdog 以主人身份点的确认表情：查主人表情时要排除。"""
+        return {r[0] for r in self.conn.execute(
+            "SELECT reaction_id FROM acks WHERE reaction_id IS NOT NULL AND (identity IS NULL OR identity='user')")}
+
+    def last_delivered_topic(self, chat_id: str, since_iso: str) -> str | None:
+        """since 之后最近一次把这个聊天（别人发的）消息投递出去的 topic。"""
+        row = self.conn.execute(
+            """SELECT m.topic_id FROM messages m JOIN dispatches d ON d.batch_id = m.batch_id
+               WHERE m.chat_id=? AND m.route='dispatch' AND m.reason != 'owner_context' AND d.sent_at >= ?
+               ORDER BY d.sent_at DESC LIMIT 1""", (chat_id, since_iso)).fetchone()
+        return row["topic_id"] if row else None
 
     # ---------- inbox ----------
-    def inbox_summary(self) -> list[sqlite3.Row]:
+    def inbox_summary(self, self_open_id: str = "") -> list[sqlite3.Row]:
+        """按群汇总 Inbox；owner_last 是主人在该群最近一次发言的时间（7.13，没有为空）。"""
         return self.conn.execute(
-            """SELECT chat_id, chat_name, reason,
+            """SELECT m.chat_id, m.chat_name, m.reason,
                       COUNT(*) AS total,
-                      SUM(CASE WHEN is_read IS NULL OR is_read=0 THEN 1 ELSE 0 END) AS unread,
-                      MAX(create_time) AS last_time
-               FROM messages WHERE route='inbox' AND inbox_cleared=0 AND deleted=0
-               GROUP BY chat_id ORDER BY last_time DESC"""
+                      SUM(CASE WHEN m.is_read IS NULL OR m.is_read=0 THEN 1 ELSE 0 END) AS unread,
+                      MAX(m.create_time) AS last_time,
+                      (SELECT MAX(s.create_time) FROM messages s
+                        WHERE s.chat_id = m.chat_id AND ? != '' AND s.sender_id = ?) AS owner_last
+               FROM messages m WHERE m.route='inbox' AND m.inbox_cleared=0 AND m.deleted=0
+               GROUP BY m.chat_id ORDER BY last_time DESC""",
+            (self_open_id, self_open_id),
         ).fetchall()
 
     def inbox_messages(self, chat_query: str, limit: int = 50) -> list[sqlite3.Row]:
@@ -536,7 +592,7 @@ class Store:
         cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
         with self.tx() as c:
             cur = c.execute(
-                "DELETE FROM messages WHERE first_seen < ? AND (route != 'dispatch' OR dispatch_state IN ('acked','failed','missed'))",
+                "DELETE FROM messages WHERE first_seen < ? AND (route != 'dispatch' OR dispatch_state IN ('acked','failed','missed','context'))",
                 (cutoff,),
             )
             return cur.rowcount

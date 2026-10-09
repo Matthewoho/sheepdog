@@ -55,6 +55,14 @@ header_regex = '^🐕 \[sheepdog·[^\]]*·(?P<topic>tp_[a-z0-9_.-]+)\] 需要你
 # 一条「需要你定」多久内算未结，超时自动关闭
 open_hours = 24
 
+[owner_context]
+# 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
+enabled = true
+follow_hours = 24              # 聊天没有会话负责时，送给这么久内最近处理过它的会话（含总线）；都没有就不送
+skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话代回的，不送（填你的代回前缀）
+reaction_lookback_hours = 24   # 查你对多久内投递过的消息点了表情
+reaction_check_minutes = 5     # 多久查一次表情；0 = 不查（查询只读）
+
 [bus]
 # 总线每天最多临时新开几个专属会话（sheepdog new-session）；0 = 禁止总线新开
 max_new_sessions_per_day = 5

@@ -43,6 +43,8 @@ SECURITY_HOLD_TAG = "security_hold"
 SECURITY_RELEASE_TAG = "security_release:quote"
 # 主人在 IM 上的回复（7.8）：发送人已由 IM 账号核实；escalation:<提问消息 id> 记它回答的是哪条「需要你定」
 OWNER_VERIFIED_TAG = "owner_verified"
+# 主人本人的发言作为背景送给负责的会话（7.13）：不点表情、不要回执、不改状态
+OWNER_CONTEXT = "owner_context"
 ESCALATION_TAG_PREFIX = "escalation:"
 
 
@@ -252,6 +254,8 @@ class Collector:
                 self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id)
                 if d.route == DISPATCH:
                     self._close_watch(w, m.message_id, self._secure(m.message_id))
+                elif d.route == SELF and me and m.sender_id == me:
+                    self._owner_context(m)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
             else:
@@ -261,6 +265,7 @@ class Collector:
                     self.store.touch(m.message_id)
 
         self._tag_read_status()
+        self._check_owner_reactions()
         self.store.set_meta("watermark", started.isoformat(timespec="seconds"))
         self.store.set_meta("last_poll", now_iso())
         return stats
@@ -273,6 +278,122 @@ class Collector:
             self.acker.on_own_message(m)
         except Exception as e:
             log.warning("处理确认表情失败 %s: %s", m.message_id, e)
+
+    # ---------- 主人本人的发言作为背景（7.13） ----------
+    def _owner_context_wanted(self, m: Message) -> bool:
+        oc = self.cfg.owner_context
+        if not oc.enabled:
+            return False
+        if m.chat_id in self.cfg.escalation.chat_ids or m.chat_id in self.cfg.routing.ignore_chat_ids:
+            return False
+        # 会话以主人身份代回的（带代回前缀）不送
+        return not any(b.startswith(p) for b in message_bodies(m.content) for p in oc.skip_prefixes)
+
+    def _owner_context_target(self, chat_id: str) -> str | None:
+        """去向：名册 / 总线新开的聊天归属 → 它；否则 follow_hours 内最近处理过该聊天的会话（含总线）；都没有 → 不送。"""
+        owner = self.roster.owner_of(chat_id) if self.roster else None
+        if owner is not None:
+            return owner[0].topic_id
+        if chat_id in self._dynamic:
+            return self._dynamic[chat_id][0]
+        since = (_now() - timedelta(hours=self.cfg.owner_context.follow_hours)).isoformat(timespec="seconds")
+        tid = self.store.last_delivered_topic(chat_id, since)
+        if not tid:
+            return None
+        t = self.store.get_topic(tid)
+        if t is None or t["state"] == sm.CLOSED or not (tid == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS):
+            return None
+        return tid
+
+    def _owner_context(self, m: Message) -> None:
+        if not self._owner_context_wanted(m):
+            return
+        topic_id = self._owner_context_target(m.chat_id)
+        if not topic_id:
+            return
+        note = ""
+        if m.reply_to and (r := self.store.get_message(m.reply_to)) is not None:
+            text = " ".join((r["content"] or "").split())
+            note = (f"回复的是 {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）："
+                    f"{text[:80] + ('…' if len(text) > 80 else '')}")
+        self.store.route_owner_context(m.message_id, topic_id, note)
+        log.info("主人的发言 %s 作为背景送给 %s", m.message_id, topic_id)
+
+    def _owner_edit(self, old, m: Message, recalled: bool) -> None:
+        if not self._owner_context_wanted(m):
+            return
+        old_text = old["content"] or ""
+        if any(b.startswith(p) for b in message_bodies(old_text) for p in self.cfg.owner_context.skip_prefixes):
+            return  # 原文是会话代回的
+        topic_id = self._owner_context_target(m.chat_id)
+        if not topic_id:
+            return
+        where = "私聊" if m.chat_type == "p2p" else f"群「{m.chat_name or m.chat_id}」"
+        if recalled:
+            body = f"📝 主人撤回了他在{where}的发言（message_id `{m.message_id}`）：原文\n> {old_text}"
+        else:
+            body = f"📝 主人编辑了他在{where}的发言（message_id `{m.message_id}`）：\n旧：{old_text}\n新：{m.content}"
+        self.store.add_system_message(topic_id, OWNER_CONTEXT, body)
+        log.info("主人%s发言 %s，作为背景送给 %s", "撤回" if recalled else "编辑", m.message_id, topic_id)
+
+    def _check_owner_reactions(self) -> None:
+        """每 reaction_check_minutes 查一次主人对已投递消息点的表情（只读），新加的作为背景送给负责的会话。
+
+        排除 sheepdog 自己以主人身份点的确认表情；已报过的不重复报；第一次检查只记基线不报。失败只记日志。
+        """
+        oc, me = self.cfg.owner_context, self.cfg.self_open_id
+        if not oc.enabled or not oc.reaction_check_minutes or not me or not hasattr(self.source, "reactions_of"):
+            return
+        last = _parse(self.store.get_meta("owner_reactions_at"))
+        if last and _now() - last < timedelta(minutes=oc.reaction_check_minutes):
+            return
+        baseline = last is None
+        since = (_now() - timedelta(hours=oc.reaction_lookback_hours)).isoformat(timespec="seconds")
+        rows = {r["message_id"]: r for r in self.store.delivered_since(since)}
+        self.store.set_meta("owner_reactions_at", now_iso())
+        if not rows:
+            return
+        try:
+            found = self.source.reactions_of(list(rows))
+        except Exception as e:
+            log.warning("查主人表情失败: %s", e)
+            return
+        acks = self.store.ack_reaction_ids()
+        for mid, items in found.items():
+            r = rows.get(mid)
+            if r is None:
+                continue
+            for it in items:
+                emoji, op, rid = it.get("emoji_type", ""), it.get("operator_id", ""), it.get("reaction_id", "")
+                if op != me or not emoji or (rid and rid in acks):
+                    continue  # 别人点的、或 sheepdog 自己点的确认表情
+                if self.store.owner_reaction_known(mid, emoji, op):
+                    continue
+                self.store.add_owner_reaction(mid, emoji, op, rid, reported=not baseline)
+                if baseline:
+                    continue
+                topic_id = self._owner_reaction_target(r)
+                if not topic_id:
+                    continue
+                text = " ".join((r["content"] or "").split())
+                where = "私聊" if r["chat_type"] == "p2p" else f"群「{r['chat_name'] or r['chat_id']}」"
+                self.store.add_system_message(
+                    topic_id, OWNER_CONTEXT,
+                    f"📝 主人对这条消息点了 {emoji}：{where} | {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）："
+                    f"{text[:80] + ('…' if len(text) > 80 else '')}（message_id `{mid}`）")
+                log.info("主人对 %s 点了 %s，作为背景送给 %s", mid, emoji, topic_id)
+
+    def _owner_reaction_target(self, row) -> str | None:
+        """名册 / 总线新开的聊天归属优先，否则送给投递过这条消息的会话。"""
+        owner = self.roster.owner_of(row["chat_id"]) if self.roster else None
+        if owner is not None:
+            return owner[0].topic_id
+        if row["chat_id"] in self._dynamic:
+            return self._dynamic[row["chat_id"]][0]
+        t = self.store.get_topic(row["topic_id"]) if row["topic_id"] else None
+        if t is None or t["state"] == sm.CLOSED or not (t["topic_id"] == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS):
+            return None
+        return t["topic_id"]
 
     # ---------- 「找主人」聊天（7.8） ----------
     def _escalation_message(self, m: Message) -> RouteDecision:
@@ -340,6 +461,12 @@ class Collector:
         recalled = m.deleted and not old["deleted"]
         if not content_changed and not recalled:
             return False
+        me = self.cfg.self_open_id
+        if me and m.sender_id == me and m.chat_id not in self.cfg.escalation.chat_ids:
+            # 主人编辑 / 撤回自己的发言：只更新账本，按 7.13 的去向送一条背景（7.13 补充）
+            self.store.update_content(m.message_id, m)
+            self._owner_edit(old, m, recalled)
+            return True
         old_route, old_state = old["route"], old["dispatch_state"]
         if m.chat_id in self.cfg.escalation.chat_ids and old_route != DISPATCH:
             # 「找主人」聊天里没投递过的消息（提问 / 其他）编辑后只更新内容，不重新路由
@@ -683,15 +810,18 @@ class Dispatcher:
                 if self.store.get_meta("roster_notify_bus") == "1":
                     roster_update = roster_table(self.roster, open_dynamic_topics(self.store))
             batch_id = self._new_batch_id("b", t["topic_id"])
+            # 主人本人的发言（背景）与信号同批；只有背景时不要求回执、不改状态（7.13）
+            signals = [r for r in rows if r["reason"] != OWNER_CONTEXT]
+            context = [r for r in rows if r["reason"] == OWNER_CONTEXT]
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
-            inbox = [] if adopted else self.store.inbox_summary()
+            inbox = [] if adopted else self.store.inbox_summary(self.cfg.self_open_id)
             # 规则变了（或从没记录过指纹）：这批最前面带上完整现行规则（7.11）
             new_hash = self.rules_hash(t)
             rules_update = self.standing_rules(t) if new_hash and new_hash != t["rules_hash"] else ""
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
-                                  security=self.security, rules_update=rules_update)
+                                  security=self.security, rules_update=rules_update, context_only=not signals)
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
             self._fail(t, None, str(e))
@@ -703,20 +833,28 @@ class Dispatcher:
         if rules_update:
             self.store.update_topic(t["topic_id"], rules_hash=new_hash)
             log.info("topic %s: 规则已更新，随批次 %s 送达", t["topic_id"], batch_id)
-        ids = [r["message_id"] for r in rows]
+        ids = [r["message_id"] for r in signals]
+        ctx_ids = [r["message_id"] for r in context]
         # 主人的回复已送到提问的会话：对应的「需要你定」标记已答
-        for r in rows:
+        for r in signals:
             for tag in json.loads(r["tags_json"] or "[]"):
                 if tag.startswith(ESCALATION_TAG_PREFIX):
                     self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
-        self.store.record_dispatch(batch_id, t["topic_id"], ids)
+        self.store.record_dispatch(batch_id, t["topic_id"], ids + ctx_ids)
+        self.store.mark_batch(ctx_ids, batch_id, t["topic_id"], "context")
+        res["context"] = len(ctx_ids)
+        if not signals:
+            # 只有背景：不要回执、不改变会话状态、不会超时重投
+            self.store.finish_dispatch(batch_id, "context")
+            res.update(batch_id=batch_id)
+            return res
         self.store.mark_batch(ids, batch_id, t["topic_id"], "delivered")
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
                                 pending_batch_id=batch_id, dispatched_at=now_iso())
         res.update(sent=len(ids), batch_id=batch_id, state=sm.RUNNING)
         if self.acker is not None:
-            try:  # 点表情只在真正送达之后；失败不影响投递
-                self.acker.on_delivered(rows)
+            try:  # 点表情只在真正送达之后；失败不影响投递；背景消息不点
+                self.acker.on_delivered(signals)
             except Exception as e:
                 log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
         return res

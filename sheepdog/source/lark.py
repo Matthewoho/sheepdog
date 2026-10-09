@@ -178,6 +178,28 @@ class LarkCliSource:
         self._run_once(["im", "reactions", "delete",
                         "--params", json.dumps({"message_id": message_id, "reaction_id": reaction_id})])
 
+    # ---------- 读：消息上的表情（7.13 补充），user 身份，只读 ----------
+    REACTION_BATCH = 20
+
+    def reactions_of(self, message_ids: list[str]) -> dict[str, list[dict]]:
+        """每条消息的表情（每条最多取第一页 10 个）：{message_id: [{emoji_type, operator_id, reaction_id}]}。"""
+        out: dict[str, list[dict]] = {}
+        for i in range(0, len(message_ids), self.REACTION_BATCH):
+            chunk = message_ids[i: i + self.REACTION_BATCH]
+            data = self._run_once(["im", "reactions", "batch_query",
+                                   "--params", json.dumps({"user_id_type": "open_id"}),
+                                   "--data", json.dumps({"queries": [{"message_id": m} for m in chunk],
+                                                         "page_size_per_message": 10})])
+            for d in self._find(data, "success_msg_reaction_details") or []:
+                items = []
+                for it in d.get("message_reaction_items") or []:
+                    op = it.get("operator") or {}
+                    items.append({"emoji_type": it.get("emoji_type") or "",
+                                  "operator_id": op.get("operator_id") or op.get("open_id") or "",
+                                  "reaction_id": it.get("reaction_id") or ""})
+                out[d.get("message_id", "")] = items
+        return out
+
     def senders_of(self, message_ids: list[str]) -> dict[str, str]:
         result: dict[str, str] = {}
         for i in range(0, len(message_ids), 50):

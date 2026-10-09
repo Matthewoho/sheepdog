@@ -230,12 +230,13 @@ def cmd_inbox(args) -> int:
             read = "✓" if r["is_read"] == 1 else "•"
             print(f"{read} [{r['create_time']}] 「{r['chat_name']}」{r['sender_name']}: {(r['content'] or '').strip()[:300]}")
         return 0
-    rows = store.inbox_summary()
+    rows = store.inbox_summary(cfg.self_open_id)
     total = sum(r["unread"] or 0 for r in rows)
     print(f"📥 Inbox：{total} 条未读，{len(rows)} 个会话")
     for r in rows:
         tag = "（Bot 私聊）" if r["reason"] == "bot_p2p" else ""
-        print(f"  「{r['chat_name'] or r['chat_id']}」{tag} 未读 {r['unread'] or 0} / 共 {r['total']}，最近 {r['last_time']}")
+        owner = f"，主人最近发言 {r['owner_last']}" if r["owner_last"] else ""
+        print(f"  「{r['chat_name'] or r['chat_id']}」{tag} 未读 {r['unread'] or 0} / 共 {r['total']}，最近 {r['last_time']}{owner}")
     return 0
 
 

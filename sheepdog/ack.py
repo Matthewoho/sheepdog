@@ -80,6 +80,8 @@ class Acker:
         主人本人的消息（带 owner_verified 标记）按 owner_reply 认：包括被 forward 转交的，以及改名前的旧 reason。
         """
         reason = r["reason"]
+        if reason == "owner_context":
+            return None  # 主人本人的发言只是背景，不点（7.13）
         if "owner_verified" in json.loads(r["tags_json"] or "[]"):
             reason = "owner_reply"
         if reason in self.cfg.bot_reasons:
