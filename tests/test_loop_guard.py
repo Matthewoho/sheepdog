@@ -31,7 +31,7 @@ class LoopGuardTest(Base):
         self.roster = Roster()
         self.cfg.owner_context.enabled = True
         self.cfg.owner_context.skip_prefixes = [PREFIX]
-        self.cfg.loop_guard.agent_sender_names = ["fx-wizard"]
+        self.cfg.loop_guard.agent_sender_names = ["fx-agentbot"]
         self.cfg.loop_guard.agent_sender_ids = ["ou_test_agentid"]
         self.d = self.disp(Roster())
         self.d.init()
@@ -40,7 +40,7 @@ class LoopGuardTest(Base):
         return Collector(self.cfg, self.store, FakeSource([msgs]), self.roster).poll_once()
 
     def agent(self, mid, **kw):
-        base = dict(message_id=mid, chat_id=LOOP, chat_name="循环群", sender_name="FX-Wizard 助手",
+        base = dict(message_id=mid, chat_id=LOOP, chat_name="循环群", sender_name="FX-AgentBot 助手",
                     sender_id="ou_test_wiz", mentions=[Mention(ME)], create_time=now())
         base.update(kw)
         return msg(**base)
