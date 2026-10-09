@@ -123,6 +123,28 @@ class EscalationConfig:
 
 
 @dataclass
+class AckConfig:
+    # 配置里有 [ack] 段才开启（7.9）
+    enabled: bool = False
+    # IM 表情类型（具体名字只写在个人配置里）
+    emoji_type: str = ""
+    # 投递原因在其中的消息，送达会话后以主人身份点表情
+    reasons: list[str] = field(default_factory=list)
+    # 这些原因的表情，在主人身份回复后撤下
+    remove_on_reply_reasons: list[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not isinstance(self.emoji_type, str) or not self.emoji_type.strip():
+            raise ConfigError("[ack] emoji_type 必填")
+        for k in ("reasons", "remove_on_reply_reasons"):
+            v = getattr(self, k)
+            if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+                raise ConfigError(f"[ack] {k} 必须是字符串列表")
+
+
+@dataclass
 class Config:
     # 「我」的 open_id，用于 @我 / 自己发的 / 回复我 的判定
     self_open_id: str = ""
@@ -147,6 +169,7 @@ class Config:
     session: SessionConfig = field(default_factory=SessionConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
+    ack: AckConfig = field(default_factory=AckConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -206,10 +229,14 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.session, data.get("session", {}))
         _apply(cfg.watch, data.get("watch", {}))
         _apply(cfg.escalation, data.get("escalation", {}))
+        if isinstance(data.get("ack"), dict):
+            _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
+            cfg.ack.enabled = True
         if "state_dir" in data:
             cfg.state_dir = Path(data["state_dir"]).expanduser()
     cfg.watch.validate()
     cfg.escalation.validate()
+    cfg.ack.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

@@ -1,0 +1,5 @@
+# 测试用确认表情配置：表情名是合成的
+[ack]
+emoji_type = "FX_EMOJI"
+reasons = ["p2p", "at_me", "at_all"]
+remove_on_reply_reasons = ["p2p", "at_me"]

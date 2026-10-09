@@ -66,6 +66,7 @@ sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回
 sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
 sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
 sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未结 / 全部
+sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -79,6 +80,23 @@ sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未�
 回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
 
 `agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行。
+
+## 确认表情：看到就点，回复后撤下
+
+配置 `[ack]` 段后开启，没有这一段就完全不动：
+
+```toml
+[ack]
+emoji_type = "Get"                          # 飞书表情类型
+reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，送达会话后以你的身份点表情
+remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情，在你回复后撤下；@所有人 只点不撤
+```
+
+- **点**：消息实际投递给会话成功之后才点；排队中（你在会话里接管、等 spawn）不点。每条消息只点一次，记进账本 `acks` 表（含 `reaction_id`）。
+- **撤**：账本入账一条你自己发的消息时（包括会话以你身份代回的）：私聊里，同一聊天中点表情早于这条消息的全部撤下；群里，回复了那条消息或 @ 了它的发送人才撤下对应的。只撤 `remove_on_reply_reasons` 里的原因。
+- 用 lark-cli 的 user 身份调 `im reactions create` / `im reactions delete`。失败只记日志和 `error` 列，不影响投递和路由，也不重试。
+- `--dry-run` 不调接口，只打印将要点 / 撤什么。
+- 这是 sheepdog 唯一的 IM 写操作。
 
 ## 业务规则：playbook
 
@@ -130,6 +148,8 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 个人配置 / 名册 / playbook / 安全规则 / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，默认保留 7 天 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
+
+除了加、撤确认表情（`[ack]`），sheepdog 对 IM 只读。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 

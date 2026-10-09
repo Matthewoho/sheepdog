@@ -104,12 +104,14 @@ def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
 # ======================= Collector =======================
 class Collector:
     def __init__(self, cfg: Config, store: Store, source: Source, roster: Roster | None = None,
-                 security: SecurityConfig | None = None):
+                 security: SecurityConfig | None = None, acker=None):
         self.cfg = cfg
         self.store = store
         self.source = source
         self.roster = roster
         self.security = security
+        # 确认表情（7.9）：入账主人自己发的消息时撤下已点的表情
+        self.acker = acker
         self._sender_cache: dict[str, str] = {}
 
     def _decide(self, m: Message, ctx: RouteContext):
@@ -202,6 +204,8 @@ class Collector:
                                  m.create_time))
         for m in msgs:
             existing = self.store.get_message(m.message_id)
+            if existing is None and me and m.sender_id == me:
+                self._own_message(m)
             if existing is None and m.chat_id in esc_chats:
                 d = self._escalation_message(m)
                 stats["new"] += 1
@@ -223,6 +227,15 @@ class Collector:
         self.store.set_meta("watermark", started.isoformat(timespec="seconds"))
         self.store.set_meta("last_poll", now_iso())
         return stats
+
+    def _own_message(self, m: Message) -> None:
+        """主人自己发的新消息（含会话以主人身份代回的）：撤下它回应了的确认表情。失败不影响入账。"""
+        if self.acker is None:
+            return
+        try:
+            self.acker.on_own_message(m)
+        except Exception as e:
+            log.warning("处理确认表情失败 %s: %s", m.message_id, e)
 
     # ---------- 「找主人」聊天（7.8） ----------
     def _escalation_message(self, m: Message) -> RouteDecision:
@@ -328,10 +341,12 @@ class Collector:
 # ======================= Dispatcher =======================
 class Dispatcher:
     def __init__(self, cfg: Config, store: Store, sink: Sink, roster: Roster | None = None,
-                 security: SecurityConfig | None = None):
+                 security: SecurityConfig | None = None, acker=None):
         self.cfg = cfg
         self.store = store
         self.sink = sink
+        # 确认表情（7.9）：投递成功后以主人身份点表情
+        self.acker = acker
         self.roster = roster or Roster()
         # 只用于批次里渲染警示（规则说明）；判定在 Collector 入账时完成
         self.security = security or SecurityConfig()
@@ -571,6 +586,11 @@ class Dispatcher:
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
                                 pending_batch_id=batch_id, dispatched_at=now_iso())
         res.update(sent=len(ids), batch_id=batch_id, state=sm.RUNNING)
+        if self.acker is not None:
+            try:  # 点表情只在真正送达之后；失败不影响投递
+                self.acker.on_delivered(rows)
+            except Exception as e:
+                log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
         return res
 
     # ---------- 主流程 ----------

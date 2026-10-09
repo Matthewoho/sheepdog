@@ -55,6 +55,13 @@ header_regex = '^🐕 \[sheepdog·[^\]]*·(?P<topic>tp_[a-z0-9_.-]+)\] 需要你
 # 一条「需要你定」多久内算未结，超时自动关闭
 open_hours = 24
 
+[ack]
+# 确认表情：消息送达会话后，以你的身份在消息下点这个表情；你回复后撤下。删掉整段 = 关闭
+# 这是 sheepdog 唯一的 IM 写操作（只加 / 撤这个表情）
+emoji_type = "Get"                          # 飞书表情类型
+reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，送达时点表情
+remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情在你回复后撤下；@所有人 只点不撤
+
 [watch]
 # 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}
 remind_minutes = [15, 30]

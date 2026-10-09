@@ -136,6 +136,46 @@ class LarkCliSource:
                 result[item["message_id"]] = bool(item.get("is_read"))
         return result
 
+    # ---------- 写：确认表情（7.9），user 身份，只试一次不重试 ----------
+    def _run_once(self, args: list[str]) -> dict:
+        proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=60)
+        out = proc.stdout.strip() or proc.stderr.strip()
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            raise SourceError(f"lark-cli 输出无法解析 rc={proc.returncode}: {out[:300]}")
+        # 既接受 {"ok":..,"data":..} 外层，也接受原始 API 的 {"code":0,"data":..} 或直接返回数据
+        if not isinstance(data, dict):
+            raise SourceError(f"lark-cli 输出不是对象: {out[:300]}")
+        if data.get("ok") is False or data.get("error") or (data.get("code") not in (None, 0)) or proc.returncode != 0:
+            err = data.get("error") or data.get("msg") or out[:300]
+            raise SourceError(f"lark-cli 调用失败 {args[:3]}: {err}")
+        return data
+
+    @staticmethod
+    def _find(data: dict, key: str):
+        cur = data
+        for _ in range(3):
+            if not isinstance(cur, dict):
+                return None
+            if key in cur:
+                return cur[key]
+            cur = cur.get("data")
+        return None
+
+    def add_reaction(self, message_id: str, emoji_type: str) -> str:
+        data = self._run_once(["im", "reactions", "create",
+                               "--params", json.dumps({"message_id": message_id}),
+                               "--data", json.dumps({"reaction_type": {"emoji_type": emoji_type}})])
+        rid = self._find(data, "reaction_id")
+        if not rid:
+            raise SourceError(f"reactions create 没返回 reaction_id: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return str(rid)
+
+    def remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        self._run_once(["im", "reactions", "delete",
+                        "--params", json.dumps({"message_id": message_id, "reaction_id": reaction_id})])
+
     def senders_of(self, message_ids: list[str]) -> dict[str, str]:
         result: dict[str, str] = {}
         for i in range(0, len(message_ids), 50):

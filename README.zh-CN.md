@@ -90,6 +90,7 @@ sheepdog inbox [--chat 群名]  # 收件箱里的群消息
 sheepdog escalations         # 等你拍板的问题
 sheepdog watches             # 会话正在等谁回复
 sheepdog security-log        # 被安全检查标记或拦截的消息
+sheepdog acks [--open]       # 替你点过的确认表情，以及是否已撤
 ```
 
 ## 配置一览
@@ -119,7 +120,7 @@ sheepdog security-log        # 被安全检查标记或拦截的消息
 | 运行数据（账本、收件箱、回执） | `~/.local/state/sheepdog/`，保留 7 天 | 否 |
 | 工作产出 | 由各会话写进你自己的笔记和任务系统 | 否 |
 
-牧羊犬本身从不写你的笔记和任务系统。提交前的检查脚本（`scripts/check_private_data.py`）会拦住真实的聊天 ID、家目录路径和凭据。测试只用编造的数据。
+除了加、撤确认表情（`[ack]`，不配置就不开），牧羊犬对 IM 只读。牧羊犬本身从不写你的笔记和任务系统。提交前的检查脚本（`scripts/check_private_data.py`）会拦住真实的聊天 ID、家目录路径和凭据。测试只用编造的数据。
 
 ## 现状
 

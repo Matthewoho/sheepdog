@@ -90,6 +90,7 @@ sheepdog inbox [--chat X]    # parked group messages
 sheepdog escalations         # questions waiting for your decision
 sheepdog watches             # sessions waiting on someone's reply
 sheepdog security-log        # messages tagged or held by the security gate
+sheepdog acks [--open]       # "seen" reactions added for you, and whether they were removed
 ```
 
 ## Configuration at a glance
@@ -119,7 +120,7 @@ Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN
 | Runtime data (ledger, inbox, receipts) | `~/.local/state/sheepdog/`, kept 7 days | no |
 | Work output | written by the sessions to your own notes and task tracker | no |
 
-sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
+Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
 
 ## Status
 

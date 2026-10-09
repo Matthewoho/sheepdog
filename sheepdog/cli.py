@@ -13,6 +13,7 @@
   sheepdog watches [--all]  /  sheepdog unwatch --id N
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
   sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
+  sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -31,6 +32,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import __version__
+from .ack import Acker
 from .config import ConfigError, load_config
 from .engine import (RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, escalation_summary,
                      forward_messages, open_escalations, write_receipt)
@@ -85,6 +87,14 @@ def _build(args):
     return cfg, store, source, sink, roster, security
 
 
+def _acker(cfg, store, source, args) -> Acker | None:
+    """确认表情（7.9）：没有 [ack] 段就不建。dry-run（含 sink = dryrun）只打印，不调接口。"""
+    if not cfg.ack.enabled:
+        return None
+    dry = getattr(args, "dry_run", False) or cfg.sink == "dryrun"
+    return Acker(cfg.ack, store, source, dry_run=dry)
+
+
 def cmd_doctor(args) -> int:
     cfg = load_config()
     ok = True
@@ -120,6 +130,8 @@ def cmd_doctor(args) -> int:
     except SecurityError as e:
         print(f"安全规则: ✗ {e}")
         ok = False
+    a = cfg.ack
+    print(f"确认表情: {'✓ ' + a.emoji_type + '，点: ' + ','.join(a.reasons) + '；回复后撤: ' + ','.join(a.remove_on_reply_reasons) if a.enabled else '（未配置 [ack]，不点表情）'}")
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
@@ -142,16 +154,18 @@ def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
 
 def cmd_poll(args) -> int:
     cfg, store, source, sink, roster, security = _build(args)
-    collector = Collector(cfg, store, source, roster, security)
-    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security)
+    acker = _acker(cfg, store, source, args)
+    collector = Collector(cfg, store, source, roster, security, acker)
+    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker)
     _cycle(collector, dispatcher)
     return 0
 
 
 def cmd_run(args) -> int:
     cfg, store, source, sink, roster, security = _build(args)
-    collector = Collector(cfg, store, source, roster, security)
-    dispatcher = Dispatcher(cfg, store, sink, roster, security)
+    acker = _acker(cfg, store, source, args)
+    collector = Collector(cfg, store, source, roster, security, acker)
+    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker)
     interval = args.interval or cfg.poll_interval_seconds
     logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", interval, sink.name)
     last_prune = 0.0
@@ -428,6 +442,28 @@ def cmd_escalations(args) -> int:
     return 0
 
 
+def cmd_acks(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    rows = store.list_acks(open_only=args.open)
+    if not rows:
+        print("没有未撤的确认表情" if args.open else "没有确认表情记录")
+        return 0
+    for a in rows:
+        if not a["reaction_id"]:
+            state = f"点失败：{a['error']}"
+        elif a["removed_at"]:
+            state = f"已撤 @ {a['removed_at']}"
+        elif a["error"]:
+            state = f"未撤（{a['error']}）"
+        else:
+            state = "未撤"
+        where = "私聊" if a["chat_type"] == "p2p" else f"群「{a['chat_name'] or a['chat_id']}」"
+        print(f"- [{state}] {a['added_at']} {where} | {a['sender_name'] or a['sender_id']} | 原因 {a['reason']} | "
+              f"message_id={a['message_id']}")
+    return 0
+
+
 def cmd_session_reset(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -506,6 +542,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("escalations")
     sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
     sp.set_defaults(func=cmd_escalations)
+
+    sp = sub.add_parser("acks")
+    sp.add_argument("--open", action="store_true", help="只看还没撤的")
+    sp.set_defaults(func=cmd_acks)
 
     sp = sub.add_parser("unwatch")
     sp.add_argument("--id", type=int, required=True)

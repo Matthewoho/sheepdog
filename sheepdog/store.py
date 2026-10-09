@@ -111,6 +111,20 @@ CREATE TABLE IF NOT EXISTS escalations (
     closed_at         TEXT,              -- 已答或超过 open_hours 时写入；为空 = 未结
     close_reason      TEXT               -- answered | expired
 );
+
+-- 确认表情（7.9）：消息送达会话后以主人身份点的表情；主人回复后撤下。每条消息只点一次，失败不重试
+CREATE TABLE IF NOT EXISTS acks (
+    message_id   TEXT PRIMARY KEY,
+    chat_id      TEXT,
+    chat_type    TEXT,
+    sender_id    TEXT,
+    reason       TEXT,
+    reaction_id  TEXT,                 -- 点失败时为空
+    added_at     TEXT,
+    removed_at   TEXT,
+    error        TEXT                  -- 点或撤失败的原因
+);
+CREATE INDEX IF NOT EXISTS idx_ack_chat ON acks(chat_id, removed_at);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -402,6 +416,38 @@ class Store:
         with self.tx() as c:
             c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
                       (now_iso(), message_id))
+
+    # ---------- acks ----------
+    def get_ack(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM acks WHERE message_id=?", (message_id,)).fetchone()
+
+    def add_ack(self, message_id: str, chat_id: str, chat_type: str, sender_id: str, reason: str,
+                reaction_id: str | None, error: str | None) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT OR IGNORE INTO acks(message_id,chat_id,chat_type,sender_id,reason,reaction_id,added_at,error)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (message_id, chat_id, chat_type, sender_id, reason, reaction_id, now_iso(), error))
+
+    def removable_acks(self, chat_id: str) -> list[sqlite3.Row]:
+        """同一聊天里点成功、还没撤、撤的时候也没失败过的表情（失败过的不再重试）。"""
+        return self.conn.execute(
+            """SELECT * FROM acks WHERE chat_id=? AND reaction_id IS NOT NULL AND removed_at IS NULL AND error IS NULL
+               ORDER BY added_at""", (chat_id,)).fetchall()
+
+    def mark_ack_removed(self, message_id: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE acks SET removed_at=? WHERE message_id=?", (now_iso(), message_id))
+
+    def set_ack_error(self, message_id: str, error: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE acks SET error=? WHERE message_id=?", (error, message_id))
+
+    def list_acks(self, open_only: bool = False, limit: int = 200) -> list[sqlite3.Row]:
+        where = "WHERE a.reaction_id IS NOT NULL AND a.removed_at IS NULL" if open_only else ""
+        return self.conn.execute(
+            f"""SELECT a.*, m.chat_name, m.sender_name, m.content FROM acks a
+                LEFT JOIN messages m ON m.message_id = a.message_id {where}
+                ORDER BY a.added_at DESC LIMIT ?""", (limit,)).fetchall()
 
     # ---------- watches ----------
     def add_watch(self, topic_id: str, person_id: str, chat_id: str, note: str) -> int:
