@@ -34,6 +34,15 @@ def transcript_path(conversation_id: str) -> Path:
     return conversation_dir(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
 
 
+def transcript_contains(conversation_id: str, text: str) -> bool:
+    """会话 transcript 里有没有出现过 text（用于发送中断后核对批次是否已送达，7.16）。"""
+    p = transcript_path(conversation_id)
+    if not text or not p.exists():
+        return False
+    with p.open(encoding="utf-8", errors="replace") as f:
+        return any(text in line for line in f)
+
+
 class AgentApiSink:
     name = "agentapi"
 

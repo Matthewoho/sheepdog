@@ -21,7 +21,7 @@ from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
 from .sink import Sink, SinkError
 from .source import Source
-from .sink.agentapi import conversation_dir, transcript_path
+from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .store import SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
 
 log = logging.getLogger("sheepdog")
@@ -985,17 +985,27 @@ class Dispatcher:
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes)
+            # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
+            self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
+            if self.store.get_dispatch(batch_id) is not None:
+                self.store.set_dispatch_state(batch_id, "failed", str(e))
             self._fail(t, None, str(e))
             res["error"] = str(e)
             return res
 
+        self.store.set_dispatch_state(batch_id, "sent")
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
         if rules_update:
             self.store.update_topic(t["topic_id"], rules_hash=new_hash)
             log.info("topic %s: 规则已更新，随批次 %s 送达", t["topic_id"], batch_id)
+        res.update(self._complete_delivery(t, batch_id, signals, context))
+        return res
+
+    def _complete_delivery(self, t, batch_id: str, signals: list, context: list, sent_at: str | None = None) -> dict:
+        """批次已送达后的记账：标记消息、改会话状态、关闭被回答的「需要你定」、点确认表情。正常发送与崩溃恢复共用。"""
         ids = [r["message_id"] for r in signals]
         ctx_ids = [r["message_id"] for r in context]
         # 主人的回复已送到提问的会话：对应的「需要你定」标记已答
@@ -1003,27 +1013,46 @@ class Dispatcher:
             for tag in json.loads(r["tags_json"] or "[]"):
                 if tag.startswith(ESCALATION_TAG_PREFIX):
                     self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
-        self.store.record_dispatch(batch_id, t["topic_id"], ids + ctx_ids)
         self.store.mark_batch(ctx_ids, batch_id, t["topic_id"], "context")
-        res["context"] = len(ctx_ids)
+        out: dict = {"context": len(ctx_ids), "batch_id": batch_id}
         if not signals:
             # 只有背景：不要回执、不改变会话状态、不会超时重投
             self.store.finish_dispatch(batch_id, "context")
-            res.update(batch_id=batch_id)
-            return res
+            return out
         self.store.mark_batch(ids, batch_id, t["topic_id"], "delivered")
-        self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
-                                pending_batch_id=batch_id, dispatched_at=now_iso())
-        res.update(sent=len(ids), batch_id=batch_id, state=sm.RUNNING)
+        t = self.store.get_topic(t["topic_id"])
+        if sm.can(t["state"], "dispatch"):
+            self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
+                                    pending_batch_id=batch_id, dispatched_at=sent_at or now_iso())
+        out.update(sent=len(ids), state=sm.RUNNING)
         if self.acker is not None:
             try:  # 点表情只在真正送达之后；失败不影响投递；背景消息不点
                 self.acker.on_delivered(signals)
             except Exception as e:
                 log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
-        return res
+        return out
+
+    def _recover_sending(self) -> None:
+        """上一轮「正在发」就中断的批次（7.16）：到会话 transcript 里找批次号——找到就补记已送达；
+        找不到标 uncertain，消息不再自动重发，等人工 sheepdog redeliver --batch 确认。"""
+        for d in self.store.dispatches_in_state("sending"):
+            t = self.store.get_topic(d["topic_id"])
+            ids = json.loads(d["message_ids"] or "[]")
+            rows = [r for r in (self.store.get_message(i) for i in ids) if r is not None]
+            if t is not None and t["conversation_id"] and transcript_contains(t["conversation_id"], d["batch_id"]):
+                self.store.set_dispatch_state(d["batch_id"], "sent")
+                self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
+                                        [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
+                log.info("批次 %s 发送中断，但 transcript 里已有，补记为已送达", d["batch_id"])
+            else:
+                self.store.set_dispatch_state(d["batch_id"], "uncertain", "发送中断，transcript 里找不到这个批次")
+                self.store.mark_batch(ids, d["batch_id"], d["topic_id"], "uncertain")
+                log.warning("批次 %s（%s）发送中断，不确定是否送达，不自动重发；确认后用 sheepdog redeliver --batch %s",
+                            d["batch_id"], d["topic_id"], d["batch_id"])
 
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
+        self._recover_sending()
         self.sync_roster()
         self.ensure_bus_topic()
         tids = [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()

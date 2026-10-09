@@ -21,6 +21,7 @@
   sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title ...]   给会话补发 / 手动发退休通知
   sheepdog actions [--all]                               排队 / 完成 / 失败的动作
   sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
+  sheepdog redeliver --batch B                           发送中断、不确定是否送达的批次：人工确认后重发
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -338,6 +339,9 @@ def cmd_sessions(args) -> int:
         print("暂无 session")
     # 只用来算规则指纹，不投递
     rules = Dispatcher(cfg, store, DryRunSink(), roster)
+    uncertain: dict[str, list] = {}
+    for u in store.dispatches_in_state("uncertain"):
+        uncertain.setdefault(u["topic_id"], []).append(u)
     for t in rows:
         mode = _MODE.get(t["kind"], t["kind"] or "-")
         print(f"- {t['title']}  [{t['state']}]  mode={mode}  topic={t['topic_id']}  conversation={t['conversation_id'] or '-'}")
@@ -376,6 +380,8 @@ def cmd_sessions(args) -> int:
             print(f"  进展: {t['summary']}")
         if t["state"] != sm.CLOSED and (status := rules.rules_status(t)):
             print(f"  规则: {status}")
+        for u in uncertain.get(t["topic_id"], []):
+            print(f"  ⚠ 批次 {u['batch_id']} 发送中断、不确定是否送达（{u['sent_at']}），确认后: sheepdog redeliver --batch {u['batch_id']}")
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
     return 0
 
@@ -671,6 +677,23 @@ def cmd_loops(args) -> int:
     return 0
 
 
+def cmd_redeliver(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    d = store.get_dispatch(args.batch)
+    if d is None:
+        print(f"批次 {args.batch} 不存在", file=sys.stderr)
+        return 2
+    if d["state"] != "uncertain":
+        print(f"批次 {args.batch} 状态是 {d['state']}，只有 uncertain 的才需要 redeliver", file=sys.stderr)
+        return 2
+    ids = json.loads(d["message_ids"] or "[]")
+    store.requeue_messages(ids)
+    store.set_dispatch_state(args.batch, "redelivered")
+    print(f"已把批次 {args.batch} 的 {len(ids)} 条消息放回待推，sheepdog 下一轮重发")
+    return 0
+
+
 def cmd_close_session(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -790,6 +813,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("loops")
     sp.add_argument("--clear", default="", help="手动解除这个聊天的冷却")
     sp.set_defaults(func=cmd_loops)
+
+    sp = sub.add_parser("redeliver")
+    sp.add_argument("--batch", required=True)
+    sp.set_defaults(func=cmd_redeliver)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

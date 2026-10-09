@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tags_json      TEXT,
     topic_id       TEXT,
     dispatch_state TEXT,               -- pending | delivered | acked | failed | missed（adopted 回执超时）
+                                       -- | uncertain（所在批次发送中断、不确定是否送达，不自动重发）
                                        -- | context（主人本人的发言作为背景已送达，不要回执）
     batch_id       TEXT,
     inbox_cleared  INTEGER DEFAULT 0,
@@ -83,7 +84,8 @@ CREATE TABLE IF NOT EXISTS dispatches (
     topic_id    TEXT NOT NULL,
     message_ids TEXT NOT NULL,
     sent_at     TEXT NOT NULL,
-    state       TEXT NOT NULL,         -- sent | acked | failed | missed
+    state       TEXT NOT NULL,         -- sending（已记、正在发）| sent | acked | failed | missed | context
+                                       -- | uncertain（发送中断、transcript 里找不到，等人工 redeliver）| redelivered
     receipt     TEXT,
     error       TEXT
 );
@@ -499,12 +501,28 @@ class Store:
     def dispatch_exists(self, batch_id: str) -> bool:
         return self.conn.execute("SELECT 1 FROM dispatches WHERE batch_id=?", (batch_id,)).fetchone() is not None
 
-    def record_dispatch(self, batch_id: str, topic_id: str, message_ids: list[str]) -> None:
+    def record_dispatch(self, batch_id: str, topic_id: str, message_ids: list[str], state: str = "sent") -> None:
         with self.tx() as c:
             c.execute(
                 "INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
-                (batch_id, topic_id, json.dumps(message_ids), now_iso(), "sent"),
+                (batch_id, topic_id, json.dumps(message_ids), now_iso(), state),
             )
+
+    def get_dispatch(self, batch_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM dispatches WHERE batch_id=?", (batch_id,)).fetchone()
+
+    def dispatches_in_state(self, state: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dispatches WHERE state=? ORDER BY sent_at", (state,)).fetchall()
+
+    def set_dispatch_state(self, batch_id: str, state: str, error: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE dispatches SET state=?, error=COALESCE(?, error) WHERE batch_id=?", (state, error, batch_id))
+
+    def requeue_messages(self, message_ids: list[str]) -> None:
+        """人工确认后重发（redeliver）：把这些消息放回待推。"""
+        with self.tx() as c:
+            c.executemany("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id=?",
+                          [(m,) for m in message_ids])
 
     def finish_dispatch(self, batch_id: str, state: str, receipt: str = "", error: str = "") -> None:
         with self.tx() as c:
