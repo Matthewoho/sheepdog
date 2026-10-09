@@ -13,7 +13,7 @@ from .models import Message
 from .playbook import Playbook
 from .prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, relay_content,
                       retirement_prompt, roster_table, watch_message)
-from .roster import Roster
+from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, SELF, RouteContext, RouteDecision, message_bodies, route
 from .sink import Sink, SinkError
@@ -27,6 +27,10 @@ BUS_TOPIC_ID = "tp_bus"
 ADOPTED = "adopted"
 KNOWN_KIND = "known"
 RETIRED = "retired"
+# 总线临时新开的会话（7.10）：只在账本里，不写名册；回执 done 即收掉
+DYNAMIC = "dynamic"
+# 会往里投信号的会话类型
+MANAGED_KINDS = (ADOPTED, DYNAMIC)
 # 总线职责写在 playbook 的 bus.md 里（7.6），topics 表只存指向
 BUS_DUTY = "见 playbook/bus.md"
 # watches 表的两个提醒时间列，按 watch.remind_minutes 的第 1、2 档使用（列名沿用规格）
@@ -79,13 +83,37 @@ def _parse(ts: str) -> datetime | None:
 
 
 # ======================= 聊天归属 =======================
+def chat_anchor(chat_id: str, all_messages: bool) -> str:
+    """dynamic 会话负责的聊天，写进 anchors：oc_x（只推 dispatch 级）或 oc_x:all（全部消息）。"""
+    return f"{chat_id}:all" if all_messages else chat_id
+
+
+def dynamic_owners(store: Store) -> dict[str, tuple[str, bool]]:
+    """未关闭的 dynamic 会话负责的聊天：chat_id → (topic_id, all_messages)。"""
+    out: dict[str, tuple[str, bool]] = {}
+    for t in store.list_topics():
+        if t["kind"] != DYNAMIC or t["state"] == sm.CLOSED:
+            continue
+        for a in json.loads(t["anchors_json"] or "[]"):
+            if a.startswith("oc_"):
+                cid, _, flag = a.partition(":")
+                out.setdefault(cid, (t["topic_id"], flag == "all"))
+    return out
+
+
+def open_dynamic_topics(store: Store) -> list:
+    return [t for t in store.list_topics() if t["kind"] == DYNAMIC and t["state"] != sm.CLOSED]
+
+
 def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
-                    ignore_chat_ids: list[str]) -> tuple[RouteDecision, str | None]:
+                    ignore_chat_ids: list[str],
+                    dynamic: dict[str, tuple[str, bool]] | None = None) -> tuple[RouteDecision, str | None]:
     """路由之后按名册判断归属（规格第 3 节），返回 (决策, topic_id)。reason 不变，归属写进 tags。
 
     - 自己发的、ignore_chat_ids：不变
     - managed 会话的聊天 + all_messages：推给它（覆盖 inbox 和免打扰 drop）
     - managed 会话的聊天 + dispatch 级：推给它
+    - 名册里没人负责、但总线新开的 dynamic 会话负责（7.10）：同上
     - 其他 dispatch 级：总线
     - 其他：不变（inbox / drop）
     """
@@ -96,6 +124,10 @@ def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
         sess, chat = owner
         if chat.all_messages or d.route == DISPATCH:
             return RouteDecision(DISPATCH, d.reason, [*d.tags, f"owner:{sess.key}"]), sess.topic_id
+    elif dynamic and msg.chat_id in dynamic:
+        topic_id, all_messages = dynamic[msg.chat_id]
+        if all_messages or d.route == DISPATCH:
+            return RouteDecision(DISPATCH, d.reason, [*d.tags, f"owner:{topic_id.removeprefix('tp_')}"]), topic_id
     if d.route == DISPATCH:
         return d, BUS_TOPIC_ID
     return d, None
@@ -113,10 +145,12 @@ class Collector:
         # 确认表情（7.9）：入账主人自己发的消息时撤下已点的表情
         self.acker = acker
         self._sender_cache: dict[str, str] = {}
+        self._dynamic: dict[str, tuple[str, bool]] = {}
 
     def _decide(self, m: Message, ctx: RouteContext):
         """路由 → 名册归属 → 等待归属。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
-        d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids)
+        d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids,
+                                      self._dynamic)
         # 等待中的回复优先归给登记等待的 topic（7.4），覆盖聊天归属、总线、Inbox、免打扰；
         # 自己发的、升级私聊、ignore_chat_ids 不受影响
         if d.route == SELF or d.reason == "self_escalation" or m.chat_id in self.cfg.routing.ignore_chat_ids:
@@ -194,6 +228,7 @@ class Collector:
             start = started - timedelta(minutes=self.cfg.initial_lookback_minutes)
         msgs = self.source.fetch_since(start.isoformat(timespec="seconds"))
         ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
+        self._dynamic = dynamic_owners(self.store)
         stats = {"fetched": len(msgs), "new": 0, "changed": 0, "dispatch": 0, "inbox": 0, "drop": 0, "self": 0}
 
         # 先入账「找主人」聊天里机器人的提问（同批次里主人的回复才找得到它），再入账自己发的消息
@@ -264,11 +299,13 @@ class Collector:
         # 名册里的 managed 会话，或总线自己（总线也会找主人）。看名册本身：新账本第一轮还没同步 topics 表
         if topic_id == BUS_TOPIC_ID:
             return True
-        if self.roster is not None:
-            s = self.roster.by_topic(topic_id)
-            return bool(s and s.mode == "managed")
+        if self.roster is not None and (s := self.roster.by_topic(topic_id)) is not None:
+            return s.mode == MANAGED
         t = self.store.get_topic(topic_id)
-        return bool(t and t["kind"] == ADOPTED and t["state"] != sm.CLOSED)
+        if t is None or t["state"] == sm.CLOSED:
+            return False
+        # 总线新开的会话也会找主人；没有名册时退回看账本里的 adopted
+        return t["kind"] == DYNAMIC or (self.roster is None and t["kind"] == ADOPTED)
 
     def _owner_reply(self, m: Message) -> RouteDecision:
         """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；没引用时，未结的全部属于同一个会话
@@ -384,6 +421,10 @@ class Dispatcher:
         for s in self.roster.sessions:
             live.add(s.topic_id)
             t = self.store.get_topic(s.topic_id)
+            if t is not None and t["kind"] == DYNAMIC and t["state"] != sm.CLOSED:
+                log.error("名册条目 %s 与总线新开的会话同名，先 sheepdog close-session --topic %s 再登记；本轮跳过",
+                          s.key, s.topic_id)
+                continue
             if t is None:
                 self.store.create_topic(s.topic_id, s.display_title, s.kind, s.duty, sm.ACTIVE)
                 t = self.store.get_topic(s.topic_id)
@@ -436,13 +477,14 @@ class Dispatcher:
         batch = t["pending_batch_id"]
         if not batch or t["state"] != sm.RUNNING:
             return
-        adopted = t["kind"] == ADOPTED
+        adopted = t["kind"] in MANAGED_KINDS
         p = self.receipt_path(t["topic_id"], batch)
         if p.exists():
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
-            # adopted 会话由名册决定存续，总线是常驻入口：两者的回执 done 都不关会话，按 handled 处理
-            if (adopted or t["topic_id"] == BUS_TOPIC_ID) and status == "done":
+            # adopted 会话由名册决定存续，总线是常驻入口：两者的回执 done 都不关会话，按 handled 处理；
+            # dynamic 会话是为一件事开的，done 就收掉（7.10）
+            if (t["kind"] == ADOPTED or t["topic_id"] == BUS_TOPIC_ID) and status == "done":
                 status = "handled"
             event = sm.RECEIPT_EVENTS.get(status, "receipt_handled")
             new_state = sm.transition(t["state"], event)
@@ -451,10 +493,14 @@ class Dispatcher:
             fields = {"state": new_state, "pending_batch_id": None, "retries": 0,
                       "summary": receipt.get("summary", t["summary"])}
             if receipt.get("anchors"):
-                anchors = sorted(set(json.loads(t["anchors_json"] or "[]")) | set(receipt["anchors"]))
+                # 回执带来的锚点只作记录；聊天归属（oc_ 开头）只能由名册 / new-session 决定，回执改不了
+                extra = {a for a in receipt["anchors"] if isinstance(a, str) and not a.startswith("oc_")}
+                anchors = sorted(set(json.loads(t["anchors_json"] or "[]")) | extra)
                 fields["anchors_json"] = json.dumps(anchors, ensure_ascii=False)
             self.store.update_topic(t["topic_id"], **fields)
             log.info("回执 %s/%s: %s -> %s", t["topic_id"], batch, status, new_state)
+            if t["kind"] == DYNAMIC and new_state == sm.CLOSED:
+                self._dynamic_closed(t["topic_id"], "回执 done")
             return
         sent = _parse(t["dispatched_at"])
         if sent and _now() - sent > timedelta(minutes=self.cfg.session.receipt_timeout_minutes):
@@ -462,6 +508,11 @@ class Dispatcher:
                 self._miss(t, batch)
             else:
                 self._fail(t, batch, "回执超时")
+
+    def _dynamic_closed(self, topic_id: str, why: str) -> None:
+        """dynamic 会话收掉：聊天归属随之释放（之后的消息回总线），总线下一批附最新名册。"""
+        self.store.set_meta("roster_notify_bus", "1")
+        log.info("总线新开的会话 %s 已收掉（%s），聊天归属释放", topic_id, why)
 
     def _miss(self, t, batch: str) -> None:
         """adopted 会话回执超时：只记一次未回执、回到可投递，不重投（避免往大上下文里重复灌消息）。"""
@@ -518,7 +569,8 @@ class Dispatcher:
             return t
         w = self.cfg.watch
         prompt = bootstrap_prompt(self.playbook, t["title"], self.cfg.session.bus_title, t["topic_id"], self.roster,
-                                  self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes)
+                                  self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes,
+                                  open_dynamic_topics(self.store))
         cid = self.sink.new_conversation(t["title"], prompt, self.cfg.session.model)
         self.store.update_topic(t["topic_id"], conversation_id=cid)
         self.store.set_meta("roster_notify_bus", "0")
@@ -546,21 +598,21 @@ class Dispatcher:
         if not self._deliverable(t):
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
-        adopted = t["kind"] == ADOPTED
+        adopted = t["kind"] in MANAGED_KINDS
         if adopted and not t["conversation_id"]:
             log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
             res["waiting_spawn"] = True
             return res
         roster_update = ""
         try:
-            if adopted and not t["onboarded_at"]:
+            if t["kind"] == ADOPTED and not t["onboarded_at"]:
                 # 第一次收消息前先发 onboarding；消息等它回执或超时后下一轮再投
                 res.update(onboarding=self.send_onboarding(t), state=sm.RUNNING)
                 return res
             if not adopted:
                 t = self._ensure_bus_conversation(t)
                 if self.store.get_meta("roster_notify_bus") == "1":
-                    roster_update = roster_table(self.roster)
+                    roster_update = roster_table(self.roster, open_dynamic_topics(self.store))
             batch_id = self._new_batch_id("b", t["topic_id"])
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
@@ -599,7 +651,7 @@ class Dispatcher:
         self.sync_roster()
         self.ensure_bus_topic()
         tids = [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
-                                 if t["kind"] == ADOPTED and t["state"] != sm.CLOSED]
+                                 if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED]
         # 先处理回执与超时（总线超时会把批次退回待推）、前任交接回执、等待计时，再取待推消息
         for tid in tids:
             self._check_receipt(self.store.get_topic(tid))
@@ -634,6 +686,68 @@ class Dispatcher:
                 result["sent"] += r["sent"]
         result["state"] = self.store.get_topic(BUS_TOPIC_ID)["state"]
         return result
+
+    # ---------- 总线新开会话（7.10） ----------
+    def new_session(self, key: str, title: str, duty: str, chats: list[tuple[str, bool]],
+                    message_ids: list[str] | None = None, note: str = "") -> dict:
+        """总线临时新开一个专属会话：只写账本（kind = dynamic），不写名册。
+
+        先做全部校验（key、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward 规则排队。
+        """
+        key, title, duty, note = key.strip(), title.strip(), duty.strip(), (note or "").strip()
+        if not _KEY_RE.match(key) or key == "bus":
+            raise ValueError("--key 只允许 [a-z0-9_-]，且不能是 bus")
+        topic_id = "tp_" + key
+        if self.roster.by_key(key) is not None:
+            raise ValueError(f"key {key!r} 已在名册里")
+        if self.store.get_topic(topic_id) is not None:
+            raise ValueError(f"{topic_id} 在账本里已存在（含已收掉的），换一个 key")
+        if not title or not duty:
+            raise ValueError("--title 和 --duty 都必填")
+        dyn = dynamic_owners(self.store)
+        seen: set[str] = set()
+        for cid, _all in chats:
+            if not cid.startswith("oc_"):
+                raise ValueError(f"--chat {cid!r} 不是聊天 ID")
+            if cid in seen:
+                raise ValueError(f"--chat {cid} 重复")
+            seen.add(cid)
+            owner = self.roster.owner_of(cid)
+            if owner is not None:
+                raise ValueError(f"聊天 {cid} 已归属名册里的 {owner[0].topic_id}")
+            if cid in dyn:
+                raise ValueError(f"聊天 {cid} 已归属总线新开的 {dyn[cid][0]}")
+        quota = self.cfg.bus.max_new_sessions_per_day
+        if quota <= 0:
+            raise ValueError("配置禁止总线新开会话（[bus] max_new_sessions_per_day = 0），请找主人")
+        midnight = _now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+        if self.store.count_topics_since(DYNAMIC, midnight) >= quota:
+            raise ValueError(f"今天已新开 {quota} 个会话，达到上限，请找主人")
+        ids = [i.strip() for i in (message_ids or []) if i.strip()]
+        for i in ids:
+            row = self.store.get_message(i)
+            if row is None:
+                raise ValueError(f"账本里没有消息 {i}")
+            if row["security_action"] == HOLD:
+                raise ValueError(f"消息 {i} 被安全规则拦截，不能随 new-session 转交；"
+                                 "先新开会话，再用 sheepdog forward --quote \"<主人原话>\" 转")
+
+        full_title = f"{self.cfg.session.title_prefix} {title}".strip()
+        s = RosterSession(key=key, mode=MANAGED, title=title, duty=duty,
+                          chats=[RosterChat(cid, "", al) for cid, al in chats])
+        prompt = adopted_bootstrap(self.playbook, s, full_title, "", self.cfg.watch.remind_minutes,
+                                   self.cfg.watch.expire_minutes)
+        cid = self.sink.new_conversation(full_title, prompt, self.cfg.session.model)
+        ts = now_iso()
+        self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE)
+        self.store.update_topic(topic_id, conversation_id=cid, spawned_at=ts, onboarded_at=ts, origin_note=note or None,
+                                anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False))
+        self.store.set_meta("roster_notify_bus", "1")
+        if ids or note:
+            forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
+                             escalation_open_hours=self.cfg.escalation.open_hours)
+        log.info("总线新开会话 %s -> %s（%d 条消息排队）", topic_id, cid, len(ids))
+        return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids)}
 
     # ---------- 新建与接手（7.2） ----------
     def spawn(self, key: str) -> dict:
@@ -797,8 +911,8 @@ def _check_target(store: Store, topic_id: str, verb: str):
         raise ValueError(f"topic {topic_id} 不存在：先确认名册里有它，并已同步（sheepdog init 或 run）")
     if t["kind"] == KNOWN_KIND:
         raise ValueError(f"{topic_id} 是 known 会话，只登记不投递；请在回执里建议主人去该会话处理")
-    if t["kind"] != ADOPTED:
-        raise ValueError(f"{topic_id} 不是名册里的 managed 会话（kind={t['kind']}）")
+    if t["kind"] not in MANAGED_KINDS:
+        raise ValueError(f"{topic_id} 不是名册里的 managed 会话或总线新开的会话（kind={t['kind']}）")
     if t["state"] == sm.CLOSED:
         raise ValueError(f"{topic_id} 已从名册移除（closed）")
     return t
@@ -861,6 +975,20 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))
     log.info("转交 %d 条消息%s -> %s", len(ids), "（含转达）" if quote or note else "", topic_id)
     return ids
+
+
+def close_session(store: Store, topic_id: str) -> None:
+    """手动收掉总线新开的会话（7.10）。名册里的会话、known、总线、前任都不能这样关。"""
+    t = store.get_topic(topic_id)
+    if t is None:
+        raise ValueError(f"topic {topic_id} 不存在")
+    if t["kind"] != DYNAMIC:
+        raise ValueError(f"{topic_id} 不是总线新开的会话（kind={t['kind']}），不能用 close-session 关")
+    if t["state"] == sm.CLOSED:
+        raise ValueError(f"{topic_id} 已经收掉了")
+    store.update_topic(topic_id, state=sm.CLOSED, pending_batch_id=None)
+    store.set_meta("roster_notify_bus", "1")
+    log.info("总线新开的会话 %s 已手动收掉，聊天归属释放", topic_id)
 
 
 def add_watch(store: Store, topic_id: str, person_id: str, chat_id: str = "", note: str = "") -> int:

@@ -55,6 +55,10 @@ header_regex = '^🐕 \[sheepdog·[^\]]*·(?P<topic>tp_[a-z0-9_.-]+)\] 需要你
 # 一条「需要你定」多久内算未结，超时自动关闭
 open_hours = 24
 
+[bus]
+# 总线每天最多临时新开几个专属会话（sheepdog new-session）；0 = 禁止总线新开
+max_new_sessions_per_day = 5
+
 [ack]
 # 确认表情：消息送达会话后，以你的身份在消息下点这个表情；你回复后撤下。删掉整段 = 关闭
 # 这是 sheepdog 唯一的 IM 写操作（只加 / 撤这个表情）

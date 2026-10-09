@@ -67,12 +67,19 @@ def chats_text(s: RosterSession) -> str:
                      for c in s.chats) or "- （无）"
 
 
-def roster_table(roster: Roster | None) -> str:
-    """名册表（数据）：每个会话的 title、topic、conversation、mode、职责、负责的聊天。"""
-    if not roster or not roster.sessions:
+def _anchor_chat(a: str) -> tuple[str, bool]:
+    """dynamic 会话的聊天锚点：oc_x 或 oc_x:all。"""
+    cid, _, flag = a.partition(":")
+    return cid, flag == "all"
+
+
+def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
+    """名册表（数据）：每个会话的 title、topic、conversation、mode、职责、负责的聊天；含总线新开的 dynamic 会话。"""
+    sessions = roster.sessions if roster else []
+    if not sessions and not dynamic:
         return "（名册为空）"
     lines = []
-    for s in roster.sessions:
+    for s in sessions:
         cid = s.conversation_id or ("（由 sheepdog 新建，见 sheepdog sessions）" if s.to_spawn else "-")
         lines.append(f"- 「{s.display_title}」 topic `{s.topic_id}` | conversation `{cid}` | {s.mode}")
         if s.duty:
@@ -80,6 +87,14 @@ def roster_table(roster: Roster | None) -> str:
         if s.mode == MANAGED and s.chats:
             lines.append("  负责的聊天：" + "、".join(
                 f"{c.name or c.chat_id}（{'全部消息' if c.all_messages else '仅 dispatch 级'}）" for c in s.chats))
+    for t in dynamic or []:
+        lines.append(f"- 「{t['title']}」 topic `{t['topic_id']}` | conversation `{t['conversation_id'] or '-'}` | "
+                     f"dynamic（总线新开，{t['created_at']}）")
+        if t["duty"]:
+            lines.append(f"  职责：{t['duty']}")
+        chats = [_anchor_chat(a) for a in json.loads(t["anchors_json"] or "[]") if a.startswith("oc_")]
+        if chats:
+            lines.append("  负责的聊天：" + "、".join(f"`{c}`（{'全部消息' if al else '仅 dispatch 级'}）" for c, al in chats))
     return "\n".join(lines)
 
 
@@ -112,6 +127,11 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "`sheepdog spawn --key <key>`：为名册里 conversation_id 留空的 managed 条目新建会话（只建一次）。",
             "### Inbox",
             "`sheepdog inbox [--chat <群名>]`：查看未直推的群消息。",
+            "### 新开 / 收掉会话",
+            "`sheepdog new-session --key <k> --title \"<短标题>\" --duty \"<职责与边界>\" [--chat <oc_id>[:all]]... "
+            "[--message-ids <id1,id2>] [--note \"<为什么开>\"]`：名册里没有合适的会话时新开一个（只在账本里，不写名册），"
+            "消息和 note 排进它的队列；--chat 的聊天之后直接推给它（:all = 全部消息）。有每日配额，超了会被拒绝。",
+            "`sheepdog close-session --topic <tp_x>`：收掉总线新开的会话（它回执 done 时也会自动收掉），聊天归属随之释放。",
             "### 需要你定",
             "`sheepdog escalations [--all]`：查看各会话找主人的未结问题。主人在 IM 上的回复无法确定回答哪条时会送到你这里，"
             "附未结列表；判断后用 `sheepdog forward --topic <topic> --message-ids <主人那条消息>` 转交（不需要 --quote）。",
@@ -122,13 +142,13 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
 
 # ---------- 各类开场 prompt ----------
 def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, roster: Roster | None,
-                     overlay: str, remind: list[int], expire: int) -> str:
+                     overlay: str, remind: list[int], expire: int, dynamic: list | None = None) -> str:
     """总线 bootstrap：bus.md（含名册表）+ common.md + overlay + 接口说明。"""
     v = dict(session_title=plain_title, topic_id=topic_id)
     return _join(
         pb.render("security.md", **v),
         f"你是由 sheepdog 创建和管理的 session：**{title}**（topic_id: `{topic_id}`）。",
-        pb.render("bus.md", roster=roster_table(roster), **v),
+        pb.render("bus.md", roster=roster_table(roster, dynamic), **v),
         pb.render("common.md", **v),
         overlay,
         interface_section(topic_id, bus=True, remind=remind, expire=expire),

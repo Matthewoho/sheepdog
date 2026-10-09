@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS topics (
     topic_id         TEXT PRIMARY KEY,
     title            TEXT NOT NULL,
     kind             TEXT,             -- bus | adopted（名册 managed）| known（名册 known，不投递）| retired（被接手的前任）
+                                       -- | dynamic（总线临时新开，只在账本里，不写名册）
     duty             TEXT,             -- 一句话职责 + 边界，纠偏时修改
     conversation_id  TEXT,
     state            TEXT NOT NULL,
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS topics (
     onboarded_at     TEXT,             -- adopted 会话收到 onboarding 的时间，只发一次
     receipt_missed   INTEGER DEFAULT 0,  -- adopted 会话回执超时次数（不重投）
     spawned_at       TEXT,             -- 由 sheepdog spawn 新建的时间；名册 conversation_id 留空时以此为准
+    origin_note      TEXT,             -- dynamic 会话的创建原因（new-session 的 --note）
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -136,7 +138,8 @@ SYSTEM_ID_PREFIX = "sd_"
 MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
                  ("security_action", "TEXT")],
-    "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT")],
+    "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
+               ("origin_note", "TEXT")],
 }
 
 
@@ -357,6 +360,10 @@ class Store:
                 "INSERT INTO topics(topic_id,title,kind,duty,state,created_at,last_active) VALUES(?,?,?,?,?,?,?)",
                 (topic_id, title, kind, duty, state, ts, ts),
             )
+
+    def count_topics_since(self, kind: str, since_iso: str) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM topics WHERE kind=? AND created_at >= ?",
+                                 (kind, since_iso)).fetchone()[0]
 
     def update_topic(self, topic_id: str, **fields) -> None:
         if not fields:

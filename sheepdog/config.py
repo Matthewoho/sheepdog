@@ -123,6 +123,17 @@ class EscalationConfig:
 
 
 @dataclass
+class BusConfig:
+    # 总线每天（本地日历日）最多新开几个会话（7.10）；0 = 禁止总线新开
+    max_new_sessions_per_day: int = 5
+
+    def validate(self) -> None:
+        v = self.max_new_sessions_per_day
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ConfigError("[bus] max_new_sessions_per_day 必须是 >= 0 的整数")
+
+
+@dataclass
 class AckConfig:
     # 配置里有 [ack] 段才开启（7.9）
     enabled: bool = False
@@ -170,6 +181,7 @@ class Config:
     watch: WatchConfig = field(default_factory=WatchConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     ack: AckConfig = field(default_factory=AckConfig)
+    bus: BusConfig = field(default_factory=BusConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -229,6 +241,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.session, data.get("session", {}))
         _apply(cfg.watch, data.get("watch", {}))
         _apply(cfg.escalation, data.get("escalation", {}))
+        _apply(cfg.bus, data.get("bus", {}))
         if isinstance(data.get("ack"), dict):
             _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
             cfg.ack.enabled = True
@@ -237,6 +250,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.watch.validate()
     cfg.escalation.validate()
     cfg.ack.validate()
+    cfg.bus.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

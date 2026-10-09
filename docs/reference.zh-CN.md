@@ -67,6 +67,9 @@ sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
 sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
 sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未结 / 全部
 sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
+sheepdog new-session --key k --title "短标题" --duty "职责与边界" [--chat oc_x[:all]]... [--message-ids a,b] [--note "..."]
+                               # 总线临时新开一个专属会话（只在账本里，不写名册）
+sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -80,6 +83,20 @@ sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
 回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
 
 `agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行。
+
+## 总线只做轻活：没有合适的会话就新开
+
+总线负责分派、转交、简单确认和汇总；需要查云、读代码、跑命令、改文件、多步排查的事交给专属会话。名册里没有合适的，总线用 `sheepdog new-session` 临时新开一个（具体判断规则写在 playbook/bus.md）：
+
+- 新开的会话类型是 `dynamic`，只记在账本 topics 表，**不写名册文件**；名册同步只关 adopted / known 里缺失的条目，不碰它。名册后来加了同名 key 会报错跳过，先 `close-session` 再登记。
+- key 规则同名册（`[a-z0-9_-]`，不能是 bus），不能和名册或账本里已有的 topic 重复（含已收掉的）；`--chat` 的聊天不能已归属其他会话。
+- 标题 = `title_prefix` + `--title`；开场同 spawn：security.md、onboarding.md（授权用 authority_default.md）、common.md、接口说明。
+- `--message-ids` 和 `--note` 按 forward 的规则排进它的队列，下一轮投递；`--note` 同时记为创建原因。被安全规则 hold 的消息不能随 new-session 转，要先新开再 `forward --quote`。
+- `--chat` 写进它的 anchors，之后这些聊天按归属直接推给它（`:all` = 全部消息）。名册里的归属优先。
+- 配额：`[bus] max_new_sessions_per_day`（默认 5，按本地日历日计，收掉的也算）；超了拒绝并提示找你；`0` = 禁止总线新开。
+- 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
+- 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
+- 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
 
 ## 确认表情：看到就点，回复后撤下
 

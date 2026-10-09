@@ -14,6 +14,9 @@
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
   sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
   sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
+  sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...] [--dry-run]
+                                                         总线临时新开一个专属会话（只在账本里）
+  sheepdog close-session --topic T                       收掉总线新开的会话
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -34,8 +37,8 @@ from datetime import datetime, timedelta
 from . import __version__
 from .ack import Acker
 from .config import ConfigError, load_config
-from .engine import (RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, escalation_summary,
-                     forward_messages, open_escalations, write_receipt)
+from .engine import (DYNAMIC, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, close_session,
+                     escalation_summary, forward_messages, open_escalations, write_receipt)
 from .playbook import PLAYBOOK_FILES, Playbook
 from .roster import Roster, RosterError, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
@@ -270,7 +273,7 @@ def cmd_spawn(args) -> int:
     return 0
 
 
-_MODE = {"adopted": "managed", "known": "known", "bus": "bus"}
+_MODE = {"adopted": "managed", "known": "known", "bus": "bus", "dynamic": "dynamic（总线新开）"}
 
 
 def cmd_sessions(args) -> int:
@@ -306,8 +309,16 @@ def cmd_sessions(args) -> int:
                 print(f"  前任: {s.predecessor_conversation_id}")
             if t["kind"] == "adopted":
                 print(f"  onboarded: {t['onboarded_at'] or '否'}  未回执: {t['receipt_missed'] or 0}")
-        if t["kind"] in ("adopted", "bus"):
+        if t["kind"] in ("adopted", "bus", "dynamic"):
             print(f"  未结「需要你定」: {len(open_escalations(store, cfg.escalation.open_hours, t['topic_id']))}")
+        if t["kind"] == DYNAMIC:
+            chats = []
+            for a in anchors:
+                if a.startswith("oc_"):
+                    cid, _, flag = a.partition(":")
+                    chats.append(cid + ("（全部）" if flag == "all" else ""))
+            print(f"  负责的聊天: {'、'.join(chats) or '-'}")
+            print(f"  创建于: {t['created_at']}  创建原因: {t['origin_note'] or '-'}")
         if t["kind"] == RETIRED:
             print(f"  交接回执: {'已转给接手会话' if not t['pending_batch_id'] else '等待中（批次 ' + t['pending_batch_id'] + '）'}")
         if t["summary"]:
@@ -464,6 +475,46 @@ def cmd_acks(args) -> int:
     return 0
 
 
+def _parse_chat(text: str) -> tuple[str, bool]:
+    cid, _, flag = text.strip().partition(":")
+    if flag not in ("", "all"):
+        raise ValueError(f"--chat {text!r} 格式应为 oc_xxx 或 oc_xxx:all")
+    return cid, flag == "all"
+
+
+def cmd_new_session(args) -> int:
+    cfg, store, _source, sink, roster, security = _build(args)
+    if args.dry_run:
+        print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
+    d = Dispatcher(cfg, store, sink, roster, security)
+    d.sync_roster()
+    try:
+        chats = [_parse_chat(c) for c in args.chat]
+        r = d.new_session(args.key, args.title, args.duty, chats, (args.message_ids or "").split(","), args.note)
+    except ValueError as e:
+        print(f"new-session 被拒绝: {e}", file=sys.stderr)
+        return 2
+    except SinkError as e:
+        print(f"new-session 失败（没有建会话）: {e}", file=sys.stderr)
+        return 1
+    print(f"已新开 {r['title']} -> {r['conversation_id']}（topic {r['topic_id']}，只记在账本，不写名册）")
+    if r["queued"] or args.note:
+        print(f"已排队 {r['queued']} 条消息{'和 note' if args.note else ''}，sheepdog 下一轮投递")
+    return 0
+
+
+def cmd_close_session(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    try:
+        close_session(store, args.topic)
+    except ValueError as e:
+        print(f"close-session 被拒绝: {e}", file=sys.stderr)
+        return 2
+    print(f"已收掉 {args.topic}，它负责的聊天之后回总线")
+    return 0
+
+
 def cmd_session_reset(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -542,6 +593,20 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("escalations")
     sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
     sp.set_defaults(func=cmd_escalations)
+
+    sp = sub.add_parser("new-session")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--duty", required=True)
+    sp.add_argument("--chat", action="append", default=[], help="oc_xxx 或 oc_xxx:all，可重复")
+    sp.add_argument("--message-ids", default="")
+    sp.add_argument("--note", default="", help="为什么开（会作为创建原因记下，并排进它的队列）")
+    sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
+    sp.set_defaults(func=cmd_new_session)
+
+    sp = sub.add_parser("close-session")
+    sp.add_argument("--topic", required=True)
+    sp.set_defaults(func=cmd_close_session)
 
     sp = sub.add_parser("acks")
     sp.add_argument("--open", action="store_true", help="只看还没撤的")
