@@ -114,6 +114,19 @@ class EscalationTest(Base):
         self.poll([reply("om_test_r2", "可以")])
         self.assertEqual(self.row("om_test_r2")["topic_id"], "tp_alpha")
 
+    def test_unquoted_multiple_same_topic_goes_to_it(self):
+        # 7.8 补丁：同一会话连问两条，主人没引用就回复 → 直接投给它，关闭最近一条；另一条仍未结
+        self.poll([ask("om_test_s1", "tp_alpha", "第一问", minutes_ago=10), ask("om_test_s2", "tp_alpha", "第二问", minutes_ago=5)])
+        self.poll([reply("om_test_rs", "都按你建议")])
+        r = self.row("om_test_rs")
+        self.assertEqual(r["topic_id"], "tp_alpha")
+        self.assertIn("第二问", r["note"])
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM messages WHERE reason='escalation_list'").fetchone()[0], 0)
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_escalation("om_test_s2")["answer_message_id"], "om_test_rs")
+        self.assertEqual(self.opens(), ["om_test_s1"])
+        self.assertIn("om_test_rs", self.sink.to("conv_test_alpha")[-1])
+
     def test_same_batch_question_then_reply(self):
         # 同一批拉到提问和回复：提问先入账，回复才找得到它
         self.poll([reply("om_test_r3", "好", reply_to="om_test_q3", minutes_ago=0),

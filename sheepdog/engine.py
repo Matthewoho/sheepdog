@@ -271,12 +271,13 @@ class Collector:
         return bool(t and t["kind"] == ADOPTED and t["state"] != sm.CLOSED)
 
     def _owner_reply(self, m: Message) -> RouteDecision:
-        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；没引用且只有一条未结就投给它；
-        否则投总线并附上当前未结列表。不走安全闸（发送人已由 IM 账号核实）。"""
-        opens = open_escalations(self.store, self.cfg.escalation.open_hours)
+        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；没引用时，未结的全部属于同一个会话
+        （含只有一条）就投给它、回答其中最近的一条；未结分属不同会话或没有未结时投总线并附上列表。
+        不走安全闸（发送人已由 IM 账号核实）。"""
+        opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
         target = self.store.get_escalation(m.reply_to) if m.reply_to else None
-        if target is None and len(opens) == 1:
-            target = opens[0]
+        if target is None and opens and len({e["topic_id"] for e in opens}) == 1:
+            target = opens[0]  # 同一会话连问几条：直接投给它，关闭最近一条（与 forward 一致）
         tags = [OWNER_VERIFIED_TAG]
         d = RouteDecision(DISPATCH, "matthew_reply", tags)
         if target is not None:
