@@ -287,8 +287,8 @@ class Dispatcher:
         if p.exists():
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
-            # adopted 会话由名册决定存续，回执 done 不关会话，按 handled 处理
-            if adopted and status == "done":
+            # adopted 会话由名册决定存续，总线是常驻入口：两者的回执 done 都不关会话，按 handled 处理
+            if (adopted or t["topic_id"] == BUS_TOPIC_ID) and status == "done":
                 status = "handled"
             event = sm.RECEIPT_EVENTS.get(status, "receipt_handled")
             new_state = sm.transition(t["state"], event)

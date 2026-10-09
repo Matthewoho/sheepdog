@@ -354,6 +354,31 @@ class DispatchTest(Base):
         d.dispatch_once()
         self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.ACTIVE)
 
+    def test_bus_done_receipt_does_not_close(self):
+        self.poll([msg(message_id="om_test_bd1", chat_type="p2p", chat_id="oc_test_stranger")])
+        d = self.disp(Roster())
+        d.dispatch_once()
+        self.ack(BUS_TOPIC_ID, "done")
+        d.dispatch_once()
+        self.assertEqual(self.store.get_topic(BUS_TOPIC_ID)["state"], sm.ACTIVE)
+        # 之后的信号照常投递
+        self.poll([msg(message_id="om_test_bd2", chat_type="p2p", chat_id="oc_test_stranger")])
+        self.assertEqual(d.dispatch_once()["topics"][BUS_TOPIC_ID]["sent"], 1)
+
+    def test_watch_cli_message_uses_config(self):
+        import io, os
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from sheepdog import cli
+        self.disp().init()
+        cfg_file = Path(self.tmp.name) / "config.toml"
+        cfg_file.write_text('[watch]\nremind_minutes = [5]\nexpire_minutes = 10\n', encoding="utf-8")
+        out = io.StringIO()
+        env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": self.tmp.name}
+        with mock.patch.dict(os.environ, env), redirect_stdout(out):
+            self.assertEqual(cli.main(["watch", "--topic", "tp_alpha", "--person", "ou_test_bob"]), 0)
+        self.assertIn("5 分钟提醒，10 分钟到期", out.getvalue())
+
     def test_removed_from_roster_closes_and_falls_back_to_bus(self):
         self.poll([msg(message_id="om_test_r1", chat_id="oc_test_alpha_p2p")])
         d = self.disp()

@@ -298,7 +298,10 @@ def cmd_watch(args) -> int:
     except ValueError as e:
         print(f"登记被拒绝: {e}", file=sys.stderr)
         return 2
-    print(f"已登记等待 #{wid}：对方回复会直接推给 {args.topic}；15/30 分钟提醒，60 分钟到期。取消：sheepdog unwatch --id {wid}")
+    w = cfg.watch
+    remind = "/".join(map(str, w.remind_minutes)) or "-"
+    print(f"已登记等待 #{wid}：对方回复会直接推给 {args.topic}；{remind} 分钟提醒，{w.expire_minutes} 分钟到期。"
+          f"取消：sheepdog unwatch --id {wid}")
     return 0
 
 
