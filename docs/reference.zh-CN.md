@@ -92,7 +92,7 @@ reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，�
 remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情，在你回复后撤下；@所有人 只点不撤
 ```
 
-- **点**：消息实际投递给会话成功之后才点；排队中（你在会话里接管、等 spawn）不点。每条消息只点一次，记进账本 `acks` 表（含 `reaction_id`）。
+- **点**：消息实际投递给会话成功之后才点；排队中（你在会话里接管、等 spawn）不点；被安全规则 hold 的消息不点（tag 的照常点）。每条消息只点一次，记进账本 `acks` 表（含 `reaction_id`）。
 - **撤**：账本入账一条你自己发的消息时（包括会话以你身份代回的）：私聊里，同一聊天中点表情早于这条消息的全部撤下；群里，回复了那条消息或 @ 了它的发送人才撤下对应的。只撤 `remove_on_reply_reasons` 里的原因。
 - 用 lark-cli 的 user 身份调 `im reactions create` / `im reactions delete`。失败只记日志和 `error` 列，不影响投递和路由，也不重试。
 - `--dry-run` 不调接口，只打印将要点 / 撤什么。

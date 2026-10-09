@@ -97,7 +97,7 @@ class EscalationTest(Base):
         self.poll([ask("om_test_q1", "tp_alpha", "Alpha 的问题"), ask("om_test_q2", BUS_TOPIC_ID, "总线的问题")])
         self.poll([reply("om_test_r1", "延期一周", reply_to="om_test_q1")])
         r = self.row("om_test_r1")
-        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "matthew_reply", "tp_alpha"))
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", "tp_alpha"))
         self.assertIn("owner_verified", json.loads(r["tags_json"]))
         self.assertIn("Alpha 的问题", r["note"])
         self.assertIsNone(self.store.get_escalation("om_test_q1")["answered_at"])  # 投递后才标已答
@@ -108,6 +108,18 @@ class EscalationTest(Base):
         e = self.store.get_escalation("om_test_q1")
         self.assertEqual((e["answer_message_id"], e["close_reason"]), ("om_test_r1", "answered"))
         self.assertEqual(self.opens(), ["om_test_q2"])
+
+    def test_legacy_reason_rows_still_rendered_as_owner_reply(self):
+        # 已上线账本里的旧行 reason 是改名前的值：靠 owner_verified 标记照样认作主人回复
+        self.poll([ask("om_test_q1", "tp_alpha", "问题")])
+        self.poll([reply("om_test_lg", "好")])
+        self.store.conn.execute("UPDATE messages SET reason='legacy_owner_reply_name' WHERE message_id='om_test_lg'")
+        self.store.conn.commit()
+        self.d.dispatch_once()
+        text = self.sink.to("conv_test_alpha")[-1]
+        self.assertIn("### [主人在 IM 的回复]", text)
+        self.assertIn(OWNER_REPLY_LABEL, text)
+        self.assertEqual(self.store.get_escalation("om_test_q1")["answer_message_id"], "om_test_lg")
 
     def test_unquoted_single_open_goes_to_it(self):
         self.poll([ask("om_test_q1", "tp_alpha", "唯一的问题")])

@@ -38,7 +38,7 @@ REASON_LABEL = {
     "watch_nudge": "等待提醒",
     "watch_expired": "等待到期",
     "bus_relay": "总线转达",
-    "matthew_reply": "主人在 IM 的回复",
+    "owner_reply": "主人在 IM 的回复",
     "escalation_list": "未结的「需要你定」",
 }
 
@@ -238,11 +238,14 @@ def security_banner(pb: Playbook, row: sqlite3.Row, security: SecurityConfig | N
 def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
+    tags = json.loads(row["tags_json"] or "[]")
+    if "owner_verified" in tags:
+        # 主人回复按标记认，不按 reason 值认：已上线账本里的旧行用的是改名前的 reason
+        label = REASON_LABEL["owner_reply"]
     if row["chat_type"] == SYSTEM_CHAT:
         return "\n".join([f"### [{label}] sheepdog | {row['create_time']}", *(row["content"] or "").splitlines()])
     where = "私聊" if row["chat_type"] == "p2p" else f"群「{row['chat_name']}」"
     lines = [f"### [{label}] {where} | {row['sender_name']} | {row['create_time']}{read}"]
-    tags = json.loads(row["tags_json"] or "[]")
     if "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
     if row["note"]:

@@ -91,6 +91,21 @@ class AckTest(Base):
         a = self.store.get_ack("om_test_p1")
         self.assertEqual((a["reaction_id"], a["reason"], a["chat_type"]), ("rx_om_test_p1", "p2p", "p2p"))
 
+    def test_hold_not_acked_tag_acked(self):
+        from sheepdog.security import load_security
+        sec = load_security(FIX / "security.toml")
+        Collector(self.cfg, self.store, FakeSource([[
+            msg(message_id="om_test_hd", chat_type="p2p", chat_id="oc_test_p1", sender_tenant_key="tenant_test_own",
+                content="fx-holdme"),
+            msg(message_id="om_test_tg", chat_type="p2p", chat_id="oc_test_p2", sender_tenant_key="tenant_test_own",
+                content="fx-tagme"),
+        ]]), self.roster, sec, self.acker).poll_once()
+        self.assertEqual(self.row("om_test_hd")["security_action"], "hold")
+        res = self.deliver()
+        self.assertEqual(res["sent"], 2)  # 两条都投到了总线
+        self.assertEqual(self.acked(), ["om_test_tg"])
+        self.assertIsNone(self.store.get_ack("om_test_hd"))
+
     def test_queued_not_acked_until_delivered(self):
         self.d.ensure_bus_topic()
         self.store.update_topic(BUS_TOPIC_ID, conversation_id="conv_test_bus")

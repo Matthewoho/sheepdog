@@ -1,7 +1,8 @@
 """确认表情（7.9）：消息送达会话后以主人身份点表情，主人回复后撤下。
 
 这是 sheepdog 唯一的 IM 写操作，只限加 / 撤这个表情。规则：
-- 点：消息实际投递给会话成功之后，投递原因在 [ack] reasons 里；每条消息只点一次（acks 表里有记录就不再点）。
+- 点：消息实际投递给会话成功之后，投递原因在 [ack] reasons 里；每条消息只点一次（acks 表里有记录就不再点）；
+  被安全规则 hold 的不点（tag 的照常点）。
 - 撤：入账一条主人自己发的消息时
   - 私聊：同一聊天里、点表情时间早于这条消息的未撤表情全部撤下；
   - 群：reply_to 指向某条已点的消息，或 @ 了它的发送人 → 撤下对应表情；
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 
 from .config import AckConfig
 from .models import Message
+from .security import HOLD
 from .store import SYSTEM_CHAT, Store
 
 log = logging.getLogger("sheepdog")
@@ -52,6 +54,8 @@ class Acker:
         for r in rows:
             if r["chat_type"] == SYSTEM_CHAT or r["reason"] not in self.cfg.reasons:
                 continue
+            if r["security_action"] == HOLD:
+                continue  # 被安全规则拦截的消息不向发送方示意「已看到」
             if self.store.get_ack(r["message_id"]) is not None:
                 continue  # 每条只点一次（含之前点失败的，不重试）
             if self.dry_run:

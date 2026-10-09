@@ -279,7 +279,7 @@ class Collector:
         if target is None and opens and len({e["topic_id"] for e in opens}) == 1:
             target = opens[0]  # 同一会话连问几条：直接投给它，关闭最近一条（与 forward 一致）
         tags = [OWNER_VERIFIED_TAG]
-        d = RouteDecision(DISPATCH, "matthew_reply", tags)
+        d = RouteDecision(DISPATCH, "owner_reply", tags)
         if target is not None:
             tags.append(ESCALATION_TAG_PREFIX + target["message_id"])
             self.store.upsert_message(m, d.route, d.reason, tags, target["topic_id"])
