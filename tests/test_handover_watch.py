@@ -15,11 +15,12 @@ from sheepdog import cli
 from sheepdog import session as sm
 from sheepdog.config import RoutingConfig
 from sheepdog.engine import BUS_TOPIC_ID, add_watch, forward_messages, predecessor_topic_id, write_receipt
+from sheepdog.playbook import Playbook
 from sheepdog.prompts import adopted_bootstrap, bootstrap_prompt, onboarding_prompt
 from sheepdog.roster import RosterError, load_roster, parse_roster
 from sheepdog.router import DROP, RouteContext, route
 
-from test_roster import ME, PREFIX, Base, msg, roster_data
+from test_roster import DROP_PREFIX, FIXTURES, ME, PREFIX, Base, msg, roster_data
 
 FAKE_APP_DIR = "/tmp/sheepdog_test_app"
 
@@ -99,9 +100,9 @@ class SpawnTest(Base):
         self.assertEqual(events, [("send", "conv_test_old"), ("new", "[managed] Beta 接手")])
         retire = self.sink.to("conv_test_old")[0]
         self.assertIn("退休通知", retire)
-        self.assertIn("「[managed] Beta 接手」", retire)
-        self.assertIn("取消你自己的飞书巡检", retire)
-        self.assertIn(f"--topic {predecessor_topic_id('tp_beta')}", retire)
+        bid = self.store.get_topic("tp_beta.prev")["pending_batch_id"]
+        self.assertIn(f"FX-RETIRE successor=[managed] Beta 接手 batch={bid}", retire)
+        self.assertIn(f"sheepdog receipt --topic {predecessor_topic_id('tp_beta')} --batch {bid}", retire)
         prev = self.store.get_topic("tp_beta.prev")
         self.assertEqual((prev["state"], prev["kind"]), (sm.CLOSED, "retired"))
         # 前任的聊天立即归接手会话；不再往前任投递
@@ -116,11 +117,15 @@ class SpawnTest(Base):
         r = d.spawn("beta")
         cid = r["conversation_id"]
         boot = next(p for t, p in self.sink.created if "Beta" in t)
-        self.assertIn(f"{FAKE_APP_DIR}/brain/conv_test_old/.system_generated/logs/transcript.jsonl", boot)
-        self.assertIn(f"{FAKE_APP_DIR}/brain/conv_test_old", boot)
-        self.assertIn("必须完整读完前任的上下文", boot)
-        self.assertIn("USER_INPUT", boot)
-        self.assertIn("needs_decision", boot)
+        # successor.md 被拼进接手 bootstrap，前任 id / transcript / 目录占位符被替换
+        self.assertIn(f"FX-SUCCESSOR id=conv_test_old "
+                      f"transcript={FAKE_APP_DIR}/brain/conv_test_old/.system_generated/logs/transcript.jsonl "
+                      f"dir={FAKE_APP_DIR}/brain/conv_test_old", boot)
+        self.assertIn("FX-ONBOARDING title=Beta 接手", boot)
+        self.assertIn("FX-COMMON title=Beta 接手 topic=tp_beta", boot)
+        # 读完回执的批次与 status 属于接口说明
+        self.assertIn(f"--batch {r['read_batch']}", boot)
+        self.assertIn('"status":"needs_decision"', boot)
         self.assertEqual(self.beta()["state"], sm.RUNNING)
 
         # 读完之前：信号排队不丢
@@ -154,8 +159,10 @@ class SpawnTest(Base):
     def test_adopted_bootstrap_without_predecessor(self):
         s = parse_roster(handover_data()).by_key("beta")
         s.predecessor_conversation_id = ""
-        text = adopted_bootstrap(s, "[managed] Beta", "", PREFIX, ME)
-        self.assertNotIn("## 接手", text)
+        pb = Playbook(FIXTURES)
+        text = adopted_bootstrap(pb, s, "[managed] Beta", "", [15, 30], 60)
+        self.assertNotIn("FX-SUCCESSOR", text)
+        self.assertIn("FX-ONBOARDING", text)
         self.assertIn("已就绪", text)
 
 
@@ -164,7 +171,7 @@ class EscalationTest(Base):
 
     def test_self_escalation_dropped(self):
         ctx = RouteContext(ME)
-        cfg = RoutingConfig()
+        cfg = RoutingConfig(drop_bot_message_prefixes=[DROP_PREFIX])
         d = route(msg(chat_type="p2p", sender_type="app", content=self.MARK), ctx, cfg)
         self.assertEqual((d.route, d.reason), (DROP, "self_escalation"))
         d = route(msg(chat_type="p2p", sender_type="bot", content=json.dumps({"text": self.MARK}, ensure_ascii=False)), ctx, cfg)
@@ -178,22 +185,19 @@ class EscalationTest(Base):
         r = self.row("om_test_esc")
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), (DROP, "self_escalation", None))
 
-    def test_rules_in_all_prompts(self):
+    def test_common_rules_in_all_prompts(self):
+        """common.md（7.1、7.3–7.5 的业务规则所在）拼进总线、接管、新建三类开场；接口说明含 watch / 回执。"""
         s = self.roster.by_key("alpha")
-        for text in (bootstrap_prompt("总线", "职责", BUS_TOPIC_ID, "", "", PREFIX, ME, "Lark 信号·总线"),
-                     onboarding_prompt(s, "o1", PREFIX, ME),
-                     adopted_bootstrap(s, "[managed] Alpha", "", PREFIX, ME)):
-            self.assertIn("拿不准就找主人", text)
-            self.assertIn(f"--user-id {ME}", text)
-            self.assertIn("🐕 [sheepdog·", text)
-            self.assertIn("needs_decision", text)
-            self.assertIn("sheepdog watch --topic", text)
-            self.assertIn("不要自己开定时任务", text)
-            # 7.5
-            self.assertIn("需求先问清属于哪个项目", text)
-            self.assertIn("project:<项目名>", text)
-            self.assertIn("不要硬猜", text)
-        self.assertIn("🐕 [sheepdog·Alpha 需求] 需要你定", onboarding_prompt(s, "o1", PREFIX, ME))
+        pb = Playbook(FIXTURES, {"reply_prefix": PREFIX})
+        for text, title, tid in (
+                (bootstrap_prompt(pb, "[managed] 总线", "Lark 信号·总线", BUS_TOPIC_ID, self.roster, "", [15, 30], 60),
+                 "Lark 信号·总线", BUS_TOPIC_ID),
+                (onboarding_prompt(pb, s, "o1", [15, 30], 60), "Alpha 需求", "tp_alpha"),
+                (adopted_bootstrap(pb, s, "[managed] Alpha", "", [15, 30], 60), "Alpha 需求", "tp_alpha")):
+            self.assertIn(f"FX-COMMON title={title} topic={tid} prefix={PREFIX}", text)
+            self.assertIn(f"sheepdog watch --topic {tid}", text)
+            self.assertIn(f"sheepdog receipt --topic {tid}", text)
+            self.assertIn("project:", text)
 
     def test_forward_quote_only_and_labels(self):
         d = self.disp()
@@ -257,21 +261,32 @@ class WatchTest(Base):
         self.d.dispatch_once()
         nudges = self.reasons("watch_nudge")
         self.assertEqual(len(nudges), 1)
-        self.assertIn("15 分钟没回", nudges[0]["content"])
-        self.assertIn(PREFIX, nudges[0]["content"])
+        self.assertIn(f"FX-REMIND note=等 Bob 确认排期 person=ou_test_bob minutes=15 prefix={PREFIX.rstrip()}",
+                      nudges[0]["content"])
         self.assertEqual(nudges[0]["topic_id"], "tp_alpha")
         self.store.update_watch(wid, started_at=ago(31))
         self.d.dispatch_once()
         self.d.dispatch_once()
-        self.assertEqual([("30 分钟没回" in n["content"]) for n in self.reasons("watch_nudge")], [False, True])
+        self.assertEqual([("minutes=30" in n["content"]) for n in self.reasons("watch_nudge")], [False, True])
         self.store.update_watch(wid, started_at=ago(61))
         self.d.dispatch_once()
         self.d.dispatch_once()
         expired = self.reasons("watch_expired")
         self.assertEqual(len(expired), 1)
-        self.assertIn("汇报主人", expired[0]["content"])
+        self.assertIn("FX-EXPIRE note=等 Bob 确认排期 person=ou_test_bob minutes=60", expired[0]["content"])
         self.assertEqual(self.store.get_watch(wid)["close_reason"], "expired")
         self.assertEqual(len(self.reasons("watch_nudge")), 2)
+
+    def test_configurable_minutes(self):
+        self.cfg.watch.remind_minutes, self.cfg.watch.expire_minutes = [5], 10
+        wid = add_watch(self.store, "tp_alpha", "ou_test_bob")
+        self.store.update_watch(wid, started_at=ago(6))
+        self.d.dispatch_once()
+        self.assertIn("minutes=5", self.reasons("watch_nudge")[0]["content"])
+        self.store.update_watch(wid, started_at=ago(11))
+        self.d.dispatch_once()
+        self.assertIn("minutes=10", self.reasons("watch_expired")[0]["content"])
+        self.assertEqual(len(self.reasons("watch_nudge")), 1)
 
     def test_late_tick_sends_single_nudge(self):
         wid = add_watch(self.store, "tp_alpha", "ou_test_bob")

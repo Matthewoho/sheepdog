@@ -2,7 +2,7 @@
 
 规则优先级（自上而下，先命中先返回）：
  1. 自己发的            → self（仅入账，供「回复我」判定）
- 1b. 会话以 bot 身份找主人的升级私聊（正文以「🐕 [sheepdog·」开头）→ drop（防回环）
+ 1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环）
  2. 强制忽略的会话       → drop
  3. 私聊：人 → dispatch；bot → inbox(bot_p2p)，关键词命中则 dispatch
  4. 群 @我             → dispatch
@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -29,9 +30,6 @@ DROP = "drop"
 INBOX = "inbox"
 DISPATCH = "dispatch"
 SELF = "self"
-
-# 会话拿不准时以 bot 身份私聊主人的正文开头（7.3）；sheepdog 自己不能把它再当信号推回去
-ESCALATION_MARK = "🐕 [sheepdog·"
 
 
 @dataclass
@@ -57,15 +55,28 @@ def _keyword_hit(text: str, keywords: list[str]) -> str:
     return ""
 
 
+def _bodies(content: str) -> list[str]:
+    """正文可能是纯文本，也可能是 {"text": "..."} 这类 JSON：两种都拿出来比对开头。"""
+    out = [(content or "").lstrip()]
+    try:
+        d = json.loads(content or "")
+    except ValueError:
+        return out
+    if isinstance(d, dict) and isinstance(d.get("text"), str):
+        out.append(d["text"].lstrip())
+    return out
+
+
 def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 1. 自己发的
     if ctx.self_open_id and msg.sender_id == ctx.self_open_id:
         return RouteDecision(SELF, "self")
 
-    # 1b. 升级私聊防回环：只认 app/bot 发的，人转述这句话不受影响。
-    # 正文可能是纯文本，也可能是 {"text": "..."} 这类 JSON，所以看开头一小段而不是严格 startswith
-    if msg.sender_type in ("app", "bot") and ESCALATION_MARK in (msg.content or "").lstrip()[:64]:
-        return RouteDecision(DROP, "self_escalation")
+    # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响
+    prefixes = [p for p in cfg.drop_bot_message_prefixes if p]
+    if prefixes and msg.sender_type in ("app", "bot"):
+        if any(b.startswith(p) for b in _bodies(msg.content) for p in prefixes):
+            return RouteDecision(DROP, "self_escalation")
 
     # 2. 强制忽略
     if msg.chat_id in cfg.ignore_chat_ids:

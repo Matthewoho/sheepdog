@@ -27,8 +27,9 @@ import sys
 import time
 
 from . import __version__
-from .config import load_config
+from .config import ConfigError, load_config
 from .engine import RETIRED, Collector, Dispatcher, add_watch, forward_messages, write_receipt
+from .playbook import PLAYBOOK_FILES, Playbook
 from .roster import Roster, RosterError, load_roster
 from .sink import SinkError
 from .sink.agentapi import AgentApiSink, DryRunSink
@@ -91,6 +92,13 @@ def cmd_doctor(args) -> int:
     except RosterError as e:
         print(f"名册: ✗ {e}")
         ok = False
+    # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
+    pb = Playbook.from_config(cfg)
+    missing = pb.missing()
+    print(f"playbook: {pb.directory} " + (f"✓ {len(PLAYBOOK_FILES)} 个文件齐全" if not missing
+                                          else f"缺 {len(missing)} 个（对应段落为空）"))
+    for name in missing:
+        print(f"  ✗ 缺 {name}：{PLAYBOOK_FILES[name]}")
     return 0 if ok else 1
 
 
@@ -415,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except _Abort:
+        return 2
+    except ConfigError as e:
+        print(f"配置无效: {e}", file=sys.stderr)
         return 2
 
 

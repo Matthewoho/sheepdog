@@ -17,6 +17,8 @@ retention_days = 7
 prompt_overlay_path = "prompts/overlay.md"
 # 名册（相对本配置文件所在目录）：登记现有会话、按聊天归属推送。留空 = roster.toml，不存在时所有信号进总线
 roster_path = "roster.toml"
+# 业务规则 md 目录（相对本配置文件所在目录），从 examples/playbook/ 拷贝改写；每次组装 prompt 时现读
+playbook_dir = "playbook"
 
 [routing]
 keywords = ["生产", "prod", "故障", "告警", "回滚", "审批"]
@@ -25,8 +27,9 @@ ignore_muted_chats = true
 dispatch_at_all = true
 dispatch_bot_p2p = false
 # 建议把「机器人 ↔ 你」的私聊放进来：会话拿不准时以 bot 身份私聊你，不应再被当成信号推回总线
-# （另外 bot 发的、正文以「🐕 [sheepdog·」开头的消息一律丢弃，reason = self_escalation）
 ignore_chat_ids = []
+# 机器人/应用发的消息正文以其中任一前缀开头就丢弃（reason = self_escalation），与 playbook 里约定的开头保持一致
+drop_bot_message_prefixes = ["🐕 [sheepdog·"]
 watch_chat_ids = []
 # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
 keyword_skip_bot_senders = true
@@ -38,5 +41,10 @@ model = ""
 bus_title = "Lark 信号·总线"
 human_attach_minutes = 15
 receipt_timeout_minutes = 20
-# 代回前缀：session 以你的身份对外发 IM 消息时，正文开头必须加它（reaction 不算）；空字符串 = 不要求
+# 代回前缀：playbook 里的 {{reply_prefix}}（规则文字写在 playbook/common.md）
 reply_prefix = "🐕 [Agent 代回] "
+
+[watch]
+# 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}
+remind_minutes = [15, 30]
+expire_minutes = 60

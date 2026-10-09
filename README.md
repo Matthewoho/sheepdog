@@ -42,6 +42,7 @@ pip install -e .
 mkdir -p ~/.config/sheepdog
 cp examples/config.example.toml ~/.config/sheepdog/config.toml   # 填 self_open_id 等
 cp examples/roster.example.toml ~/.config/sheepdog/roster.toml   # 登记你现有的会话（可选）
+cp -r examples/playbook ~/.config/sheepdog/playbook              # 业务规则 md，按自己的工作方式改写
 sheepdog doctor
 sheepdog init --dry-run        # 预览：名册同步、总线、给每个 managed 会话的 onboarding
 sheepdog init                  # 正式登记（可重复执行，已 onboarding 的跳过）
@@ -58,22 +59,45 @@ sheepdog sessions              # session 注册表与状态（mode、职责、�
 sheepdog forward --topic tp_x --message-ids a,b --note "..."   # 总线把消息转交给 managed 会话
 sheepdog forward --topic tp_x --quote "主人原话" --note "总线补充"  # 主人在总线里的回答转达过去（原话与备注分开标注）
 sheepdog spawn --key k         # 名册里 conversation_id 留空的条目：新建会话（可接手前任：先发退休通知、再新建、转交接回执）
-sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，15/30 分钟提醒，1 小时到期
+sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，按 [watch] 配置提醒与到期
 sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
 ```
 
-会话之间的约定都写在它们收到的 prompt 里：拿不准就以 bot 身份私聊你（正文以 `🐕 [sheepdog·<会话>]` 开头，sheepdog 不会把它推回来）；等别人回复用 `sheepdog watch` 登记，不自己开定时任务；收到需求先问清属于哪个项目，回执 anchors 写 `project:<项目名>`，`sheepdog sessions` 会显示每个会话关联的项目。
-
-Agent 以你的身份对外发 IM 消息时，正文开头必须加代回前缀（`session.reply_prefix`，默认 `🐕 [Agent 代回] `）。这条规则写在总线 bootstrap、onboarding 和每批信号末尾；消息是各会话自己发的，sheepdog 只能靠 prompt 约束，做不到发送时强制。
+回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
 
 `agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行。
+
+## 业务规则：playbook
+
+代码只放机制（名册、路由、投递、回执、等待计时、spawn、forward，以及自动生成的「sheepdog 接口说明」）。总线职责、工作方式、代回前缀、拿不准找你、等别人回复、需求归属项目、退休与接手说明、提醒文字，全部写在配置目录的 md 文件里：
+
+```bash
+cp -r examples/playbook ~/.config/sheepdog/playbook   # 拷贝通用示例后按自己的工作方式改写
+sheepdog doctor                                         # 列出缺哪些文件（缺的那一段在 prompt 里为空）
+```
+
+| 文件 | 用在哪 | 专用占位符 |
+|---|---|---|
+| `common.md` | 所有会话（总线、新建、接管、接手） | — |
+| `bus.md` | 总线 bootstrap | `{{roster}}` |
+| `onboarding.md` | 接管现有会话（新建的会话也用它） | `{{duty}}` `{{chats}}` `{{authority}}` `{{self_polling_section}}` |
+| `retire_self_polling.md` | `retire_self_polling = true` 时填进 `{{self_polling_section}}` | （额外可用 `{{self_polling}}`） |
+| `authority_default.md` | authority 为空时代替 `{{authority}}` | — |
+| `retire.md` | 给前任的退休通知 | `{{successor_title}}` `{{batch_id}}` |
+| `successor.md` | 接手会话开场附加 | `{{predecessor_id}}` `{{predecessor_transcript}}` `{{predecessor_dir}}` |
+| `nudge_remind.md` / `nudge_expire.md` | 等待提醒 / 到期 | `{{note}}` `{{person}}` `{{minutes}}` |
+| `batch_footer.md` | 每批信号末尾 | — |
+
+通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_prefix}}` `{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
+
+相关参数在 `config.toml`：`session.reply_prefix`、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
 
 ## 数据与隐私
 
 | 层 | 位置 | 进仓库 |
 |---|---|---|
 | 引擎代码 | 本仓库 | ✅ |
-| 个人配置 / 名册 / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
+| 个人配置 / 名册 / playbook / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，默认保留 7 天 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 

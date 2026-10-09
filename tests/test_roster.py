@@ -11,6 +11,7 @@ from sheepdog import session as sm
 from sheepdog.config import Config, RoutingConfig
 from sheepdog.engine import BUS_TOPIC_ID, Collector, Dispatcher, forward_messages, write_receipt
 from sheepdog.models import Mention, Message
+from sheepdog.playbook import PLAYBOOK_FILES, Playbook
 from sheepdog.prompts import batch_prompt, bootstrap_prompt, onboarding_prompt
 from sheepdog.roster import Roster, RosterError, load_roster, parse_roster
 from sheepdog.router import DISPATCH, DROP, INBOX, RouteContext, route
@@ -18,7 +19,17 @@ from sheepdog.store import Store
 
 ME = "ou_test_me"
 REPO = Path(__file__).resolve().parent.parent
+FIXTURES = REPO / "tests" / "fixtures" / "playbook"
 PREFIX = "🐕 [Agent 代回] "
+DROP_PREFIX = "🐕 [sheepdog·"
+
+
+def test_config(state_dir: Path) -> Config:
+    """测试配置：playbook 指向 tests/fixtures/playbook（只含标记和占位符，不含业务文字）。"""
+    cfg = Config(self_open_id=ME, state_dir=state_dir)
+    cfg.playbook_dir = str(FIXTURES)
+    cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
 
 
 def msg(**kw) -> Message:
@@ -164,9 +175,9 @@ class BotKeywordTest(unittest.TestCase):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = Config(self_open_id=ME, state_dir=Path(self.tmp.name))
-        self.cfg.routing = RoutingConfig(keywords=["故障"], ignore_chat_ids=["oc_test_ignored"])
-        self.cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg = test_config(Path(self.tmp.name))
+        self.cfg.routing = RoutingConfig(keywords=["故障"], ignore_chat_ids=["oc_test_ignored"],
+                                         drop_bot_message_prefixes=[DROP_PREFIX])
         self.store = Store(self.cfg.db_path)
         self.sink = FakeSink()
         self.roster = parse_roster(roster_data())
@@ -251,9 +262,11 @@ class DispatchTest(Base):
         alpha = self.sink.to("conv_test_alpha")
         self.assertEqual(len(alpha), 1)
         self.assertIn("登记通知", alpha[0])
-        self.assertIn("可以直接回复 Alpha 的确认类问题", alpha[0])
-        self.assertIn("不扩大也不收回", alpha[0])
-        self.assertIn("请取消你自己针对这些聊天的飞书巡检", alpha[0])
+        self.assertIn("FX-ONBOARDING title=Alpha 需求 duty=跟进 Alpha 的需求", alpha[0])
+        self.assertIn("auth=可以直接回复 Alpha 的确认类问题", alpha[0])
+        self.assertIn("FX-RETIRE-POLLING polling=每 10 分钟巡检", alpha[0])
+        self.assertIn("FX-COMMON title=Alpha 需求 topic=tp_alpha", alpha[0])
+        self.assertIn("sheepdog receipt --topic tp_alpha --batch o", alpha[0])
         self.assertEqual(self.row("om_test_a1")["dispatch_state"], "pending")
 
         self.ack("tp_alpha")
@@ -284,11 +297,15 @@ class DispatchTest(Base):
         self.assertIsNotNone(self.store.get_topic("tp_alpha")["onboarded_at"])
         # 总线 bootstrap 带名册与转交规则
         bootstrap = self.sink.created[0][1]
-        self.assertIn("## 名册", bootstrap)
+        self.assertIn("FX-BUS topic=tp_bus", bootstrap)
+        self.assertIn("FX-COMMON title=Lark 信号·总线 topic=tp_bus", bootstrap)
+        # {{roster}} 被替换成代码渲染的名册表
         self.assertIn("Alpha 私聊（全部消息）", bootstrap)
         self.assertIn("conv_test_ops", bootstrap)
+        self.assertNotIn("{{roster}}", bootstrap)
+        # 接口说明由代码生成
         self.assertIn("sheepdog forward --topic", bootstrap)
-        self.assertIn("known 会话的事：不转交", bootstrap)
+        self.assertIn("sheepdog spawn --key", bootstrap)
 
     def test_adopted_timeout_counts_missed_without_requeue(self):
         d = self.disp()
@@ -413,38 +430,104 @@ class ForwardTest(Base):
         self.assertIn("总线备注（不是主人原话）：这是 Alpha 的需求", last)
 
 
-class ReplyPrefixTest(unittest.TestCase):
+class PlaybookTest(unittest.TestCase):
+    """7.6：模板内容被拼进 prompt、占位符被替换、未知占位符原样保留、缺文件为空且 doctor 报缺、改完现读。"""
+
     def setUp(self):
         self.s = parse_roster(roster_data()).by_topic("tp_alpha")
+        self.pb = Playbook(FIXTURES, {"reply_prefix": PREFIX, "watch_remind_minutes": "15/30",
+                                      "watch_expire_minutes": "60"})
 
-    def test_prefix_rule_everywhere(self):
-        for text in (bootstrap_prompt("总线", "职责", BUS_TOPIC_ID, "", "", PREFIX),
-                     onboarding_prompt(self.s, "o1", PREFIX)):
-            self.assertIn("代回前缀（硬规则）", text)
-            self.assertIn(f"`{PREFIX}`", text)
-            self.assertIn("reaction", text)
-        tail = batch_prompt("tp_alpha", "b1", [], [], reply_prefix=PREFIX).splitlines()[-1]
-        self.assertIn(PREFIX, tail)
+    def test_render_substitutes_and_keeps_unknown(self):
+        text = self.pb.render("common.md", session_title="T", topic_id="tp_t")
+        self.assertEqual(text, f"FX-COMMON title=T topic=tp_t prefix={PREFIX} remind=15/30 expire=60 keep={{{{not_a_var}}}}")
 
-    def test_empty_prefix_omits_rule(self):
-        for text in (bootstrap_prompt("总线", "职责", BUS_TOPIC_ID, "", "", ""),
-                     onboarding_prompt(self.s, "o1", ""),
-                     batch_prompt("tp_alpha", "b1", [], [], reply_prefix="")):
-            self.assertNotIn("代回前缀", text)
-            self.assertNotIn("提醒：以主人身份", text)
+    def test_values_are_not_re_substituted(self):
+        text = self.pb.render("authority_default.md")
+        self.assertEqual(text, "FX-AUTH-DEFAULT")
+        s = self.s
+        s.authority = "原话里有 {{topic_id}}"
+        out = onboarding_prompt(self.pb, s, "o1", [15, 30], 60)
+        self.assertIn("auth=原话里有 {{topic_id}}", out)
 
-    def test_onboarding_without_authority(self):
+    def test_assembly_order_and_defaults(self):
         self.s.authority = ""
-        self.assertIn("未明确授权，对外只起草", onboarding_prompt(self.s, "o1", PREFIX))
+        self.s.retire_self_polling = False
+        out = onboarding_prompt(self.pb, self.s, "o1", [15, 30], 60)
+        self.assertIn("auth=FX-AUTH-DEFAULT", out)
+        self.assertNotIn("FX-RETIRE-POLLING", out)
+        self.assertLess(out.index("FX-ONBOARDING"), out.index("FX-COMMON"))
+        self.assertLess(out.index("FX-COMMON"), out.index("## sheepdog 接口说明"))
+        boot = bootstrap_prompt(self.pb, "[managed] 总线", "总线", BUS_TOPIC_ID, parse_roster(roster_data()),
+                                "OVERLAY-MARK", [15, 30], 60)
+        # overlay 照旧拼在 common.md 之后
+        self.assertLess(boot.index("FX-BUS"), boot.index("FX-COMMON"))
+        self.assertLess(boot.index("FX-COMMON"), boot.index("OVERLAY-MARK"))
+        self.assertIn("15/30 分钟没回时提示你；60 分钟到期", boot)
+        tail = batch_prompt(self.pb, "tp_alpha", "b1", [], [], "Alpha 需求").splitlines()[-1]
+        self.assertEqual(tail, f"FX-FOOTER title=Alpha 需求 prefix={PREFIX}".rstrip())
 
-    def test_dispatcher_uses_config_prefix(self):
+    def test_missing_files_render_empty(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = Config(self_open_id=ME, state_dir=Path(d))
-            cfg.receipts_dir.mkdir(parents=True)
+            pb = Playbook(Path(d) / "nope")
+            self.assertEqual(pb.missing(), list(PLAYBOOK_FILES))
+            out = onboarding_prompt(pb, self.s, "o1", [15, 30], 60)
+            self.assertNotIn("FX-", out)
+            self.assertIn("## sheepdog 接口说明", out)  # 机制部分照常
+            self.assertTrue(batch_prompt(pb, "tp_alpha", "b1", [], [], "A").splitlines()[-1].startswith("处理完成后提交回执"))
+
+    def test_hot_reload(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "batch_footer.md").write_text("V1", encoding="utf-8")
+            pb = Playbook(Path(d))
+            self.assertEqual(pb.render("batch_footer.md"), "V1")
+            (Path(d) / "batch_footer.md").write_text("V2 {{topic_id}}", encoding="utf-8")
+            self.assertEqual(pb.render("batch_footer.md", topic_id="tp_x"), "V2 tp_x")
+
+    def test_doctor_reports_missing(self):
+        import io, os
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from sheepdog import cli
+        with tempfile.TemporaryDirectory() as d:
+            pdir = Path(d) / "playbook"
+            pdir.mkdir()
+            for name in PLAYBOOK_FILES:
+                if name != "retire.md":
+                    (pdir / name).write_text((FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8")
+            (Path(d) / "config.toml").write_text('self_open_id = "ou_test_me"\n', encoding="utf-8")
+            out = io.StringIO()
+            env = {"SHEEPDOG_CONFIG": str(Path(d) / "config.toml"), "SHEEPDOG_STATE_DIR": str(Path(d) / "state")}
+            with mock.patch.dict(os.environ, env), redirect_stdout(out):
+                cli.main(["doctor"])
+            text = out.getvalue()
+            self.assertIn("缺 1 个", text)
+            self.assertIn("✗ 缺 retire.md", text)
+            self.assertNotIn("缺 common.md", text)
+
+    def test_dispatcher_uses_config_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = test_config(Path(d))
+            cfg.session.reply_prefix = "[P] "
+            cfg.watch.remind_minutes, cfg.watch.expire_minutes = [5], 10
             sink = FakeSink()
-            Dispatcher(cfg, Store(cfg.db_path), sink, parse_roster(roster_data())).init()
-            self.assertIn(PREFIX, sink.created[0][1])
-            self.assertIn(PREFIX, sink.to("conv_test_alpha")[0])
+            store = Store(cfg.db_path)
+            Dispatcher(cfg, store, sink, parse_roster(roster_data())).init()
+            self.assertIn("prefix=[P]  remind=5 expire=10", sink.created[0][1])
+            self.assertIn("prefix=[P]  remind=5 expire=10", sink.to("conv_test_alpha")[0])
+            store.close()
+
+    def test_watch_config_validation(self):
+        from sheepdog.config import ConfigError, WatchConfig
+        for bad in (WatchConfig([15, 30, 45], 60), WatchConfig([30, 15], 60), WatchConfig([15, 60], 60)):
+            with self.assertRaises(ConfigError):
+                bad.validate()
+        WatchConfig([5], 10).validate()
+
+    def test_drop_prefix_off_by_default(self):
+        d = route(msg(chat_type="p2p", sender_type="app", content=DROP_PREFIX + "x] 需要你定"), RouteContext(ME),
+                  RoutingConfig())
+        self.assertNotEqual(d.reason, "self_escalation")
 
 
 class StoreTest(unittest.TestCase):

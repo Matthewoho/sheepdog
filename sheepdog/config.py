@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+class ConfigError(ValueError):
+    pass
+
+
 def default_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "sheepdog"
@@ -48,6 +52,9 @@ class RoutingConfig:
     watch_chat_ids: list[str] = field(default_factory=list)
     # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的 bot_p2p_keyword 不受影响）
     keyword_skip_bot_senders: bool = True
+    # 机器人/应用发的消息正文以其中任一前缀开头就 drop（reason self_escalation），
+    # 用来挡住会话以 bot 身份找主人的私聊，防止回环
+    drop_bot_message_prefixes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,8 +69,27 @@ class SessionConfig:
     human_attach_minutes: int = 15
     # 回执超时（分钟），超时判为 failed
     receipt_timeout_minutes: int = 20
-    # 代回前缀：session 以主人身份对外发 IM 消息时，正文开头必须加它；空字符串 = 不要求
+    # 代回前缀：作为 playbook 的 {{reply_prefix}} 占位符，规则文字写在 playbook 里
     reply_prefix: str = "🐕 [Agent 代回] "
+
+
+@dataclass
+class WatchConfig:
+    # 「等别人回复」的提醒档位（分钟，最多两档）与到期时间
+    remind_minutes: list[int] = field(default_factory=lambda: [15, 30])
+    expire_minutes: int = 60
+
+    def validate(self) -> None:
+        r = self.remind_minutes
+        if not isinstance(r, list) or not all(isinstance(m, int) and m > 0 for m in r):
+            raise ConfigError("watch.remind_minutes 必须是正整数列表")
+        # watches 表只有两个提醒时间列（nudged_15_at / nudged_30_at 按第 1、2 档使用）
+        if len(r) > 2:
+            raise ConfigError("watch.remind_minutes 最多两档")
+        if r != sorted(set(r)):
+            raise ConfigError("watch.remind_minutes 必须从小到大且不重复")
+        if not isinstance(self.expire_minutes, int) or any(m >= self.expire_minutes for m in r):
+            raise ConfigError("watch.expire_minutes 必须是整数且大于所有提醒档位")
 
 
 @dataclass
@@ -83,8 +109,11 @@ class Config:
     prompt_overlay_path: str = ""
     # 名册文件（相对本配置文件所在目录）；留空 = 默认 roster.toml，不存在时视为空名册
     roster_path: str = ""
+    # 业务规则 md 目录（相对本配置文件所在目录）；留空 = playbook/
+    playbook_dir: str = ""
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    watch: WatchConfig = field(default_factory=WatchConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -99,6 +128,11 @@ class Config:
     @property
     def roster_file(self) -> Path:
         p = Path(self.roster_path or "roster.toml").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
+    def playbook_path(self) -> Path:
+        p = Path(self.playbook_dir or "playbook").expanduser()
         return p if p.is_absolute() else self.config_path.parent / p
 
     @property
@@ -132,8 +166,10 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg, data)
         _apply(cfg.routing, data.get("routing", {}))
         _apply(cfg.session, data.get("session", {}))
+        _apply(cfg.watch, data.get("watch", {}))
         if "state_dir" in data:
             cfg.state_dir = Path(data["state_dir"]).expanduser()
+    cfg.watch.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

@@ -10,8 +10,9 @@ from pathlib import Path
 from . import session as sm
 from .config import Config
 from .models import Message
+from .playbook import Playbook
 from .prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, relay_content,
-                      retirement_prompt, roster_section)
+                      retirement_prompt, roster_table, watch_message)
 from .roster import Roster
 from .router import DISPATCH, SELF, RouteContext, RouteDecision, route
 from .sink import Sink, SinkError
@@ -25,9 +26,10 @@ BUS_TOPIC_ID = "tp_bus"
 ADOPTED = "adopted"
 KNOWN_KIND = "known"
 RETIRED = "retired"
-# 等待计时（7.4）：15/30 分钟提醒，60 分钟到期
-WATCH_NUDGES = (15, 30)
-WATCH_EXPIRE_MINUTES = 60
+# 总线职责写在 playbook 的 bus.md 里（7.6），topics 表只存指向
+BUS_DUTY = "见 playbook/bus.md"
+# watches 表的两个提醒时间列，按 watch.remind_minutes 的第 1、2 档使用（列名沿用规格）
+WATCH_SLOTS = ("nudged_15_at", "nudged_30_at")
 
 
 def predecessor_topic_id(topic_id: str) -> str:
@@ -195,22 +197,25 @@ class Dispatcher:
         self.store = store
         self.sink = sink
         self.roster = roster or Roster()
+        # 业务文字每次组装 prompt 时从 playbook 现读，改完下一批生效
+        self.playbook = Playbook.from_config(cfg)
 
     @property
     def bus_title(self) -> str:
         return f"{self.cfg.session.title_prefix} {self.cfg.session.bus_title}".strip()
 
-    @property
-    def reply_prefix(self) -> str:
-        return self.cfg.session.reply_prefix or ""
+    def _session_title(self, t) -> str:
+        """{{session_title}}：总线用不带前缀的 bus_title，其他用名册 title。"""
+        return self.cfg.session.bus_title if t["topic_id"] == BUS_TOPIC_ID else t["title"]
 
     def ensure_bus_topic(self):
         t = self.store.get_topic(BUS_TOPIC_ID)
         if t is None:
-            duty = ("接收主人在 IM 中收到的所有直推信号（私聊、@我、@所有人、回复我、关键词），"
-                    "判断是否为需要跟进的工作，整理要点、起草回复、提出需要主人决策的问题。"
-                    "不负责：对外发送消息、审批、生产写操作。")
-            self.store.create_topic(BUS_TOPIC_ID, self.bus_title, "bus", duty, sm.ACTIVE)
+            self.store.create_topic(BUS_TOPIC_ID, self.bus_title, "bus", BUS_DUTY, sm.ACTIVE)
+            t = self.store.get_topic(BUS_TOPIC_ID)
+        elif t["duty"] != BUS_DUTY:
+            # 老账本里总线 duty 是写死的业务文字，改成指向 playbook
+            self.store.update_topic(BUS_TOPIC_ID, duty=BUS_DUTY)
             t = self.store.get_topic(BUS_TOPIC_ID)
         return t
 
@@ -357,9 +362,9 @@ class Dispatcher:
         """总线没有会话就新建（adopted 会话永远不走这里）。bootstrap 已含完整名册，名册更新标记随之清掉。"""
         if t["conversation_id"]:
             return t
-        prompt = bootstrap_prompt(t["title"], t["duty"], t["topic_id"], self.cfg.prompt_overlay(),
-                                  roster_section(self.roster), self.reply_prefix, self.cfg.self_open_id,
-                                  self.cfg.session.bus_title)
+        w = self.cfg.watch
+        prompt = bootstrap_prompt(self.playbook, t["title"], self.cfg.session.bus_title, t["topic_id"], self.roster,
+                                  self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes)
         cid = self.sink.new_conversation(t["title"], prompt, self.cfg.session.model)
         self.store.update_topic(t["topic_id"], conversation_id=cid)
         self.store.set_meta("roster_notify_bus", "0")
@@ -372,7 +377,9 @@ class Dispatcher:
         if s is None:
             raise SinkError(f"{t['topic_id']} 不在名册里，不能 onboarding")
         bid = self._new_batch_id("o", t["topic_id"])
-        self.sink.send_message(t["conversation_id"], onboarding_prompt(s, bid, self.reply_prefix, self.cfg.self_open_id))
+        w = self.cfg.watch
+        self.sink.send_message(t["conversation_id"],
+                               onboarding_prompt(self.playbook, s, bid, w.remind_minutes, w.expire_minutes))
         ts = now_iso()
         self.store.record_dispatch(bid, t["topic_id"], [])
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
@@ -399,14 +406,13 @@ class Dispatcher:
             if not adopted:
                 t = self._ensure_bus_conversation(t)
                 if self.store.get_meta("roster_notify_bus") == "1":
-                    roster_update = (roster_section(self.roster)
-                                     or "名册已清空：当前没有登记的会话，所有信号由你自己处理。")
+                    roster_update = roster_table(self.roster)
             batch_id = self._new_batch_id("b", t["topic_id"])
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
             inbox = [] if adopted else self.store.inbox_summary()
-            prompt = batch_prompt(t["topic_id"], batch_id, rows, inbox, waiting, self.reply_prefix,
-                                  receipt_optional=adopted, roster_update=roster_update)
+            prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
+                                  waiting, receipt_optional=adopted, roster_update=roster_update)
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
             self._fail(t, None, str(e))
@@ -479,7 +485,7 @@ class Dispatcher:
             report["retire"] = self._retire_predecessor(s, title)
         read_bid = self._new_batch_id("h", s.topic_id) if s.predecessor_conversation_id else ""
         prompt = adopted_bootstrap(
-            s, title, read_bid, self.reply_prefix, self.cfg.self_open_id,
+            self.playbook, s, title, read_bid, self.cfg.watch.remind_minutes, self.cfg.watch.expire_minutes,
             str(transcript_path(s.predecessor_conversation_id)) if s.predecessor_conversation_id else "",
             str(conversation_dir(s.predecessor_conversation_id)) if s.predecessor_conversation_id else "",
         )
@@ -507,7 +513,8 @@ class Dispatcher:
         bid = self._new_batch_id("r", pid)
         # 先发退休通知，失败就整个 spawn 失败，不新建接手会话
         self.sink.send_message(s.predecessor_conversation_id,
-                               retirement_prompt(pid, bid, successor_title, s.topic_id))
+                               retirement_prompt(self.playbook, pid, f"{s.display_title}（前任）", bid,
+                                                 successor_title, s.topic_id))
         self.store.record_dispatch(bid, pid, [])
         self.store.update_topic(pid, conversation_id=s.predecessor_conversation_id, kind=RETIRED, state=sm.CLOSED,
                                 pending_batch_id=bid, dispatched_at=now_iso())
@@ -534,7 +541,9 @@ class Dispatcher:
 
     # ---------- 等别人回复（7.4） ----------
     def _tick_watches(self, live_topics: set[str]) -> None:
+        """每轮检查等待：到 remind_minutes 各档各提醒一次，到 expire_minutes 关闭并提示。文字来自 nudge_*.md。"""
         now = _now()
+        remind, expire = self.cfg.watch.remind_minutes, self.cfg.watch.expire_minutes
         for w in self.store.open_watches():
             if w["topic_id"] not in live_topics:
                 self.store.close_watch(w["id"], "topic_closed")
@@ -543,27 +552,23 @@ class Dispatcher:
             if not started:
                 continue
             mins = (now - started).total_seconds() / 60
-            what = w["note"] or "你在等的回复"
-            who = f"`{w['person_id']}`" + (f"（聊天 `{w['chat_id']}`）" if w["chat_id"] else "")
-            if mins >= WATCH_EXPIRE_MINUTES:
+            title = self._session_title(self.store.get_topic(w["topic_id"]))
+            if mins >= expire:
                 self.store.close_watch(w["id"], "expired")
-                self.store.add_system_message(
-                    w["topic_id"], "watch_expired",
-                    f"等待 #{w['id']}：{what}。对方 {who} 已等 1 小时没回，停止等待，用 lark-cli 汇报主人。",
-                    [f"watch:{w['id']}"])
+                self.store.add_system_message(w["topic_id"], "watch_expired",
+                                              watch_message(self.playbook, "nudge_expire.md", w, expire, title),
+                                              [f"watch:{w['id']}"])
                 continue
-            # 只发最近一档：进程停过一阵、一次跨过 15 和 30 时，只提醒一次并把 15 也记上
-            due = [m for m in WATCH_NUDGES if mins >= m and not w[f"nudged_{m}_at"]]
+            # 只发最近一档：进程停过一阵、一次跨过两档时只提醒一次，并把前面的档也记上
+            due = [i for i, m in enumerate(remind) if mins >= m and not w[WATCH_SLOTS[i]]]
             if not due:
                 continue
-            m = max(due)
-            hint = f"（记得代回前缀 `{self.reply_prefix}`）" if self.reply_prefix else ""
-            self.store.add_system_message(
-                w["topic_id"], "watch_nudge",
-                f"等待 #{w['id']}：{what}。对方 {who} {m} 分钟没回，请礼貌提醒一下{hint}。",
-                [f"watch:{w['id']}"])
+            i = max(due)
+            self.store.add_system_message(w["topic_id"], "watch_nudge",
+                                          watch_message(self.playbook, "nudge_remind.md", w, remind[i], title),
+                                          [f"watch:{w['id']}"])
             ts = now_iso()
-            self.store.update_watch(w["id"], **{f"nudged_{x}_at": ts for x in WATCH_NUDGES if x <= m and not w[f"nudged_{x}_at"]})
+            self.store.update_watch(w["id"], **{WATCH_SLOTS[j]: ts for j in range(i + 1) if not w[WATCH_SLOTS[j]]})
 
     def init(self) -> dict:
         """sheepdog init：同步名册；没有总线就建；给未 onboarding 的 managed 会话发 onboarding。可重复执行。"""

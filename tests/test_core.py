@@ -131,6 +131,7 @@ class EngineTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(self_open_id=ME, state_dir=Path(self.tmp.name))
         self.cfg.routing = RoutingConfig(keywords=["故障"])
+        self.cfg.playbook_dir = str(Path(__file__).parent / "fixtures" / "playbook")
         self.cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(self.cfg.db_path)
         self.sink = FakeSink()
