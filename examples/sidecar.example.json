@@ -1,7 +1,13 @@
 {
   "command": "/bin/sh",
-  "args": ["-c", "exec sheepdog run"],
+  "args": ["-c", "$HOME/.local/bin/sheepdog init && exec $HOME/.local/bin/sheepdog run"],
   "restart_policy": "always",
   "display_name": "sheepdog",
-  "description": "常驻拉取 IM 消息：私聊/@我 直推 [managed] session，其他群消息进 Inbox。"
+  "description": "Work assistant: pulls IM messages every minute and routes them to the agent sessions in your roster. Runs `sheepdog init` (idempotent) before `sheepdog run`.",
+  "env": {
+    "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+  },
+  "agent_permissions": {
+    "workspace_uris": ["file:///path/to/your/workspace"]
+  }
 }

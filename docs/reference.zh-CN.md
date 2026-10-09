@@ -1,0 +1,144 @@
+> sheepdog 配置与命令的完整参考（中文）。项目介绍见 [README](../README.md) · [简体中文](../README.zh-CN.md) · [日本語](../README.ja.md)。
+
+# sheepdog 参考手册
+
+**sheepdog 是你的工作助理。** 它的第一项工作是：接收你在 IM 上收到的工作，分给负责的 Agent session。
+
+> 你是牧羊人，AI Agent session 是羊群，sheepdog 是牧羊犬。
+>
+> 它盯着你的 IM，把需要你知道的信号赶到负责的 session 里，把 session 管在该待的状态里，只把需要你拍板的事带回给你。你负责**观察、指导、决策**，Agent 负责**收集、分类、处理、起草**。
+
+`sheepdog` 持续增量拉取你在 IM（目前是飞书 / Lark）里收到的所有消息，按规则分成三类：
+
+| 消息 | 去向 |
+|---|---|
+| 私聊、群里 @我 / @所有人、回复我的消息、关键人发言、命中关键词 | **直推** `[managed]` Agent session |
+| 其他群消息 | **Inbox**（按群分区，@我时附带摘要） |
+| 免打扰群（未 @我）、自己发的消息 | 忽略（自己的消息仅入账，用于「回复我」判定） |
+
+直推的消息先看**名册**（`roster.toml`）里有没有会话负责这个聊天：有就直接推给那个会话，没有就推给总线 session。名册里可以登记你已经在用的会话（`managed`，sheepdog 往里推）或只让总线知道它管什么（`known`，从不投递）；`all_messages = true` 的聊天连普通群消息和免打扰也会推给负责的会话。总线知道名册，遇到属于别人的事会用 `sheepdog forward` 转交。
+
+已读不影响路由：你看过的消息照样推给 session，并标注「✓已读」。编辑 / 撤回按原消息的路由级别处理：已推送的会通知 session，Inbox 中的静默更新，编辑后新增 @我 会升级直推。
+
+## 架构
+
+```
+Source (lark-cli, user 身份)
+   └─► Collector ──► Ledger (SQLite) ──► Router (纯规则)
+                                            ├─ drop
+                                            ├─ inbox（按群）
+                                            └─ dispatch ──► Dispatcher ──► Sink (Antigravity agentapi)
+                                                               ▲                 │
+                                                               └── 回执 ◄────────┘  sheepdog receipt
+```
+
+- **Session 状态机**：`active → running → (active | waiting_human | blocked | closed)`，以及 `human_attached`（你在 session 里发言后暂停投递）、`failed → attention`（重试耗尽）。状态由 session 每批提交的回执驱动。
+- **可插拔**：`Source`（消息源）、`Sink`（session 投递）、`Store`（账本）都是接口，当前实现分别为 lark-cli、Antigravity `agentapi`、SQLite。
+
+## 安装
+
+要求 Python ≥ 3.11、已登录的 [`lark-cli`](https://github.com/larksuite)（user 身份）、Antigravity App。
+
+```bash
+pip install -e .
+mkdir -p ~/.config/sheepdog
+cp examples/config.example.toml ~/.config/sheepdog/config.toml   # 填 self_open_id 等
+cp examples/roster.example.toml ~/.config/sheepdog/roster.toml   # 登记你现有的会话（可选）
+cp -r examples/playbook ~/.config/sheepdog/playbook              # 业务规则 md，按自己的工作方式改写
+cp examples/security.example.toml ~/.config/sheepdog/security.toml  # 安全规则，按自己的情况改写
+sheepdog doctor
+sheepdog init --dry-run        # 预览：名册同步、总线、给每个 managed 会话的 onboarding
+sheepdog init                  # 正式登记（可重复执行，已 onboarding 的跳过）
+```
+
+## 使用
+
+```bash
+sheepdog poll --dry-run        # 拉一次、只打印将要投递的内容
+sheepdog run                   # 常驻（推荐由 Antigravity App 以 sidecar 托管，见 examples/sidecar.example.json）
+sheepdog inbox                 # Inbox 按群汇总
+sheepdog inbox --chat 某群      # 查看某个群的 Inbox
+sheepdog sessions              # session 注册表与状态（mode、职责、负责的聊天、onboarding、未回执次数）
+sheepdog forward --topic tp_x --message-ids a,b --note "..."   # 总线把消息转交给 managed 会话
+sheepdog forward --topic tp_x --quote "主人原话" --note "总线补充"  # 主人在总线里的回答转达过去（原话与备注分开标注）
+sheepdog spawn --key k         # 名册里 conversation_id 留空的条目：新建会话（可接手前任：先发退休通知、再新建、转交接回执）
+sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，按 [watch] 配置提醒与到期
+sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
+sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
+sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未结 / 全部
+```
+
+## 在飞书上直接回复「需要你定」
+
+会话拿不准时以 bot 身份私聊你（开头约定写在 playbook/common.md，带 topic_id）。把这个私聊配进 `[escalation] chat_ids`（不要放 `ignore_chat_ids`），sheepdog 会先于普通路由处理它：
+
+- 机器人发的、正文匹配 `header_regex` 的提问：登记为一条「需要你定」，消息本身不投递；
+- 你的回复：引用了哪条就送回哪条的会话；没引用且只有一条未结就送给它；否则送总线并附未结列表，由总线 `sheepdog forward --message-ids` 转交。送达时标「✅ 主人在飞书的回复（已核对：发送人是主人本人账号）」并附问题摘要，不走安全闸；
+- 其他消息一律丢弃。超过 `open_hours` 未答的自动关闭。
+
+回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
+
+`agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行。
+
+## 业务规则：playbook
+
+代码只放机制（名册、路由、投递、回执、等待计时、spawn、forward，以及自动生成的「sheepdog 接口说明」）。总线职责、工作方式、代回前缀、拿不准找你、等别人回复、需求归属项目、退休与接手说明、提醒文字，全部写在配置目录的 md 文件里：
+
+```bash
+cp -r examples/playbook ~/.config/sheepdog/playbook   # 拷贝通用示例后按自己的工作方式改写
+sheepdog doctor                                         # 列出缺哪些文件（缺的那一段在 prompt 里为空）
+```
+
+| 文件 | 用在哪 | 专用占位符 |
+|---|---|---|
+| `common.md` | 所有会话（总线、新建、接管、接手） | — |
+| `bus.md` | 总线 bootstrap | `{{roster}}` |
+| `onboarding.md` | 接管现有会话（新建的会话也用它） | `{{duty}}` `{{chats}}` `{{authority}}` `{{self_polling_section}}` |
+| `retire_self_polling.md` | `retire_self_polling = true` 时填进 `{{self_polling_section}}` | （额外可用 `{{self_polling}}`） |
+| `authority_default.md` | authority 为空时代替 `{{authority}}` | — |
+| `retire.md` | 给前任的退休通知 | `{{successor_title}}` `{{batch_id}}` |
+| `successor.md` | 接手会话开场附加 | `{{predecessor_id}}` `{{predecessor_transcript}}` `{{predecessor_dir}}` |
+| `nudge_remind.md` / `nudge_expire.md` | 等待提醒 / 到期 | `{{note}}` `{{person}}` `{{minutes}}` |
+| `batch_footer.md` | 每批信号末尾 | — |
+| `security.md` | 所有开场的最前面（在 common.md 之前） | — |
+| `security_banner.md` | 被安全规则标记的消息正文前的警示 | `{{tags}}` `{{notes}}` `{{action}}` |
+| `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
+
+通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_prefix}}` `{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
+
+相关参数在 `config.toml`：`session.reply_prefix`、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
+
+## 安全闸
+
+有人在 IM 里发危险请求（要密钥、要权限、删东西、跑脚本、转账、冒充你「已经同意了」、让 agent 忽略规则）时，sheepdog 在投递前先过一道规则：
+
+- 规则写在 `security.toml`（`security_path`，示例见 `examples/security.example.toml`），每条是正则 `patterns` 加可选条件 `external_sender`（发送方租户不在 `own_tenant_keys` 里）、`sender_types`。代码里没有任何具体关键词。
+- `tag`：照常投递，正文前插 `security_banner.md` 警示。`hold`：不投给任何专职会话（覆盖名册、等待、all_messages），改投总线并带警示。
+- 被 hold 的消息只能由总线 `sheepdog forward --message-ids ... --quote "<你的原话>"` 转交；`--quote` 会对照总线会话 transcript 里你亲口说过的话核对（回看 `quote_max_age_hours`），核对不过就拒绝。
+- 编辑过的消息会重新判定；`sheepdog security-log` 查看记录，`sheepdog doctor` 显示规则条数和 `own_tenant_keys` 是否配置。
+
+**已知局限**：
+
+- 规则匹配挡不住所有变形话术；最后一道防线仍是会话自己遵守 `security.md`，以及 Antigravity 的命令权限和云权限本身。
+- 消息是会话自己用 lark-cli 发的、命令是会话自己执行的，sheepdog 不在执行路径上，只能在投递前标记和拦截。
+
+## 数据与隐私
+
+| 层 | 位置 | 进仓库 |
+|---|---|---|
+| 引擎代码 | 本仓库 | ✅ |
+| 个人配置 / 名册 / playbook / 安全规则 / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
+| 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，默认保留 7 天 | ❌ |
+| 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
+
+提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
+
+## 开发
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## License
+
+Apache-2.0
