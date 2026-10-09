@@ -80,12 +80,17 @@ class PartialTest(Base):
         self.assertIn("采集不完整", self.sink.to("conv_test_bus")[-1])
 
     def test_first_round_partial_without_watermark(self):
+        from datetime import datetime, timedelta
+        t0 = datetime.now().astimezone()
+        clock = iter([t0, t0 + timedelta(minutes=1), t0 + timedelta(minutes=1)] + [t0 + timedelta(minutes=2)] * 50)
         src = PartialSource([([], True), ([], False)])
         col = Collector(self.cfg, self.store, src, Roster())
-        col.poll_once()
-        self.assertEqual(self.store.get_meta("watermark"), "")
-        col.poll_once()
-        self.assertEqual(src.calls[1][0], src.calls[0][0])  # 首轮的 lookback 起点也保留下来重拉
+        with mock.patch("sheepdog.engine._now", side_effect=lambda: next(clock)):
+            col.poll_once()
+            self.assertEqual(self.store.get_meta("watermark"), "")
+            col.poll_once()
+        self.assertEqual(src.calls[1][0], src.calls[0][0])  # 首轮的 lookback 起点保留下来重拉，不随时间后移
+        self.assertNotEqual(src.calls[1][1], src.calls[0][1])
 
 
 class LarkPagingTest(unittest.TestCase):
