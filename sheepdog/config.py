@@ -72,8 +72,18 @@ class SessionConfig:
     receipt_timeout_minutes: int = 20
     # 每条消息送进会话时最多带多少行正文；超过的末尾提示用 sheepdog show 看全文（7.16）
     max_message_lines: int = 200
-    # 代回前缀：作为 playbook 的 {{reply_prefix}} 占位符，规则文字写在 playbook 里
+    # 代回前缀：作为 playbook 的 {{reply_prefix}} 占位符（7.17 起改用卡片 + 后缀，保留兼容）
     reply_prefix: str = "🐕 [Agent 代回] "
+    # 代回卡片右下角的标记（7.17）：playbook 的 {{reply_suffix}}，sheepdog reply-card 用它
+    reply_suffix: str = "[🐕Sheepdog Reply]"
+    # 代回卡片宽度：compact（400px）| default（≤600px）| fill（撑满）
+    reply_card_width: str = "compact"
+
+    def validate(self) -> None:
+        if self.reply_card_width not in ("compact", "default", "fill"):
+            raise ConfigError("session.reply_card_width 只能是 compact / default / fill")
+        if not isinstance(self.reply_suffix, str):
+            raise ConfigError("session.reply_suffix 必须是字符串")
 
 
 @dataclass
@@ -146,6 +156,8 @@ class OwnerContextConfig:
     follow_hours: float = 24
     # 正文以这些前缀开头的视为会话代回，不送
     skip_prefixes: list[str] = field(default_factory=list)
+    # 正文任意位置包含其一也视为会话代回（7.17：代回改成卡片，标记在右下角），与 skip_prefixes 并存
+    agent_markers: list[str] = field(default_factory=list)
     # 主人对已投递消息点的表情（7.13 补充）：回看多久内投递过的消息、多久查一次（0 = 不查）
     reaction_lookback_hours: float = 24
     reaction_check_minutes: float = 5
@@ -155,8 +167,10 @@ class OwnerContextConfig:
             raise ConfigError("[owner_context] enabled 必须是 true/false")
         if isinstance(self.follow_hours, bool) or not isinstance(self.follow_hours, (int, float)) or self.follow_hours < 0:
             raise ConfigError("[owner_context] follow_hours 必须是 >= 0 的数")
-        if not isinstance(self.skip_prefixes, list) or not all(isinstance(x, str) and x for x in self.skip_prefixes):
-            raise ConfigError("[owner_context] skip_prefixes 必须是非空字符串列表")
+        for k in ("skip_prefixes", "agent_markers"):
+            v = getattr(self, k)
+            if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+                raise ConfigError(f"[owner_context] {k} 必须是非空字符串列表")
         for k in ("reaction_lookback_hours", "reaction_check_minutes"):
             v = getattr(self, k)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
@@ -323,6 +337,7 @@ def load_config(path: Path | None = None) -> Config:
             cfg.ack.enabled = True
         if "state_dir" in data:
             cfg.state_dir = Path(data["state_dir"]).expanduser()
+    cfg.session.validate()
     cfg.watch.validate()
     cfg.escalation.validate()
     cfg.ack.validate()

@@ -43,6 +43,7 @@ class Playbook:
         w = cfg.watch
         return cls(cfg.playbook_path, {
             "reply_prefix": cfg.session.reply_prefix or "",
+            "reply_suffix": cfg.session.reply_suffix or "",
             "watch_remind_minutes": "/".join(str(m) for m in w.remind_minutes),
             "watch_expire_minutes": str(w.expire_minutes),
         })

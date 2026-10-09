@@ -32,7 +32,7 @@ On top of routing:
 - **Ask the human.** When a session is unsure, it DMs you through a bot. You can answer in the bus session or reply right in Lark. sheepdog verifies the reply came from your account and routes it back to the session that asked.
 - **Waiting on others.** A session registers a wait (`sheepdog watch`); the reply is routed straight back to it, with reminders at 15 / 30 minutes and a report to you at 60 (all configurable).
 - **Project anchoring.** Sessions ask which project a request belongs to and record it, so information doesn't scatter.
-- **Agent reply prefix.** Anything an agent sends on your behalf starts with a marker such as `🐕 [Agent reply]`, so people can tell it from you.
+- **Agent replies as cards.** Anything an agent sends on your behalf goes out as a card with a small grey marker in the bottom-right corner (`[🐕Sheepdog Reply]`), so people can tell it from you.
 - **Security gate.** Configurable rules tag or hold suspicious messages (credential requests, permission grants, destructive or production actions, "the boss already approved" claims, prompt injection) before any session sees them.
 
 ## How it works
@@ -51,7 +51,7 @@ Lark (lark-cli, as you)
 - If you start typing in a session, sheepdog pauses deliveries to it and catches up 15 minutes after you stop.
 - Source (where messages come from), Sink (where sessions live) and Store are interfaces. Today only Lark, Google Antigravity and SQLite are implemented.
 
-**Mechanism lives in code, rules live in your config.** Every business rule (the reply prefix, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
+**Mechanism lives in code, rules live in your config.** Every business rule (how agent replies are marked, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
 
 ## Requirements
 
@@ -98,7 +98,7 @@ sheepdog acks [--open]       # "seen" reactions added for you, and whether they 
 
 | File in `~/.config/sheepdog/` | What it holds |
 |---|---|
-| `config.toml` | Your IDs, polling, keywords, reply prefix, wait timings, escalation chat |
+| `config.toml` | Your IDs, polling, keywords, agent reply marker, wait timings, escalation chat |
 | `roster.toml` | Which session owns which chats, its duty, and the authority you gave it |
 | `playbook/*.md` | Business rules and message templates (bus, onboarding, handover, reminders, security) |
 | `security.toml` | Security gate rules: regex patterns plus conditions, `tag` or `hold` |

@@ -23,6 +23,7 @@
   sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
   sheepdog redeliver --batch B                           发送中断、不确定是否送达的批次：人工确认后重发
   sheepdog show <message_id>                             打印账本里这条消息的完整正文
+  sheepdog reply-card (--text 正文 | --text-file 文件或 -)  打印代回卡片 JSON（正文 + 右下角标记）
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -42,10 +43,12 @@ import shutil
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from . import __version__
 from . import actions
 from .ack import Acker
+from .card import build_reply_card
 from .config import ConfigError, load_config
 from .engine import (DYNAMIC, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, close_session,
                      escalation_summary, forward_messages, open_escalations, write_receipt)
@@ -159,7 +162,8 @@ def cmd_doctor(args) -> int:
     print(f"防循环: Agent 名字 {len(lg.agent_sender_names)} 个 / id {len(lg.agent_sender_ids)} 个 / "
           f"机器人一律算 Agent {'是' if lg.treat_all_bots_as_agents else '否'}；"
           f"{lg.window_minutes:g} 分钟内代回超过 {lg.max_agent_replies} 次冷却 {lg.cooldown_minutes:g} 分钟"
-          + ("" if cfg.owner_context.skip_prefixes else "（⚠ owner_context.skip_prefixes 为空，无法识别代回，熔断不生效）"))
+          + ("" if cfg.owner_context.skip_prefixes or cfg.owner_context.agent_markers
+             else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
@@ -741,6 +745,24 @@ def cmd_redeliver(args) -> int:
     return 0
 
 
+def cmd_reply_card(args) -> int:
+    """打印代回卡片（Card 2.0）JSON（7.17），用法：
+    lark-cli im +messages-send --as user --chat-id oc_x --msg-type interactive --content "$(sheepdog reply-card --text ...)"
+    """
+    cfg = load_config()
+    if args.text_file:
+        text = sys.stdin.read() if args.text_file == "-" else Path(args.text_file).expanduser().read_text(encoding="utf-8")
+    else:
+        text = args.text or ""
+    try:
+        card = build_reply_card(text, cfg.session.reply_suffix, cfg.session.reply_card_width)
+    except ValueError as e:
+        print(f"reply-card 被拒绝: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(card, ensure_ascii=False))
+    return 0
+
+
 def cmd_show(args) -> int:
     """打印账本里一条消息的完整正文（送进会话的长消息会截断，7.16）。"""
     cfg = load_config()
@@ -879,6 +901,12 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("redeliver")
     sp.add_argument("--batch", required=True)
     sp.set_defaults(func=cmd_redeliver)
+
+    sp = sub.add_parser("reply-card")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text", help="正文")
+    g.add_argument("--text-file", help="正文文件；- 表示标准输入")
+    sp.set_defaults(func=cmd_reply_card)
 
     sp = sub.add_parser("show")
     sp.add_argument("message_id")

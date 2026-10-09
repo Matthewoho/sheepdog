@@ -48,7 +48,10 @@ human_attach_minutes = 15
 # 每条消息送进会话时最多带多少行正文，超过的末尾提示用 sheepdog show 看全文
 max_message_lines = 200
 receipt_timeout_minutes = 20
-# 代回前缀：playbook 里的 {{reply_prefix}}（规则文字写在 playbook/common.md）
+# 代回以卡片发出：正文 + 右下角灰色小字标记（sheepdog reply-card 生成；playbook 里的 {{reply_suffix}}）
+reply_suffix = "[🐕Sheepdog Reply]"
+reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill（撑满）
+# 旧的代回前缀：playbook 里的 {{reply_prefix}}，保留兼容
 reply_prefix = "🐕 [Agent 代回] "
 
 [escalation]
@@ -70,7 +73,8 @@ open_hours = 24
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
 enabled = true
 follow_hours = 24              # 聊天没有会话负责时，送给这么久内最近处理过它的会话（含总线）；都没有就不送
-skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话代回的，不送（填你的代回前缀）
+skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话代回的（旧的代回前缀）
+agent_markers = ["[🐕Sheepdog Reply]"]   # 正文任意位置包含这些的也是会话代回（代回卡片右下角的标记）；两者任一命中即算
 reaction_lookback_hours = 24   # 查你对多久内投递过的消息点了表情
 reaction_check_minutes = 5     # 多久查一次表情；0 = 不查（查询只读）
 
@@ -79,7 +83,7 @@ reaction_check_minutes = 5     # 多久查一次表情；0 = 不查（查询只�
 agent_sender_names = ["agent-bot-a", "agent-bot-b"]  # 发送人名字包含其一（不分大小写）即视为 Agent，填你那边会自动回话的机器人
 agent_sender_ids = []                                 # 也可以按 open_id / app_id 精确指定
 treat_all_bots_as_agents = true                       # 机器人 / 应用发的一律按 Agent：照常投递，但标注「不要回复它」
-max_agent_replies = 4    # 同一聊天 window_minutes 内会话代回（带 owner_context.skip_prefixes 前缀）超过这么多次、且对方是 Agent → 熔断
+max_agent_replies = 4    # 同一聊天 window_minutes 内会话代回（按 owner_context 的 skip_prefixes / agent_markers 识别）超过这么多次、且对方是 Agent → 熔断
 window_minutes = 10
 cooldown_minutes = 30    # 冷却期间该聊天除你以外的消息只进 Inbox；sheepdog loops --clear <chat_id> 手动解除
 

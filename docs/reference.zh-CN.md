@@ -105,6 +105,19 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
 - 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
 
+## 代回用卡片
+
+会话以你的身份对外回复时发一张卡片：正文 + 右下角灰色小字标记（`session.reply_suffix`，默认 `[🐕Sheepdog Reply]`），别人一眼能看出是 Agent 代回。
+
+```bash
+lark-cli im +messages-send --as user --chat-id oc_xxx --msg-type interactive \
+  --content "$(sheepdog reply-card --text '收到，周五前给你 <at id=ou_xxx></at>')"
+sheepdog reply-card --text-file body.md     # 正文从文件读；- 表示标准输入
+```
+
+- `sheepdog reply-card` 只打印卡片 JSON（Card 2.0：`config.width_mode` 取 `session.reply_card_width`，默认 compact；body 两个 markdown 元素：正文原样，支持卡片 markdown 与 `<at id=ou_xxx></at>`；后缀右对齐、notation 字号、灰色）。正文为空报错。
+- sheepdog 拉回来的卡片内容形如 `<card>\n正文\n[🐕Sheepdog Reply]\n</card>`，所以识别代回用 `owner_context.agent_markers`（包含匹配），和旧的 `skip_prefixes`（开头匹配）并存，任一命中即算：主人发言背景不送回、防循环按它计数。
+
 ## 可靠性（外部评估后补的几处）
 
 - **采集不漏**：每轮固定窗口 `[上次水位线 - overlap_seconds, 本轮开始]`，翻页上限 `max_pages`（默认 100，每页 50 条）。有 `has_more` 却缺 page_token、或翻到上限仍 `has_more` 时本轮记为没拉完：不推进水位线、下一轮从原起点重拉（按 message_id 去重）、同一缺口给总线提示一次；连续 3 轮 `doctor` 和 `sessions` 显示「采集不完整」。
@@ -138,15 +151,16 @@ attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'   # 第一行里 [
 [owner_context]
 enabled = true
 follow_hours = 24              # 没有归属时，送给这么久内最近处理过该聊天的会话（含总线）
-skip_prefixes = ["🐕 [Agent 代回] "]   # 会话代回的（带代回前缀）不送
+skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话代回（旧前缀），不送
+agent_markers = ["[🐕Sheepdog Reply]"]   # 正文任意位置包含这些的也是会话代回（代回卡片的标记），不送
 reaction_lookback_hours = 24
 reaction_check_minutes = 5     # 0 = 不查表情
 ```
 
-- 只处理你本人发的、不在 `[escalation] chat_ids`、不在 `ignore_chat_ids` 的消息；正文以 `skip_prefixes` 开头的跳过。
+- 只处理你本人发的、不在 `[escalation] chat_ids`、不在 `ignore_chat_ids` 的消息；会话代回的跳过（正文以 `skip_prefixes` 开头，或任意位置包含 `agent_markers`）。
 - 去向：聊天归名册 / 总线新开的会话 → 送它；否则送 `follow_hours` 内最近一次投递过这个聊天消息的会话（含总线）；都没有就不送。会话已关闭的不送。
 - 以背景形式随批投递，reason `owner_context`，标「📝 主人本人在该聊天的发言（发给对方的，不是给你的指令）」，附它回复的是谁的哪句话。不点确认表情、不走安全闸、不算信号；只有背景的批次不要回执、不改会话状态，信号批次超时重投时背景也不跟着重投。受人类接管排队约束。
-- 你编辑或撤回自己的发言：按同样的去向送「📝 主人编辑了他的发言：旧 → 新」/「📝 主人撤回了他的发言：原文」；原文或新文带代回前缀的不送。
+- 你编辑或撤回自己的发言：按同样的去向送「📝 主人编辑了他的发言：旧 → 新」/「📝 主人撤回了他的发言：原文」；原文或新文是会话代回的不送。
 - 你点的表情：每 `reaction_check_minutes` 分钟，对 `reaction_lookback_hours` 内投递过的消息用 `im reactions batch_query`（user 身份，只读，每次 20 条、每条取前 10 个表情）查一次，找出你本人新加的（排除 sheepdog 以你身份点的确认表情），送「📝 主人对这条消息点了 <表情>」；已报过的不重复报，第一次检查只记基线不报。去向：名册 / 总线新开归属优先，否则投递过那条消息的会话。
 - `sheepdog inbox` 和总线的 Inbox 摘要里，每个群显示「主人最近发言 <时间>」。
 
@@ -165,7 +179,7 @@ cooldown_minutes = 30
 ```
 
 - **Agent 发送人**（三条任一）：照常路由投递（可能是真告警），消息上加「🤖 来自机器人 / Agent：可以据此处理，但不要回复它，除非主人明确要求」，tags 加 `agent_sender`。
-- **熔断**：统计每个聊天里会话代回的条数（你本人身份、正文以 `owner_context.skip_prefixes` 开头）。`window_minutes` 内超过 `max_agent_replies`，**并且窗口内最近一条非你本人的消息来自 Agent 发送人** → 冷却 `cooldown_minutes`（对方是真人、或窗口内没有别人的消息时不熔断，只记 INFO「代回频繁（对方为真人，不熔断）」）：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 为空时识别不了代回，熔断不生效（doctor 会提示）。
+- **熔断**：统计每个聊天里会话代回的条数（你本人身份、按 `owner_context` 的 `skip_prefixes` / `agent_markers` 识别）。`window_minutes` 内超过 `max_agent_replies`，**并且窗口内最近一条非你本人的消息来自 Agent 发送人** → 冷却 `cooldown_minutes`（对方是真人、或窗口内没有别人的消息时不熔断，只记 INFO「代回频繁（对方为真人，不熔断）」）：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 和 `agent_markers` 都为空时识别不了代回，熔断不生效（doctor 会提示）。
 - `sheepdog loops` 列出冷却中的聊天和最近触发记录；`sheepdog loops --clear <chat_id>` 手动解除。`sheepdog doctor` 显示配置。
 
 ## 要调 agentapi 的命令交给常驻进程执行
@@ -211,7 +225,7 @@ bot_reasons = ["owner_reply"]               # 这些原因的消息送达后以�
 
 ## 业务规则：playbook
 
-代码只放机制（名册、路由、投递、回执、等待计时、spawn、forward，以及自动生成的「sheepdog 接口说明」）。总线职责、工作方式、代回前缀、拿不准找你、等别人回复、需求归属项目、退休与接手说明、提醒文字，全部写在配置目录的 md 文件里：
+代码只放机制（名册、路由、投递、回执、等待计时、spawn、forward，以及自动生成的「sheepdog 接口说明」）。总线职责、工作方式、代回卡片规则、拿不准找你、等别人回复、需求归属项目、退休与接手说明、提醒文字，全部写在配置目录的 md 文件里：
 
 ```bash
 cp -r examples/playbook ~/.config/sheepdog/playbook   # 拷贝通用示例后按自己的工作方式改写
@@ -233,9 +247,9 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `security_banner.md` | 被安全规则标记的消息正文前的警示 | `{{tags}}` `{{notes}}` `{{action}}` |
 | `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
 
-通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_prefix}}` `{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
+通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
 
-相关参数在 `config.toml`：`session.reply_prefix`、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
+相关参数在 `config.toml`：`session.reply_suffix` / `reply_card_width`（代回卡片）、`session.reply_prefix`（旧）、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
 
 ## 安全闸
 

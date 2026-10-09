@@ -69,6 +69,15 @@ def escalation_note(e) -> str:
     return f"回复的问题（topic `{e['topic_id']}`，{e['asked_at']}，message_id `{e['message_id']}`）：{escalation_summary(e)}"
 
 
+def is_agent_reply(content: str, oc) -> bool:
+    """这条主人身份的消息是不是会话代回的（7.13 / 7.17）：正文以 skip_prefixes 之一开头，或任意位置包含
+    agent_markers 之一（代回卡片的右下角标记；卡片按账本里的 content 匹配）。"""
+    bodies = message_bodies(content)
+    if any(b.startswith(p) for b in bodies for p in oc.skip_prefixes):
+        return True
+    return any(mk in b for b in [content or "", *bodies] for mk in oc.agent_markers)
+
+
 def predecessor_topic_id(topic_id: str) -> str:
     # 「.」不在名册 key 允许的字符里，不会和真实条目撞名
     return topic_id + ".prev"
@@ -185,13 +194,12 @@ class Collector:
                 self._cooling[e["chat_id"]] = until
 
     def _loop_check(self, m: Message) -> None:
-        """会话代回（主人身份、带代回前缀）计数：window 内超过 max_agent_replies、且窗口内最近一条非主人消息
+        """会话代回（主人身份、带代回前缀或代回卡片标记）计数：window 内超过 max_agent_replies、且窗口内最近一条非主人消息
         来自 Agent 发送人 → 该聊天冷却，并提示总线一次。对方是真人时不熔断，只记 INFO。"""
-        lg, me = self.cfg.loop_guard, self.cfg.self_open_id
-        prefixes = self.cfg.owner_context.skip_prefixes
-        if not prefixes or m.chat_id in self.cfg.escalation.chat_ids:
+        lg, me, oc = self.cfg.loop_guard, self.cfg.self_open_id, self.cfg.owner_context
+        if not (oc.skip_prefixes or oc.agent_markers) or m.chat_id in self.cfg.escalation.chat_ids:
             return
-        if not any(b.startswith(p) for b in message_bodies(m.content) for p in prefixes):
+        if not is_agent_reply(m.content, oc):
             return
         until = self._cooling.get(m.chat_id)
         if until and _now() < until:
@@ -202,7 +210,7 @@ class Collector:
             t = _parse(r["create_time"])
             if t is None or t.tzinfo is None or t < start:
                 continue
-            if any(b.startswith(p) for b in message_bodies(r["content"]) for p in prefixes):
+            if is_agent_reply(r["content"], oc):
                 n += 1
         if n <= lg.max_agent_replies:
             return
@@ -389,7 +397,7 @@ class Collector:
         if m.chat_id in self.cfg.escalation.chat_ids or m.chat_id in self.cfg.routing.ignore_chat_ids:
             return False
         # 会话以主人身份代回的（带代回前缀）不送
-        return not any(b.startswith(p) for b in message_bodies(m.content) for p in oc.skip_prefixes)
+        return not is_agent_reply(m.content, oc)
 
     def _owner_context_target(self, chat_id: str) -> str | None:
         """去向：名册 / 总线新开的聊天归属 → 它；否则 follow_hours 内最近处理过该聊天的会话（含总线）；都没有 → 不送。"""
@@ -421,7 +429,7 @@ class Collector:
         if not self._owner_context_wanted(m):
             return
         old_text = old["content"] or ""
-        if any(b.startswith(p) for b in message_bodies(old_text) for p in self.cfg.owner_context.skip_prefixes):
+        if is_agent_reply(old_text, self.cfg.owner_context):
             return  # 原文是会话代回的
         topic_id = self._owner_context_target(m.chat_id)
         if not topic_id:
