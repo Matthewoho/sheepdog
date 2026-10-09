@@ -60,6 +60,7 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
         deleted=bool(raw.get("deleted")),
         updated=bool(raw.get("updated")),
         update_time=_norm_time(raw.get("update_time", ""), tz),
+        sender_tenant_key=sender.get("tenant_key") or "",
         raw=raw,
     )
 

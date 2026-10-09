@@ -11,6 +11,7 @@
   sheepdog spawn --key K [--dry-run]                     为名册里 conversation_id 留空的条目新建会话（可接手前任）
   sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
   sheepdog watches [--all]  /  sheepdog unwatch --id N
+  sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -22,15 +23,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import time
+from datetime import datetime, timedelta
 
 from . import __version__
 from .config import ConfigError, load_config
-from .engine import RETIRED, Collector, Dispatcher, add_watch, forward_messages, write_receipt
+from .engine import (RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, forward_messages,
+                     write_receipt)
 from .playbook import PLAYBOOK_FILES, Playbook
 from .roster import Roster, RosterError, load_roster
+from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
 from .sink.agentapi import AgentApiSink, DryRunSink
 from .source.lark import LarkCliSource
@@ -59,14 +64,24 @@ def _roster(cfg) -> Roster:
         raise _Abort() from e
 
 
+def _security(cfg) -> SecurityConfig:
+    """安全规则格式错误直接报错退出（同名册）；文件不存在 = 没有规则。"""
+    try:
+        return load_security(cfg.security_file)
+    except SecurityError as e:
+        print(f"安全规则无效: {e}", file=sys.stderr)
+        raise _Abort() from e
+
+
 def _build(args):
     cfg = load_config()
     roster = _roster(cfg)
+    security = _security(cfg)
     dry = getattr(args, "dry_run", False)
     store = Store.snapshot(cfg.db_path) if dry else Store(cfg.db_path)
     source = LarkCliSource(tz=cfg.timezone_offset)
     sink = DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()
-    return cfg, store, source, sink, roster
+    return cfg, store, source, sink, roster, security
 
 
 def cmd_doctor(args) -> int:
@@ -92,6 +107,18 @@ def cmd_doctor(args) -> int:
     except RosterError as e:
         print(f"名册: ✗ {e}")
         ok = False
+    try:
+        sec = load_security(cfg.security_file)
+        if not sec.loaded:
+            print(f"安全规则: ⚠ {cfg.security_file} 不存在，没有任何规则")
+        else:
+            c = sec.counts()
+            print(f"安全规则: {cfg.security_file} ✓ {len(sec.rules)} 条（tag {c[TAG]} / hold {c[HOLD]}）")
+        print(f"own_tenant_keys: {'✓ ' + str(len(sec.own_tenant_keys)) + ' 个' if sec.own_tenant_keys else '⚠ 未配置（所有发送方都按外部人处理）'}"
+              f"  quote 回看 {sec.quote_max_age_hours:g} 小时")
+    except SecurityError as e:
+        print(f"安全规则: ✗ {e}")
+        ok = False
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
     pb = Playbook.from_config(cfg)
     missing = pb.missing()
@@ -111,17 +138,17 @@ def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
 
 
 def cmd_poll(args) -> int:
-    cfg, store, source, sink, roster = _build(args)
-    collector = Collector(cfg, store, source, roster)
-    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster)
+    cfg, store, source, sink, roster, security = _build(args)
+    collector = Collector(cfg, store, source, roster, security)
+    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security)
     _cycle(collector, dispatcher)
     return 0
 
 
 def cmd_run(args) -> int:
-    cfg, store, source, sink, roster = _build(args)
-    collector = Collector(cfg, store, source, roster)
-    dispatcher = Dispatcher(cfg, store, sink, roster)
+    cfg, store, source, sink, roster, security = _build(args)
+    collector = Collector(cfg, store, source, roster, security)
+    dispatcher = Dispatcher(cfg, store, sink, roster, security)
     interval = args.interval or cfg.poll_interval_seconds
     logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", interval, sink.name)
     last_prune = 0.0
@@ -132,6 +159,11 @@ def cmd_run(args) -> int:
                 collector.roster = dispatcher.roster = load_roster(cfg.roster_file, cfg.roster_required)
             except RosterError as e:
                 logging.error("名册无效，沿用上一份: %s", e)
+            # 安全规则同样每轮现读，改坏了沿用上一份有效规则
+            try:
+                collector.security = dispatcher.security = load_security(cfg.security_file)
+            except SecurityError as e:
+                logging.error("安全规则无效，沿用上一份: %s", e)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
                 n = store.prune(cfg.retention_days)
@@ -178,11 +210,11 @@ def cmd_inbox_clear(args) -> int:
 
 
 def cmd_init(args) -> int:
-    cfg, store, _source, sink, roster = _build(args)
+    cfg, store, _source, sink, roster, security = _build(args)
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     print(f"名册: {cfg.roster_file}（{len(roster.managed)} managed / {len(roster.sessions) - len(roster.managed)} known）")
-    rep = Dispatcher(cfg, store, sink, roster).init()
+    rep = Dispatcher(cfg, store, sink, roster, security).init()
     for k, label in (("created", "新登记"), ("updated", "已更新"), ("reopened", "重新启用"), ("closed", "已移除→closed")):
         if rep["roster"][k]:
             print(f"  {label}: {', '.join(rep['roster'][k])}")
@@ -197,10 +229,10 @@ def cmd_init(args) -> int:
 
 
 def cmd_spawn(args) -> int:
-    cfg, store, _source, sink, roster = _build(args)
+    cfg, store, _source, sink, roster, security = _build(args)
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
-    d = Dispatcher(cfg, store, sink, roster)
+    d = Dispatcher(cfg, store, sink, roster, security)
     d.sync_roster()
     try:
         r = d.spawn(args.key)
@@ -279,9 +311,11 @@ def cmd_receipt(args) -> int:
 
 def cmd_forward(args) -> int:
     cfg = load_config()
+    security = _security(cfg)
     store = Store(cfg.db_path)
+    verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
-        ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote)
+        ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify)
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
@@ -333,6 +367,36 @@ def cmd_unwatch(args) -> int:
         return 0
     store.close_watch(args.id, "cancelled")
     print(f"已取消等待 #{args.id}")
+    return 0
+
+
+def _parse_since(text: str) -> timedelta:
+    m = re.fullmatch(r"\s*(\d+)\s*([mhd])\s*", text or "")
+    if not m:
+        raise ValueError(f"--since 格式应为 30m / 24h / 7d，收到 {text!r}")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(minutes=n) if unit == "m" else timedelta(hours=n) if unit == "h" else timedelta(days=n)
+
+
+def cmd_security_log(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    try:
+        since = datetime.now().astimezone() - _parse_since(args.since)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    rows = store.security_log(since.isoformat(timespec="seconds"))
+    if not rows:
+        print(f"最近 {args.since} 没有被标记或拦截的消息")
+        return 0
+    print(f"最近 {args.since} 被标记 / 拦截 {len(rows)} 条：")
+    for r in rows:
+        where = "私聊" if r["chat_type"] == "p2p" else f"群「{r['chat_name'] or r['chat_id']}」"
+        rules = ", ".join(json.loads(r["security_tags"] or "[]"))
+        print(f"- [{r['create_time']}] {where} | {r['sender_name']} ({r['sender_id']}) | 规则: {rules} | "
+              f"动作: {r['security_action']} | 去向: {r['topic_id'] or '-'}（{r['dispatch_state'] or '-'}）")
+        print(f"  message_id: {r['message_id']}")
     return 0
 
 
@@ -406,6 +470,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("watches")
     sp.add_argument("--all", action="store_true", help="包括已结束的")
     sp.set_defaults(func=cmd_watches)
+
+    sp = sub.add_parser("security-log")
+    sp.add_argument("--since", default="24h", help="回看时长：30m / 24h / 7d")
+    sp.set_defaults(func=cmd_security_log)
 
     sp = sub.add_parser("unwatch")
     sp.add_argument("--id", type=int, required=True)

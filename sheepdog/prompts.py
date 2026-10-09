@@ -1,4 +1,7 @@
-"""Prompt 组装（7.6）：这里只放机制——消息格式、名册表、「sheepdog 接口说明」和各段的拼装顺序。
+"""Prompt 组装（7.6、7.7）：这里只放机制——消息格式、名册表、「sheepdog 接口说明」和各段的拼装顺序。
+
+拼装顺序：所有开场最前面是 security.md，然后才是各自的说明和 common.md；
+每批末尾先 security_footer.md 再 batch_footer.md；被安全规则标记的消息正文前插 security_banner.md。
 
 业务规则（职责、工作方式、代回前缀、找主人、等回复、项目归属、退休/接手说明、提醒文字）一律来自 playbook 目录的
 md 文件，见 playbook.py；文件缺失时那一段为空。个人化 overlay 照旧拼在总线的 common.md 之后。
@@ -11,6 +14,7 @@ import sqlite3
 
 from .playbook import Playbook
 from .roster import MANAGED, Roster, RosterSession
+from .security import NONE, SecurityConfig
 from .store import SYSTEM_CHAT
 
 # 路由原因 → 批次里的标签（数据说明，不是业务规则）
@@ -44,8 +48,8 @@ RECEIPT_SCHEMA_HINT = """{
   "anchors": ["project:<项目名>", "issue:XXX-123", "service:xxx"]
 }"""
 
-# forward 的两种标注：属于 forward 接口的渲染格式
-QUOTE_LABEL = "主人原话（经总线转达）"
+# forward 的两种标注：属于 forward 接口的渲染格式；quote 已由 sheepdog 对照总线 transcript 核对过（7.7 C）
+QUOTE_LABEL = "✅ 主人原话（已核对：主人在总线里亲口说过）"
 NOTE_LABEL = "总线备注（不是主人原话）"
 
 
@@ -97,6 +101,9 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "`sheepdog forward --topic <topic_id> [--message-ids <id1,id2>] [--quote \"<主人原话>\"] [--note \"<你的备注>\"]`："
             f"把消息交给名册里的 managed 会话；--quote 投递时标成「{QUOTE_LABEL}」，--note 标成「{NOTE_LABEL}」。"
             "目标是 known 会话或总线时会被拒绝。",
+            "--quote 必须是主人在本会话里亲口说过的原文（sheepdog 会对照本会话 transcript 核对，空白不敏感，"
+            "可以只引其中一段），核对不通过就拒绝；--note 不核对。",
+            "带安全警示且 action=hold 的消息只能带 --quote（主人原话）转交，不带就拒绝。",
             "### 新建会话",
             "`sheepdog spawn --key <key>`：为名册里 conversation_id 留空的 managed 条目新建会话（只建一次）。",
             "### Inbox",
@@ -112,6 +119,7 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
     """总线 bootstrap：bus.md（含名册表）+ common.md + overlay + 接口说明。"""
     v = dict(session_title=plain_title, topic_id=topic_id)
     return _join(
+        pb.render("security.md", **v),
         f"你是由 sheepdog 创建和管理的 session：**{title}**（topic_id: `{topic_id}`）。",
         pb.render("bus.md", roster=roster_table(roster), **v),
         pb.render("common.md", **v),
@@ -137,6 +145,7 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
     confirm = ["### 确认登记",
                f"`sheepdog receipt --topic {s.topic_id} --batch {batch_id} --json '{{\"status\":\"handled\",\"summary\":\"...\"}}'`"]
     return _join(
+        pb.render("security.md", session_title=s.display_title, topic_id=s.topic_id),
         f"[sheepdog] 登记通知（topic `{s.topic_id}`，批次 `{batch_id}`）",
         _onboarding_body(pb, s),
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
@@ -158,6 +167,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
             "前任的交接回执到达后，sheepdog 会以「前任交接回执」原样转给你。",
         ]
     return _join(
+        pb.render("security.md", **v),
         f"你是由 sheepdog 新建的 session：**{title}**（topic_id: `{s.topic_id}`）。",
         _onboarding_body(pb, s),
         pb.render("common.md", **v),
@@ -205,7 +215,20 @@ def relay_content(quote: str, note: str) -> str:
 
 
 # ---------- 批次 ----------
-def _fmt_msg(row: sqlite3.Row) -> str:
+def security_banner(pb: Playbook, row: sqlite3.Row, security: SecurityConfig | None, session_title: str) -> str:
+    """被标记 / 拦截消息的警示：一行数据（动作 + 规则名）+ security_banner.md。"""
+    action = row["security_action"] or NONE
+    if action == NONE:
+        return ""
+    names = json.loads(row["security_tags"] or "[]")
+    notes = "\n".join((security.note_of(n) if security else n) for n in names)
+    head = f"⚠️ [sheepdog 安全规则] action={action} | rules={', '.join(names)}"
+    body = pb.render("security_banner.md", tags=", ".join(names), notes=notes, action=action,
+                     session_title=session_title, topic_id=row["topic_id"] or "")
+    return _join(head, body)
+
+
+def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     if row["chat_type"] == SYSTEM_CHAT:
@@ -214,6 +237,8 @@ def _fmt_msg(row: sqlite3.Row) -> str:
     lines = [f"### [{label}] {where} | {row['sender_name']} | {row['create_time']}{read}"]
     if any(t.startswith("watch:") for t in json.loads(row["tags_json"] or "[]")):
         lines.append("（这是你登记等待的回复，等待已结束）")
+    if banner:
+        lines.append(banner)  # 警示在正文之前
     content = (row["content"] or "").strip()
     lines += ["> " + ln for ln in content.splitlines()[:40]] or ["> (空)"]
     if row["link"]:
@@ -224,11 +249,11 @@ def _fmt_msg(row: sqlite3.Row) -> str:
 
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
-                 roster_update: str = "") -> str:
+                 roster_update: str = "", security: SecurityConfig | None = None) -> str:
     parts = [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
-    parts += [_fmt_msg(r) for r in rows]
+    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title)) for r in rows]
     if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
@@ -239,7 +264,8 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts += ["", "🗂 名册更新（以此为准，替换你之前看到的名册）：", roster_update.rstrip()]
     tail = "处理完成后提交回执" + ("（可选）" if receipt_optional else "")
     parts += ["", f"{tail}：`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '...'`"]
-    footer = pb.render("batch_footer.md", session_title=session_title, topic_id=topic_id)
-    if footer:
-        parts += ["", footer]
+    for name in ("security_footer.md", "batch_footer.md"):
+        footer = pb.render(name, session_title=session_title, topic_id=topic_id)
+        if footer:
+            parts += ["", footer]
     return "\n".join(parts)

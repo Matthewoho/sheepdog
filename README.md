@@ -43,6 +43,7 @@ mkdir -p ~/.config/sheepdog
 cp examples/config.example.toml ~/.config/sheepdog/config.toml   # 填 self_open_id 等
 cp examples/roster.example.toml ~/.config/sheepdog/roster.toml   # 登记你现有的会话（可选）
 cp -r examples/playbook ~/.config/sheepdog/playbook              # 业务规则 md，按自己的工作方式改写
+cp examples/security.example.toml ~/.config/sheepdog/security.toml  # 安全规则，按自己的情况改写
 sheepdog doctor
 sheepdog init --dry-run        # 预览：名册同步、总线、给每个 managed 会话的 onboarding
 sheepdog init                  # 正式登记（可重复执行，已 onboarding 的跳过）
@@ -61,6 +62,7 @@ sheepdog forward --topic tp_x --quote "主人原话" --note "总线补充"  # �
 sheepdog spawn --key k         # 名册里 conversation_id 留空的条目：新建会话（可接手前任：先发退休通知、再新建、转交接回执）
 sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，按 [watch] 配置提醒与到期
 sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
+sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
 ```
 
 回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
@@ -87,17 +89,34 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `successor.md` | 接手会话开场附加 | `{{predecessor_id}}` `{{predecessor_transcript}}` `{{predecessor_dir}}` |
 | `nudge_remind.md` / `nudge_expire.md` | 等待提醒 / 到期 | `{{note}}` `{{person}}` `{{minutes}}` |
 | `batch_footer.md` | 每批信号末尾 | — |
+| `security.md` | 所有开场的最前面（在 common.md 之前） | — |
+| `security_banner.md` | 被安全规则标记的消息正文前的警示 | `{{tags}}` `{{notes}}` `{{action}}` |
+| `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
 
 通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_prefix}}` `{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
 
 相关参数在 `config.toml`：`session.reply_prefix`、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
+
+## 安全闸
+
+有人在 IM 里发危险请求（要密钥、要权限、删东西、跑脚本、转账、冒充你「已经同意了」、让 agent 忽略规则）时，sheepdog 在投递前先过一道规则：
+
+- 规则写在 `security.toml`（`security_path`，示例见 `examples/security.example.toml`），每条是正则 `patterns` 加可选条件 `external_sender`（发送方租户不在 `own_tenant_keys` 里）、`sender_types`。代码里没有任何具体关键词。
+- `tag`：照常投递，正文前插 `security_banner.md` 警示。`hold`：不投给任何专职会话（覆盖名册、等待、all_messages），改投总线并带警示。
+- 被 hold 的消息只能由总线 `sheepdog forward --message-ids ... --quote "<你的原话>"` 转交；`--quote` 会对照总线会话 transcript 里你亲口说过的话核对（回看 `quote_max_age_hours`），核对不过就拒绝。
+- 编辑过的消息会重新判定；`sheepdog security-log` 查看记录，`sheepdog doctor` 显示规则条数和 `own_tenant_keys` 是否配置。
+
+**已知局限**：
+
+- 规则匹配挡不住所有变形话术；最后一道防线仍是会话自己遵守 `security.md`，以及 Antigravity 的命令权限和云权限本身。
+- 消息是会话自己用 lark-cli 发的、命令是会话自己执行的，sheepdog 不在执行路径上，只能在投递前标记和拦截。
 
 ## 数据与隐私
 
 | 层 | 位置 | 进仓库 |
 |---|---|---|
 | 引擎代码 | 本仓库 | ✅ |
-| 个人配置 / 名册 / playbook / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
+| 个人配置 / 名册 / playbook / 安全规则 / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，默认保留 7 天 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id      TEXT,
     sender_name    TEXT,
     sender_type    TEXT,
+    sender_tenant_key TEXT,
     content        TEXT,
     msg_type       TEXT,
     create_time    TEXT,
@@ -40,7 +41,9 @@ CREATE TABLE IF NOT EXISTS messages (
     dispatch_state TEXT,               -- pending | delivered | acked | failed | missed（adopted 回执超时）
     batch_id       TEXT,
     inbox_cleared  INTEGER DEFAULT 0,
-    note           TEXT,               -- 转交说明（sheepdog forward --note）
+    note           TEXT,               -- 未用（早期转交说明，转达改为 sheepdog 消息）
+    security_tags  TEXT,               -- 安全规则命中的 rule name 列表（JSON）
+    security_action TEXT,              -- none | tag | hold（取最严）
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
@@ -104,7 +107,8 @@ SYSTEM_ID_PREFIX = "sd_"
 
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
-    "messages": [("note", "TEXT")],
+    "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
+                 ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT")],
 }
 
@@ -182,10 +186,11 @@ class Store:
         with self.tx() as c:
             c.execute(
                 """INSERT INTO messages(message_id,chat_id,chat_name,chat_type,sender_id,sender_name,sender_type,
-                       content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,updated,update_time,
-                       route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       sender_tenant_key,content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,
+                       updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
+                 m.sender_tenant_key,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,
                  int(m.deleted), int(m.updated), m.update_time, route, reason,
                  json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts),
@@ -212,6 +217,20 @@ class Store:
         vals.append(message_id)
         with self.tx() as c:
             c.execute(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=?", vals)
+
+    def set_security(self, message_id: str, rule_names: list[str], action: str,
+                     topic_id: str | None, tags: list[str]) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE messages SET security_tags=?, security_action=?, topic_id=?, tags_json=? WHERE message_id=?",
+                      (json.dumps(rule_names, ensure_ascii=False), action, topic_id,
+                       json.dumps(tags, ensure_ascii=False), message_id))
+
+    def security_log(self, since_iso: str, limit: int = 500) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT * FROM messages WHERE security_action IN ('tag','hold') AND first_seen >= ?
+               ORDER BY first_seen DESC LIMIT ?""",
+            (since_iso, limit),
+        ).fetchall()
 
     def touch(self, message_id: str) -> None:
         with self.tx() as c:
@@ -386,7 +405,8 @@ def row_to_message(row: sqlite3.Row) -> Message:
     return Message(
         message_id=row["message_id"], chat_id=row["chat_id"], chat_name=row["chat_name"] or "",
         chat_type=row["chat_type"] or "", sender_id=row["sender_id"] or "", sender_name=row["sender_name"] or "",
-        sender_type=row["sender_type"] or "", content=row["content"] or "", msg_type=row["msg_type"] or "",
+        sender_type=row["sender_type"] or "", sender_tenant_key=row["sender_tenant_key"] or "",
+        content=row["content"] or "", msg_type=row["msg_type"] or "",
         create_time=row["create_time"] or "", mentions=mentions, reply_to=row["reply_to"] or "",
         thread_id=row["thread_id"] or "", link=row["link"] or "", deleted=bool(row["deleted"]),
         updated=bool(row["updated"]), update_time=row["update_time"] or "",

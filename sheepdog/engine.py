@@ -14,11 +14,12 @@ from .playbook import Playbook
 from .prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, relay_content,
                       retirement_prompt, roster_table, watch_message)
 from .roster import Roster
+from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, SELF, RouteContext, RouteDecision, route
 from .sink import Sink, SinkError
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_path
-from .store import SYSTEM_ID_PREFIX, Store, now_iso
+from .store import SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
 
 log = logging.getLogger("sheepdog")
 
@@ -30,6 +31,10 @@ RETIRED = "retired"
 BUS_DUTY = "见 playbook/bus.md"
 # watches 表的两个提醒时间列，按 watch.remind_minutes 的第 1、2 档使用（列名沿用规格）
 WATCH_SLOTS = ("nudged_15_at", "nudged_30_at")
+# 安全闸（7.7）在 messages.tags 里留的标记
+SECURITY_HOLD_TAG = "security_hold"
+# hold 消息凭已核对的主人原话转交后打上，投递时不再被拉回总线
+SECURITY_RELEASE_TAG = "security_release:quote"
 
 
 def predecessor_topic_id(topic_id: str) -> str:
@@ -75,25 +80,56 @@ def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
 
 # ======================= Collector =======================
 class Collector:
-    def __init__(self, cfg: Config, store: Store, source: Source, roster: Roster | None = None):
+    def __init__(self, cfg: Config, store: Store, source: Source, roster: Roster | None = None,
+                 security: SecurityConfig | None = None):
         self.cfg = cfg
         self.store = store
         self.source = source
         self.roster = roster
+        self.security = security
         self._sender_cache: dict[str, str] = {}
 
-    def _decide(self, m: Message, ctx: RouteContext) -> tuple[RouteDecision, str | None]:
+    def _decide(self, m: Message, ctx: RouteContext):
+        """路由 → 名册归属 → 等待归属。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
         d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids)
         # 等待中的回复优先归给登记等待的 topic（7.4），覆盖聊天归属、总线、Inbox、免打扰；
         # 自己发的、升级私聊、ignore_chat_ids 不受影响
         if d.route == SELF or d.reason == "self_escalation" or m.chat_id in self.cfg.routing.ignore_chat_ids:
-            return d, topic_id
+            return d, topic_id, None
         w = self.store.match_watch(m.sender_id, m.chat_id)
         if w:
-            self.store.close_watch(w["id"], "replied")
-            log.info("等待 #%s 收到回复 %s -> %s", w["id"], m.message_id, w["topic_id"])
-            return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"]
-        return d, topic_id
+            return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"], w
+        return d, topic_id, None
+
+    def _secure(self, message_id: str) -> str:
+        """安全闸（7.7）：对 dispatch 级消息跑规则，结果写进 security_tags / security_action。
+
+        hold：改投总线（覆盖名册、等待、all_messages），tags 加 security_hold，去掉等待标记。返回动作。
+        """
+        if self.security is None:
+            return NONE
+        row = self.store.get_message(message_id)
+        if row is None or row["route"] != DISPATCH:
+            return NONE
+        names, action = self.security.evaluate(row_to_message(row))
+        tags = json.loads(row["tags_json"] or "[]")
+        topic_id = row["topic_id"]
+        if action == HOLD:
+            topic_id = BUS_TOPIC_ID
+            tags = [t for t in tags if not t.startswith("watch:") and t != SECURITY_RELEASE_TAG]
+            if SECURITY_HOLD_TAG not in tags:
+                tags.append(SECURITY_HOLD_TAG)
+        self.store.set_security(message_id, names, action, topic_id, tags)
+        if action != NONE:
+            log.warning("安全规则命中 %s: %s -> %s（%s）", message_id, ",".join(names), action, topic_id)
+        return action
+
+    def _close_watch(self, w, message_id: str, action: str) -> None:
+        # 被 hold 的回复没到等待的会话手里：等待不关，照常提醒 / 到期
+        if w is None or action == HOLD:
+            return
+        self.store.close_watch(w["id"], "replied")
+        log.info("等待 #%s 收到回复 %s -> %s", w["id"], message_id, w["topic_id"])
 
     def _muted(self) -> set[str]:
         at = _parse(self.store.get_meta("muted_at"))
@@ -138,8 +174,10 @@ class Collector:
         for m in msgs:
             existing = self.store.get_message(m.message_id)
             if existing is None:
-                d, topic_id = self._decide(m, ctx)
+                d, topic_id, w = self._decide(m, ctx)
                 self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id)
+                if d.route == DISPATCH:
+                    self._close_watch(w, m.message_id, self._secure(m.message_id))
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
             else:
@@ -167,14 +205,17 @@ class Collector:
             else:
                 m.content = f"（已编辑）旧：{old['content']}\n新：{m.content}"
             self.store.update_content(m.message_id, m, DISPATCH, "recalled" if recalled else "edited", "pending")
+            self._secure(m.message_id)  # 编辑后重新判定：改成危险内容会被拉回总线
         elif old_route == DISPATCH:
-            # 尚未投递：直接更新内容
+            # 尚未投递：直接更新内容，并重新判定
             self.store.update_content(m.message_id, m)
+            self._secure(m.message_id)
         else:
             # Inbox / drop：重新路由，若升级为直推则投递
-            d, topic_id = self._decide(m, ctx)
+            d, topic_id, w = self._decide(m, ctx)
             if d.route == DISPATCH and not recalled:
                 self.store.update_content(m.message_id, m, DISPATCH, d.reason, "pending", d.tags, topic_id)
+                self._close_watch(w, m.message_id, self._secure(m.message_id))
             else:
                 self.store.update_content(m.message_id, m)
         return True
@@ -192,11 +233,14 @@ class Collector:
 
 # ======================= Dispatcher =======================
 class Dispatcher:
-    def __init__(self, cfg: Config, store: Store, sink: Sink, roster: Roster | None = None):
+    def __init__(self, cfg: Config, store: Store, sink: Sink, roster: Roster | None = None,
+                 security: SecurityConfig | None = None):
         self.cfg = cfg
         self.store = store
         self.sink = sink
         self.roster = roster or Roster()
+        # 只用于批次里渲染警示（规则说明）；判定在 Collector 入账时完成
+        self.security = security or SecurityConfig()
         # 业务文字每次组装 prompt 时从 playbook 现读，改完下一批生效
         self.playbook = Playbook.from_config(cfg)
 
@@ -412,7 +456,8 @@ class Dispatcher:
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
             inbox = [] if adopted else self.store.inbox_summary()
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
-                                  waiting, receipt_optional=adopted, roster_update=roster_update)
+                                  waiting, receipt_optional=adopted, roster_update=roster_update,
+                                  security=self.security)
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
             self._fail(t, None, str(e))
@@ -448,6 +493,11 @@ class Dispatcher:
             if tid not in tids:
                 # 归属的会话已从名册移除或改成 known：退回总线，不丢消息
                 log.warning("消息 %s 归属的 %s 已不可投递，改投总线", r["message_id"], tid)
+                tid = BUS_TOPIC_ID
+            elif (tid != BUS_TOPIC_ID and r["security_action"] == HOLD
+                  and SECURITY_RELEASE_TAG not in json.loads(r["tags_json"] or "[]")):
+                # 兜底：被 hold 的消息没有经已核对的主人原话放行，不得投给 managed 会话
+                log.warning("消息 %s 被安全规则拦截，改投总线", r["message_id"])
                 tid = BUS_TOPIC_ID
             groups.setdefault(tid, []).append(r)
 
@@ -624,10 +674,28 @@ def _check_target(store: Store, topic_id: str, verb: str):
     return t
 
 
-def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "") -> list[str]:
-    """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3）。只改归属并回到待推，真正投递由 Dispatcher
-    下一轮完成，因此同样受人类接管、onboarding 约束。quote 标成「主人原话（经总线转达）」、note 标成「总线备注」，
-    合成一条 sheepdog 消息随批投递。目标是总线、known、已移除或不存在时抛 ValueError。"""
+QUOTE_NOT_FOUND = "这句话在总线里找不到主人的原文，请原样引用"
+
+
+def bus_quote_verifier(store: Store, max_age_hours: float):
+    """--quote 核对器（7.7 C）：读总线会话 transcript 的 USER_INPUT，确认主人在回看期内亲口说过。"""
+    bus = store.get_topic(BUS_TOPIC_ID)
+    cid = bus["conversation_id"] if bus else None
+
+    def verify(quote: str) -> bool:
+        return bool(cid) and quote_verified(quote, transcript_path(cid), max_age_hours)
+    return verify
+
+
+def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
+                     verify_quote=None) -> list[str]:
+    """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
+    下一轮完成，因此同样受人类接管、onboarding 约束。
+
+    - quote 必须通过 verify_quote 核对（没给核对器一律拒绝），投递时标成已核对的主人原话；note 不核对，标成总线备注。
+    - 被安全规则 hold 的消息只能带已核对的 quote 转交。
+    - 目标是总线、known、已移除或不存在时抛 ValueError。
+    """
     _check_target(store, topic_id, "转交")
     ids = list(dict.fromkeys(i.strip() for i in message_ids if i.strip()))
     quote, note = (quote or "").strip(), (note or "").strip()
@@ -637,10 +705,17 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     missing = [i for i, r in rows.items() if r is None]
     if missing:
         raise ValueError(f"账本里没有这些消息: {missing}")
+    held = [i for i, r in rows.items() if r["security_action"] == HOLD]
+    if held and not quote:
+        raise ValueError(f"消息 {held} 被安全规则拦截，只能凭已核对的主人原话转交：加 --quote \"<主人原话>\"")
+    if quote and not (verify_quote and verify_quote(quote)):
+        raise ValueError(QUOTE_NOT_FOUND)
     for i, row in rows.items():
         src = row["topic_id"] or BUS_TOPIC_ID
         tags = [x for x in json.loads(row["tags_json"] or "[]") if not x.startswith(("owner:", "forwarded_from:"))]
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
+        if i in held and SECURITY_RELEASE_TAG not in tags:
+            tags.append(SECURITY_RELEASE_TAG)
         store.forward_message(i, topic_id, tags)
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""

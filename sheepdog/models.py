@@ -35,6 +35,8 @@ class Message:
     deleted: bool = False
     updated: bool = False
     update_time: str = ""
+    # 发送方所属租户（lark sender.tenant_key），安全规则据此判断外部人
+    sender_tenant_key: str = ""
     raw: dict = field(default_factory=dict)
 
     @property

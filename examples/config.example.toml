@@ -19,6 +19,8 @@ prompt_overlay_path = "prompts/overlay.md"
 roster_path = "roster.toml"
 # 业务规则 md 目录（相对本配置文件所在目录），从 examples/playbook/ 拷贝改写；每次组装 prompt 时现读
 playbook_dir = "playbook"
+# 安全规则（相对本配置文件所在目录），从 examples/security.example.toml 拷贝改写；不存在 = 没有规则
+security_path = "security.toml"
 
 [routing]
 keywords = ["生产", "prod", "故障", "告警", "回滚", "审批"]

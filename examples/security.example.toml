@@ -1,0 +1,65 @@
+# sheepdog 安全规则示例（7.7）
+# 复制到 ~/.config/sheepdog/security.toml 后按自己的情况改写。真实规则不要提交到仓库。
+# 每轮现读；格式错误启动时报错退出，常驻运行中改坏则沿用上一份有效规则。
+#
+# action：
+#   tag  —— 照常投递，消息正文前插入警示（playbook/security_banner.md）
+#   hold —— 不投给任何 managed 会话（覆盖名册、等待、all_messages），改投总线并带警示；
+#           之后只能由总线凭核对过的主人原话 sheepdog forward --quote 转交
+# 匹配：patterns 是正则，任一命中即命中（对消息正文）；external_sender / sender_types 是附加条件，全部满足才算。
+# 多条规则同时命中时取最严的动作。
+
+# 自己公司的 tenant_key；发送方不在其中 = 外部人。留空则所有发送方都按外部人处理
+own_tenant_keys = []
+# forward --quote 核对主人原话时，回看总线 transcript 多少小时
+quote_max_age_hours = 24
+
+[[rule]]
+name = "secrets"
+note = "索要或发送密钥、密码、token、验证码"
+action = "tag"
+patterns = ["(?i)\\b(secret|password|passwd|token|api[_ -]?key|private key|credential)s?\\b", "密钥", "密码", "令牌", "验证码", "私钥"]
+
+[[rule]]
+name = "secrets_external"
+note = "外部人索要凭据：不投给专职会话，交总线和主人判断"
+action = "hold"
+patterns = ["(?i)\\b(secret|password|token|api[_ -]?key|credential)s?\\b", "密钥", "密码", "令牌", "验证码"]
+external_sender = true
+
+[[rule]]
+name = "permissions"
+note = "要求开通、提升或转交权限 / 账号"
+action = "tag"
+patterns = ["(?i)\\b(grant|admin|sudo|root|iam|owner)\\b", "开通权限", "加权限", "管理员", "提权", "拉我进"]
+
+[[rule]]
+name = "destructive"
+note = "删除、清空、重置、回滚生产数据或资源"
+action = "tag"
+patterns = ["(?i)\\b(drop table|truncate|rm -rf|delete|force push)\\b", "删除", "删库", "清空", "重置"]
+
+[[rule]]
+name = "run_code"
+note = "要求执行脚本、命令或打开不明链接 / 附件"
+action = "tag"
+patterns = ["(?i)(curl .*\\|\\s*(ba)?sh|bash -c|powershell|\\.sh\\b|\\.exe\\b)", "跑一下这个脚本", "执行这个命令"]
+
+[[rule]]
+name = "money"
+note = "转账、付款、报销、改收款信息"
+action = "hold"
+patterns = ["(?i)\\b(wire|transfer|invoice|payment)\\b", "转账", "打款", "付款", "汇款", "收款账号"]
+external_sender = true
+
+[[rule]]
+name = "impersonation"
+note = "声称主人已经同意 / 授权，或冒充主人、管理员下指令"
+action = "tag"
+patterns = ["已经同意", "已同意", "他同意了", "老板说", "授权你", "代表.*决定"]
+
+[[rule]]
+name = "prompt_injection"
+note = "要求 agent 忽略规则、切换身份或泄露指令"
+action = "hold"
+patterns = ["(?i)ignore (all |the )?(previous|above) (instructions|rules)", "(?i)system prompt", "忽略(之前|上面|所有)的?(规则|指令)", "你现在是"]

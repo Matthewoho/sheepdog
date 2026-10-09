@@ -204,17 +204,18 @@ class EscalationTest(Base):
         d.init()
         self.ack("tp_alpha")
         d.dispatch_once()
-        forward_messages(self.store, "tp_alpha", [], note="总线觉得可以先答应", quote="可以，按周五交付")
+        forward_messages(self.store, "tp_alpha", [], note="总线觉得可以先答应", quote="可以，按周五交付",
+                         verify_quote=lambda q: q == "可以，按周五交付")
         d.dispatch_once()
         last = self.sink.to("conv_test_alpha")[-1]
-        self.assertIn("主人原话（经总线转达）：\n> 可以，按周五交付", last)
+        self.assertIn("✅ 主人原话（已核对：主人在总线里亲口说过）：\n> 可以，按周五交付", last)
         self.assertIn("总线备注（不是主人原话）：总线觉得可以先答应", last)
         note_line = next(ln for ln in last.splitlines() if ln.startswith("总线备注"))
         self.assertNotIn("周五", note_line)
         with self.assertRaisesRegex(ValueError, "至少"):
             forward_messages(self.store, "tp_alpha", [])
         with self.assertRaisesRegex(ValueError, "known"):
-            forward_messages(self.store, "tp_ops", [], quote="x")
+            forward_messages(self.store, "tp_ops", [], quote="x", verify_quote=lambda q: True)
 
 
 class WatchTest(Base):

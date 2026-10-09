@@ -111,6 +111,8 @@ class Config:
     roster_path: str = ""
     # 业务规则 md 目录（相对本配置文件所在目录）；留空 = playbook/
     playbook_dir: str = ""
+    # 安全规则文件（相对本配置文件所在目录）；留空 = security.toml，不存在 = 没有规则
+    security_path: str = ""
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
@@ -133,6 +135,11 @@ class Config:
     @property
     def playbook_path(self) -> Path:
         p = Path(self.playbook_dir or "playbook").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
+    def security_file(self) -> Path:
+        p = Path(self.security_path or "security.toml").expanduser()
         return p if p.is_absolute() else self.config_path.parent / p
 
     @property

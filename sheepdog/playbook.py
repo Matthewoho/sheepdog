@@ -23,6 +23,10 @@ PLAYBOOK_FILES: dict[str, str] = {
     "nudge_remind.md": "watch 提醒，可用 {{note}} {{person}} {{minutes}}",
     "nudge_expire.md": "watch 到期，可用 {{note}} {{person}} {{minutes}}",
     "batch_footer.md": "每批信号末尾",
+    # 安全（7.7）
+    "security.md": "所有开场的最前面（排在 common.md 之前）",
+    "security_banner.md": "被安全规则标记的消息正文前的警示，可用 {{tags}} {{notes}} {{action}}",
+    "security_footer.md": "每批信号末尾，batch_footer 之前",
 }
 
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
