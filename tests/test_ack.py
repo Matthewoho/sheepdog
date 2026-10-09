@@ -40,12 +40,14 @@ def local(minutes: float = 0) -> str:
 class FakeIM:
     def __init__(self):
         self.added: list[tuple[str, str]] = []
+        self.identities: dict[str, str] = {}
         self.removed: list[tuple[str, str]] = []
         self.fail_add: set[str] = set()
         self.fail_remove: set[str] = set()
 
-    def add_reaction(self, message_id, emoji_type):
+    def add_reaction(self, message_id, emoji_type, identity="user"):
         self.added.append((message_id, emoji_type))
+        self.identities[message_id] = identity
         if message_id in self.fail_add:
             raise SourceError("fx 点失败")
         return f"rx_{message_id}"
@@ -199,7 +201,7 @@ class AckTest(Base):
         with redirect_stdout(out):
             self.deliver()
         self.assertEqual((self.im.added, self.store.get_ack("om_test_d1")), ([], None))
-        self.assertIn("[dryrun] 点表情 FX_EMOJI -> om_test_d1", out.getvalue())
+        self.assertIn("[dryrun] 点表情 FX_EMOJI（user）-> om_test_d1", out.getvalue())
 
     def test_disabled_does_nothing(self):
         self.d.acker = self.acker = Acker(AckConfig(), self.store, self.im)
@@ -246,6 +248,103 @@ class AckTest(Base):
         self.assertNotIn("om_test_c2", open_text)
 
 
+class BotAckTest(Base):
+    """[ack] bot_reasons：主人在「找主人」聊天里的回复送达会话后以 bot 身份点表情，永不撤。"""
+
+    def setUp(self):
+        super().setUp()
+        from test_escalation import ESC_CHAT, ask, esc_config, reply
+        self.ask, self.reply = ask, reply
+        self.cfg.escalation = esc_config()
+        self.im = FakeIM()
+        cfg = ack_config()
+        cfg.bot_reasons = ["owner_reply", "p2p"]  # p2p 同时在 reasons 里：以 bot_reasons 为准
+        self.acker = Acker(cfg, self.store, self.im)
+        self.d = self.disp()
+        self.d.acker = self.acker
+        self.d.init()
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+
+    def poll(self, msgs, muted=()):
+        return Collector(self.cfg, self.store, FakeSource([msgs], muted), self.roster, None, self.acker).poll_once()
+
+    def test_owner_reply_acked_as_bot_once_never_removed(self):
+        self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
+        self.poll([self.reply("om_test_r1", "好的")])
+        self.assertEqual(self.im.added, [])  # 入账时不点
+        self.d.dispatch_once()
+        self.assertEqual(self.im.identities, {"om_test_r1": "bot"})
+        a = self.store.get_ack("om_test_r1")
+        self.assertEqual((a["identity"], a["reason"]), ("bot", "owner_reply"))
+        # 主人在同一私聊再发消息：bot 点的表情不撤
+        self.poll([self.reply("om_test_r2", "补充一句", minutes_ago=-1)])
+        self.assertEqual(self.im.removed, [])
+        self.assertIsNone(self.store.get_ack("om_test_r1")["removed_at"])
+        # 同一条再投一次也不重复点
+        self.store.conn.execute("UPDATE messages SET dispatch_state='pending' WHERE message_id='om_test_r1'")
+        self.store.conn.commit()
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+        self.assertEqual([m for m, _ in self.im.added].count("om_test_r1"), 1)
+
+    def test_forwarded_owner_reply_acked_on_delivery(self):
+        from sheepdog.engine import forward_messages
+        self.poll([self.ask("om_test_q1", "tp_alpha", "一"), self.ask("om_test_q2", BUS_TOPIC_ID, "二")])
+        self.poll([self.reply("om_test_r3", "第一个按 A")])  # 分属两个会话 → 投总线
+        self.d.dispatch_once()
+        self.assertEqual(self.im.identities.get("om_test_r3"), "bot")  # 送达总线就点了
+        self.im.added.clear()
+        forward_messages(self.store, "tp_alpha", ["om_test_r3"], self_open_id=ME)
+        self.ack(BUS_TOPIC_ID)
+        self.d.dispatch_once()
+        self.assertIn("om_test_r3", self.sink.to("conv_test_alpha")[-1])
+        self.assertEqual(self.im.added, [])  # 已点过，转交后不再点
+
+    def test_forwarded_owner_reply_first_delivery_is_the_forward(self):
+        from sheepdog.engine import forward_messages
+        self.poll([self.ask("om_test_q1", "tp_alpha", "一"), self.ask("om_test_q2", BUS_TOPIC_ID, "二")])
+        self.sink.human["conv_test_bus"] = datetime.now().astimezone()  # 总线被主人接管，回复卡在队列
+        self.poll([self.reply("om_test_r4", "第一个按 A")])
+        self.d.dispatch_once()
+        self.assertEqual(self.im.added, [])
+        forward_messages(self.store, "tp_alpha", ["om_test_r4"], self_open_id=ME)
+        self.d.dispatch_once()
+        self.assertEqual(self.im.identities, {"om_test_r4": "bot"})
+
+    def test_owner_verified_rows_count_as_owner_reply(self):
+        # 已上线账本里改名前的旧 reason：靠 owner_verified 标记认作主人回复，照样以 bot 点
+        self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
+        self.poll([self.reply("om_test_lg", "好")])
+        self.store.conn.execute("UPDATE messages SET reason='legacy_owner_reply_name' WHERE message_id='om_test_lg'")
+        self.store.conn.commit()
+        self.d.dispatch_once()
+        self.assertEqual(self.im.identities, {"om_test_lg": "bot"})
+
+    def test_bot_reasons_win_over_reasons(self):
+        self.poll([msg(message_id="om_test_p1", chat_type="p2p", chat_id="oc_test_alpha_p2p")])
+        self.d.dispatch_once()
+        self.assertEqual(self.im.identities["om_test_p1"], "bot")
+        self.poll([msg(message_id="om_test_me", chat_type="p2p", chat_id="oc_test_alpha_p2p", sender_id=ME,
+                       create_time=local(1))])
+        self.assertEqual(self.im.removed, [])  # bot 的不撤
+
+    def test_default_empty_bot_reasons(self):
+        self.acker.cfg.bot_reasons = []
+        self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
+        self.poll([self.reply("om_test_r5", "好")])
+        self.d.dispatch_once()
+        self.assertEqual(self.im.added, [])
+        self.assertEqual(load_config_default_bot_reasons(), [])
+
+
+def load_config_default_bot_reasons():
+    with tempfile.TemporaryDirectory() as d:
+        on = Path(d) / "on.toml"
+        on.write_text((FIX / "ack.toml").read_text(encoding="utf-8"), encoding="utf-8")
+        return load_config(on).ack.bot_reasons
+
+
 class LarkReactionTest(unittest.TestCase):
     """真实 LarkCliSource 的加 / 撤表情：用假 lark-cli 校验参数与输出解析，不碰真实飞书。"""
 
@@ -273,6 +372,11 @@ class LarkReactionTest(unittest.TestCase):
             self.assertEqual(json.loads(a[a.index("--params") + 1]), {"message_id": "om_test_1"})
             self.assertEqual(json.loads(a[a.index("--data") + 1]), {"reaction_type": {"emoji_type": "FX_EMOJI"}})
             self.assertEqual(a[-2:], ["--as", "user"])
+            src = self.fake_cli(Path(t), '{"ok": true, "data": {"reaction_id": "rx_2"}}')
+            self.assertEqual(src.add_reaction("om_test_2", "FX_EMOJI", "bot"), "rx_2")
+            self.assertEqual(self.args()[-2:], ["--as", "bot"])
+            with self.assertRaises(SourceError):
+                src.add_reaction("om_test_2", "FX_EMOJI", "admin")
 
     def test_delete_and_errors(self):
         with tempfile.TemporaryDirectory() as t:

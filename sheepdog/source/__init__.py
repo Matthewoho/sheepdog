@@ -23,7 +23,7 @@ class Source(Protocol):
 
 
 class ImWriter(Protocol):
-    """对 IM 唯一的写操作：加 / 撤确认表情（7.9），以主人身份。"""
+    """对 IM 唯一的写操作：加 / 撤确认表情（7.9）。identity：user = 主人身份，bot = 机器人身份。"""
 
-    def add_reaction(self, message_id: str, emoji_type: str) -> str: ...
+    def add_reaction(self, message_id: str, emoji_type: str, identity: str = "user") -> str: ...
     def remove_reaction(self, message_id: str, reaction_id: str) -> None: ...

@@ -136,9 +136,11 @@ class LarkCliSource:
                 result[item["message_id"]] = bool(item.get("is_read"))
         return result
 
-    # ---------- 写：确认表情（7.9），user 身份，只试一次不重试 ----------
-    def _run_once(self, args: list[str]) -> dict:
-        proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=60)
+    # ---------- 写：确认表情（7.9），默认 user 身份，只试一次不重试 ----------
+    def _run_once(self, args: list[str], identity: str = "user") -> dict:
+        if identity not in ("user", "bot"):
+            raise SourceError(f"未知身份 {identity!r}")
+        proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=60)
         out = proc.stdout.strip() or proc.stderr.strip()
         try:
             data = json.loads(out)
@@ -163,10 +165,10 @@ class LarkCliSource:
             cur = cur.get("data")
         return None
 
-    def add_reaction(self, message_id: str, emoji_type: str) -> str:
+    def add_reaction(self, message_id: str, emoji_type: str, identity: str = "user") -> str:
         data = self._run_once(["im", "reactions", "create",
                                "--params", json.dumps({"message_id": message_id}),
-                               "--data", json.dumps({"reaction_type": {"emoji_type": emoji_type}})])
+                               "--data", json.dumps({"reaction_type": {"emoji_type": emoji_type}})], identity)
         rid = self._find(data, "reaction_id")
         if not rid:
             raise SourceError(f"reactions create 没返回 reaction_id: {json.dumps(data, ensure_ascii=False)[:300]}")

@@ -132,11 +132,13 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
 emoji_type = "Get"                          # 飞书表情类型
 reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，送达会话后以你的身份点表情
 remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情，在你回复后撤下；@所有人 只点不撤
+bot_reasons = ["owner_reply"]               # 这些原因的消息送达后以机器人身份点、永不撤（默认空）
 ```
 
 - **点**：消息实际投递给会话成功之后才点；排队中（你在会话里接管、等 spawn）不点；被安全规则 hold 的消息不点（tag 的照常点）。每条消息只点一次，记进账本 `acks` 表（含 `reaction_id`）。
 - **撤**：账本入账一条你自己发的消息时（包括会话以你身份代回的）：私聊里，同一聊天中点表情早于这条消息的全部撤下；群里，回复了那条消息或 @ 了它的发送人才撤下对应的。只撤 `remove_on_reply_reasons` 里的原因。
-- 用 lark-cli 的 user 身份调 `im reactions create` / `im reactions delete`。失败只记日志和 `error` 列，不影响投递和路由，也不重试。
+- `bot_reasons`：投递原因在其中的消息，送达后以**机器人身份**（`--as bot`）点同一个表情，永不撤；与 `reasons` 同时命中以它为准。典型是 `owner_reply`：你在「找你」聊天里回复机器人，会话收到了（包括总线 forward 转交的，以实际送达为准）就点给你看。你本人的消息都按 `owner_reply` 认（含改名前的旧记录）。`acks` 表的 `identity` 列记 user / bot。
+- 用 lark-cli 调 `im reactions create` / `im reactions delete`，默认 user 身份。失败只记日志和 `error` 列，不影响投递和路由，也不重试。
 - `--dry-run` 不调接口，只打印将要点 / 撤什么。
 - 这是 sheepdog 唯一的 IM 写操作。
 

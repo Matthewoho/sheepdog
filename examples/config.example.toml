@@ -65,6 +65,9 @@ max_new_sessions_per_day = 5
 emoji_type = "Get"                          # 飞书表情类型
 reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，送达时点表情
 remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情在你回复后撤下；@所有人 只点不撤
+# 这些原因的消息送达后以机器人身份点表情、永不撤（你在「找你」聊天里回复机器人时，会话收到了就点给你看）
+# 与 reasons 同时命中以这里为准；默认空
+bot_reasons = ["owner_reply"]
 
 [watch]
 # 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}

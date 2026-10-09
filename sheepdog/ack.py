@@ -1,8 +1,9 @@
 """确认表情（7.9）：消息送达会话后以主人身份点表情，主人回复后撤下。
 
 这是 sheepdog 唯一的 IM 写操作，只限加 / 撤这个表情。规则：
-- 点：消息实际投递给会话成功之后，投递原因在 [ack] reasons 里；每条消息只点一次（acks 表里有记录就不再点）；
-  被安全规则 hold 的不点（tag 的照常点）。
+- 点：消息实际投递给会话成功之后，投递原因在 [ack] reasons 里（以主人身份）或 bot_reasons 里（以 bot 身份，
+  两者都命中以 bot 为准）；每条消息只点一次（acks 表里有记录就不再点）；被安全规则 hold 的不点（tag 的照常点）。
+- bot 身份点的表情永不撤（主人自己的回复，点给主人看「会话已收到」）。
 - 撤：入账一条主人自己发的消息时
   - 私聊：同一聊天里、点表情时间早于这条消息的未撤表情全部撤下；
   - 群：reply_to 指向某条已点的消息，或 @ 了它的发送人 → 撤下对应表情；
@@ -13,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -52,21 +54,39 @@ class Acker:
         if not self.enabled:
             return
         for r in rows:
-            if r["chat_type"] == SYSTEM_CHAT or r["reason"] not in self.cfg.reasons:
+            if r["chat_type"] == SYSTEM_CHAT:
+                continue
+            identity = self.identity_for(r)
+            if identity is None:
                 continue
             if r["security_action"] == HOLD:
                 continue  # 被安全规则拦截的消息不向发送方示意「已看到」
             if self.store.get_ack(r["message_id"]) is not None:
                 continue  # 每条只点一次（含之前点失败的，不重试）
             if self.dry_run:
-                print(f"[dryrun] 点表情 {self.cfg.emoji_type} -> {r['message_id']}（{r['reason']}）")
+                print(f"[dryrun] 点表情 {self.cfg.emoji_type}（{identity}）-> {r['message_id']}（{r['reason']}）")
                 continue
             try:
-                rid, err = self.im.add_reaction(r["message_id"], self.cfg.emoji_type), None
+                rid, err = self.im.add_reaction(r["message_id"], self.cfg.emoji_type, identity), None
             except Exception as e:  # 失败只记录，不影响投递
                 rid, err = None, str(e)[:500]
                 log.warning("点表情失败 %s: %s", r["message_id"], err)
-            self.store.add_ack(r["message_id"], r["chat_id"], r["chat_type"], r["sender_id"], r["reason"], rid, err)
+            self.store.add_ack(r["message_id"], r["chat_id"], r["chat_type"], r["sender_id"], r["reason"], rid, err,
+                               identity)
+
+    def identity_for(self, r) -> str | None:
+        """以谁的身份点：bot_reasons 优先（bot，永不撤），其次 reasons（user，主人回复后撤），都不在就不点。
+
+        主人本人的消息（带 owner_verified 标记）按 owner_reply 认：包括被 forward 转交的，以及改名前的旧 reason。
+        """
+        reason = r["reason"]
+        if "owner_verified" in json.loads(r["tags_json"] or "[]"):
+            reason = "owner_reply"
+        if reason in self.cfg.bot_reasons:
+            return "bot"
+        if reason in self.cfg.reasons:
+            return "user"
+        return None
 
     # ---------- 撤 ----------
     def candidates(self, m: Message) -> list:

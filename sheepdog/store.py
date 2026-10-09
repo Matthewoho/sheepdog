@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS acks (
     chat_type    TEXT,
     sender_id    TEXT,
     reason       TEXT,
+    identity     TEXT,                 -- user（以主人身份点，回复后撤）| bot（以机器人身份点，永不撤）
     reaction_id  TEXT,                 -- 点失败时为空
     added_at     TEXT,
     removed_at   TEXT,
@@ -153,6 +154,7 @@ MIGRATIONS = {
                  ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT")],
+    "acks": [("identity", "TEXT")],
 }
 
 
@@ -465,16 +467,18 @@ class Store:
         return self.conn.execute("SELECT * FROM acks WHERE message_id=?", (message_id,)).fetchone()
 
     def add_ack(self, message_id: str, chat_id: str, chat_type: str, sender_id: str, reason: str,
-                reaction_id: str | None, error: str | None) -> None:
+                reaction_id: str | None, error: str | None, identity: str = "user") -> None:
         with self.tx() as c:
-            c.execute("""INSERT OR IGNORE INTO acks(message_id,chat_id,chat_type,sender_id,reason,reaction_id,added_at,error)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (message_id, chat_id, chat_type, sender_id, reason, reaction_id, now_iso(), error))
+            c.execute("""INSERT OR IGNORE INTO acks(message_id,chat_id,chat_type,sender_id,reason,identity,reaction_id,
+                                                    added_at,error)
+                         VALUES(?,?,?,?,?,?,?,?,?)""",
+                      (message_id, chat_id, chat_type, sender_id, reason, identity, reaction_id, now_iso(), error))
 
     def removable_acks(self, chat_id: str) -> list[sqlite3.Row]:
         """同一聊天里点成功、还没撤、撤的时候也没失败过的表情（失败过的不再重试）。"""
         return self.conn.execute(
             """SELECT * FROM acks WHERE chat_id=? AND reaction_id IS NOT NULL AND removed_at IS NULL AND error IS NULL
+                 AND (identity IS NULL OR identity='user')
                ORDER BY added_at""", (chat_id,)).fetchall()
 
     def mark_ack_removed(self, message_id: str) -> None:

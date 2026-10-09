@@ -141,7 +141,7 @@ def cmd_doctor(args) -> int:
         print(f"安全规则: ✗ {e}")
         ok = False
     a = cfg.ack
-    print(f"确认表情: {'✓ ' + a.emoji_type + '，点: ' + ','.join(a.reasons) + '；回复后撤: ' + ','.join(a.remove_on_reply_reasons) if a.enabled else '（未配置 [ack]，不点表情）'}")
+    print(f"确认表情: {'✓ ' + a.emoji_type + '，点: ' + ','.join(a.reasons) + '；回复后撤: ' + ','.join(a.remove_on_reply_reasons) + '；bot 身份点: ' + (','.join(a.bot_reasons) or '-') if a.enabled else '（未配置 [ack]，不点表情）'}")
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
@@ -505,7 +505,7 @@ def cmd_acks(args) -> int:
             state = "未撤"
         where = "私聊" if a["chat_type"] == "p2p" else f"群「{a['chat_name'] or a['chat_id']}」"
         print(f"- [{state}] {a['added_at']} {where} | {a['sender_name'] or a['sender_id']} | 原因 {a['reason']} | "
-              f"message_id={a['message_id']}")
+              f"身份 {a['identity'] or 'user'} | message_id={a['message_id']}")
     return 0
 
 

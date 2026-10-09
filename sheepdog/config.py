@@ -143,13 +143,15 @@ class AckConfig:
     reasons: list[str] = field(default_factory=list)
     # 这些原因的表情，在主人身份回复后撤下
     remove_on_reply_reasons: list[str] = field(default_factory=list)
+    # 投递原因在其中的消息，送达后以 bot 身份点表情、永不撤（如主人在「找主人」聊天里的回复）；与 reasons 同时命中以它为准
+    bot_reasons: list[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.enabled:
             return
         if not isinstance(self.emoji_type, str) or not self.emoji_type.strip():
             raise ConfigError("[ack] emoji_type 必填")
-        for k in ("reasons", "remove_on_reply_reasons"):
+        for k in ("reasons", "remove_on_reply_reasons", "bot_reasons"):
             v = getattr(self, k)
             if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
                 raise ConfigError(f"[ack] {k} 必须是字符串列表")
