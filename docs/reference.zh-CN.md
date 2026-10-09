@@ -73,6 +73,9 @@ sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
 sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title "..."]   # 给会话补发 / 手动发退休通知
 sheepdog actions [--all]       # 排队 / 完成 / 失败的动作
+sheepdog show <message_id>     # 账本里这条消息的完整正文（送进会话的长消息会截断）
+sheepdog redeliver --batch b   # 发送中断、不确定是否送达的批次：人工确认后重发
+sheepdog watch-done --id N     # 会话确认真的等到了对方的回复
 sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
 ```
 
@@ -101,6 +104,15 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 - 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
 - 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
+
+## 可靠性（外部评估后补的几处）
+
+- **采集不漏**：每轮固定窗口 `[上次水位线 - overlap_seconds, 本轮开始]`，翻页上限 `max_pages`（默认 100，每页 50 条）。有 `has_more` 却缺 page_token、或翻到上限仍 `has_more` 时本轮记为没拉完：不推进水位线、下一轮从原起点重拉（按 message_id 去重）、同一缺口给总线提示一次；连续 3 轮 `doctor` 和 `sessions` 显示「采集不完整」。
+- **投递不重不丢**：先在账本记批次 `sending` 再发送，成功后改 `sent`。进程在两者之间中断时，下一轮到会话 transcript 里找批次号：找到就补记已送达；找不到标 `uncertain`，不自动重发，`sessions` 显示，确认后 `sheepdog redeliver --batch <批次>`。
+- **等别人回复要会话确认**：对方回复后等待进入「已回复、等确认」，回复照常送达，提醒和到期暂停；会话确认真等到了用 `sheepdog watch-done --id N` 或回执 anchors 写 `watch_done:N`，否则带这条回复的批次回执后回到等待、从回复时间重新计时。
+- **免打扰群里回复你的消息照常直推**：「回复我」与「@我」同级，在免打扰判断之前；关键人发言仍受免打扰约束。
+- **长消息**：每条最多带 `session.max_message_lines` 行（默认 200），超过的末尾提示「后面还有 N 行未显示，用 `sheepdog show <message_id>` 看全文」。
+- **配置热加载**：`run` 每轮重读 config.toml；改坏了沿用上一份并记 WARNING；轮询间隔、关键词、路由、ack、watch、loop_guard、owner_context 等下一轮生效；`state_dir`、`sink` 改了只提示需要重启。名册和安全规则同样每轮重读，playbook 每次组装 prompt 时现读。
 
 ## 引用回复按引用走
 
@@ -245,10 +257,12 @@ sheepdog doctor                                         # 列出缺哪些文件�
 |---|---|---|
 | 引擎代码 | 本仓库 | ✅ |
 | 个人配置 / 名册 / playbook / 安全规则 / Prompt 覆盖层 | `~/.config/sheepdog/` | ❌ |
-| 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，默认保留 7 天 | ❌ |
+| 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
 除了加、撤确认表情（`[ack]`），sheepdog 对 IM 只读。
+
+清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 

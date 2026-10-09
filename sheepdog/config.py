@@ -70,6 +70,8 @@ class SessionConfig:
     human_attach_minutes: int = 15
     # 回执超时（分钟），超时判为 failed
     receipt_timeout_minutes: int = 20
+    # 每条消息送进会话时最多带多少行正文；超过的末尾提示用 sheepdog show 看全文（7.16）
+    max_message_lines: int = 200
     # 代回前缀：作为 playbook 的 {{reply_prefix}} 占位符，规则文字写在 playbook 里
     reply_prefix: str = "🐕 [Agent 代回] "
 

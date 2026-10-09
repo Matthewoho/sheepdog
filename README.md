@@ -51,7 +51,7 @@ Lark (lark-cli, as you)
 - If you start typing in a session, sheepdog pauses deliveries to it and catches up 15 minutes after you stop.
 - Source (where messages come from), Sink (where sessions live) and Store are interfaces. Today only Lark, Google Antigravity and SQLite are implemented.
 
-**Mechanism lives in code, rules live in your config.** Every business rule (the reply prefix, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Edits apply on the next batch, with no restart and no code change.
+**Mechanism lives in code, rules live in your config.** Every business rule (the reply prefix, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
 
 ## Requirements
 
@@ -118,10 +118,10 @@ Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN
 |---|---|---|
 | Engine code | this repository | yes |
 | Your config, roster, playbook, rules | `~/.config/sheepdog/` | no |
-| Runtime data (ledger, inbox, receipts) | `~/.local/state/sheepdog/`, kept 7 days | no |
+| Runtime data (ledger, inbox, receipts) | `~/.local/state/sheepdog/`, pruned after `retention_days` (default 7) | no |
 | Work output | written by the sessions to your own notes and task tracker | no |
 
-Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
+Pruning covers messages, delivery records, escalations, bot message sources, reactions, finished waits and actions, loop records and receipt files; anything still open or in progress is kept. What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup. Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
 
 ## Status
 

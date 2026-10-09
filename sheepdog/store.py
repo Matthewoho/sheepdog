@@ -676,14 +676,44 @@ class Store:
         self.update_watch(watch_id, closed_at=now_iso(), close_reason=reason)
 
     # ---------- 保留期清理 ----------
-    def prune(self, retention_days: int) -> int:
-        cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
+    PRUNE_SQL = {
+        "messages": """DELETE FROM messages WHERE first_seen < ?
+                       AND (route != 'dispatch' OR dispatch_state IN ('acked','failed','missed','context'))""",
+        "dispatches": """DELETE FROM dispatches WHERE sent_at < ? AND state NOT IN ('sending','uncertain')
+                         AND batch_id NOT IN (SELECT pending_batch_id FROM topics WHERE pending_batch_id IS NOT NULL)""",
+        "escalations": "DELETE FROM escalations WHERE closed_at IS NOT NULL AND closed_at < ?",
+        "bot_outbox": "DELETE FROM bot_outbox WHERE sent_at < ?",
+        "acks": """DELETE FROM acks WHERE added_at < ?
+                   AND (removed_at IS NOT NULL OR identity = 'bot' OR reaction_id IS NULL)""",
+        "owner_reactions": "DELETE FROM owner_reactions WHERE seen_at < ?",
+        "watches": "DELETE FROM watches WHERE closed_at IS NOT NULL AND closed_at < ?",
+        "actions": "DELETE FROM actions WHERE done_at IS NOT NULL AND done_at < ?",
+        "loop_events": "DELETE FROM loop_events WHERE until < ?",
+    }
+
+    def prune(self, retention_days: int, receipts_dir: Path | None = None) -> dict[str, int]:
+        """清理超过 retention_days 的记录与回执文件；返回每类删了多少。"""
+        now = datetime.now().astimezone()
+        cutoff = (now - timedelta(days=retention_days)).isoformat(timespec="seconds")
+        out: dict[str, int] = {}
         with self.tx() as c:
-            cur = c.execute(
-                "DELETE FROM messages WHERE first_seen < ? AND (route != 'dispatch' OR dispatch_state IN ('acked','failed','missed','context'))",
-                (cutoff,),
-            )
-            return cur.rowcount
+            for table, sql in self.PRUNE_SQL.items():
+                out[table] = c.execute(sql, (cutoff,)).rowcount
+        if receipts_dir is not None and receipts_dir.exists():
+            keep = {r[0] for r in self.conn.execute(
+                "SELECT pending_batch_id FROM topics WHERE pending_batch_id IS NOT NULL")}
+            limit = (now - timedelta(days=retention_days)).timestamp()
+            n = 0
+            for f in receipts_dir.glob("*/*.json"):
+                if f.stem not in keep and f.stat().st_mtime < limit:
+                    f.unlink()
+                    n += 1
+            for d in receipts_dir.iterdir():
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            out["receipt_files"] = n
+        return out
 
 
 def row_to_message(row: sqlite3.Row) -> Message:

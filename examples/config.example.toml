@@ -7,6 +7,8 @@ self_open_id = "ou_test_replace_me"
 poll_interval_seconds = 60
 # 每次拉取向前重叠的秒数（防止搜索索引延迟漏消息，按 message_id 去重）
 overlap_seconds = 180
+# 每轮最多翻几页（每页 50 条）；拉不完不推进水位线，下一轮重拉
+max_pages = 100
 # 首次启动回看多久
 initial_lookback_minutes = 10
 timezone_offset = "+08:00"
@@ -43,6 +45,8 @@ title_prefix = "[managed]"
 model = ""
 bus_title = "Lark 信号·总线"
 human_attach_minutes = 15
+# 每条消息送进会话时最多带多少行正文，超过的末尾提示用 sheepdog show 看全文
+max_message_lines = 200
 receipt_timeout_minutes = 20
 # 代回前缀：playbook 里的 {{reply_prefix}}（规则文字写在 playbook/common.md）
 reply_prefix = "🐕 [Agent 代回] "

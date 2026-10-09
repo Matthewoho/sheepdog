@@ -1008,7 +1008,7 @@ class Dispatcher:
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
-                                  quotes=quotes)
+                                  quotes=quotes, max_lines=self.cfg.session.max_message_lines)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self.sink.send_message(t["conversation_id"], prompt)

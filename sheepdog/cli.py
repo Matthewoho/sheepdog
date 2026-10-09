@@ -22,6 +22,7 @@
   sheepdog actions [--all]                               排队 / 完成 / 失败的动作
   sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
   sheepdog redeliver --batch B                           发送中断、不确定是否送达的批次：人工确认后重发
+  sheepdog show <message_id>                             打印账本里这条消息的完整正文
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -197,6 +198,29 @@ def _queued(args, store: Store, kind: str, payload: dict) -> int | None:
     return 0
 
 
+def _reload_config(old, args, store: Store, source, collector: Collector, dispatcher: Dispatcher):
+    """run 每轮重读 config.toml（7.16）：改坏了沿用上一份并 WARNING；state_dir / sink 变了只提示需要重启。"""
+    try:
+        new = load_config()
+    except ConfigError as e:
+        logging.warning("配置无效，沿用上一份: %s", e)
+        return old
+    if new.state_dir != old.state_dir:
+        logging.warning("state_dir 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s", new.state_dir, old.state_dir)
+        new.state_dir = old.state_dir
+    if new.sink != old.sink:
+        logging.warning("sink 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s", new.sink, old.sink)
+        new.sink = old.sink
+    collector.cfg = dispatcher.cfg = new
+    dispatcher.playbook = Playbook.from_config(new)  # 代回前缀、等待分钟数等占位符跟着新配置
+    if hasattr(source, "max_pages"):
+        source.max_pages = new.max_pages
+    if hasattr(source, "tz"):
+        source.tz = new.timezone_offset
+    collector.acker = dispatcher.acker = _acker(new, store, source, args)
+    return new
+
+
 def cmd_run(args) -> int:
     # 本进程是常驻进程：只有它能跨项目调 agentapi，会话里发起的动作由它执行
     actions.mark_resident()
@@ -204,11 +228,12 @@ def cmd_run(args) -> int:
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
     dispatcher = Dispatcher(cfg, store, sink, roster, security, acker)
-    interval = args.interval or cfg.poll_interval_seconds
-    logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", interval, sink.name)
+    logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", args.interval or cfg.poll_interval_seconds, sink.name)
     last_prune = 0.0
     while True:
         try:
+            # 每轮重读 config.toml：轮询间隔、关键词、路由、ack、watch、loop_guard、owner_context 等下一轮生效
+            cfg = _reload_config(cfg, args, store, source, collector, dispatcher)
             # 每轮重读名册：改名册不必重启；改坏了沿用上一份有效名册并报错，常驻进程不退出
             try:
                 collector.roster = dispatcher.roster = load_roster(cfg.roster_file, cfg.roster_required)
@@ -224,15 +249,16 @@ def cmd_run(args) -> int:
                 logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
-                n = store.prune(cfg.retention_days)
+                pruned = store.prune(cfg.retention_days, cfg.receipts_dir)
                 last_prune = time.time()
-                if n:
-                    logging.info("清理过期消息 %d 条", n)
+                if any(pruned.values()):
+                    logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,
+                                 {k: v for k, v in pruned.items() if v})
         except KeyboardInterrupt:
             return 0
         except Exception:  # 单轮失败不退出，下一轮从水位线续跑
             logging.exception("本轮失败")
-        time.sleep(interval)
+        time.sleep(args.interval or cfg.poll_interval_seconds)
 
 
 def cmd_inbox(args) -> int:
@@ -715,6 +741,21 @@ def cmd_redeliver(args) -> int:
     return 0
 
 
+def cmd_show(args) -> int:
+    """打印账本里一条消息的完整正文（送进会话的长消息会截断，7.16）。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    r = store.get_message(args.message_id)
+    if r is None:
+        print(f"账本里没有 {args.message_id}（可能已超过保留期被清理）", file=sys.stderr)
+        return 2
+    where = "私聊" if r["chat_type"] == "p2p" else f"群「{r['chat_name'] or r['chat_id']}」"
+    print(f"{where} | {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）| {r['create_time']} | {r['route']}/{r['reason']}"
+          + (f" | 回复 {r['reply_to']}" if r["reply_to"] else ""))
+    print(r["content"] or "")
+    return 0
+
+
 def cmd_close_session(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -838,6 +879,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("redeliver")
     sp.add_argument("--batch", required=True)
     sp.set_defaults(func=cmd_redeliver)
+
+    sp = sub.add_parser("show")
+    sp.add_argument("message_id")
+    sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

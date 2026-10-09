@@ -318,7 +318,7 @@ def quote_line(quoted) -> str:
     return f"↪ 回复的是：{_person(quoted['sender_name'], quoted['sender_id'])}：{text[:80] + ('…' if len(text) > 80 else '')}"
 
 
-def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "") -> str:
+def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200) -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -350,7 +350,11 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "") -> str:
     if banner:
         lines.append(banner)  # 警示在正文之前
     content = (row["content"] or "").strip()
-    lines += ["> " + ln for ln in content.splitlines()[:40]] or ["> (空)"]
+    body = content.splitlines()
+    lines += ["> " + ln for ln in body[:max_lines]] or ["> (空)"]
+    if len(body) > max_lines:
+        # 长消息截断时明说（7.16）：之前固定只送前 40 行且没有任何提示
+        lines.append(f"…（后面还有 {len(body) - max_lines} 行未显示，用 `sheepdog show {row['message_id']}` 看全文）")
     if row["link"]:
         lines.append(f"链接：{row['link']}")
     lines.append(f"message_id: `{row['message_id']}`" + (f"（回复 `{row['reply_to']}`）" if row["reply_to"] else ""))
@@ -360,7 +364,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "") -> str:
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
-                 context_only: bool = False, quotes: dict | None = None) -> str:
+                 context_only: bool = False, quotes: dict | None = None, max_lines: int = 200) -> str:
     parts = []
     if rules_update:
         # 规则变了：完整现行规则放在这批最前面（7.11）
@@ -369,7 +373,7 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
     quotes = quotes or {}
-    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""))
+    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines)
               for r in rows]
     if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
