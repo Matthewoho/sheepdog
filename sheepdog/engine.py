@@ -764,7 +764,7 @@ class Dispatcher:
 
     # ---------- 总线新开会话（7.10） ----------
     def new_session(self, key: str, title: str, duty: str, chats: list[tuple[str, bool]],
-                    message_ids: list[str] | None = None, note: str = "") -> dict:
+                    message_ids: list[str] | None = None, note: str = "", validate_only: bool = False) -> dict:
         """总线临时新开一个专属会话：只写账本（kind = dynamic），不写名册。
 
         先做全部校验（key、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward 规则排队。
@@ -806,6 +806,8 @@ class Dispatcher:
             if row["security_action"] == HOLD:
                 raise ValueError(f"消息 {i} 被安全规则拦截，不能随 new-session 转交；"
                                  "先新开会话，再用 sheepdog forward --quote \"<主人原话>\" 转")
+        if validate_only:
+            return {"topic_id": topic_id}
 
         full_title = f"{self.cfg.session.title_prefix} {title}".strip()
         s = RosterSession(key=key, mode=MANAGED, title=title, duty=duty,
@@ -869,18 +871,76 @@ class Dispatcher:
         pt = self.store.get_topic(pid)
         if pt is not None and pt["conversation_id"] == s.predecessor_conversation_id:
             return f"已发过（{pid}）"
-        if pt is None:
-            self.store.create_topic(pid, f"{s.display_title}（前任）", RETIRED, "已退休，由接手会话继续", sm.CLOSED)
-        bid = self._new_batch_id("r", pid)
         # 先发退休通知，失败就整个 spawn 失败，不新建接手会话
-        self.sink.send_message(s.predecessor_conversation_id,
-                               retirement_prompt(self.playbook, pid, f"{s.display_title}（前任）", bid,
-                                                 successor_title, s.topic_id))
-        self.store.record_dispatch(bid, pid, [])
-        self.store.update_topic(pid, conversation_id=s.predecessor_conversation_id, kind=RETIRED, state=sm.CLOSED,
-                                pending_batch_id=bid, dispatched_at=now_iso())
-        log.info("已给前任 %s 发退休通知 %s", s.predecessor_conversation_id, bid)
+        bid = self._send_retirement(pid, f"{s.display_title}（前任）", s.predecessor_conversation_id,
+                                    successor_title, s.topic_id)
         return f"已发送 {bid}"
+
+    def _send_retirement(self, record_id: str, title: str, conversation_id: str, successor_title: str,
+                         successor_topic_id: str | None) -> str:
+        """给一个会话发退休通知（retire.md）。record_id 是记录它的 retired topic（closed，不再投递）；
+        它的交接回执到达后转给 successor_topic_id，没有接手会话时转总线。"""
+        if self.store.get_topic(record_id) is None:
+            self.store.create_topic(record_id, title, RETIRED, "已退休，由接手会话继续", sm.CLOSED)
+        bid = self._new_batch_id("r", record_id)
+        self.sink.send_message(conversation_id, retirement_prompt(self.playbook, record_id, title, bid,
+                                                                  successor_title, successor_topic_id or BUS_TOPIC_ID))
+        self.store.record_dispatch(bid, record_id, [])
+        self.store.update_topic(record_id, conversation_id=conversation_id, kind=RETIRED, state=sm.CLOSED,
+                                pending_batch_id=bid, dispatched_at=now_iso(),
+                                anchors_json=json.dumps([f"successor:{successor_topic_id or BUS_TOPIC_ID}"]))
+        log.info("已给 %s 发退休通知 %s（记录 %s）", conversation_id, bid, record_id)
+        return bid
+
+    def retire(self, target: str, successor_title: str = "") -> dict:
+        """sheepdog retire（7.12）：给一个会话补发 / 手动发退休通知。target 是 topic_id 或裸 conversation_id。
+
+        - 已关闭的前任（retired topic）：照原记录补发，回执转给它的接手会话；
+        - 名册里某条的 predecessor_conversation_id：记到 tp_<key>.prev，回执转给该条目；
+        - 账本里某个会话的 conversation_id 或 topic_id：记到 <topic>.retired，回执转总线；dynamic 会话同时收掉；
+        - 都不是：记到 tp_retired.<id 前 12 位>，回执转总线。
+        """
+        target = (target or "").strip()
+        if not target:
+            raise ValueError("--topic 不能为空")
+        if target == BUS_TOPIC_ID or (self.store.get_topic(BUS_TOPIC_ID) or {"conversation_id": None})["conversation_id"] == target:
+            raise ValueError("总线不能退休")
+        t = self.store.get_topic(target) if target.startswith("tp_") else None
+        if target.startswith("tp_") and t is None:
+            raise ValueError(f"topic {target} 不存在")
+        if t is None:
+            s = next((x for x in self.roster.sessions if x.predecessor_conversation_id == target), None)
+            if s is not None:
+                record, title, cid, succ = predecessor_topic_id(s.topic_id), f"{s.display_title}（前任）", target, s.topic_id
+            else:
+                t = next((x for x in self.store.list_topics() if x["conversation_id"] == target), None)
+                if t is None:
+                    safe = "".join(ch for ch in target[:12].lower() if ch.isalnum() or ch in "-_")
+                    record, title, cid, succ = f"tp_retired.{safe}", f"已退休会话 {target[:12]}", target, None
+        if t is not None:
+            if not t["conversation_id"]:
+                raise ValueError(f"{t['topic_id']} 还没有会话，无从退休")
+            cid, title = t["conversation_id"], t["title"]
+            if t["kind"] == RETIRED:
+                record = t["topic_id"]
+                anchors = json.loads(t["anchors_json"] or "[]")
+                succ = next((a.removeprefix("successor:") for a in anchors if a.startswith("successor:")),
+                            t["topic_id"].removesuffix(".prev") if t["topic_id"].endswith(".prev") else None)
+            else:
+                record, succ = t["topic_id"] + ".retired", None
+                title = f"{t['title']}（已退休）"
+        st = self.store.get_topic(succ) if succ else None
+        if not successor_title:
+            successor_title = (f"{self.cfg.session.title_prefix} {st['title']}".strip() if st and succ != BUS_TOPIC_ID
+                               else "总线（会转给合适的会话）")
+        bid = self._send_retirement(record, title, cid, successor_title, succ)
+        result = {"record_topic": record, "conversation_id": cid, "batch": bid, "successor": succ or BUS_TOPIC_ID}
+        if t is not None and t["kind"] == DYNAMIC and t["state"] != sm.CLOSED:
+            close_session(self.store, t["topic_id"])
+            result["closed"] = t["topic_id"]
+        elif t is not None and t["kind"] in (ADOPTED, KNOWN_KIND):
+            result["note"] = "它还在名册里：要停止投递，请从名册删掉这一条"
+        return result
 
     def _check_handovers(self) -> None:
         """前任交接回执到达：原样转给接手会话（作为待推消息，受接管/排队约束）。前任 topic 保持 closed。"""
@@ -891,7 +951,9 @@ class Dispatcher:
             if not p.exists():
                 continue
             raw = p.read_text(encoding="utf-8")
-            successor = t["topic_id"].removesuffix(".prev")
+            anchors = json.loads(t["anchors_json"] or "[]")
+            successor = next((a.removeprefix("successor:") for a in anchors if a.startswith("successor:")),
+                             t["topic_id"].removesuffix(".prev") if t["topic_id"].endswith(".prev") else BUS_TOPIC_ID)
             self.store.add_system_message(
                 successor, "handover_receipt",
                 f"前任「{t['title']}」（`{t['conversation_id']}`）的交接回执，原样转发：\n```json\n{raw.strip()}\n```")

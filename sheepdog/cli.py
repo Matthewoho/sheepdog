@@ -18,10 +18,15 @@
                                                          总线临时新开一个专属会话（只在账本里）
   sheepdog close-session --topic T                       收掉总线新开的会话
   sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
+  sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title ...]   给会话补发 / 手动发退休通知
+  sheepdog actions [--all]                               排队 / 完成 / 失败的动作
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
+
+spawn / new-session / push-rules / init / retire 要调 agentapi：只有常驻进程（sheepdog run）能跨项目投递，
+其他进程里执行时只入队，由 run 下一轮执行（--dry-run 一律本地执行）。
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import __version__
+from . import actions
 from .ack import Acker
 from .config import ConfigError, load_config
 from .engine import (DYNAMIC, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, close_session,
@@ -165,7 +171,18 @@ def cmd_poll(args) -> int:
     return 0
 
 
+def _queued(args, store: Store, kind: str, payload: dict) -> int | None:
+    """不在常驻进程里、又不是 --dry-run：入队并返回退出码 0；否则返回 None 表示本地执行（7.12）。"""
+    if getattr(args, "dry_run", False) or actions.is_resident():
+        return None
+    aid = actions.enqueue(store, kind, payload)
+    print(f"动作 #{aid}（{kind}）{actions.QUEUED_HINT}")
+    return 0
+
+
 def cmd_run(args) -> int:
+    # 本进程是常驻进程：只有它能跨项目调 agentapi，会话里发起的动作由它执行
+    actions.mark_resident()
     cfg, store, source, sink, roster, security = _build(args)
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
@@ -185,6 +202,9 @@ def cmd_run(args) -> int:
                 collector.security = dispatcher.security = load_security(cfg.security_file)
             except SecurityError as e:
                 logging.error("安全规则无效，沿用上一份: %s", e)
+            # 先执行会话发起的动作（spawn / new-session / push-rules / init / retire），再拉取和投递
+            if n := actions.run_pending(dispatcher):
+                logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
                 n = store.prune(cfg.retention_days)
@@ -232,6 +252,8 @@ def cmd_inbox_clear(args) -> int:
 
 def cmd_init(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
+    if (rc := _queued(args, store, "init", {})) is not None:
+        return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     print(f"名册: {cfg.roster_file}（{len(roster.managed)} managed / {len(roster.sessions) - len(roster.managed)} known）")
@@ -251,6 +273,13 @@ def cmd_init(args) -> int:
 
 def cmd_spawn(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
+    if not args.dry_run and not actions.is_resident():
+        s = roster.by_key(args.key)
+        if s is None or not s.to_spawn:
+            print(f"spawn 被拒绝: {args.key} 不是名册里 conversation_id 留空的 managed 条目", file=sys.stderr)
+            return 2
+    if (rc := _queued(args, store, "spawn", {"key": args.key})) is not None:
+        return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
@@ -489,6 +518,18 @@ def _parse_chat(text: str) -> tuple[str, bool]:
 
 def cmd_new_session(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
+    if not args.dry_run and not actions.is_resident():
+        # 入队前先校验，key / 聊天冲突、配额等当场就能告诉调用方
+        try:
+            chats = [_parse_chat(c) for c in args.chat]
+            ids = [i for i in (args.message_ids or "").split(",") if i.strip()]
+            Dispatcher(cfg, store, sink, roster, security).new_session(
+                args.key, args.title, args.duty, chats, ids, args.note, validate_only=True)
+        except ValueError as e:
+            print(f"new-session 被拒绝: {e}", file=sys.stderr)
+            return 2
+        return _queued(args, store, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
+                                                    "chats": chats, "message_ids": ids, "note": args.note})
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
@@ -510,6 +551,11 @@ def cmd_new_session(args) -> int:
 
 def cmd_push_rules(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
+    if args.topic and not args.dry_run and not actions.is_resident() and store.get_topic(args.topic) is None:
+        print(f"push-rules 被拒绝: topic {args.topic} 不存在", file=sys.stderr)
+        return 2
+    if (rc := _queued(args, store, "push_rules", {"topic": args.topic or ""})) is not None:
+        return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
@@ -523,6 +569,60 @@ def cmd_push_rules(args) -> int:
         print("没有可发的会话")
     for tid, what in report.items():
         print(f"{tid}: {what}")
+    return 0
+
+
+def cmd_retire(args) -> int:
+    cfg, store, _source, sink, roster, security = _build(args)
+    target = (args.topic or "").strip()
+    if target.startswith("tp_") and store.get_topic(target) is None:
+        print(f"retire 被拒绝: topic {target} 不存在", file=sys.stderr)
+        return 2
+    if target == "tp_bus":
+        print("retire 被拒绝: 总线不能退休", file=sys.stderr)
+        return 2
+    if (rc := _queued(args, store, "retire", {"target": target, "successor_title": args.successor_title})) is not None:
+        return rc
+    if args.dry_run:
+        print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
+    d = Dispatcher(cfg, store, sink, roster, security)
+    d.sync_roster()
+    try:
+        r = d.retire(target, args.successor_title)
+    except ValueError as e:
+        print(f"retire 被拒绝: {e}", file=sys.stderr)
+        return 2
+    except SinkError as e:
+        print(f"retire 失败: {e}", file=sys.stderr)
+        return 1
+    print(f"已发退休通知 -> {r['conversation_id']}（批次 {r['batch']}，记录 {r['record_topic']}），"
+          f"交接回执会转给 {r['successor']}")
+    if r.get("closed"):
+        print(f"已收掉 {r['closed']}")
+    if r.get("note"):
+        print(r["note"])
+    return 0
+
+
+def cmd_actions(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    rows = store.list_actions(include_done=args.all)
+    if not rows:
+        print("没有动作记录")
+        return 0
+    for a in rows:
+        if not a["done_at"]:
+            state = "排队中"
+        elif a["error"]:
+            state = f"失败 @ {a['done_at']}"
+        else:
+            state = f"完成 @ {a['done_at']}"
+        print(f"#{a['id']} [{state}] {a['kind']} {a['args_json']}  提交于 {a['requested_at']}（{a['requested_by'] or '-'}）")
+        if a["error"]:
+            print(f"  错误: {a['error']}")
+        elif a["result"]:
+            print(f"  结果: {a['result'][:500]}")
     return 0
 
 
@@ -631,6 +731,16 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--topic", default="", help="不填 = 全部会话（含总线）")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不发、不写账本")
     sp.set_defaults(func=cmd_push_rules)
+
+    sp = sub.add_parser("retire")
+    sp.add_argument("--topic", required=True, help="tp_x 或裸 conversation_id")
+    sp.add_argument("--successor-title", default="", help="接手者的称呼，填进 retire.md 的 {{successor_title}}")
+    sp.add_argument("--dry-run", action="store_true", help="只打印，不发、不写账本")
+    sp.set_defaults(func=cmd_retire)
+
+    sp = sub.add_parser("actions")
+    sp.add_argument("--all", action="store_true", help="全部（默认只看排队中和最近 10 条已完成）")
+    sp.set_defaults(func=cmd_actions)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

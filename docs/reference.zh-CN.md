@@ -71,6 +71,8 @@ sheepdog new-session --key k --title "短标题" --duty "职责与边界" [--cha
                                # 总线临时新开一个专属会话（只在账本里，不写名册）
 sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
+sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title "..."]   # 给会话补发 / 手动发退休通知
+sheepdog actions [--all]       # 排队 / 完成 / 失败的动作
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -98,6 +100,16 @@ sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完�
 - 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
 - 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
+
+## 要调 agentapi 的命令交给常驻进程执行
+
+实测只有 sidecar 常驻进程能给别的项目里的会话投递；会话终端里直接调 agentapi 会因为 project_id 不匹配被拒。所以：
+
+- `spawn`、`new-session`、`push-rules`、`init`、`retire` 不在常驻进程里执行时，不调 agentapi，只在账本 `actions` 表里入队，打印「已提交，sheepdog 下一轮执行，结果见 `sheepdog actions`」，退出码 0。入队前会先做能做的校验（key、聊天冲突、配额、topic 是否存在），不合法当场报错。`--dry-run` 一律本地执行、不入队。
+- 「是不是常驻进程」：`sheepdog run` 启动时在本进程内打标记，其他进程一律不是。App 注入的环境变量里没有可靠、可核实的 sidecar 标识，会话终端里同样有 agentapi 的环境变量，分不出来。sidecar 启动命令里的 `sheepdog init` 也会入队，紧接着由 run 第一轮执行。
+- `run` 每轮开始先按 id 顺序执行排队的动作，单条失败记 `error`，不阻塞后续，也不重试；然后再拉取和投递。
+- `sheepdog retire --topic <tp_x 或 conversation_id>`：给一个会话补发退休通知（retire.md）。已关闭的前任（`tp_<key>.prev`）照原记录补发；名册里某条的 `predecessor_conversation_id` 记到 `tp_<key>.prev`；交接回执都转给接手会话。账本里其他会话记到 `<topic>.retired`、回执转总线（dynamic 会话同时收掉；名册里的会话要停止投递得从名册删）；完全不认识的 id 记到 `tp_retired.<前 12 位>`、回执转总线。总线不能退休。
+- `forward` 本来就是入队、由常驻进程投递，不变。
 
 ## 规则改了自动同步给已有会话
 

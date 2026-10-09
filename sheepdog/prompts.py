@@ -132,6 +132,9 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "[--message-ids <id1,id2>] [--note \"<为什么开>\"]`：名册里没有合适的会话时新开一个（只在账本里，不写名册），"
             "消息和 note 排进它的队列；--chat 的聊天之后直接推给它（:all = 全部消息）。有每日配额，超了会被拒绝。",
             "`sheepdog close-session --topic <tp_x>`：收掉总线新开的会话（它回执 done 时也会自动收掉），聊天归属随之释放。",
+            "### 要调 agentapi 的命令",
+            "`new-session` / `spawn` / `push-rules` / `init` / `retire --topic <tp_x 或 conversation_id>`（给会话补发退休通知）"
+            "在你的终端里执行时只入队，由 sheepdog 常驻进程下一轮执行（只有它能跨项目投递）；结果用 `sheepdog actions` 查看。",
             "### 需要你定",
             "`sheepdog escalations [--all]`：查看各会话找主人的未结问题。主人在 IM 上的回复无法确定回答哪条时会送到你这里，"
             "附未结列表；判断后用 `sheepdog forward --topic <topic> --message-ids <主人那条消息>` 转交（不需要 --quote）。",

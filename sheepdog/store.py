@@ -128,6 +128,18 @@ CREATE TABLE IF NOT EXISTS acks (
     error        TEXT                  -- 点或撤失败的原因
 );
 CREATE INDEX IF NOT EXISTS idx_ack_chat ON acks(chat_id, removed_at);
+
+-- 会话发起、要调 agentapi 的动作（7.12）：只有常驻进程能跨项目投递，其他进程只入队，由 run 每轮执行
+CREATE TABLE IF NOT EXISTS actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,        -- init | spawn | new_session | push_rules | retire
+    args_json    TEXT NOT NULL,
+    requested_by TEXT,
+    requested_at TEXT NOT NULL,
+    done_at      TEXT,                 -- 执行完（成功或失败）；为空 = 排队中
+    result       TEXT,
+    error        TEXT
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -424,6 +436,29 @@ class Store:
         with self.tx() as c:
             c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
                       (now_iso(), message_id))
+
+    # ---------- actions ----------
+    def add_action(self, kind: str, args: dict, requested_by: str) -> int:
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO actions(kind,args_json,requested_by,requested_at) VALUES(?,?,?,?)",
+                            (kind, json.dumps(args, ensure_ascii=False), requested_by, now_iso()))
+            return int(cur.lastrowid)
+
+    def pending_actions(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM actions WHERE done_at IS NULL ORDER BY id").fetchall()
+
+    def finish_action(self, action_id: int, result: str = "", error: str = "") -> None:
+        with self.tx() as c:
+            c.execute("UPDATE actions SET done_at=?, result=?, error=? WHERE id=?",
+                      (now_iso(), result or None, error or None, action_id))
+
+    def list_actions(self, include_done: bool = False, recent_done: int = 10) -> list[sqlite3.Row]:
+        if include_done:
+            return self.conn.execute("SELECT * FROM actions ORDER BY id DESC").fetchall()
+        pending = self.conn.execute("SELECT * FROM actions WHERE done_at IS NULL ORDER BY id DESC").fetchall()
+        done = self.conn.execute("SELECT * FROM actions WHERE done_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+                                 (recent_done,)).fetchall()
+        return list(pending) + list(done)
 
     # ---------- acks ----------
     def get_ack(self, message_id: str) -> sqlite3.Row | None:
