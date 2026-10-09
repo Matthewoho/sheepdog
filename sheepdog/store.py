@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS watches (
     close_reason TEXT                  -- replied | expired | cancelled | topic_closed
 );
 CREATE INDEX IF NOT EXISTS idx_watch_person ON watches(person_id, closed_at);
+
+-- 「需要你定」（7.8）：会话以 bot 身份找主人的提问；主人在 IM 上的回复按它投回对应 topic
+CREATE TABLE IF NOT EXISTS escalations (
+    message_id        TEXT PRIMARY KEY,  -- 机器人那条提问
+    topic_id          TEXT NOT NULL,
+    chat_id           TEXT,
+    text              TEXT,
+    asked_at          TEXT NOT NULL,
+    answered_at       TEXT,
+    answer_message_id TEXT,
+    closed_at         TEXT,              -- 已答或超过 open_hours 时写入；为空 = 未结
+    close_reason      TEXT               -- answered | expired
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -353,6 +366,42 @@ class Store:
     def finish_dispatch(self, batch_id: str, state: str, receipt: str = "", error: str = "") -> None:
         with self.tx() as c:
             c.execute("UPDATE dispatches SET state=?, receipt=?, error=? WHERE batch_id=?", (state, receipt, error, batch_id))
+
+    def set_note(self, message_id: str, note: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE messages SET note=? WHERE message_id=?", (note, message_id))
+
+    # ---------- escalations ----------
+    def add_escalation(self, message_id: str, topic_id: str, chat_id: str, text: str, asked_at: str) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT OR IGNORE INTO escalations(message_id,topic_id,chat_id,text,asked_at)
+                         VALUES(?,?,?,?,?)""", (message_id, topic_id, chat_id, text, asked_at))
+
+    def get_escalation(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM escalations WHERE message_id=?", (message_id,)).fetchone()
+
+    def open_escalations(self, topic_id: str | None = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM escalations WHERE closed_at IS NULL", []
+        if topic_id:
+            sql += " AND topic_id=?"
+            args.append(topic_id)
+        return self.conn.execute(sql + " ORDER BY asked_at DESC", args).fetchall()
+
+    def list_escalations(self, include_closed: bool = False, limit: int = 200) -> list[sqlite3.Row]:
+        where = "" if include_closed else "WHERE closed_at IS NULL"
+        return self.conn.execute(f"SELECT * FROM escalations {where} ORDER BY asked_at DESC LIMIT ?", (limit,)).fetchall()
+
+    def answer_escalation(self, message_id: str, answer_message_id: str) -> bool:
+        ts = now_iso()
+        with self.tx() as c:
+            cur = c.execute("""UPDATE escalations SET answered_at=?, answer_message_id=?, closed_at=?, close_reason='answered'
+                               WHERE message_id=? AND closed_at IS NULL""", (ts, answer_message_id, ts, message_id))
+            return cur.rowcount > 0
+
+    def expire_escalation(self, message_id: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
+                      (now_iso(), message_id))
 
     # ---------- watches ----------
     def add_watch(self, topic_id: str, person_id: str, chat_id: str, note: str) -> int:

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +94,35 @@ class WatchConfig:
 
 
 @dataclass
+class EscalationConfig:
+    # 「找主人」用的聊天（机器人与主人的私聊）：其中的消息先于普通路由处理（7.8）
+    chat_ids: list[str] = field(default_factory=list)
+    # 从机器人消息正文里提取 topic_id 的正则，必须有命名分组 (?P<topic>...)；具体格式写在个人配置里
+    header_regex: str = ""
+    # 一条「需要你定」多久内算未结
+    open_hours: float = 24
+
+    def validate(self) -> None:
+        if not isinstance(self.chat_ids, list) or not all(isinstance(c, str) and c for c in self.chat_ids):
+            raise ConfigError("escalation.chat_ids 必须是非空字符串列表")
+        if isinstance(self.open_hours, bool) or not isinstance(self.open_hours, (int, float)) or self.open_hours <= 0:
+            raise ConfigError("escalation.open_hours 必须是正数")
+        if self.chat_ids and not self.header_regex:
+            raise ConfigError("escalation.chat_ids 已配置但 header_regex 为空：机器人的提问将无法识别")
+        if self.header_regex:
+            try:
+                rx = re.compile(self.header_regex)
+            except re.error as e:
+                raise ConfigError(f"escalation.header_regex 无效: {e}") from e
+            if "topic" not in rx.groupindex:
+                raise ConfigError("escalation.header_regex 必须有命名分组 (?P<topic>...)")
+
+    @property
+    def pattern(self) -> re.Pattern | None:
+        return re.compile(self.header_regex) if self.header_regex else None
+
+
+@dataclass
 class Config:
     # 「我」的 open_id，用于 @我 / 自己发的 / 回复我 的判定
     self_open_id: str = ""
@@ -116,6 +146,7 @@ class Config:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    escalation: EscalationConfig = field(default_factory=EscalationConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -174,9 +205,11 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.routing, data.get("routing", {}))
         _apply(cfg.session, data.get("session", {}))
         _apply(cfg.watch, data.get("watch", {}))
+        _apply(cfg.escalation, data.get("escalation", {}))
         if "state_dir" in data:
             cfg.state_dir = Path(data["state_dir"]).expanduser()
     cfg.watch.validate()
+    cfg.escalation.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

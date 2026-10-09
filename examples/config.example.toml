@@ -28,9 +28,10 @@ vip_sender_ids = []
 ignore_muted_chats = true
 dispatch_at_all = true
 dispatch_bot_p2p = false
-# 建议把「机器人 ↔ 你」的私聊放进来：会话拿不准时以 bot 身份私聊你，不应再被当成信号推回总线
+# 「机器人 ↔ 你」的私聊不要放这里，放到下面 [escalation] chat_ids，由 sheepdog 接管
 ignore_chat_ids = []
-# 机器人/应用发的消息正文以其中任一前缀开头就丢弃（reason = self_escalation），与 playbook 里约定的开头保持一致
+# 机器人/应用发的消息正文以其中任一前缀开头就丢弃（reason = self_escalation）。
+# [escalation] 接管找你的聊天后已不需要它防回环，保留作其他聊天的兜底
 drop_bot_message_prefixes = ["🐕 [sheepdog·"]
 watch_chat_ids = []
 # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
@@ -45,6 +46,14 @@ human_attach_minutes = 15
 receipt_timeout_minutes = 20
 # 代回前缀：playbook 里的 {{reply_prefix}}（规则文字写在 playbook/common.md）
 reply_prefix = "🐕 [Agent 代回] "
+
+[escalation]
+# 「找你」用的聊天（机器人与你的私聊）。其中：机器人带头的提问登记为「需要你定」；你的回复投回提问的会话；其他丢弃
+chat_ids = []
+# 从机器人提问正文里提取 topic_id，必须有命名分组 topic；和 playbook/common.md 里约定的开头保持一致
+header_regex = '^🐕 \[sheepdog·[^\]]*·(?P<topic>tp_[a-z0-9_.-]+)\] 需要你定：'
+# 一条「需要你定」多久内算未结，超时自动关闭
+open_hours = 24
 
 [watch]
 # 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}

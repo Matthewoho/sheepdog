@@ -167,7 +167,7 @@ class SpawnTest(Base):
 
 
 class EscalationTest(Base):
-    MARK = "🐕 [sheepdog·Alpha 需求] 需要你定：要不要延期"
+    MARK = "FX-DROP·Alpha 需求 要不要延期"
 
     def test_self_escalation_dropped(self):
         ctx = RouteContext(ME)

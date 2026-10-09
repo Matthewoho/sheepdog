@@ -38,6 +38,8 @@ REASON_LABEL = {
     "watch_nudge": "等待提醒",
     "watch_expired": "等待到期",
     "bus_relay": "总线转达",
+    "matthew_reply": "主人在 IM 的回复",
+    "escalation_list": "未结的「需要你定」",
 }
 
 RECEIPT_SCHEMA_HINT = """{
@@ -51,6 +53,8 @@ RECEIPT_SCHEMA_HINT = """{
 # forward 的两种标注：属于 forward 接口的渲染格式；quote 已由 sheepdog 对照总线 transcript 核对过（7.7 C）
 QUOTE_LABEL = "✅ 主人原话（已核对：主人在总线里亲口说过）"
 NOTE_LABEL = "总线备注（不是主人原话）"
+# 主人在「找主人」聊天里的回复（7.8）：发送人已由 IM 账号核实
+OWNER_REPLY_LABEL = "✅ 主人在飞书的回复（已核对：发送人是主人本人账号）"
 
 
 def _join(*parts: str) -> str:
@@ -108,6 +112,9 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "`sheepdog spawn --key <key>`：为名册里 conversation_id 留空的 managed 条目新建会话（只建一次）。",
             "### Inbox",
             "`sheepdog inbox [--chat <群名>]`：查看未直推的群消息。",
+            "### 需要你定",
+            "`sheepdog escalations [--all]`：查看各会话找主人的未结问题。主人在 IM 上的回复无法确定回答哪条时会送到你这里，"
+            "附未结列表；判断后用 `sheepdog forward --topic <topic> --message-ids <主人那条消息>` 转交（不需要 --quote）。",
         ]
     lines += list(extra)
     return "\n".join(lines)
@@ -235,7 +242,12 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
         return "\n".join([f"### [{label}] sheepdog | {row['create_time']}", *(row["content"] or "").splitlines()])
     where = "私聊" if row["chat_type"] == "p2p" else f"群「{row['chat_name']}」"
     lines = [f"### [{label}] {where} | {row['sender_name']} | {row['create_time']}{read}"]
-    if any(t.startswith("watch:") for t in json.loads(row["tags_json"] or "[]")):
+    tags = json.loads(row["tags_json"] or "[]")
+    if "owner_verified" in tags:
+        lines.append(OWNER_REPLY_LABEL)
+    if row["note"]:
+        lines.append(row["note"])
+    if any(t.startswith("watch:") for t in tags):
         lines.append("（这是你登记等待的回复，等待已结束）")
     if banner:
         lines.append(banner)  # 警示在正文之前

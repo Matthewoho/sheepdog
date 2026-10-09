@@ -12,6 +12,7 @@
   sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
   sheepdog watches [--all]  /  sheepdog unwatch --id N
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
+  sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -31,8 +32,8 @@ from datetime import datetime, timedelta
 
 from . import __version__
 from .config import ConfigError, load_config
-from .engine import (RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, forward_messages,
-                     write_receipt)
+from .engine import (RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, escalation_summary,
+                     forward_messages, open_escalations, write_receipt)
 from .playbook import PLAYBOOK_FILES, Playbook
 from .roster import Roster, RosterError, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
@@ -119,6 +120,8 @@ def cmd_doctor(args) -> int:
     except SecurityError as e:
         print(f"安全规则: ✗ {e}")
         ok = False
+    esc = cfg.escalation
+    print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
     pb = Playbook.from_config(cfg)
     missing = pb.missing()
@@ -289,6 +292,8 @@ def cmd_sessions(args) -> int:
                 print(f"  前任: {s.predecessor_conversation_id}")
             if t["kind"] == "adopted":
                 print(f"  onboarded: {t['onboarded_at'] or '否'}  未回执: {t['receipt_missed'] or 0}")
+        if t["kind"] in ("adopted", "bus"):
+            print(f"  未结「需要你定」: {len(open_escalations(store, cfg.escalation.open_hours, t['topic_id']))}")
         if t["kind"] == RETIRED:
             print(f"  交接回执: {'已转给接手会话' if not t['pending_batch_id'] else '等待中（批次 ' + t['pending_batch_id'] + '）'}")
         if t["summary"]:
@@ -315,7 +320,8 @@ def cmd_forward(args) -> int:
     store = Store(cfg.db_path)
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
-        ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify)
+        ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
+                               cfg.self_open_id, cfg.escalation.open_hours)
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
@@ -400,6 +406,28 @@ def cmd_security_log(args) -> int:
     return 0
 
 
+def cmd_escalations(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    open_ids = {e["message_id"] for e in open_escalations(store, cfg.escalation.open_hours)}
+    rows = store.list_escalations(include_closed=args.all)
+    if not args.all:
+        rows = [e for e in rows if e["message_id"] in open_ids]  # 超时还没被常驻进程关掉的也不算未结
+    if not rows:
+        print("没有未结的「需要你定」" if not args.all else "没有「需要你定」记录")
+        return 0
+    for e in rows:
+        if e["answered_at"]:
+            state = f"已答 @ {e['answered_at']}（答复 {e['answer_message_id']}）"
+        elif e["message_id"] in open_ids:
+            state = "未结"
+        else:
+            state = f"已关闭（{e['close_reason'] or '超时'}）"
+        print(f"- [{state}] topic={e['topic_id']} 提问 {e['asked_at']} message_id={e['message_id']}")
+        print(f"  问题: {escalation_summary(e)}")
+    return 0
+
+
 def cmd_session_reset(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -474,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("security-log")
     sp.add_argument("--since", default="24h", help="回看时长：30m / 24h / 7d")
     sp.set_defaults(func=cmd_security_log)
+
+    sp = sub.add_parser("escalations")
+    sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
+    sp.set_defaults(func=cmd_escalations)
 
     sp = sub.add_parser("unwatch")
     sp.add_argument("--id", type=int, required=True)

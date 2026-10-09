@@ -55,7 +55,7 @@ def _keyword_hit(text: str, keywords: list[str]) -> str:
     return ""
 
 
-def _bodies(content: str) -> list[str]:
+def message_bodies(content: str) -> list[str]:
     """正文可能是纯文本，也可能是 {"text": "..."} 这类 JSON：两种都拿出来比对开头。"""
     out = [(content or "").lstrip()]
     try:
@@ -75,7 +75,7 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响
     prefixes = [p for p in cfg.drop_bot_message_prefixes if p]
     if prefixes and msg.sender_type in ("app", "bot"):
-        if any(b.startswith(p) for b in _bodies(msg.content) for p in prefixes):
+        if any(b.startswith(p) for b in message_bodies(msg.content) for p in prefixes):
             return RouteDecision(DROP, "self_escalation")
 
     # 2. 强制忽略

@@ -63,7 +63,16 @@ sheepdog spawn --key k         # 名册里 conversation_id 留空的条目：新
 sheepdog watch --topic tp_x --person ou_x --note "在等什么"   # 等别人回复：对方回复直推，按 [watch] 配置提醒与到期
 sheepdog watches               # 等待列表；sheepdog unwatch --id N 取消
 sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
+sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未结 / 全部
 ```
+
+## 在飞书上直接回复「需要你定」
+
+会话拿不准时以 bot 身份私聊你（开头约定写在 playbook/common.md，带 topic_id）。把这个私聊配进 `[escalation] chat_ids`（不要放 `ignore_chat_ids`），sheepdog 会先于普通路由处理它：
+
+- 机器人发的、正文匹配 `header_regex` 的提问：登记为一条「需要你定」，消息本身不投递；
+- 你的回复：引用了哪条就送回哪条的会话；没引用且只有一条未结就送给它；否则送总线并附未结列表，由总线 `sheepdog forward --message-ids` 转交。送达时标「✅ 主人在飞书的回复（已核对：发送人是主人本人账号）」并附问题摘要，不走安全闸；
+- 其他消息一律丢弃。超过 `open_hours` 未答的自动关闭。
 
 回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
 

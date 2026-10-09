@@ -21,7 +21,7 @@ ME = "ou_test_me"
 REPO = Path(__file__).resolve().parent.parent
 FIXTURES = REPO / "tests" / "fixtures" / "playbook"
 PREFIX = "🐕 [Agent 代回] "
-DROP_PREFIX = "🐕 [sheepdog·"
+DROP_PREFIX = "FX-DROP·"
 
 
 def test_config(state_dir: Path) -> Config:

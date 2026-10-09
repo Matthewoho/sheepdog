@@ -15,7 +15,7 @@ from .prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboard
                       retirement_prompt, roster_table, watch_message)
 from .roster import Roster
 from .security import HOLD, NONE, SecurityConfig, quote_verified
-from .router import DISPATCH, SELF, RouteContext, RouteDecision, route
+from .router import DISPATCH, DROP, SELF, RouteContext, RouteDecision, message_bodies, route
 from .sink import Sink, SinkError
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_path
@@ -35,6 +35,29 @@ WATCH_SLOTS = ("nudged_15_at", "nudged_30_at")
 SECURITY_HOLD_TAG = "security_hold"
 # hold 消息凭已核对的主人原话转交后打上，投递时不再被拉回总线
 SECURITY_RELEASE_TAG = "security_release:quote"
+# 主人在 IM 上的回复（7.8）：发送人已由 IM 账号核实；escalation:<提问消息 id> 记它回答的是哪条「需要你定」
+OWNER_VERIFIED_TAG = "owner_verified"
+ESCALATION_TAG_PREFIX = "escalation:"
+
+
+def open_escalations(store: Store, open_hours: float, topic_id: str | None = None) -> list:
+    """未结的「需要你定」：没关闭、且提问时间在 open_hours 内（超时的即使还没被每轮检查关掉也不算）。"""
+    cutoff = _now() - timedelta(hours=open_hours)
+    out = []
+    for e in store.open_escalations(topic_id):
+        asked = _parse(e["asked_at"])
+        if asked is None or asked.tzinfo is None or asked >= cutoff:
+            out.append(e)
+    return out
+
+
+def escalation_summary(e, limit: int = 120) -> str:
+    text = " ".join((e["text"] or "").split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def escalation_note(e) -> str:
+    return f"回复的问题（topic `{e['topic_id']}`，{e['asked_at']}，message_id `{e['message_id']}`）：{escalation_summary(e)}"
 
 
 def predecessor_topic_id(topic_id: str) -> str:
@@ -111,6 +134,8 @@ class Collector:
         row = self.store.get_message(message_id)
         if row is None or row["route"] != DISPATCH:
             return NONE
+        if self.cfg.self_open_id and row["sender_id"] == self.cfg.self_open_id:
+            return NONE  # 主人本人的消息不走安全闸（7.8）
         names, action = self.security.evaluate(row_to_message(row))
         tags = json.loads(row["tags_json"] or "[]")
         topic_id = row["topic_id"]
@@ -169,11 +194,19 @@ class Collector:
         ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
         stats = {"fetched": len(msgs), "new": 0, "changed": 0, "dispatch": 0, "inbox": 0, "drop": 0, "self": 0}
 
-        # 先入账自己发的消息，保证同批次里「回复我」能判定
-        msgs.sort(key=lambda m: (0 if m.sender_id == self.cfg.self_open_id else 1, m.create_time))
+        # 先入账「找主人」聊天里机器人的提问（同批次里主人的回复才找得到它），再入账自己发的消息
+        # （保证同批次里「回复我」能判定），最后其他
+        esc_chats = set(self.cfg.escalation.chat_ids)
+        me = self.cfg.self_open_id
+        msgs.sort(key=lambda m: (0 if m.chat_id in esc_chats and m.sender_id != me else 1 if m.sender_id == me else 2,
+                                 m.create_time))
         for m in msgs:
             existing = self.store.get_message(m.message_id)
-            if existing is None:
+            if existing is None and m.chat_id in esc_chats:
+                d = self._escalation_message(m)
+                stats["new"] += 1
+                stats[d.route] = stats.get(d.route, 0) + 1
+            elif existing is None:
                 d, topic_id, w = self._decide(m, ctx)
                 self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id)
                 if d.route == DISPATCH:
@@ -191,6 +224,63 @@ class Collector:
         self.store.set_meta("last_poll", now_iso())
         return stats
 
+    # ---------- 「找主人」聊天（7.8） ----------
+    def _escalation_message(self, m: Message) -> RouteDecision:
+        """先于普通路由，不受 ignore_chat_ids 影响。三种结果：登记提问 / 主人的回复 / 其他一律 drop。"""
+        esc = self.cfg.escalation
+        me = self.cfg.self_open_id
+        if me and m.sender_id == me:
+            return self._owner_reply(m)
+        if m.sender_type in ("app", "bot") and esc.pattern is not None:
+            topic = next((mt.group("topic") for b in message_bodies(m.content)
+                          if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
+            if topic:
+                d = RouteDecision(DROP, "escalation_asked")
+                self.store.upsert_message(m, d.route, d.reason, [f"escalation_topic:{topic}"])
+                if self._escalation_target_ok(topic):
+                    self.store.add_escalation(m.message_id, topic, m.chat_id, m.content, m.create_time or now_iso())
+                    log.info("登记「需要你定」%s -> %s", m.message_id, topic)
+                else:
+                    log.warning("「需要你定」%s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
+                return d
+        d = RouteDecision(DROP, "escalation_chat_other")
+        self.store.upsert_message(m, d.route, d.reason, [])
+        return d
+
+    def _escalation_target_ok(self, topic_id: str) -> bool:
+        # 名册里的 managed 会话，或总线自己（总线也会找主人）。看名册本身：新账本第一轮还没同步 topics 表
+        if topic_id == BUS_TOPIC_ID:
+            return True
+        if self.roster is not None:
+            s = self.roster.by_topic(topic_id)
+            return bool(s and s.mode == "managed")
+        t = self.store.get_topic(topic_id)
+        return bool(t and t["kind"] == ADOPTED and t["state"] != sm.CLOSED)
+
+    def _owner_reply(self, m: Message) -> RouteDecision:
+        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；没引用且只有一条未结就投给它；
+        否则投总线并附上当前未结列表。不走安全闸（发送人已由 IM 账号核实）。"""
+        opens = open_escalations(self.store, self.cfg.escalation.open_hours)
+        target = self.store.get_escalation(m.reply_to) if m.reply_to else None
+        if target is None and len(opens) == 1:
+            target = opens[0]
+        tags = [OWNER_VERIFIED_TAG]
+        d = RouteDecision(DISPATCH, "matthew_reply", tags)
+        if target is not None:
+            tags.append(ESCALATION_TAG_PREFIX + target["message_id"])
+            self.store.upsert_message(m, d.route, d.reason, tags, target["topic_id"])
+            self.store.set_note(m.message_id, escalation_note(target))
+            log.info("主人的回复 %s -> %s（回答 %s）", m.message_id, target["topic_id"], target["message_id"])
+            return d
+        self.store.upsert_message(m, d.route, d.reason, tags, BUS_TOPIC_ID)
+        lines = [f"主人的回复 `{m.message_id}` 没有引用具体问题，当前未结的「需要你定」{len(opens)} 条："]
+        lines += [f"- topic `{e['topic_id']}` | {e['asked_at']} | message_id `{e['message_id']}` | {escalation_summary(e)}"
+                  for e in opens] or ["- （无）"]
+        lines.append("判断它回答的是哪一条后，用 `sheepdog forward --topic <topic> --message-ids " + m.message_id + "` 转交。")
+        self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "\n".join(lines))
+        log.info("主人的回复 %s 无法确定回答哪条（未结 %d 条），投总线", m.message_id, len(opens))
+        return d
+
     def _handle_change(self, old, m: Message, ctx: RouteContext) -> bool:
         """编辑 / 撤回：按原消息的路由级别处理（设计稿 2.2.1）。返回是否有变化。"""
         content_changed = (old["content"] or "") != (m.content or "")
@@ -198,6 +288,10 @@ class Collector:
         if not content_changed and not recalled:
             return False
         old_route, old_state = old["route"], old["dispatch_state"]
+        if m.chat_id in self.cfg.escalation.chat_ids and old_route != DISPATCH:
+            # 「找主人」聊天里没投递过的消息（提问 / 其他）编辑后只更新内容，不重新路由
+            self.store.update_content(m.message_id, m)
+            return True
         if old_route == DISPATCH and old_state in ("delivered", "acked", "missed"):
             # 已推送过：通知原来那个 session（topic_id 不变；撤回附原文，编辑附新内容）
             if recalled:
@@ -467,6 +561,11 @@ class Dispatcher:
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
         ids = [r["message_id"] for r in rows]
+        # 主人的回复已送到提问的会话：对应的「需要你定」标记已答
+        for r in rows:
+            for tag in json.loads(r["tags_json"] or "[]"):
+                if tag.startswith(ESCALATION_TAG_PREFIX):
+                    self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
         self.store.record_dispatch(batch_id, t["topic_id"], ids)
         self.store.mark_batch(ids, batch_id, t["topic_id"], "delivered")
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
@@ -485,6 +584,7 @@ class Dispatcher:
             self._check_receipt(self.store.get_topic(tid))
         self._check_handovers()
         self._tick_watches(set(tids))
+        self._expire_escalations()
 
         rows = self.store.pending_dispatch()
         groups: dict[str, list] = {}
@@ -620,6 +720,15 @@ class Dispatcher:
             ts = now_iso()
             self.store.update_watch(w["id"], **{WATCH_SLOTS[j]: ts for j in range(i + 1) if not w[WATCH_SLOTS[j]]})
 
+    def _expire_escalations(self) -> None:
+        """超过 open_hours 未答的「需要你定」自动关闭（只关闭，不提醒）。"""
+        cutoff = _now() - timedelta(hours=self.cfg.escalation.open_hours)
+        for e in self.store.open_escalations():
+            asked = _parse(e["asked_at"])
+            if asked is not None and asked.tzinfo is not None and asked < cutoff:
+                self.store.expire_escalation(e["message_id"])
+                log.info("「需要你定」%s（%s）超时未答，已关闭", e["message_id"], e["topic_id"])
+
     def init(self) -> dict:
         """sheepdog init：同步名册；没有总线就建；给未 onboarding 的 managed 会话发 onboarding。可重复执行。"""
         report: dict = {"roster": self.sync_roster(), "onboarding": {}}
@@ -688,10 +797,11 @@ def bus_quote_verifier(store: Store, max_age_hours: float):
 
 
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
-                     verify_quote=None) -> list[str]:
+                     verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24) -> list[str]:
     """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
     下一轮完成，因此同样受人类接管、onboarding 约束。
 
+    - 主人本人发的消息（sender_id == self_open_id）带「已核对」标注，并关闭目标会话最近一条未结的「需要你定」。
     - quote 必须通过 verify_quote 核对（没给核对器一律拒绝），投递时标成已核对的主人原话；note 不核对，标成总线备注。
     - 被安全规则 hold 的消息只能带已核对的 quote 转交。
     - 目标是总线、known、已移除或不存在时抛 ValueError。
@@ -716,6 +826,14 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
         if i in held and SECURITY_RELEASE_TAG not in tags:
             tags.append(SECURITY_RELEASE_TAG)
+        if self_open_id and row["sender_id"] == self_open_id:
+            # 主人本人的消息（7.8）：带已核对标注，不需要 --quote；目标会话最近一条未结的「需要你定」标记已答
+            if OWNER_VERIFIED_TAG not in tags:
+                tags.append(OWNER_VERIFIED_TAG)
+            opens = open_escalations(store, escalation_open_hours, topic_id)
+            if opens:
+                store.answer_escalation(opens[0]["message_id"], i)
+                store.set_note(i, escalation_note(opens[0]))
         store.forward_message(i, topic_id, tags)
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
