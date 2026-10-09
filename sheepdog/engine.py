@@ -17,7 +17,7 @@ from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstr
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
-from .router import DISPATCH, DROP, SELF, RouteContext, RouteDecision, message_bodies, route
+from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
 from .sink import Sink, SinkError
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_path
@@ -150,9 +150,72 @@ class Collector:
         self.acker = acker
         self._sender_cache: dict[str, str] = {}
         self._dynamic: dict[str, tuple[str, bool]] = {}
+        # 正在冷却的聊天（7.14）：chat_id → until
+        self._cooling: dict[str, datetime] = {}
 
     def _decide(self, m: Message, ctx: RouteContext):
-        """路由 → 名册归属 → 等待归属。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
+        """路由 → 名册归属 → 等待归属 → 防循环。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
+        d, topic_id, w = self._decide_inner(m, ctx)
+        if d.route == SELF:
+            return d, topic_id, w
+        if self._is_agent(m):
+            d = RouteDecision(d.route, d.reason, [*d.tags, "agent_sender"])
+        until = self._cooling.get(m.chat_id)
+        if until and _now() < until and d.route in (DISPATCH, INBOX):
+            # 疑似循环冷却中：除主人本人以外一律进 Inbox，不投给任何会话（等待也不算收到回复）
+            return RouteDecision(INBOX, "loop_guard", d.tags), None, None
+        return d, topic_id, w
+
+    def _is_agent(self, m: Message) -> bool:
+        lg = self.cfg.loop_guard
+        if lg.treat_all_bots_as_agents and m.sender_type in ("app", "bot"):
+            return True
+        if m.sender_id and m.sender_id in lg.agent_sender_ids:
+            return True
+        name = (m.sender_name or "").lower()
+        return any(n.lower() in name for n in lg.agent_sender_names)
+
+    def _refresh_cooling(self) -> None:
+        now = _now()
+        self._cooling = {}
+        for e in self.store.open_loop_events():
+            until = _parse(e["until"])
+            if until and until > now and e["chat_id"] not in self._cooling:
+                self._cooling[e["chat_id"]] = until
+
+    def _loop_check(self, m: Message) -> None:
+        """会话代回（主人身份、带代回前缀）计数：window 内超过 max_agent_replies → 该聊天冷却，并提示总线一次。"""
+        lg, me = self.cfg.loop_guard, self.cfg.self_open_id
+        prefixes = self.cfg.owner_context.skip_prefixes
+        if not prefixes or m.chat_id in self.cfg.escalation.chat_ids:
+            return
+        if not any(b.startswith(p) for b in message_bodies(m.content) for p in prefixes):
+            return
+        until = self._cooling.get(m.chat_id)
+        if until and _now() < until:
+            return  # 已在冷却，不重复触发
+        start = _now() - timedelta(minutes=lg.window_minutes)
+        n = 0
+        for r in self.store.own_messages_in_chat(m.chat_id, me):
+            t = _parse(r["create_time"])
+            if t is None or t.tzinfo is None or t < start:
+                continue
+            if any(b.startswith(p) for b in message_bodies(r["content"]) for p in prefixes):
+                n += 1
+        if n <= lg.max_agent_replies:
+            return
+        until = _now() + timedelta(minutes=lg.cooldown_minutes)
+        name = m.chat_name or m.chat_id
+        self.store.add_loop_event(m.chat_id, name, n, until.isoformat(timespec="seconds"))
+        self._cooling[m.chat_id] = until
+        log.warning("疑似循环：%s（%s）%g 分钟内代回 %d 次，暂停 %g 分钟", name, m.chat_id, lg.window_minutes, n,
+                    lg.cooldown_minutes)
+        self.store.add_system_message(
+            BUS_TOPIC_ID, "loop_guard",
+            f"⚠️ 疑似循环：{name}（`{m.chat_id}`），{lg.window_minutes:g} 分钟内代回 {n} 次，已暂停 {lg.cooldown_minutes:g} 分钟。"
+            f"期间该聊天除主人以外的消息只进 Inbox；手动解除：`sheepdog loops --clear {m.chat_id}`")
+
+    def _decide_inner(self, m: Message, ctx: RouteContext):
         d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids,
                                       self._dynamic)
         # 等待中的回复优先归给登记等待的 topic（7.4），覆盖聊天归属、总线、Inbox、免打扰；
@@ -233,6 +296,7 @@ class Collector:
         msgs = self.source.fetch_since(start.isoformat(timespec="seconds"))
         ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
         self._dynamic = dynamic_owners(self.store)
+        self._refresh_cooling()
         stats = {"fetched": len(msgs), "new": 0, "changed": 0, "dispatch": 0, "inbox": 0, "drop": 0, "self": 0}
 
         # 先入账「找主人」聊天里机器人的提问（同批次里主人的回复才找得到它），再入账自己发的消息
@@ -255,6 +319,7 @@ class Collector:
                 if d.route == DISPATCH:
                     self._close_watch(w, m.message_id, self._secure(m.message_id))
                 elif d.route == SELF and me and m.sender_id == me:
+                    self._loop_check(m)
                     self._owner_context(m)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1

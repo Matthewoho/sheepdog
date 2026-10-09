@@ -20,6 +20,7 @@
   sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
   sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title ...]   给会话补发 / 手动发退休通知
   sheepdog actions [--all]                               排队 / 完成 / 失败的动作
+  sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
 
@@ -142,6 +143,11 @@ def cmd_doctor(args) -> int:
         ok = False
     a = cfg.ack
     print(f"确认表情: {'✓ ' + a.emoji_type + '，点: ' + ','.join(a.reasons) + '；回复后撤: ' + ','.join(a.remove_on_reply_reasons) + '；bot 身份点: ' + (','.join(a.bot_reasons) or '-') if a.enabled else '（未配置 [ack]，不点表情）'}")
+    lg = cfg.loop_guard
+    print(f"防循环: Agent 名字 {len(lg.agent_sender_names)} 个 / id {len(lg.agent_sender_ids)} 个 / "
+          f"机器人一律算 Agent {'是' if lg.treat_all_bots_as_agents else '否'}；"
+          f"{lg.window_minutes:g} 分钟内代回超过 {lg.max_agent_replies} 次冷却 {lg.cooldown_minutes:g} 分钟"
+          + ("" if cfg.owner_context.skip_prefixes else "（⚠ owner_context.skip_prefixes 为空，无法识别代回，熔断不生效）"))
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
@@ -627,6 +633,32 @@ def cmd_actions(args) -> int:
     return 0
 
 
+def cmd_loops(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    if args.clear:
+        n = store.clear_loop(args.clear)
+        print(f"已解除 {args.clear} 的冷却（{n} 条记录）" if n else f"{args.clear} 没有冷却记录")
+        return 0
+    now = datetime.now().astimezone()
+    active = []
+    for e in store.open_loop_events():
+        until = datetime.fromisoformat(e["until"])
+        if until > now and e["chat_id"] not in {a["chat_id"] for a in active}:
+            active.append(e)
+    print(f"冷却中 {len(active)} 个聊天" + ("：" if active else ""))
+    for e in active:
+        print(f"- {e['chat_name'] or e['chat_id']}（{e['chat_id']}）到 {e['until']}，触发时代回 {e['replies']} 次")
+    recent = store.list_loop_events(10)
+    if recent:
+        print("最近触发记录：")
+    for e in recent:
+        state = "已手动解除" if e["cleared_at"] else ("冷却中" if datetime.fromisoformat(e["until"]) > now else "已结束")
+        print(f"- [{state}] {e['triggered_at']} {e['chat_name'] or e['chat_id']}（{e['chat_id']}）代回 {e['replies']} 次，"
+              f"冷却到 {e['until']}")
+    return 0
+
+
 def cmd_close_session(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
@@ -742,6 +774,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("actions")
     sp.add_argument("--all", action="store_true", help="全部（默认只看排队中和最近 10 条已完成）")
     sp.set_defaults(func=cmd_actions)
+
+    sp = sub.add_parser("loops")
+    sp.add_argument("--clear", default="", help="手动解除这个聊天的冷却")
+    sp.set_defaults(func=cmd_loops)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

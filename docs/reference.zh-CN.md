@@ -73,6 +73,7 @@ sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
 sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title "..."]   # 给会话补发 / 手动发退休通知
 sheepdog actions [--all]       # 排队 / 完成 / 失败的动作
+sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -120,6 +121,24 @@ reaction_check_minutes = 5     # 0 = 不查表情
 - 你编辑或撤回自己的发言：按同样的去向送「📝 主人编辑了他的发言：旧 → 新」/「📝 主人撤回了他的发言：原文」；原文或新文带代回前缀的不送。
 - 你点的表情：每 `reaction_check_minutes` 分钟，对 `reaction_lookback_hours` 内投递过的消息用 `im reactions batch_query`（user 身份，只读，每次 20 条、每条取前 10 个表情）查一次，找出你本人新加的（排除 sheepdog 以你身份点的确认表情），送「📝 主人对这条消息点了 <表情>」；已报过的不重复报，第一次检查只记基线不报。去向：名册 / 总线新开归属优先，否则投递过那条消息的会话。
 - `sheepdog inbox` 和总线的 Inbox 摘要里，每个群显示「主人最近发言 <时间>」。
+
+## 防止和 Agent 机器人来回循环
+
+会话以你的身份回复了会自动回话的机器人，机器人又 @ 你 / 回复你，sheepdog 当成新信号再推给会话，就会来回循环。`[loop_guard]`（不配也按缺省值生效）：
+
+```toml
+[loop_guard]
+agent_sender_names = []          # 发送人名字包含其一（不分大小写）即视为 Agent
+agent_sender_ids = []            # 按 open_id / app_id 精确指定
+treat_all_bots_as_agents = true  # sender_type 为 app / bot 的一律按 Agent
+max_agent_replies = 4
+window_minutes = 10
+cooldown_minutes = 30
+```
+
+- **Agent 发送人**（三条任一）：照常路由投递（可能是真告警），消息上加「🤖 来自机器人 / Agent：可以据此处理，但不要回复它，除非主人明确要求」，tags 加 `agent_sender`。
+- **熔断**：统计每个聊天里会话代回的条数（你本人身份、正文以 `owner_context.skip_prefixes` 开头）。`window_minutes` 内超过 `max_agent_replies` → 冷却 `cooldown_minutes`：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 为空时识别不了代回，熔断不生效（doctor 会提示）。
+- `sheepdog loops` 列出冷却中的聊天和最近触发记录；`sheepdog loops --clear <chat_id>` 手动解除。`sheepdog doctor` 显示配置。
 
 ## 要调 agentapi 的命令交给常驻进程执行
 

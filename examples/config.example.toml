@@ -63,6 +63,15 @@ skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话�
 reaction_lookback_hours = 24   # 查你对多久内投递过的消息点了表情
 reaction_check_minutes = 5     # 多久查一次表情；0 = 不查（查询只读）
 
+[loop_guard]
+# 防止会话和 Agent 机器人来回循环（不配也按下面的缺省值生效）
+agent_sender_names = ["agent-bot-a", "agent-bot-b"]  # 发送人名字包含其一（不分大小写）即视为 Agent，填你那边会自动回话的机器人
+agent_sender_ids = []                                 # 也可以按 open_id / app_id 精确指定
+treat_all_bots_as_agents = true                       # 机器人 / 应用发的一律按 Agent：照常投递，但标注「不要回复它」
+max_agent_replies = 4    # 同一聊天 window_minutes 内会话代回（带 owner_context.skip_prefixes 前缀）超过这么多次 → 熔断
+window_minutes = 10
+cooldown_minutes = 30    # 冷却期间该聊天除你以外的消息只进 Inbox；sheepdog loops --clear <chat_id> 手动解除
+
 [bus]
 # 总线每天最多临时新开几个专属会话（sheepdog new-session）；0 = 禁止总线新开
 max_new_sessions_per_day = 5

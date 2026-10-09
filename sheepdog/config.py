@@ -148,6 +148,31 @@ class OwnerContextConfig:
 
 
 @dataclass
+class LoopGuardConfig:
+    # 防止和 Agent 机器人来回循环（7.14）。名字 / id 的具体值只写在个人配置里
+    agent_sender_names: list[str] = field(default_factory=list)   # 发送人名字包含其一（不分大小写）即视为 Agent
+    agent_sender_ids: list[str] = field(default_factory=list)     # 按 open_id / app_id 精确指定
+    treat_all_bots_as_agents: bool = True                         # sender_type 为 app/bot 的一律按 Agent
+    max_agent_replies: int = 4        # 同一聊天 window_minutes 内会话代回超过这么多次 → 熔断
+    window_minutes: float = 10
+    cooldown_minutes: float = 30
+
+    def validate(self) -> None:
+        for k in ("agent_sender_names", "agent_sender_ids"):
+            v = getattr(self, k)
+            if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+                raise ConfigError(f"[loop_guard] {k} 必须是非空字符串列表")
+        if not isinstance(self.treat_all_bots_as_agents, bool):
+            raise ConfigError("[loop_guard] treat_all_bots_as_agents 必须是 true/false")
+        if isinstance(self.max_agent_replies, bool) or not isinstance(self.max_agent_replies, int) or self.max_agent_replies < 1:
+            raise ConfigError("[loop_guard] max_agent_replies 必须是 >= 1 的整数")
+        for k in ("window_minutes", "cooldown_minutes"):
+            v = getattr(self, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                raise ConfigError(f"[loop_guard] {k} 必须是正数")
+
+
+@dataclass
 class BusConfig:
     # 总线每天（本地日历日）最多新开几个会话（7.10）；0 = 禁止总线新开
     max_new_sessions_per_day: int = 5
@@ -210,6 +235,7 @@ class Config:
     ack: AckConfig = field(default_factory=AckConfig)
     bus: BusConfig = field(default_factory=BusConfig)
     owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
+    loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -271,6 +297,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.escalation, data.get("escalation", {}))
         _apply(cfg.bus, data.get("bus", {}))
         _apply(cfg.owner_context, data.get("owner_context", {}))
+        _apply(cfg.loop_guard, data.get("loop_guard", {}))
         if isinstance(data.get("ack"), dict):
             _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
             cfg.ack.enabled = True
@@ -281,6 +308,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.ack.validate()
     cfg.bus.validate()
     cfg.owner_context.validate()
+    cfg.loop_guard.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

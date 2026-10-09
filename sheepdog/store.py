@@ -142,6 +142,18 @@ CREATE TABLE IF NOT EXISTS owner_reactions (
     PRIMARY KEY (message_id, emoji_type, operator_id)
 );
 
+-- 疑似和 Agent 机器人循环的熔断记录（7.14）：until 之前该聊天非主人的消息进 Inbox
+CREATE TABLE IF NOT EXISTS loop_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      TEXT NOT NULL,
+    chat_name    TEXT,
+    triggered_at TEXT NOT NULL,
+    replies      INTEGER,              -- 触发时 window 内的会话代回次数
+    until        TEXT NOT NULL,
+    cleared_at   TEXT                  -- 手动解除时间
+);
+CREATE INDEX IF NOT EXISTS idx_loop_chat ON loop_events(chat_id, until);
+
 -- 会话发起、要调 agentapi 的动作（7.12）：只有常驻进程能跨项目投递，其他进程只入队，由 run 每轮执行
 CREATE TABLE IF NOT EXISTS actions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -368,6 +380,30 @@ class Store:
         """sheepdog 以主人身份点的确认表情：查主人表情时要排除。"""
         return {r[0] for r in self.conn.execute(
             "SELECT reaction_id FROM acks WHERE reaction_id IS NOT NULL AND (identity IS NULL OR identity='user')")}
+
+    # ---------- loop guard ----------
+    def own_messages_in_chat(self, chat_id: str, self_open_id: str, limit: int = 200) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE chat_id=? AND sender_id=? ORDER BY first_seen DESC LIMIT ?",
+            (chat_id, self_open_id, limit)).fetchall()
+
+    def add_loop_event(self, chat_id: str, chat_name: str, replies: int, until_iso: str) -> int:
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO loop_events(chat_id,chat_name,triggered_at,replies,until) VALUES(?,?,?,?,?)",
+                            (chat_id, chat_name, now_iso(), replies, until_iso))
+            return int(cur.lastrowid)
+
+    def open_loop_events(self) -> list[sqlite3.Row]:
+        """没被手动解除的熔断记录（是否还在冷却由调用方按 until 判断）。"""
+        return self.conn.execute("SELECT * FROM loop_events WHERE cleared_at IS NULL ORDER BY id DESC").fetchall()
+
+    def list_loop_events(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM loop_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def clear_loop(self, chat_id: str) -> int:
+        with self.tx() as c:
+            return c.execute("UPDATE loop_events SET cleared_at=? WHERE chat_id=? AND cleared_at IS NULL",
+                             (now_iso(), chat_id)).rowcount
 
     def last_delivered_topic(self, chat_id: str, since_iso: str) -> str | None:
         """since 之后最近一次把这个聊天（别人发的）消息投递出去的 topic。"""
