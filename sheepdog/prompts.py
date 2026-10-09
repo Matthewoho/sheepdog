@@ -308,7 +308,15 @@ def _mention_line(mentions_json: str) -> str:
     return ("@了：" + "、".join(dict.fromkeys(names))) if names else ""
 
 
-def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
+def quote_line(quoted) -> str:
+    """↪ 回复的是：被引用消息的发送人和摘要（7.15）。quoted 是账本里那条消息，None = 账本里没有。"""
+    if quoted is None:
+        return "↪ 回复的是：（原文不在账本里）"
+    text = " ".join((quoted["content"] or "").split())
+    return f"↪ 回复的是：{_person(quoted['sender_name'], quoted['sender_id'])}：{text[:80] + ('…' if len(text) > 80 else '')}"
+
+
+def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "") -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -322,6 +330,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
     mentions = _mention_line(row["mentions_json"])
     if mentions:
         lines.append(mentions)
+    if quote:
+        lines.append(quote)
     if "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
     if row["reason"] == "owner_context":
@@ -345,7 +355,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "") -> str:
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
-                 context_only: bool = False) -> str:
+                 context_only: bool = False, quotes: dict | None = None) -> str:
     parts = []
     if rules_update:
         # 规则变了：完整现行规则放在这批最前面（7.11）
@@ -353,7 +363,9 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     parts += [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
-    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title)) for r in rows]
+    quotes = quotes or {}
+    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""))
+              for r in rows]
     if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]

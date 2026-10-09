@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS escalations (
     close_reason      TEXT               -- answered | expired
 );
 
+-- 机器人发给主人的消息来自哪个 topic（7.15）：主人引用回复它时按这里送回
+CREATE TABLE IF NOT EXISTS bot_outbox (
+    message_id  TEXT PRIMARY KEY,
+    topic_id    TEXT NOT NULL,
+    is_question INTEGER DEFAULT 0,     -- 同时匹配 header_regex（问题仍照旧进 escalations）
+    text        TEXT,
+    sent_at     TEXT
+);
+
 -- 确认表情（7.9）：消息送达会话后以主人身份点的表情；主人回复后撤下。每条消息只点一次，失败不重试
 CREATE TABLE IF NOT EXISTS acks (
     message_id   TEXT PRIMARY KEY,
@@ -510,6 +519,14 @@ class Store:
         with self.tx() as c:
             c.execute("""INSERT OR IGNORE INTO escalations(message_id,topic_id,chat_id,text,asked_at)
                          VALUES(?,?,?,?,?)""", (message_id, topic_id, chat_id, text, asked_at))
+
+    def add_bot_outbox(self, message_id: str, topic_id: str, is_question: bool, text: str, sent_at: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR IGNORE INTO bot_outbox(message_id,topic_id,is_question,text,sent_at) VALUES(?,?,?,?,?)",
+                      (message_id, topic_id, int(is_question), text, sent_at))
+
+    def get_bot_outbox(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM bot_outbox WHERE message_id=?", (message_id,)).fetchone()
 
     def get_escalation(self, message_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM escalations WHERE message_id=?", (message_id,)).fetchone()

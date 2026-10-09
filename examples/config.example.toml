@@ -32,7 +32,7 @@ dispatch_bot_p2p = false
 ignore_chat_ids = []
 # 机器人/应用发的消息正文以其中任一前缀开头就丢弃（reason = self_escalation）。
 # [escalation] 接管找你的聊天后已不需要它防回环，保留作其他聊天的兜底
-drop_bot_message_prefixes = ["🐕 [sheepdog·"]
+drop_bot_message_prefixes = ["🐕 需要你定 ·", "🐕 汇报 ·", "🐕 回复 ·", "🐕 [sheepdog·"]
 watch_chat_ids = []
 # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
 keyword_skip_bot_senders = true
@@ -51,9 +51,16 @@ reply_prefix = "🐕 [Agent 代回] "
 # 「找你」用的聊天（机器人与你的私聊）。其中：机器人带头的提问登记为「需要你定」；你的回复投回提问的会话；其他丢弃
 chat_ids = []
 # 从机器人提问正文里提取 topic_id，必须有命名分组 topic；和 playbook/common.md 里约定的开头保持一致
-header_regex = '^🐕 \[sheepdog·[^\]]*·(?P<topic>tp_[a-z0-9_.-]+)\] 需要你定：'
+# 新格式第一行：🐕 需要你定 · <短标题> [tp_xxx]；同时兼容旧格式 🐕 [sheepdog·<标题>·tp_xxx] 需要你定：
+header_regex = '^🐕 (?=.*需要你定).*?\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'
+# 机器人发给你的任何消息（问题、汇报、回复）：第一行里 [… tp_xxx] 认出来自哪个会话；你引用回复它时按这个送回
+attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'
 # 一条「需要你定」多久内算未结，超时自动关闭
 open_hours = 24
+
+[escalation.aliases]
+# 第一行没有 topic_id、只有 [..·名字] 时，按名字认会话；认不出再和各会话标题比（唯一命中才算）
+"总线" = "tp_bus"
 
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态

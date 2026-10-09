@@ -58,12 +58,12 @@ class OwnerContextTest(_OwnerBase):
         self.poll([mine("om_test_m1", "oc_test_alpha_p2p", "可以，下周三给你", chat_type="p2p", reply_to="om_test_a1")])
         r = self.row("om_test_m1")
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_context", "tp_alpha"))
-        self.assertIn("回复的是 Alice（ou_test_alice）：能下周给吗", r["note"])
         state_before = self.store.get_topic("tp_alpha")["state"]
         res = self.d.dispatch_once()
         text = self.sink.to("conv_test_alpha")[-1]
         self.assertIn(OWNER_CONTEXT_LABEL, text)
         self.assertIn("> 可以，下周三给你", text)
+        self.assertIn("↪ 回复的是：Alice（ou_test_alice）：能下周给吗", text)
         self.assertIn("不需要回执", text)
         self.assertNotIn("处理完成后提交回执", text)
         t = self.store.get_topic("tp_alpha")

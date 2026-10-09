@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from .config import Config
 from .models import Message
 from .playbook import Playbook
 from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
-                      relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
+                      quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
@@ -387,12 +388,8 @@ class Collector:
         topic_id = self._owner_context_target(m.chat_id)
         if not topic_id:
             return
-        note = ""
-        if m.reply_to and (r := self.store.get_message(m.reply_to)) is not None:
-            text = " ".join((r["content"] or "").split())
-            note = (f"回复的是 {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）："
-                    f"{text[:80] + ('…' if len(text) > 80 else '')}")
-        self.store.route_owner_context(m.message_id, topic_id, note)
+        # 回复的是哪条由投递时统一附的「↪ 回复的是」说明（7.15）
+        self.store.route_owner_context(m.message_id, topic_id, "")
         log.info("主人的发言 %s 作为背景送给 %s", m.message_id, topic_id)
 
     def _owner_edit(self, old, m: Message, recalled: bool) -> None:
@@ -478,21 +475,61 @@ class Collector:
         me = self.cfg.self_open_id
         if me and m.sender_id == me:
             return self._owner_reply(m)
-        if m.sender_type in ("app", "bot") and esc.pattern is not None:
-            topic = next((mt.group("topic") for b in message_bodies(m.content)
-                          if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
+        if m.sender_type in ("app", "bot"):
+            question = ""
+            if esc.pattern is not None:
+                question = next((mt.group("topic") for b in message_bodies(m.content)
+                                 if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
+            topic = question or self._attribute(m)
             if topic:
-                d = RouteDecision(DROP, "escalation_asked")
+                ok = self._escalation_target_ok(topic)
+                d = RouteDecision(DROP, "escalation_asked" if question else "escalation_bot_message")
                 self.store.upsert_message(m, d.route, d.reason, [f"escalation_topic:{topic}"])
-                if self._escalation_target_ok(topic):
+                if ok:
+                    # 7.15：机器人发给主人的每条消息都记来源，主人引用回复它时按这里送回
+                    self.store.add_bot_outbox(m.message_id, topic, bool(question), m.content, m.create_time or now_iso())
+                if question and ok:
                     self.store.add_escalation(m.message_id, topic, m.chat_id, m.content, m.create_time or now_iso())
                     log.info("登记「需要你定」%s -> %s", m.message_id, topic)
-                else:
-                    log.warning("「需要你定」%s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
+                elif not ok:
+                    log.warning("机器人消息 %s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
                 return d
         d = RouteDecision(DROP, "escalation_chat_other")
         self.store.upsert_message(m, d.route, d.reason, [])
         return d
+
+    # 机器人消息第一行里的 [..] 标签（7.15）：按「·」拆开逐段和 aliases、会话标题比
+    _BRACKET = re.compile(r"\[([^\[\]]+)\]")
+
+    def _attribute(self, m: Message) -> str | None:
+        """机器人发给主人的消息来自哪个 topic：第一行先用 attribution_regex，认不出再用 aliases 和会话标题；唯一命中才算。"""
+        bodies = message_bodies(m.content)
+        text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
+        first = text.splitlines()[0] if text else ""
+        if not first:
+            return None
+        rx = self.cfg.escalation.attribution
+        if rx is not None and (mt := rx.search(first)) and mt.group("topic"):
+            return mt.group("topic")
+        names = [part.strip() for br in self._BRACKET.findall(first) for part in br.split("·") if part.strip()]
+        aliases = self.cfg.escalation.aliases or {}
+        hits = {aliases[n] for n in names if n in aliases}
+        if not hits:
+            titles = self._titles_for_attribution()
+            hits = {tid for n in names for tid, title in titles if title and (n == title or n in title or title in n)}
+        return hits.pop() if len(hits) == 1 else None
+
+    def _titles_for_attribution(self) -> list[tuple[str, str]]:
+        """会发消息给主人的会话（总线、名册 managed、总线新开）及去掉 title_prefix 的标题。"""
+        prefix = self.cfg.session.title_prefix
+        out = [(BUS_TOPIC_ID, self.cfg.session.bus_title)]
+        for t in self.store.list_topics():
+            if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED:
+                title = (t["title"] or "").strip()
+                if prefix and title.startswith(prefix):
+                    title = title[len(prefix):].strip()
+                out.append((t["topic_id"], title))
+        return out
 
     def _escalation_target_ok(self, topic_id: str) -> bool:
         # 名册里的 managed 会话，或总线自己（总线也会找主人）。看名册本身：新账本第一轮还没同步 topics 表
@@ -511,11 +548,33 @@ class Collector:
         （含只有一条）就投给它、回答其中最近的一条；未结分属不同会话或没有未结时投总线并附上列表。
         不走安全闸（发送人已由 IM 账号核实）。"""
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
-        target = self.store.get_escalation(m.reply_to) if m.reply_to else None
-        if target is None and opens and len({e["topic_id"] for e in opens}) == 1:
-            target = opens[0]  # 同一会话连问几条：直接投给它，关闭最近一条（与 forward 一致）
         tags = [OWNER_VERIFIED_TAG]
         d = RouteDecision(DISPATCH, "owner_reply", tags)
+        if m.reply_to:
+            # 7.15：有引用就按引用走，绝不当成没引用去匹配未结问题
+            target = self.store.get_escalation(m.reply_to)
+            if target is None:
+                out = self.store.get_bot_outbox(m.reply_to)
+                if out is not None:
+                    self.store.upsert_message(m, d.route, d.reason, tags, out["topic_id"])
+                    text = " ".join((out["text"] or "").split())
+                    self.store.set_note(m.message_id, f"回复的是 topic `{out['topic_id']}` 发给主人的消息（{out['sent_at']}）："
+                                                      f"{text[:120] + ('…' if len(text) > 120 else '')}")
+                    log.info("主人的回复 %s 引用了 %s 的消息 %s，送回", m.message_id, out["topic_id"], m.reply_to)
+                    return d
+                self.store.upsert_message(m, d.route, d.reason, tags, BUS_TOPIC_ID)
+                q = self.store.get_message(m.reply_to)
+                quoted = " ".join((q["content"] or "").split())[:200] if q is not None else "（原文不在账本里）"
+                self.store.add_system_message(
+                    BUS_TOPIC_ID, "escalation_list",
+                    f"主人引用回复了一条认不出来源的消息（message_id `{m.reply_to}`）：{quoted}\n"
+                    f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
+                    f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。")
+                log.info("主人的回复 %s 引用了认不出来源的消息 %s，投总线", m.message_id, m.reply_to)
+                return d
+        else:
+            target = opens[0] if opens and len({e["topic_id"] for e in opens}) == 1 else None
+            # 没引用：未结全属同一会话（含只有一条）就投给它，关闭最近一条（与 forward 一致）
         if target is not None:
             tags.append(ESCALATION_TAG_PREFIX + target["message_id"])
             self.store.upsert_message(m, d.route, d.reason, tags, target["topic_id"])
@@ -895,9 +954,13 @@ class Dispatcher:
             # 规则变了（或从没记录过指纹）：这批最前面带上完整现行规则（7.11）
             new_hash = self.rules_hash(t)
             rules_update = self.standing_rules(t) if new_hash and new_hash != t["rules_hash"] else ""
+            # 7.15：有引用的消息都附「↪ 回复的是」（从账本取被引用的那条）
+            quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"]))
+                      for r in rows if "reply_to" in r.keys() and r["reply_to"]}
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
-                                  security=self.security, rules_update=rules_update, context_only=not signals)
+                                  security=self.security, rules_update=rules_update, context_only=not signals,
+                                  quotes=quotes)
             self.sink.send_message(t["conversation_id"], prompt)
         except SinkError as e:
             self._fail(t, None, str(e))

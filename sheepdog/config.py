@@ -101,6 +101,10 @@ class EscalationConfig:
     header_regex: str = ""
     # 一条「需要你定」多久内算未结
     open_hours: float = 24
+    # 机器人发给主人的任何消息，从第一行认出来自哪个 topic（命名分组 topic，第一行任意位置）（7.15）
+    attribution_regex: str = ""
+    # 第一行 [..·名字] 里的名字 → topic_id（如 "总线" = "tp_bus"）；认不出时再和各会话标题比
+    aliases: dict = field(default_factory=dict)
 
     def validate(self) -> None:
         if not isinstance(self.chat_ids, list) or not all(isinstance(c, str) and c for c in self.chat_ids):
@@ -109,17 +113,27 @@ class EscalationConfig:
             raise ConfigError("escalation.open_hours 必须是正数")
         if self.chat_ids and not self.header_regex:
             raise ConfigError("escalation.chat_ids 已配置但 header_regex 为空：机器人的提问将无法识别")
-        if self.header_regex:
+        for key in ("header_regex", "attribution_regex"):
+            text = getattr(self, key)
+            if not text:
+                continue
             try:
-                rx = re.compile(self.header_regex)
+                rx = re.compile(text)
             except re.error as e:
-                raise ConfigError(f"escalation.header_regex 无效: {e}") from e
+                raise ConfigError(f"escalation.{key} 无效: {e}") from e
             if "topic" not in rx.groupindex:
-                raise ConfigError("escalation.header_regex 必须有命名分组 (?P<topic>...)")
+                raise ConfigError(f"escalation.{key} 必须有命名分组 (?P<topic>...)")
+        if not isinstance(self.aliases, dict) or not all(
+                isinstance(k, str) and k and isinstance(v, str) and v.startswith("tp_") for k, v in self.aliases.items()):
+            raise ConfigError("[escalation.aliases] 必须是「名字 = \"tp_xxx\"」")
 
     @property
     def pattern(self) -> re.Pattern | None:
         return re.compile(self.header_regex) if self.header_regex else None
+
+    @property
+    def attribution(self) -> re.Pattern | None:
+        return re.compile(self.attribution_regex) if self.attribution_regex else None
 
 
 @dataclass
@@ -295,6 +309,8 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.session, data.get("session", {}))
         _apply(cfg.watch, data.get("watch", {}))
         _apply(cfg.escalation, data.get("escalation", {}))
+        if "aliases" in data.get("escalation", {}):
+            cfg.escalation.aliases = data["escalation"]["aliases"]
         _apply(cfg.bus, data.get("bus", {}))
         _apply(cfg.owner_context, data.get("owner_context", {}))
         _apply(cfg.loop_guard, data.get("loop_guard", {}))

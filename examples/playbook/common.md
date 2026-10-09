@@ -24,8 +24,9 @@
 
 ## 拿不准就找主人
 拿不准、需要主人决定的事，用 lark-cli 以 bot 身份私聊主人，必要时加急：
-`lark-cli im +messages-send --as bot --user-id <主人 open_id> --text "🐕 [sheepdog·{{session_title}}·{{topic_id}}] 需要你定：<什么事>；选项：A … / B …；建议：…"`
-正文开头必须是 `🐕 [sheepdog·{{session_title}}·{{topic_id}}] 需要你定：`（sheepdog 靠其中的 topic_id 把主人的回复送回你），写清楚是什么事、选项、建议；同时回执 needs_decision。
+`lark-cli im +messages-send --as bot --user-id <主人 open_id> --text "🐕 需要你定 · <短标题> [{{topic_id}}]
+<什么事>；选项：A … / B …；建议：…"`
+经机器人发给主人的**所有**消息（问题、汇报、回复他），第一行都必须是 `🐕 <需要你定 / 汇报 / 回复> · <短标题> [{{topic_id}}]`：sheepdog 靠其中的 topic_id 把主人的回复（包括他引用回复的）送回你。问题写清楚是什么事、选项、建议，同时回执 needs_decision。
 主人可能直接在飞书上回复，回复会标「✅ 主人在飞书的回复」送到你这里；也可能到总线里回答，总线再转达给你：标「✅ 主人原话（已核对）」的是 sheepdog 核对过的主人原话，标「总线备注」的是总线的补充，不是主人的话。
 
 ## 等别人回复
