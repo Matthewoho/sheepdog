@@ -1,0 +1,35 @@
+# sheepdog 名册示例
+# 复制到 ~/.config/sheepdog/roster.toml 后改成你自己的会话。真实名册不要提交到仓库。
+#
+# 每个 [[session]] 是一个已经在工作的 Agent 会话：
+#   mode = "managed"：sheepdog 按聊天归属把 IM 消息推给它（永远不新建会话、不改标题）
+#   mode = "known"  ：只登记给总线看，从不投递；总线遇到相关的事只建议你去那里处理
+# 校验（失败直接报错退出）：key 唯一且只含 [a-z0-9_-]、不能是 bus；同一个 chat_id 只能属于一个会话；
+# managed 必须有 conversation_id；known 不能有 chats；不认识的字段一律报错。
+
+[[session]]
+key = "demo_requests"                       # topic_id = "tp_demo_requests"
+mode = "managed"
+conversation_id = "00000000-0000-4000-8000-000000000001"
+title = "示例：需求对接"                       # 现有标题，仅展示
+duty = "跟进同事提来的需求：整理要点、起草回复。不负责审批和生产操作。"
+authority = ""                               # 主人在该会话里给过的授权原话；空 = 未明确授权，对外只起草
+self_polling = "每 10 分钟自己巡检一次需求私聊"   # 该会话自己的 IM 巡检，没有就留空
+retire_self_polling = true                   # true：onboarding 时请它停掉自己的巡检，以 sheepdog 推送为准
+
+[[session.chats]]
+chat_id = "oc_test_demo_p2p"
+name = "示例同事私聊"
+all_messages = true                          # 除自己发的以外全部推给本会话（覆盖 Inbox 和免打扰）
+
+[[session.chats]]
+chat_id = "oc_test_demo_group"
+name = "示例需求群"
+all_messages = false                         # 只推 dispatch 级消息（@我、回复我、关键词等）
+
+[[session]]
+key = "demo_ops"
+mode = "known"
+conversation_id = "00000000-0000-4000-8000-000000000002"
+title = "示例：发布值守"
+duty = "发布与回滚的值守会话，主人直接在里面操作。"

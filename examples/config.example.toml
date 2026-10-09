@@ -15,6 +15,8 @@ sink = "agentapi"
 retention_days = 7
 # 个人化 Prompt 覆盖层（相对本配置文件所在目录），例如告诉 session 遵循你的知识库协议
 prompt_overlay_path = "prompts/overlay.md"
+# 名册（相对本配置文件所在目录）：登记现有会话、按聊天归属推送。留空 = roster.toml，不存在时所有信号进总线
+roster_path = "roster.toml"
 
 [routing]
 keywords = ["生产", "prod", "故障", "告警", "回滚", "审批"]
@@ -24,6 +26,8 @@ dispatch_at_all = true
 dispatch_bot_p2p = false
 ignore_chat_ids = []
 watch_chat_ids = []
+# 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
+keyword_skip_bot_senders = true
 
 [session]
 title_prefix = "[managed]"
@@ -32,3 +36,5 @@ model = ""
 bus_title = "Lark 信号·总线"
 human_attach_minutes = 15
 receipt_timeout_minutes = 20
+# 代回前缀：session 以你的身份对外发 IM 消息时，正文开头必须加它（reaction 不算）；空字符串 = 不要求
+reply_prefix = "🐕 [Agent 代回] "

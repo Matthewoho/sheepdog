@@ -46,6 +46,8 @@ class RoutingConfig:
     # 额外强制忽略 / 强制关注的 chat_id
     ignore_chat_ids: list[str] = field(default_factory=list)
     watch_chat_ids: list[str] = field(default_factory=list)
+    # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的 bot_p2p_keyword 不受影响）
+    keyword_skip_bot_senders: bool = True
 
 
 @dataclass
@@ -60,6 +62,8 @@ class SessionConfig:
     human_attach_minutes: int = 15
     # 回执超时（分钟），超时判为 failed
     receipt_timeout_minutes: int = 20
+    # 代回前缀：session 以主人身份对外发 IM 消息时，正文开头必须加它；空字符串 = 不要求
+    reply_prefix: str = "🐕 [Agent 代回] "
 
 
 @dataclass
@@ -77,6 +81,8 @@ class Config:
     retention_days: int = 7
     # Prompt 覆盖层文件（个人化指令，例如指向你的知识库协议），不进仓库
     prompt_overlay_path: str = ""
+    # 名册文件（相对本配置文件所在目录）；留空 = 默认 roster.toml，不存在时视为空名册
+    roster_path: str = ""
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     state_dir: Path = field(default_factory=default_state_dir)
@@ -89,6 +95,16 @@ class Config:
     @property
     def receipts_dir(self) -> Path:
         return self.state_dir / "receipts"
+
+    @property
+    def roster_file(self) -> Path:
+        p = Path(self.roster_path or "roster.toml").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
+    def roster_required(self) -> bool:
+        # 显式配置了 roster_path 时文件必须存在，避免路径写错后静默退回「无名册」
+        return bool(self.roster_path)
 
     def prompt_overlay(self) -> str:
         if not self.prompt_overlay_path:

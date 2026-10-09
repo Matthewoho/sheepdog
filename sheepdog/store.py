@@ -36,9 +36,10 @@ CREATE TABLE IF NOT EXISTS messages (
     reason         TEXT,
     tags_json      TEXT,
     topic_id       TEXT,
-    dispatch_state TEXT,               -- pending | delivered | acked | failed
+    dispatch_state TEXT,               -- pending | delivered | acked | failed | missed（adopted 回执超时）
     batch_id       TEXT,
     inbox_cleared  INTEGER DEFAULT 0,
+    note           TEXT,               -- 转交说明（sheepdog forward --note）
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS topics (
     topic_id         TEXT PRIMARY KEY,
     title            TEXT NOT NULL,
-    kind             TEXT,
+    kind             TEXT,             -- bus | adopted（名册 managed）| known（名册 known，不投递）
     duty             TEXT,             -- 一句话职责 + 边界，纠偏时修改
     conversation_id  TEXT,
     state            TEXT NOT NULL,
@@ -62,6 +63,8 @@ CREATE TABLE IF NOT EXISTS topics (
     pending_batch_id TEXT,
     dispatched_at    TEXT,
     retries          INTEGER DEFAULT 0,
+    onboarded_at     TEXT,             -- adopted 会话收到 onboarding 的时间，只发一次
+    receipt_missed   INTEGER DEFAULT 0,  -- adopted 会话回执超时次数（不重投）
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -71,11 +74,18 @@ CREATE TABLE IF NOT EXISTS dispatches (
     topic_id    TEXT NOT NULL,
     message_ids TEXT NOT NULL,
     sent_at     TEXT NOT NULL,
-    state       TEXT NOT NULL,         -- sent | acked | failed
+    state       TEXT NOT NULL,         -- sent | acked | failed | missed
     receipt     TEXT,
     error       TEXT
 );
 """
+
+
+# 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
+MIGRATIONS = {
+    "messages": [("note", "TEXT")],
+    "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0")],
+}
 
 
 def now_iso() -> str:
@@ -83,12 +93,40 @@ def now_iso() -> str:
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path | str):
         self.path = path
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        self.conn.commit()
+
+    @classmethod
+    def snapshot(cls, path: Path) -> "Store":
+        """--dry-run 用：把账本复制进内存，之后的写入都不落盘。
+
+        否则 dry-run 会把假的 conversation_id、onboarded_at、水位线写进真实账本，正式运行时漏发 onboarding。
+        """
+        mem = cls(":memory:")
+        if Path(path).exists():
+            src = sqlite3.connect(str(path))
+            try:
+                src.backup(mem.conn)
+            finally:
+                src.close()
+            mem._migrate()
+        return mem
+
+    def close(self) -> None:
+        self.conn.close()
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -116,7 +154,7 @@ class Store:
         row = self.conn.execute("SELECT sender_id FROM messages WHERE message_id=?", (message_id,)).fetchone()
         return bool(row and self_open_id and row["sender_id"] == self_open_id)
 
-    def upsert_message(self, m: Message, route: str, reason: str, tags: list[str]) -> None:
+    def upsert_message(self, m: Message, route: str, reason: str, tags: list[str], topic_id: str | None = None) -> None:
         ts = now_iso()
         mentions = json.dumps([asdict(x) for x in m.mentions], ensure_ascii=False)
         dispatch_state = "pending" if route == "dispatch" else None
@@ -124,16 +162,17 @@ class Store:
             c.execute(
                 """INSERT INTO messages(message_id,chat_id,chat_name,chat_type,sender_id,sender_name,sender_type,
                        content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,updated,update_time,
-                       route,reason,tags_json,dispatch_state,first_seen,last_seen)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,
                  int(m.deleted), int(m.updated), m.update_time, route, reason,
-                 json.dumps(tags, ensure_ascii=False), dispatch_state, ts, ts),
+                 json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts),
             )
 
     def update_content(self, message_id: str, m: Message, route: str | None = None,
-                       reason: str | None = None, dispatch_state: str | None = None) -> None:
+                       reason: str | None = None, dispatch_state: str | None = None,
+                       tags: list[str] | None = None, topic_id: str | None = None) -> None:
         sets = ["content=?", "updated=?", "update_time=?", "deleted=?", "mentions_json=?", "last_seen=?"]
         vals: list = [m.content, int(m.updated), m.update_time, int(m.deleted),
                       json.dumps([asdict(x) for x in m.mentions], ensure_ascii=False), now_iso()]
@@ -143,6 +182,12 @@ class Store:
         if dispatch_state is not None:
             sets.append("dispatch_state=?")
             vals.append(dispatch_state)
+        if tags is not None:
+            sets.append("tags_json=?")
+            vals.append(json.dumps(tags, ensure_ascii=False))
+        if topic_id is not None:
+            sets.append("topic_id=?")
+            vals.append(topic_id)
         vals.append(message_id)
         with self.tx() as c:
             c.execute(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=?", vals)
@@ -171,6 +216,15 @@ class Store:
     def mark_batch_state(self, batch_id: str, state: str) -> None:
         with self.tx() as c:
             c.execute("UPDATE messages SET dispatch_state=? WHERE batch_id=?", (state, batch_id))
+
+    def forward_message(self, message_id: str, topic_id: str, tags: list[str], note: str) -> None:
+        """转交：改归属并回到待推，由 Dispatcher 下一轮按目标会话的状态投递（同样受人类接管约束）。"""
+        with self.tx() as c:
+            c.execute(
+                """UPDATE messages SET route='dispatch', dispatch_state='pending', batch_id=NULL,
+                       topic_id=?, tags_json=?, note=? WHERE message_id=?""",
+                (topic_id, json.dumps(tags, ensure_ascii=False), note, message_id),
+            )
 
     def requeue_batch(self, batch_id: str) -> None:
         with self.tx() as c:
@@ -236,6 +290,9 @@ class Store:
             c.execute(f"UPDATE topics SET {cols} WHERE topic_id=?", (*fields.values(), topic_id))
 
     # ---------- dispatches ----------
+    def dispatch_exists(self, batch_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM dispatches WHERE batch_id=?", (batch_id,)).fetchone() is not None
+
     def record_dispatch(self, batch_id: str, topic_id: str, message_ids: list[str]) -> None:
         with self.tx() as c:
             c.execute(
@@ -252,7 +309,7 @@ class Store:
         cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
         with self.tx() as c:
             cur = c.execute(
-                "DELETE FROM messages WHERE first_seen < ? AND (route != 'dispatch' OR dispatch_state IN ('acked','failed'))",
+                "DELETE FROM messages WHERE first_seen < ? AND (route != 'dispatch' OR dispatch_state IN ('acked','failed','missed'))",
                 (cutoff,),
             )
             return cur.rowcount

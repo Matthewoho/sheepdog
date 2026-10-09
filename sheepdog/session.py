@@ -32,6 +32,8 @@ TRANSITIONS: dict[str, dict[str, str]] = {
     "receipt_needs_decision": {RUNNING: WAITING_HUMAN},
     "receipt_waiting_external": {RUNNING: BLOCKED},
     "receipt_done": {RUNNING: CLOSED},
+    # adopted 会话回执可选：超时不算失败、不重投，直接回到可投递
+    "receipt_missed": {RUNNING: ACTIVE},
     "error": {RUNNING: FAILED},
     "retries_exhausted": {FAILED: ATTENTION},
     "human_attach": {

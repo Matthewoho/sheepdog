@@ -9,9 +9,11 @@
  6. 免打扰群            → drop（@我/@所有人 已在上面处理）
  7. 回复我的消息         → dispatch
  8. 关键人发言           → dispatch
- 9. 关键词              → dispatch
+ 9. 关键词              → dispatch（群里机器人发的默认不参与，见 keyword_skip_bot_senders）
 10. 强制关注的会话       → dispatch
 11. 其他群消息          → inbox
+
+按聊天归属推给名册里的会话（P0.5）是在路由之后的一步，见 engine.apply_ownership；这里保持纯规则。
 """
 
 from __future__ import annotations
@@ -92,8 +94,8 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     if msg.sender_id in cfg.vip_sender_ids:
         return RouteDecision(DISPATCH, "vip_sender")
 
-    # 9. 关键词
-    if kw:
+    # 9. 关键词：群里机器人的消息常带「告警」「审批」之类字样，默认不参与，避免误报
+    if kw and not (cfg.keyword_skip_bot_senders and msg.is_bot_sender):
         return RouteDecision(DISPATCH, "keyword", [f"keyword:{kw}"])
 
     # 10. 强制关注

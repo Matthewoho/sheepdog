@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sheepdog"
 version = "0.1.0"
-description = "牧羊犬：盯着你的 IM，把信号赶进对应的 AI Agent session，并管好这群 session。"
+description = "你的工作助理：第一项工作是接收 IM 上的工作，分给负责的 AI Agent session（像牧羊犬一样看好这群 session）。"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
