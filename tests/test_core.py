@@ -7,13 +7,13 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from signal_pilot import session as sm
-from signal_pilot.config import Config, RoutingConfig
-from signal_pilot.engine import BUS_TOPIC_ID, Collector, Dispatcher, write_receipt
-from signal_pilot.models import Mention, Message
-from signal_pilot.router import DISPATCH, DROP, INBOX, SELF, RouteContext, route
-from signal_pilot.source.lark import parse_message
-from signal_pilot.store import Store
+from sheepdog import session as sm
+from sheepdog.config import Config, RoutingConfig
+from sheepdog.engine import BUS_TOPIC_ID, Collector, Dispatcher, write_receipt
+from sheepdog.models import Mention, Message
+from sheepdog.router import DISPATCH, DROP, INBOX, SELF, RouteContext, route
+from sheepdog.source.lark import parse_message
+from sheepdog.store import Store
 
 ME = "ou_test_me"
 

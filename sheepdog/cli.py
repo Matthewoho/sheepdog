@@ -1,13 +1,13 @@
 """命令行入口。
 
-  signal-pilot doctor                 检查依赖与环境
-  signal-pilot poll [--dry-run]       拉取一次并路由（--dry-run 不投递）
-  signal-pilot run [--dry-run]        常驻循环：拉取 → 路由 → 投递
-  signal-pilot inbox [--chat 群名]     查看 Inbox（按群分组）
-  signal-pilot inbox-clear [--chat 群名 | --all]
-  signal-pilot sessions               查看 session 注册表与状态
-  signal-pilot receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
-  signal-pilot session-reset --topic T                       人工把 attention/failed 复位
+  sheepdog doctor                 检查依赖与环境
+  sheepdog poll [--dry-run]       拉取一次并路由（--dry-run 不投递）
+  sheepdog run [--dry-run]        常驻循环：拉取 → 路由 → 投递
+  sheepdog inbox [--chat 群名]     查看 Inbox（按群分组）
+  sheepdog inbox-clear [--chat 群名 | --all]
+  sheepdog sessions               查看 session 注册表与状态
+  sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
+  sheepdog session-reset --topic T                       人工把 attention/failed 复位
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def _build(args):
 def cmd_doctor(args) -> int:
     cfg = load_config()
     ok = True
-    print(f"signal-pilot {__version__}")
+    print(f"sheepdog {__version__}")
     print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
     print(f"状态目录: {cfg.state_dir}")
     print(f"self_open_id: {'✓ 已配置' if cfg.self_open_id else '✗ 未配置（@我/回复我 判定会失效）'}")
@@ -83,7 +83,7 @@ def cmd_run(args) -> int:
     collector = Collector(cfg, store, source)
     dispatcher = Dispatcher(cfg, store, sink)
     interval = args.interval or cfg.poll_interval_seconds
-    logging.info("signal-pilot 常驻运行，间隔 %ss，sink=%s", interval, sink.name)
+    logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", interval, sink.name)
     last_prune = 0.0
     while True:
         try:
@@ -175,7 +175,7 @@ def cmd_session_reset(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="signal-pilot", description="IM 信号 → AI Agent session 路由引擎")
+    p = argparse.ArgumentParser(prog="sheepdog", description="IM 信号 → AI Agent session 路由引擎")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 

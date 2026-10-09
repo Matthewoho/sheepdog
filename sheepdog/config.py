@@ -1,8 +1,8 @@
 """配置加载。
 
 配置与运行数据都放在仓库之外（XDG 目录），仓库内只有 examples/ 下的示例：
-- 配置：$SIGNAL_PILOT_CONFIG 或 ~/.config/signal-pilot/config.toml
-- 状态：$SIGNAL_PILOT_STATE_DIR 或 ~/.local/state/signal-pilot/
+- 配置：$SHEEPDOG_CONFIG 或 ~/.config/sheepdog/config.toml
+- 状态：$SHEEPDOG_STATE_DIR 或 ~/.local/state/sheepdog/
 """
 
 from __future__ import annotations
@@ -15,19 +15,19 @@ from pathlib import Path
 
 def default_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "signal-pilot"
+    return Path(base) / "sheepdog"
 
 
 def default_state_dir() -> Path:
-    env = os.environ.get("SIGNAL_PILOT_STATE_DIR")
+    env = os.environ.get("SHEEPDOG_STATE_DIR")
     if env:
         return Path(env).expanduser()
     base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(base) / "signal-pilot"
+    return Path(base) / "sheepdog"
 
 
 def default_config_path() -> Path:
-    env = os.environ.get("SIGNAL_PILOT_CONFIG")
+    env = os.environ.get("SHEEPDOG_CONFIG")
     return Path(env).expanduser() if env else default_config_dir() / "config.toml"
 
 
@@ -84,7 +84,7 @@ class Config:
 
     @property
     def db_path(self) -> Path:
-        return self.state_dir / "signal-pilot.sqlite3"
+        return self.state_dir / "sheepdog.sqlite3"
 
     @property
     def receipts_dir(self) -> Path:

@@ -16,7 +16,7 @@ from .sink import Sink, SinkError
 from .source import Source
 from .store import Store, now_iso
 
-log = logging.getLogger("signal-pilot")
+log = logging.getLogger("sheepdog")
 
 BUS_TOPIC_ID = "tp_bus"
 MUTED_REFRESH_MINUTES = 30

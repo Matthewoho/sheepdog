@@ -1,7 +1,7 @@
 {
   "command": "/bin/sh",
-  "args": ["-c", "exec signal-pilot run"],
+  "args": ["-c", "exec sheepdog run"],
   "restart_policy": "always",
-  "display_name": "signal-pilot",
+  "display_name": "sheepdog",
   "description": "常驻拉取 IM 消息：私聊/@我 直推 [managed] session，其他群消息进 Inbox。"
 }

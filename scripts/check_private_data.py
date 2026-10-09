@@ -3,7 +3,7 @@
 
 用法：python3 scripts/check_private_data.py [文件...]   （无参数时扫描 git 暂存区）
 允许的合成 ID 形如 ou_test_* / oc_test_* / om_test_*。
-可在 ~/.config/signal-pilot/private_terms.txt 中追加个人敏感词（每行一个，不进仓库）。
+可在 ~/.config/sheepdog/private_terms.txt 中追加个人敏感词（每行一个，不进仓库）。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ SELF = Path(__file__).resolve()
 
 def private_terms() -> list[str]:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    p = Path(base) / "signal-pilot" / "private_terms.txt"
+    p = Path(base) / "sheepdog" / "private_terms.txt"
     if not p.exists():
         return []
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]

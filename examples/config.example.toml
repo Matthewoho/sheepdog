@@ -1,5 +1,5 @@
-# signal-pilot 配置示例
-# 复制到 ~/.config/signal-pilot/config.toml 后修改。真实配置不要提交到仓库。
+# sheepdog 配置示例
+# 复制到 ~/.config/sheepdog/config.toml 后修改。真实配置不要提交到仓库。
 
 # 「我」的 open_id（lark-cli auth status 可查）
 self_open_id = "ou_test_replace_me"

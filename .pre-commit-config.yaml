@@ -1,7 +1,7 @@
 repos:
   - repo: local
     hooks:
-      - id: signal-pilot-private-data
+      - id: sheepdog-private-data
         name: 私有数据扫描
         entry: python3 scripts/check_private_data.py
         language: system
