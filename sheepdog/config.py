@@ -228,6 +228,8 @@ class Config:
     # 轮询间隔与回看窗口
     poll_interval_seconds: int = 60
     overlap_seconds: int = 180
+    # 每轮拉取最多翻几页（每页 50 条）；拉不完记 partial，不推进水位线（7.16）
+    max_pages: int = 100
     initial_lookback_minutes: int = 10
     timezone_offset: str = "+08:00"
     # 投递目标：agentapi（Antigravity App）| dryrun

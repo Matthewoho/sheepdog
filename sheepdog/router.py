@@ -5,10 +5,9 @@
  1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环）
  2. 强制忽略的会话       → drop
  3. 私聊：人 → dispatch；bot → inbox(bot_p2p)，关键词命中则 dispatch
- 4. 群 @我             → dispatch
+ 4. 群 @我、回复我的消息 → dispatch（同级，都在免打扰之前，7.16）
  5. 群 @所有人          → dispatch（可配置）
- 6. 免打扰群            → drop（@我/@所有人 已在上面处理）
- 7. 回复我的消息         → dispatch
+ 6. 免打扰群            → drop（@我/回复我/@所有人 已在上面处理；关键人发言仍受免打扰约束）
  8. 关键人发言           → dispatch
  9. 关键词              → dispatch（群里机器人发的默认不参与，见 keyword_skip_bot_senders）
 10. 强制关注的会话       → dispatch
@@ -95,9 +94,11 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     mentioned_me = any(m.id == ctx.self_open_id for m in msg.mentions if ctx.self_open_id)
     mentioned_all = any(m.is_all for m in msg.mentions)
 
-    # 4. @我
+    # 4. @我、回复我：同级，排在免打扰之前——免打扰群里有人回复主人也要送到（7.16）
     if mentioned_me:
         return RouteDecision(DISPATCH, "at_me")
+    if msg.reply_to and ctx.is_my_message(msg.reply_to):
+        return RouteDecision(DISPATCH, "reply_to_me")
     # 5. @所有人
     if mentioned_all and cfg.dispatch_at_all:
         return RouteDecision(DISPATCH, "at_all")
@@ -105,10 +106,6 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 6. 免打扰群
     if cfg.ignore_muted_chats and msg.chat_id in ctx.muted_chat_ids and msg.chat_id not in cfg.watch_chat_ids:
         return RouteDecision(DROP, "muted_chat")
-
-    # 7. 回复我
-    if msg.reply_to and ctx.is_my_message(msg.reply_to):
-        return RouteDecision(DISPATCH, "reply_to_me")
 
     # 8. 关键人
     if msg.sender_id in cfg.vip_sender_ids:

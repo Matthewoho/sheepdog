@@ -301,11 +301,16 @@ class Collector:
     def poll_once(self) -> dict:
         started = _now()
         wm = _parse(self.store.get_meta("watermark"))
-        if wm:
+        pending_start = _parse(self.store.get_meta("partial_start"))
+        if pending_start:
+            start = pending_start  # 上一轮没拉完：从原 start 重拉（按 message_id 去重）
+        elif wm:
             start = wm - timedelta(seconds=self.cfg.overlap_seconds)
         else:
             start = started - timedelta(minutes=self.cfg.initial_lookback_minutes)
-        msgs = self.source.fetch_since(start.isoformat(timespec="seconds"))
+        # 固定窗口 [start, started]：翻页期间新来的消息留给下一轮，水位线只推进到 started（7.16）
+        msgs = self.source.fetch_since(start.isoformat(timespec="seconds"), started.isoformat(timespec="seconds"))
+        partial = bool(getattr(self.source, "last_fetch_partial", False))
         ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
         self._dynamic = dynamic_owners(self.store)
         self._refresh_cooling()
@@ -343,7 +348,13 @@ class Collector:
 
         self._tag_read_status()
         self._check_owner_reactions()
-        self.store.set_meta("watermark", started.isoformat(timespec="seconds"))
+        stats["partial"] = partial
+        if partial:
+            self._partial_round(start)
+        else:
+            self.store.set_meta("partial_start", "")
+            self.store.set_meta("partial_streak", "0")
+            self.store.set_meta("watermark", started.isoformat(timespec="seconds"))
         self.store.set_meta("last_poll", now_iso())
         return stats
 
@@ -355,6 +366,19 @@ class Collector:
             self.acker.on_own_message(m)
         except Exception as e:
             log.warning("处理确认表情失败 %s: %s", m.message_id, e)
+
+    def _partial_round(self, start: datetime) -> None:
+        """本轮没拉完（7.16）：不推进水位线，下一轮从原 start 重拉；同一缺口只提示总线一次。"""
+        streak = int(self.store.get_meta("partial_streak", "0") or 0) + 1
+        self.store.set_meta("partial_streak", str(streak))
+        key = start.isoformat(timespec="seconds")
+        log.warning("本轮消息没拉完（从 %s 起，连续 %d 轮），不推进水位线，下一轮重拉", key, streak)
+        if self.store.get_meta("partial_start") != key:
+            self.store.set_meta("partial_start", key)
+            self.store.add_system_message(
+                BUS_TOPIC_ID, "collect_partial",
+                f"⚠️ 采集不完整：从 {key} 起的消息这一轮没拉完（翻页上限 max_pages 或分页中断），"
+                "sheepdog 会从这个时间点重拉，期间消息可能晚到。")
 
     # ---------- 主人本人的发言作为背景（7.13） ----------
     def _owner_context_wanted(self, m: Message) -> bool:

@@ -66,10 +66,12 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
 
 
 class LarkCliSource:
-    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 20, retries: int = 3):
+    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3):
         self.tz = tz
         self.binary = shutil.which(binary) or binary
         self.max_pages = max_pages
+        # 最近一次 fetch_since 是否没拉完（7.16）：has_more 却缺 page_token，或翻到上限仍 has_more
+        self.last_fetch_partial = False
         self.retries = retries
 
     # ---------- 底层调用 ----------
@@ -102,12 +104,15 @@ class LarkCliSource:
             args += ["--end", end_iso]
         out: list[Message] = []
         token = ""
+        more = False
         for _ in range(self.max_pages):
             data = self._run(args + (["--page-token", token] if token else []))
             out += [parse_message(m, self.tz) for m in data.get("messages") or []]
             token = data.get("page_token") or ""
-            if not data.get("has_more") or not token:
+            more = bool(data.get("has_more"))
+            if not more or not token:
                 break
+        self.last_fetch_partial = more
         return out
 
     def _chat_ids(self, extra: list[str]) -> set[str]:

@@ -93,7 +93,7 @@ def _build(args):
     security = _security(cfg)
     dry = getattr(args, "dry_run", False)
     store = Store.snapshot(cfg.db_path) if dry else Store(cfg.db_path)
-    source = LarkCliSource(tz=cfg.timezone_offset)
+    source = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages)
     sink = DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()
     return cfg, store, source, sink, roster, security
 
@@ -104,6 +104,14 @@ def _acker(cfg, store, source, args) -> Acker | None:
         return None
     dry = getattr(args, "dry_run", False) or cfg.sink == "dryrun"
     return Acker(cfg.ack, store, source, dry_run=dry)
+
+
+def _collect_warning(store: Store) -> str:
+    """连续 3 轮以上没拉完时的提示（7.16），否则空串。"""
+    streak = int(store.get_meta("partial_streak", "0") or 0)
+    if streak >= 3:
+        return f"⚠ 采集不完整：已连续 {streak} 轮没拉完（从 {store.get_meta('partial_start')} 起），可调大 max_pages"
+    return ""
 
 
 def cmd_doctor(args) -> int:
@@ -141,6 +149,8 @@ def cmd_doctor(args) -> int:
     except SecurityError as e:
         print(f"安全规则: ✗ {e}")
         ok = False
+    if warn := _collect_warning(Store(cfg.db_path)):
+        print(warn)
     a = cfg.ack
     print(f"确认表情: {'✓ ' + a.emoji_type + '，点: ' + ','.join(a.reasons) + '；回复后撤: ' + ','.join(a.remove_on_reply_reasons) + '；bot 身份点: ' + (','.join(a.bot_reasons) or '-') if a.enabled else '（未配置 [ack]，不点表情）'}")
     lg = cfg.loop_guard
@@ -322,6 +332,8 @@ def cmd_sessions(args) -> int:
         print(f"（名册无效，聊天名称显示为 ID: {e}）")
         roster = Roster()
     rows = store.list_topics()
+    if warn := _collect_warning(store):
+        print(warn)
     if not rows:
         print("暂无 session")
     # 只用来算规则指纹，不投递

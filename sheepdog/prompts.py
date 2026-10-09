@@ -41,6 +41,7 @@ REASON_LABEL = {
     "owner_reply": "主人在 IM 的回复",
     "owner_context": "主人本人的发言",
     "loop_guard": "疑似循环",
+    "collect_partial": "采集不完整",
     "escalation_list": "未结的「需要你定」",
 }
 
