@@ -42,14 +42,14 @@ Lark (lark-cli, as you)
    └─► Collector ──► Ledger (SQLite) ──► Router ──► Security gate
                                                      ├─ drop
                                                      ├─ inbox (per chat)
-                                                     └─ dispatch ──► Dispatcher ──► Antigravity sessions
+                                                     └─ dispatch ──► Dispatcher ──► sessions (Antigravity / Codex / Claude)
                                                                         ▲                 │
                                                                         └──── receipts ◄──┘  (sheepdog receipt)
 ```
 
 - Sessions report back after every batch with a structured receipt (`handled`, `needs_decision`, `waiting_external`, `done`), which drives a per-session state machine.
 - If you start typing in a session, sheepdog pauses deliveries to it and catches up 15 minutes after you stop.
-- Source (where messages come from), Sink (where sessions live) and Store are interfaces. Today only Lark, Google Antigravity and SQLite are implemented.
+- Source (where messages come from), Sink (where sessions live) and Store are interfaces. Implemented today: Lark, SQLite, and three session hosts: Google Antigravity (default), Codex (`codex app-server`) and Claude Code (`claude -p`). Codex and Claude are off by default; sheepdog passes no sandbox or permission flags to them, so their permissions come from their own config.
 
 **Mechanism lives in code, rules live in your config.** Every business rule (how agent replies are marked, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
 
@@ -58,6 +58,7 @@ Lark (lark-cli, as you)
 - Python ≥ 3.11 (standard library only)
 - [`lark-cli`](https://github.com/larksuite/cli) (`npm install -g @larksuite/cli`), logged in with your user identity
 - The [Google Antigravity](https://antigravity.google) desktop app. sheepdog creates and messages sessions through the app's built-in `agentapi`, which only works inside the app's own processes, so sheepdog runs as an Antigravity sidecar.
+- Optional: the `codex` and/or `claude` CLI, installed and logged in, if you enable Codex or Claude sessions (`[hosts.codex]`, `[hosts.claude]`).
 
 ## Quick start
 
@@ -108,9 +109,9 @@ Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN
 
 ## Security model and known limits
 
-- **Only your words are instructions.** Chat messages are information, not commands. Sessions treat these three sources as you: what you type in Antigravity, a quote the bus relays that sheepdog has checked against your own messages, and a Lark reply verified to come from your account.
+- **Only your words are instructions.** Chat messages are information, not commands. Sessions treat these three sources as you: what you type in the session itself (Antigravity, Codex or Claude), a quote the bus relays that sheepdog has checked against your own messages, and a Lark reply verified to come from your account.
 - `hold` messages never reach a specialist session. They go to the bus, and leave it only with a verified quote from you.
-- **Limits.** Regex rules won't catch every rewording. sheepdog is not on the execution path: sessions send messages and run commands themselves, so the last lines of defence are the sessions following `security.md`, Antigravity's command permissions, and your cloud IAM.
+- **Limits.** Regex rules won't catch every rewording. sheepdog is not on the execution path: sessions send messages and run commands themselves, so the last lines of defence are the sessions following `security.md`, the session host's own command permissions (Antigravity, Codex or Claude), and your cloud IAM.
 
 ## Data and privacy
 
@@ -121,11 +122,11 @@ Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN
 | Runtime data (ledger, inbox, receipts) | `~/.local/state/sheepdog/`, pruned after `retention_days` (default 7) | no |
 | Work output | written by the sessions to your own notes and task tracker | no |
 
-Pruning covers messages, delivery records, escalations, bot message sources, reactions, finished waits and actions, loop records and receipt files; anything still open or in progress is kept. What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup. Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
+Pruning covers messages, delivery records, escalations, bot message sources, reactions, finished waits and actions, loop records and receipt files; anything still open or in progress is kept. What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup. Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured) and a bot DM asking you to log in again when the Codex or Claude CLI is logged out (at most once a day). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
 
 ## Status
 
-Early and opinionated: built around one person's daily workflow, Lark plus Google Antigravity. The Source / Sink interfaces are there for other chat tools and agent hosts, but none are implemented yet.
+Early and opinionated: built around one person's daily workflow, Lark plus Google Antigravity, with Codex and Claude Code sessions as optional extra hosts. The Source interface is there for other chat tools, but only Lark is implemented.
 
 ## Development
 

@@ -27,6 +27,8 @@ PLAYBOOK_FILES: dict[str, str] = {
     "security.md": "所有开场的最前面（排在 common.md 之前）",
     "security_banner.md": "被安全规则标记的消息正文前的警示，可用 {{tags}} {{notes}} {{action}}",
     "security_footer.md": "每批信号末尾，batch_footer 之前",
+    # 命令行宿主（7.18）
+    "cli_host.md": "只发给 Codex / Claude 会话（排在 common.md 之后）：回执块怎么写、发不了 IM 时怎么办，可用 {{host}}",
 }
 
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")

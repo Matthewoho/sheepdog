@@ -22,10 +22,14 @@ from pathlib import Path
 
 MANAGED = "managed"
 KNOWN = "known"
+# 会话宿主（7.18），和 config.HOSTS 一致；默认 antigravity
+HOSTS = ("antigravity", "codex", "claude")
+DEFAULT_HOST = "antigravity"
 
 _KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
-                 "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats"}
+                 "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats",
+                 "host", "model", "effort"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages"}
 
 
@@ -57,6 +61,14 @@ class RosterSession:
     predecessor_conversation_id: str = ""
     retire_predecessor: bool = False
     chats: list[RosterChat] = field(default_factory=list)
+    # 会话宿主（7.18）：antigravity | codex | claude；model / effort 留空 = 这个宿主的默认值
+    host: str = DEFAULT_HOST
+    model: str = ""
+    effort: str = ""
+
+    @property
+    def is_cli_host(self) -> bool:
+        return self.host != DEFAULT_HOST
 
     @property
     def to_spawn(self) -> bool:
@@ -103,7 +115,15 @@ class Roster:
 
     def content_hash(self) -> str:
         """按解析后的内容算 hash：改注释、空白不算名册变化。"""
-        blob = json.dumps([asdict(s) for s in self.sessions], ensure_ascii=False, sort_keys=True)
+        rows = []
+        for s in self.sessions:
+            d = asdict(s)
+            # 7.18 新增的宿主字段取默认值时不进 hash：老名册升级后不算「名册更新」
+            for k, default in (("host", DEFAULT_HOST), ("model", ""), ("effort", "")):
+                if d.get(k) == default:
+                    d.pop(k, None)
+            rows.append(d)
+        blob = json.dumps(rows, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
@@ -160,7 +180,12 @@ def parse_roster(data: dict) -> Roster:
             retire_self_polling=_bool(raw, "retire_self_polling", where),
             predecessor_conversation_id=_str(raw, "predecessor_conversation_id", where),
             retire_predecessor=_bool(raw, "retire_predecessor", where),
+            host=_str(raw, "host", where) or DEFAULT_HOST,
+            model=_str(raw, "model", where),
+            effort=_str(raw, "effort", where),
         )
+        if s.host not in HOSTS:
+            raise RosterError(f"{where}: host 只能是 {' / '.join(HOSTS)}，收到 {s.host!r}")
         # 必须显式写出 conversation_id：漏写是笔误，报错；写成 "" 才表示「由 sheepdog 新建」
         if mode == MANAGED and "conversation_id" not in raw:
             raise RosterError(f"{where}: managed 会话必须有 conversation_id（要 sheepdog 新建就写 conversation_id = \"\"）")
@@ -197,6 +222,13 @@ def parse_roster(data: dict) -> Roster:
             raise RosterError(f"session key={x.key!r}: predecessor_conversation_id 仍登记在 "
                               f"{live_cids[x.predecessor_conversation_id]!r}，先把旧条目删掉")
     return Roster(sessions)
+
+
+def check_hosts(roster: Roster, enabled) -> None:
+    """managed 会话引用的宿主必须已启用（7.18）；enabled(host) -> bool。没开的直接报错，说清是哪个宿主。"""
+    for s in roster.managed:
+        if not enabled(s.host):
+            raise RosterError(f"session key={s.key!r}: 宿主 {s.host} 没开（配置里 [hosts.{s.host}] enabled = false）")
 
 
 def load_roster(path: Path, required: bool) -> Roster:

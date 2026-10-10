@@ -45,6 +45,7 @@ def transcript_contains(conversation_id: str, text: str) -> bool:
 
 class AgentApiSink:
     name = "agentapi"
+    host = "antigravity"
 
     def available(self) -> tuple[bool, str]:
         missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
@@ -68,7 +69,8 @@ class AgentApiSink:
         except json.JSONDecodeError as e:
             raise SinkError(f"agentapi 输出无法解析: {out[:300]}") from e
 
-    def new_conversation(self, title: str, prompt: str, model: str = "") -> str:
+    def new_conversation(self, title: str, prompt: str, model: str = "", effort: str = "", **_ctx) -> str:
+        # agentapi 没有推理档位参数，effort 忽略
         args = ["new-conversation"]
         if model:
             args.append(f"--model={model}")
@@ -79,10 +81,37 @@ class AgentApiSink:
             raise SinkError(f"agentapi 未返回 conversationId: {data}")
         return cid
 
-    def send_message(self, conversation_id: str, content: str) -> None:
+    def send_message(self, conversation_id: str, content: str, **_ctx) -> None:
         data = self._call(["send-message", conversation_id, content])
         if not (data.get("response") or {}).get("sendMessage"):
             raise SinkError(f"agentapi send-message 异常: {data}")
+
+    def transcript_contains(self, conversation_id: str, text: str) -> bool:
+        return transcript_contains(conversation_id, text)
+
+    def history(self, conversation_id: str, limit: int = 6) -> list[tuple[str, str, str]]:
+        """transcript 里最近几条 USER_INPUT / PLANNER_RESPONSE：(角色, 正文, 时间)。"""
+        p = transcript_path(conversation_id)
+        if not p.exists():
+            return []
+        out: list[tuple[str, str, str]] = []
+        with p.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = d.get("type") if isinstance(d, dict) else None
+                if kind not in ("USER_INPUT", "PLANNER_RESPONSE"):
+                    continue
+                text = d.get("content")
+                if not isinstance(text, str):
+                    text = json.dumps(text, ensure_ascii=False)
+                out.append(("问" if kind == "USER_INPUT" else "答", text, d.get("created_at") or ""))
+        return out[-limit:]
+
+    def resume_hint(self, conversation_id: str, title: str = "") -> str:
+        return f"在 Antigravity App 里打开会话 {conversation_id}"
 
     def last_human_activity(self, conversation_id: str) -> datetime | None:
         """读 session transcript，返回人类最后一次在 App 里发言（USER_INPUT）的时间。
@@ -112,24 +141,34 @@ class AgentApiSink:
 
 
 class DryRunSink:
-    """不真正投递，只打印，用于调试规则。"""
+    """不真正投递，只打印，用于调试规则。每个宿主一个，打印时带上宿主名（7.18）。"""
 
     name = "dryrun"
 
-    def __init__(self):
+    def __init__(self, host: str = "antigravity"):
+        self.host = host
         self._n = 0
+
+    @property
+    def _tag(self) -> str:
+        return "[dryrun]" if self.host == "antigravity" else f"[dryrun:{self.host}]"
 
     def available(self) -> tuple[bool, str]:
         return True, "dry-run"
 
-    def new_conversation(self, title: str, prompt: str, model: str = "") -> str:
+    def new_conversation(self, title: str, prompt: str, model: str = "", effort: str = "", **_ctx) -> str:
         self._n += 1
-        cid = f"dryrun-{self._n}"
-        print(f"[dryrun] new-conversation title={title!r} -> {cid}\n{prompt}\n")
+        cid = f"dryrun-{self._n}" if self.host == "antigravity" else f"dryrun-{self.host}-{self._n}"
+        extra = "".join(f" {k}={v}" for k, v in (("model", model), ("effort", effort)) if v)
+        print(f"{self._tag} new-conversation title={title!r}{extra} -> {cid}\n{prompt}\n")
         return cid
 
-    def send_message(self, conversation_id: str, content: str) -> None:
-        print(f"[dryrun] send-message -> {conversation_id}\n{content}\n")
+    def send_message(self, conversation_id: str, content: str, **_ctx) -> None:
+        extra = "".join(f" {k}={_ctx[k]}" for k in ("model", "effort") if _ctx.get(k))
+        print(f"{self._tag} send-message -> {conversation_id}{extra}\n{content}\n")
+
+    def transcript_contains(self, conversation_id: str, text: str) -> bool:
+        return False
 
     def last_human_activity(self, conversation_id: str) -> datetime | None:
         return None

@@ -27,17 +27,18 @@ Source (lark-cli, user 身份)
    └─► Collector ──► Ledger (SQLite) ──► Router (纯规则)
                                             ├─ drop
                                             ├─ inbox（按群）
-                                            └─ dispatch ──► Dispatcher ──► Sink (Antigravity agentapi)
+                                            └─ dispatch ──► Dispatcher ──► Sink（按会话宿主：Antigravity agentapi /
+                                                                                 Codex app-server / Claude 命令行）
                                                                ▲                 │
                                                                └── 回执 ◄────────┘  sheepdog receipt
 ```
 
 - **Session 状态机**：`active → running → (active | waiting_human | blocked | closed)`，以及 `human_attached`（你在 session 里发言后暂停投递）、`failed → attention`（重试耗尽）。状态由 session 每批提交的回执驱动。
-- **可插拔**：`Source`（消息源）、`Sink`（session 投递）、`Store`（账本）都是接口，当前实现分别为 lark-cli、Antigravity `agentapi`、SQLite。
+- **可插拔**：`Source`（消息源）、`Sink`（session 投递）、`Store`（账本）都是接口，当前实现分别为 lark-cli、SQLite，以及三种会话宿主：Antigravity `agentapi`（默认）、Codex（`codex app-server`）、Claude（`claude -p`）。后两种默认关闭，见下文「Codex 和 Claude 会话」。
 
 ## 安装
 
-要求 Python ≥ 3.11、已登录的 [`lark-cli`](https://github.com/larksuite)（user 身份）、Antigravity App。
+要求 Python ≥ 3.11、已登录的 [`lark-cli`](https://github.com/larksuite)（user 身份）、Antigravity App。要用 Codex / Claude 会话，还要装好并登录对应的命令行（`codex`、`claude`）。
 
 ```bash
 pip install -e .
@@ -68,12 +69,15 @@ sheepdog security-log --since 24h   # 被安全规则标记 / 拦截的消息
 sheepdog escalations [--all]   # 会话找你拍板的「需要你定」：未结 / 全部
 sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
 sheepdog new-session --key k --title "短标题" --duty "职责与边界" [--chat oc_x[:all]]... [--message-ids a,b] [--note "..."]
+                               [--host antigravity|codex|claude] [--model M] [--effort E]
                                # 总线临时新开一个专属会话（只在账本里，不写名册）
 sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
 sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title "..."]   # 给会话补发 / 手动发退休通知
 sheepdog actions [--all]       # 排队 / 完成 / 失败的动作
 sheepdog show <message_id>     # 账本里这条消息的完整正文（送进会话的长消息会截断）
+sheepdog show --topic tp_x     # 这个会话最近几轮的问答（读对应宿主的记录），最后一行告诉你去哪里接着看
+sheepdog inject --text "..." [--chat oc_x] [--sender ou_x] [--at-me]   # 测试环境（[source] enabled = false）：放一条合成消息进账本
 sheepdog redeliver --batch b   # 发送中断、不确定是否送达的批次：人工确认后重发
 sheepdog watch-done --id N     # 会话确认真的等到了对方的回复
 sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
@@ -89,7 +93,7 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 
 回执 anchors 里 `project:` 开头的条目会存进会话记录，`sheepdog sessions` 显示为关联项目。
 
-`agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行。
+`agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行（Codex / Claude 会话不依赖这些变量，但总线和默认宿主的会话仍然走 agentapi）。
 
 ## 总线只做轻活：没有合适的会话就新开
 
@@ -104,6 +108,20 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 - 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
 - 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
+
+## Codex 和 Claude 会话
+
+每个会话有一个宿主（`host`）：`antigravity`（默认，经 App 的 agentapi）、`codex`、`claude`。名册 `[[session]]` 可以写 `host`、`model`、`effort`，`new-session` 有同名参数；留空就用配置里这个宿主的默认值。已有会话不能换宿主，要换就退休旧的、新开一个（接手流程）。`max_new_sessions_per_day` 是所有宿主共用的一个额度。
+
+- **配置**：`[hosts.codex]`、`[hosts.claude]`，默认 `enabled = false`；启用时 `workdir` 必填。`model`、`effort`、`timeout_minutes`、`max_concurrent` 下一轮生效，`enabled`、`command`、`workdir`、`settings` 要重启。没启用的宿主，new-session 和名册引用直接报错。
+- **怎么跑**：一轮是一个后台进程（自成进程组），不卡主循环。Codex 由 sheepdog 自己的 runner 起一个 `codex app-server`（JSON-RPC over stdio）：`initialize` → `thread/start`（新建，带 `threadSource: "user"`，再 `thread/name/set` 设标题）或 `thread/resume`（续接）→ `turn/start` → 等 `turn/completed`，跑完关掉。Claude 是 `claude -p --output-format json`，新建用 `--session-id` 预定编号、`-n` 设标题，续接用 `--resume`。输入、输出、错误在 `state_dir/runs/<batch_id>.in/.out/.err`，运行记录在账本 `runs` 表。同一会话同一时间只跑一轮；超过 `max_concurrent` 的批次排队。
+- **权限不归 sheepdog 管**：不传任何沙箱、审批、权限参数，全部来自宿主自己的配置（Codex 看 `~/.codex/config.toml`；Claude 看用户设置、workdir 下的设置，或 `settings` 指的文件，sheepdog 只传文件名）。Codex 发来的审批请求一律拒绝，方法名记进运行记录。`sheepdog doctor` 会列出每个宿主的命令、登录状态、Codex 的 `sandbox_mode` 和网络开关；只读或网络关着时提示「能读、能分析，但发不了飞书」。
+- **回执**：会话可能写不了 sheepdog 的状态目录，所以也可以在回答末尾附一个 ```` ```sheepdog-receipt ```` 块（内容同 `--json`）。一轮结束时：会话自己交过回执就以它为准；没交就取回执块；都没有就按回执超时处理。写法在 playbook 的 `cli_host.md`，只发给这两类会话。
+- **出错**：按输出内容认，不靠退出码。容量满 / 5xx：同一批次 5、10、20 分钟后重试，最多 3 次，还不行会话标 attention、提示总线，不换模型。写锁冲突（有人在 Codex 应用里开着这个线程）：视同主人正在用，批次退回排队，连续 60 分钟提示总线。登录失效：这个宿主整体排队，经机器人给你发一条「需要你重新登录」（24 小时一次）。超过 `timeout_minutes`：杀掉整个进程组，会话标 attention。Claude 的 `permission_denials` 记日志，并在 `sheepdog sessions` 里显示。
+- **你在用时让路**：Codex 读线程的 rollout 文件（`~/.codex/sessions/**/rollout-*-<编号>.jsonl`），Claude 读 `~/.claude/projects/*/<编号>.jsonl`；sheepdog 自己发的（带 `[sheepdog]` 头的）和第一条开场不算，其他用户消息算你的发言。另外有交互式 `claude --resume <编号>` 在跑也算你在用。
+- **重启**：`runs` 里还在跑的，进程还活着、命令行对得上就继续等；已经退出的按输出文件收尾；一律不重发。
+- **查看**：`sheepdog sessions` 多了宿主、模型、档位三列和最近一轮的状态；`sheepdog show --topic tp_x` 打印最近几轮问答，并告诉你去哪接着看（Codex：应用里的同名线程；Claude：在 workdir 里跑 `claude --resume <编号>`）。
+- **测试环境**：`[source] enabled = false` 时不拉 IM，用 `sheepdog inject` 把一条合成消息（编号以 `om_test_inject_` 开头）放进账本，走正常的路由和投递。
 
 ## 代回用卡片
 
@@ -246,6 +264,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `security.md` | 所有开场的最前面（在 common.md 之前） | — |
 | `security_banner.md` | 被安全规则标记的消息正文前的警示 | `{{tags}}` `{{notes}}` `{{action}}` |
 | `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
+| `cli_host.md` | 只发给 Codex / Claude 会话（common.md 之后）：回执块怎么写、发不了 IM 时怎么办 | `{{host}}` |
 
 通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
 
@@ -262,7 +281,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 
 **已知局限**：
 
-- 规则匹配挡不住所有变形话术；最后一道防线仍是会话自己遵守 `security.md`，以及 Antigravity 的命令权限和云权限本身。
+- 规则匹配挡不住所有变形话术；最后一道防线仍是会话自己遵守 `security.md`，以及会话宿主（Antigravity / Codex / Claude）自己的命令权限和云权限本身。
 - 消息是会话自己用 lark-cli 发的、命令是会话自己执行的，sheepdog 不在执行路径上，只能在投递前标记和拦截。
 
 ## 数据与隐私
@@ -274,9 +293,9 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），sheepdog 对 IM 只读。
+除了加、撤确认表情（`[ack]`），以及 Codex / Claude 登录失效时经机器人私聊你一条「需要你重新登录」（24 小时最多一次），sheepdog 对 IM 只读。
 
-清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
+清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 

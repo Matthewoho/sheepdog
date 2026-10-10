@@ -105,3 +105,30 @@ bot_reasons = ["owner_reply"]
 # 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}
 remind_minutes = [15, 30]
 expire_minutes = 60
+
+[source]
+# false = 不拉 IM（测试环境用）：这时可以用 sheepdog inject 往账本里放一条合成消息；改了要重启
+enabled = true
+
+# 会话宿主（每个会话一个，默认 antigravity = 上面的 sink）。codex / claude 走各自的命令行，一轮在后台跑完。
+# 权限不归 sheepdog 管：这里没有沙箱、审批、权限项，全部来自宿主自己的配置
+# （Codex 看 ~/.codex/config.toml；Claude 看它自己的用户设置、workdir 下的设置，或下面 settings 指的文件）。
+# model / effort / timeout_minutes / max_concurrent 改了下一轮生效；enabled / command / workdir / settings 要重启。
+[hosts.codex]
+enabled = false
+command = "codex"              # 可执行文件
+model = "gpt-6-astra"          # 默认模型；名册和 new-session 可以逐个会话覆盖
+effort = "high"                # 默认推理档位
+workdir = "~/sheepdog-work"    # 会话的工作目录，启用时必填
+timeout_minutes = 60           # 一轮最多跑多久，超过就杀掉，会话标 attention
+max_concurrent = 2             # 这个宿主同时最多跑几轮，超过的批次排队
+
+[hosts.claude]
+enabled = false
+command = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+workdir = "~/sheepdog-work"
+timeout_minutes = 60
+max_concurrent = 2
+# settings = "~/.config/sheepdog/claude-settings.json"   # 可选，原样传 --settings；sheepdog 不写它的内容

@@ -237,6 +237,66 @@ class AckConfig:
                 raise ConfigError(f"[ack] {k} 必须是字符串列表")
 
 
+# 会话宿主（7.18）：antigravity 走 App 的 agentapi；codex / claude 走各自的命令行，在后台跑
+ANTIGRAVITY = "antigravity"
+CLI_HOSTS = ("codex", "claude")
+HOSTS = (ANTIGRAVITY, *CLI_HOSTS)
+
+
+@dataclass
+class HostConfig:
+    """[hosts.codex] / [hosts.claude]（7.18）。model / effort 只是默认值，名册和 new-session 可以逐个会话覆盖。
+
+    权限不归 sheepdog 管：这里没有任何沙箱、审批、权限项，全部来自宿主自己的配置；
+    settings 只是一个文件名（只给 Claude，原样传给 --settings），sheepdog 不写它的内容。
+    """
+    name: str = ""
+    enabled: bool = False
+    command: str = ""             # 可执行文件；留空 = 宿主名（codex / claude）
+    model: str = ""               # 默认模型；留空 = 宿主自己的默认
+    effort: str = ""              # 默认推理档位；留空 = 宿主自己的默认
+    workdir: str = ""             # 会话的工作目录，启用时必填
+    timeout_minutes: float = 60   # 一轮最多跑多久，超过就杀掉整个进程组
+    max_concurrent: int = 2       # 这个宿主同时最多跑几轮，超过的批次排队
+    settings: str = ""            # 只给 Claude
+
+    @property
+    def executable(self) -> str:
+        return self.command or self.name
+
+    @property
+    def workdir_path(self) -> Path:
+        return Path(self.workdir).expanduser()
+
+    def validate(self) -> None:
+        where = f"[hosts.{self.name}]"
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"{where} enabled 必须是 true/false")
+        for k in ("command", "model", "effort", "workdir", "settings"):
+            if not isinstance(getattr(self, k), str):
+                raise ConfigError(f"{where} {k} 必须是字符串")
+        if self.settings and self.name != "claude":
+            raise ConfigError(f"{where} settings 只给 Claude 用")
+        t = self.timeout_minutes
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
+            raise ConfigError(f"{where} timeout_minutes 必须是正数")
+        m = self.max_concurrent
+        if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+            raise ConfigError(f"{where} max_concurrent 必须是 >= 1 的整数")
+        if self.enabled and not self.workdir.strip():
+            raise ConfigError(f"{where} 已启用但 workdir 为空：会话的工作目录必填")
+
+
+@dataclass
+class SourceConfig:
+    # false = 不拉飞书（测试环境用，7.18）：这时可以用 sheepdog inject 往账本里放合成消息
+    enabled: bool = True
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("[source] enabled 必须是 true/false")
+
+
 @dataclass
 class Config:
     # 「我」的 open_id，用于 @我 / 自己发的 / 回复我 的判定
@@ -268,6 +328,8 @@ class Config:
     bus: BusConfig = field(default_factory=BusConfig)
     owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
+    source: SourceConfig = field(default_factory=SourceConfig)
+    hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
 
@@ -278,6 +340,21 @@ class Config:
     @property
     def receipts_dir(self) -> Path:
         return self.state_dir / "receipts"
+
+    @property
+    def runs_dir(self) -> Path:
+        """命令行宿主每轮的输入、输出、错误（7.18）：runs/<batch_id>.in / .out / .err"""
+        return self.state_dir / "runs"
+
+    def host_enabled(self, host: str) -> bool:
+        return host == ANTIGRAVITY or (host in self.hosts and self.hosts[host].enabled)
+
+    def check_host(self, host: str) -> None:
+        """会话要用的宿主必须存在且已启用；不行就抛 ValueError，说清是哪个宿主没开。"""
+        if host not in HOSTS:
+            raise ValueError(f"未知宿主 {host!r}，只能是 {' / '.join(HOSTS)}")
+        if not self.host_enabled(host):
+            raise ValueError(f"宿主 {host} 没开：配置里 [hosts.{host}] enabled = false")
 
     @property
     def roster_file(self) -> Path:
@@ -332,6 +409,13 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.bus, data.get("bus", {}))
         _apply(cfg.owner_context, data.get("owner_context", {}))
         _apply(cfg.loop_guard, data.get("loop_guard", {}))
+        _apply(cfg.source, data.get("source", {}))
+        hosts = data.get("hosts", {})
+        if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
+            raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
+        for h in CLI_HOSTS:
+            _apply(cfg.hosts[h], hosts.get(h, {}))
+            cfg.hosts[h].name = h
         if isinstance(data.get("ack"), dict):
             _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
             cfg.ack.enabled = True
@@ -344,6 +428,9 @@ def load_config(path: Path | None = None) -> Config:
     cfg.bus.validate()
     cfg.owner_context.validate()
     cfg.loop_guard.validate()
+    cfg.source.validate()
+    for h in cfg.hosts.values():
+        h.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

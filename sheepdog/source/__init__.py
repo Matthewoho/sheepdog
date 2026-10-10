@@ -28,3 +28,21 @@ class ImWriter(Protocol):
     def add_reaction(self, message_id: str, emoji_type: str, identity: str = "user") -> str: ...
     def remove_reaction(self, message_id: str, reaction_id: str) -> None: ...
     def reactions_of(self, message_ids: list[str]) -> dict[str, list[dict]]: ...
+
+
+class NullSource:
+    """[source] enabled = false 时用（7.18 测试环境）：不拉 IM，什么都不返回；消息用 sheepdog inject 放进账本。"""
+
+    last_fetch_partial = False
+
+    def fetch_since(self, start_iso: str, end_iso: str | None = None) -> list[Message]:
+        return []
+
+    def muted_chat_ids(self) -> set[str]:
+        return set()
+
+    def read_status(self, message_ids: list[str]) -> dict[str, bool]:
+        return {}
+
+    def senders_of(self, message_ids: list[str]) -> dict[str, str]:
+        return {}

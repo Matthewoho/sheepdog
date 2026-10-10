@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS topics (
     spawned_at       TEXT,             -- 由 sheepdog spawn 新建的时间；名册 conversation_id 留空时以此为准
     origin_note      TEXT,             -- dynamic 会话的创建原因（new-session 的 --note）
     rules_hash       TEXT,             -- 上次送达的常驻规则指纹（7.11）；为空 = 没记录，下一批带上完整规则
+    host             TEXT DEFAULT 'antigravity',  -- 会话宿主（7.18）：antigravity | codex | claude；建好后不能换
+    model            TEXT,             -- 这个会话的模型；空 = 宿主默认值（每轮现取配置）
+    effort           TEXT,             -- 这个会话的推理档位；空 = 宿主默认值
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -179,6 +182,31 @@ CREATE TABLE IF NOT EXISTS actions (
     result       TEXT,
     error        TEXT
 );
+
+-- 命令行宿主（Codex / Claude）每一轮的后台运行（7.18）。batch_id 是批次号；不属于批次的轮（新建会话的开场、
+-- push-rules）用 sheepdog 自己生成的编号
+CREATE TABLE IF NOT EXISTS runs (
+    batch_id        TEXT PRIMARY KEY,
+    topic_id        TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    conversation_id TEXT,
+    pid             INTEGER,
+    cmd_fingerprint TEXT,              -- 启动命令行（不含可执行文件本身）；重启后用 ps 核对 pid 还是不是这个进程
+    started_at      TEXT,
+    ended_at        TEXT,
+    state           TEXT NOT NULL,     -- running | done | failed | timeout | locked | retry_wait
+    attempts        INTEGER DEFAULT 0,
+    error           TEXT,
+    error_kind      TEXT,              -- capacity | locked | auth | other | timeout
+    kind            TEXT,              -- new（新建会话）| resume（续接）
+    title           TEXT,
+    model           TEXT,
+    effort          TEXT,
+    retry_at        TEXT,              -- retry_wait 时下一次重试的时间
+    denials         TEXT,              -- 宿主拒绝的工具 / 审批请求（JSON 列表）
+    answer          TEXT               -- 这一轮最后的回答
+);
+CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(host, state);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -191,7 +219,8 @@ MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
                  ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
-               ("origin_note", "TEXT"), ("rules_hash", "TEXT")],
+               ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
+               ("model", "TEXT"), ("effort", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
 }
@@ -481,12 +510,14 @@ class Store:
     def list_topics(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM topics ORDER BY last_active DESC").fetchall()
 
-    def create_topic(self, topic_id: str, title: str, kind: str, duty: str, state: str) -> None:
+    def create_topic(self, topic_id: str, title: str, kind: str, duty: str, state: str,
+                     host: str = "antigravity", model: str = "", effort: str = "") -> None:
         ts = now_iso()
         with self.tx() as c:
             c.execute(
-                "INSERT INTO topics(topic_id,title,kind,duty,state,created_at,last_active) VALUES(?,?,?,?,?,?,?)",
-                (topic_id, title, kind, duty, state, ts, ts),
+                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,created_at,last_active)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None, ts, ts),
             )
 
     def count_topics_since(self, kind: str, since_iso: str) -> int:
@@ -675,6 +706,53 @@ class Store:
     def close_watch(self, watch_id: int, reason: str) -> None:
         self.update_watch(watch_id, closed_at=now_iso(), close_reason=reason)
 
+    # ---------- runs（7.18） ----------
+    RUN_ACTIVE = ("running", "retry_wait")
+
+    def add_run(self, batch_id: str, topic_id: str, host: str, conversation_id: str, kind: str, title: str,
+                model: str, effort: str) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT OR REPLACE INTO runs(batch_id,topic_id,host,conversation_id,state,attempts,kind,title,
+                                                    model,effort,started_at)
+                         VALUES(?,?,?,?,'running',0,?,?,?,?,?)""",
+                      (batch_id, topic_id, host, conversation_id or None, kind, title, model, effort, now_iso()))
+
+    def get_run(self, batch_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM runs WHERE batch_id=?", (batch_id,)).fetchone()
+
+    def update_run(self, batch_id: str, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as c:
+            c.execute(f"UPDATE runs SET {cols} WHERE batch_id=?", (*fields.values(), batch_id))
+
+    def runs_in_state(self, host: str, *states: str) -> list[sqlite3.Row]:
+        marks = ",".join("?" * len(states))
+        return self.conn.execute(f"SELECT * FROM runs WHERE host=? AND state IN ({marks}) ORDER BY started_at",
+                                 (host, *states)).fetchall()
+
+    def active_runs_for(self, conversation_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM runs WHERE conversation_id=? AND state IN ('running','retry_wait')",
+                                 (conversation_id,)).fetchall()
+
+    def runs_for_conversation(self, conversation_id: str, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM runs WHERE conversation_id=? ORDER BY started_at DESC, rowid DESC "
+                                 "LIMIT ?", (conversation_id, limit)).fetchall()
+
+    def host_of_conversation(self, conversation_id: str) -> str:
+        """这个会话编号属于哪个宿主：先看 topics，再看 runs（换宿主后旧编号只留在 runs 里）；都没有就是空串。"""
+        r = self.conn.execute("SELECT host FROM topics WHERE conversation_id=? AND host IS NOT NULL LIMIT 1",
+                              (conversation_id,)).fetchone()
+        if r is None:
+            r = self.conn.execute("SELECT host FROM runs WHERE conversation_id=? ORDER BY started_at DESC LIMIT 1",
+                                  (conversation_id,)).fetchone()
+        return r[0] if r is not None else ""
+
+    def latest_run_for_topic(self, topic_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM runs WHERE topic_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                                 (topic_id,)).fetchone()
+
     # ---------- 保留期清理 ----------
     # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
     PRUNE_SQL = {
@@ -690,9 +768,11 @@ class Store:
         "watches": "DELETE FROM watches WHERE closed_at IS NOT NULL AND closed_at < ?",
         "actions": "DELETE FROM actions WHERE done_at IS NOT NULL AND done_at < ?",
         "loop_events": "DELETE FROM loop_events WHERE until < ?",
+        "runs": "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at < ? AND state NOT IN ('running','retry_wait')",
     }
 
-    def prune(self, retention_days: int, receipts_dir: Path | None = None) -> dict[str, int]:
+    def prune(self, retention_days: int, receipts_dir: Path | None = None,
+              runs_dir: Path | None = None) -> dict[str, int]:
         """清理超过 retention_days 的记录与回执文件；返回每类删了多少。"""
         now = datetime.now().astimezone()
         cutoff = (now - timedelta(days=retention_days)).isoformat(timespec="seconds")
@@ -713,6 +793,16 @@ class Store:
                 if d.is_dir() and not any(d.iterdir()):
                     d.rmdir()
             out["receipt_files"] = n
+        if runs_dir is not None and runs_dir.exists():
+            # 命令行宿主的输入输出文件：账本里已经没有、或已结束的运行，超过保留期就删
+            active = {r[0] for r in self.conn.execute("SELECT batch_id FROM runs WHERE state IN ('running','retry_wait')")}
+            limit = (now - timedelta(days=retention_days)).timestamp()
+            n = 0
+            for f in runs_dir.iterdir():
+                if f.is_file() and f.stem not in active and f.stat().st_mtime < limit:
+                    f.unlink()
+                    n += 1
+            out["run_files"] = n
         return out
 
 

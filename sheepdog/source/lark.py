@@ -190,6 +190,10 @@ class LarkCliSource:
             raise SourceError(f"reactions create 没返回 reaction_id: {json.dumps(data, ensure_ascii=False)[:300]}")
         return str(rid)
 
+    def send_text(self, user_id: str, text: str, identity: str = "bot") -> None:
+        """经机器人给一个人发一条私聊（7.18：命令行宿主登录失效时提醒主人）。只试一次。"""
+        self._run_once(["im", "+messages-send", "--user-id", user_id, "--text", text], identity)
+
     def remove_reaction(self, message_id: str, reaction_id: str) -> None:
         self._run_once(["im", "reactions", "delete",
                         "--params", json.dumps({"message_id": message_id, "reaction_id": reaction_id})])

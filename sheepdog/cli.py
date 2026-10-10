@@ -14,7 +14,8 @@
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
   sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
   sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
-  sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...] [--dry-run]
+  sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...]
+                       [--host antigravity|codex|claude] [--model M] [--effort E] [--dry-run]
                                                          总线临时新开一个专属会话（只在账本里）
   sheepdog close-session --topic T                       收掉总线新开的会话
   sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
@@ -23,6 +24,8 @@
   sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
   sheepdog redeliver --batch B                           发送中断、不确定是否送达的批次：人工确认后重发
   sheepdog show <message_id>                             打印账本里这条消息的完整正文
+  sheepdog show --topic T                                打印这个会话最近几轮的问答，告诉你去哪里接着看
+  sheepdog inject --text 正文 [--chat oc_x] [--sender ou_x] ...  （只在 [source] enabled = false 时）放一条合成消息进账本
   sheepdog reply-card (--text 正文 | --text-file 文件或 -)  打印代回卡片 JSON（正文 + 右下角标记）
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
   sheepdog session-reset --topic T                       人工把 attention/failed 复位
@@ -40,8 +43,11 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import sys
 import time
+import tomllib
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,16 +55,20 @@ from . import __version__
 from . import actions
 from .ack import Acker
 from .card import build_reply_card
-from .config import ConfigError, load_config
-from .engine import (DYNAMIC, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier, close_session,
-                     escalation_summary, forward_messages, open_escalations, write_receipt)
+from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, load_config
+from .engine import (DYNAMIC, HOST_LABEL, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier,
+                     close_session, escalation_summary, forward_messages, open_escalations, write_receipt)
+from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
-from .roster import Roster, RosterError, load_roster
+from .roster import Roster, RosterError, check_hosts, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
 from .sink.agentapi import AgentApiSink, DryRunSink
+from .sink.claude import ClaudeSink
+from .sink.codex import CodexSink, codex_home
+from .source import NullSource
 from .source.lark import LarkCliSource
-from .store import Store
+from .store import Store, now_iso
 from . import session as sm
 
 
@@ -74,10 +84,22 @@ class _Abort(Exception):
     pass
 
 
+SINK_CLASSES = {"codex": CodexSink, "claude": ClaudeSink}
+# 这些宿主配置要重启才生效（sink 是启动时建的）；model / effort / timeout_minutes / max_concurrent 下一轮生效
+HOST_RESTART_KEYS = ("enabled", "command", "workdir", "settings")
+
+
+def load_checked_roster(cfg) -> Roster:
+    """读名册并检查 managed 会话引用的宿主都已启用（7.18）。"""
+    roster = load_roster(cfg.roster_file, cfg.roster_required)
+    check_hosts(roster, cfg.host_enabled)
+    return roster
+
+
 def _roster(cfg) -> Roster:
     """名册校验失败直接报错退出，不静默降级。"""
     try:
-        return load_roster(cfg.roster_file, cfg.roster_required)
+        return load_checked_roster(cfg)
     except RosterError as e:
         print(f"名册无效: {e}", file=sys.stderr)
         raise _Abort() from e
@@ -98,14 +120,38 @@ def _build(args):
     security = _security(cfg)
     dry = getattr(args, "dry_run", False)
     store = Store.snapshot(cfg.db_path) if dry else Store(cfg.db_path)
-    source = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages)
-    sink = DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()
-    return cfg, store, source, sink, roster, security
+    source = _source(cfg)
+    return cfg, store, source, _sinks(cfg, store, dry), roster, security
+
+
+def _source(cfg):
+    """[source] enabled = false（测试环境）时不拉 IM（7.18）。"""
+    if not cfg.source.enabled:
+        return NullSource()
+    return LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages)
+
+
+def _sinks(cfg, store: Store, dry: bool) -> dict:
+    """按宿主建 sink（7.18）：sink = dryrun 只管 Antigravity；--dry-run 一律打印。没启用的宿主不建。"""
+    sinks: dict = {ANTIGRAVITY: DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()}
+    for h in CLI_HOSTS:
+        if cfg.hosts[h].enabled:
+            sinks[h] = DryRunSink(h) if dry else SINK_CLASSES[h](cfg.hosts[h], store, cfg.runs_dir)
+    return sinks
+
+
+def _notifier(cfg, source, args):
+    """经机器人给主人发私聊（登录失效提醒）。不拉 IM、没有 self_open_id 时没有；dry-run 只打印。"""
+    if not cfg.self_open_id or not hasattr(source, "send_text"):
+        return None
+    if getattr(args, "dry_run", False):
+        return lambda text: print(f"[dryrun] 给主人发私聊：\n{text}\n")
+    return lambda text: source.send_text(cfg.self_open_id, text, "bot")
 
 
 def _acker(cfg, store, source, args) -> Acker | None:
     """确认表情（7.9）：没有 [ack] 段就不建。dry-run（含 sink = dryrun）只打印，不调接口。"""
-    if not cfg.ack.enabled:
+    if not cfg.ack.enabled or not cfg.source.enabled:
         return None
     dry = getattr(args, "dry_run", False) or cfg.sink == "dryrun"
     return Acker(cfg.ack, store, source, dry_run=dry)
@@ -127,11 +173,17 @@ def cmd_doctor(args) -> int:
     print(f"状态目录: {cfg.state_dir}")
     print(f"self_open_id: {'✓ 已配置' if cfg.self_open_id else '✗ 未配置（@我/回复我 判定会失效）'}")
     ok &= bool(cfg.self_open_id)
-    lark = shutil.which("lark-cli")
-    print(f"lark-cli: {lark or '✗ 未找到'}")
-    ok &= bool(lark)
+    if cfg.source.enabled:
+        lark = shutil.which("lark-cli")
+        print(f"lark-cli: {lark or '✗ 未找到'}")
+        ok &= bool(lark)
+    else:
+        print("消息源: [source] enabled = false，不拉 IM（测试环境，用 sheepdog inject 放消息）")
     avail, why = AgentApiSink().available()
     print(f"agentapi: {'✓' if avail else '✗ ' + why}")
+    store = Store(cfg.db_path)
+    for line in host_report(cfg, store):
+        print(line)
     overlay = cfg.prompt_overlay()
     print(f"prompt overlay: {'✓ ' + str(len(overlay)) + ' 字' if overlay else '（无）'}")
     try:
@@ -176,6 +228,71 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 1
 
 
+def _codex_sandbox() -> tuple[str, str]:
+    """Codex 生效的 sandbox_mode 和网络开关：从 ~/.codex/config.toml 读（CODEX_HOME 可改），读不到就写「读不到」。"""
+    p = codex_home() / "config.toml"
+    try:
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return "读不到", "读不到"
+    mode = data.get("sandbox_mode")
+    net = (data.get("sandbox_workspace_write") or {}).get("network_access")
+    return (str(mode) if mode else "读不到"), ("读不到" if net is None else ("开" if net else "关"))
+
+
+def _claude_login(exe: str) -> str:
+    try:
+        out = subprocess.run([exe, "auth", "status"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"读不到（{e}）"
+    text = (out.stdout or out.stderr).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return f"读不到（{text[:80]}）"
+    return "✓ 已登录" if data.get("loggedIn") else "✗ 没登录：在终端跑 `claude auth login`"
+
+
+def host_report(cfg, store: Store) -> list[str]:
+    """sheepdog doctor 的宿主一节（7.18 第 3 条）：命令在不在、登录状态、Codex 的沙箱和网络。"""
+    lines = []
+    for h in CLI_HOSTS:
+        hc = cfg.hosts[h]
+        label = HOST_LABEL[h]
+        if not hc.enabled:
+            lines.append(f"{label}: 未启用（[hosts.{h}] enabled = false）")
+            continue
+        exe = shutil.which(hc.executable) or (hc.executable if Path(hc.executable).expanduser().is_file() else "")
+        lines.append(f"{label}: 命令 {exe or '✗ 找不到 ' + hc.executable}；workdir {hc.workdir}"
+                     f"{'' if hc.workdir_path.is_dir() else ' ✗ 不存在'}；默认模型 {hc.model or '（宿主默认）'} / "
+                     f"档位 {hc.effort or '（宿主默认）'}；超时 {hc.timeout_minutes:g} 分钟，并发 {hc.max_concurrent}")
+        u = store.get_meta(f"host_unavailable:{h}")
+        if u:
+            lines.append(f"  ⚠ 标为不可用：{json.loads(u).get('reason', '')}")
+        if h == "claude":
+            lines.append(f"  登录: {_claude_login(hc.executable) if exe else '读不到'}")
+            if hc.settings:
+                lines.append(f"  权限: 来自 --settings {hc.settings}（sheepdog 不写它的内容）")
+            else:
+                lines.append("  权限: 来自 Claude 自己的用户设置和 workdir 下的设置")
+        else:
+            last = store.conn.execute("SELECT * FROM runs WHERE host='codex' AND ended_at IS NOT NULL "
+                                      "ORDER BY ended_at DESC LIMIT 1").fetchone()
+            if last is None:
+                lines.append("  登录: 还没跑过，看不出来")
+            elif last["error_kind"] == "auth":
+                lines.append(f"  登录: ✗ 最近一次运行报登录失效（{last['ended_at']}）：在终端跑 `codex login`")
+            else:
+                lines.append(f"  登录: ✓ 最近一次运行（{last['ended_at']}）没有登录类报错")
+            lines.append("  提示: Codex 应用侧边栏只列登记过的项目下的线程；新建的线程要重开应用才看得到")
+            mode, net = _codex_sandbox()
+            lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}（来自 Codex 自己的配置，sheepdog 不传任何权限参数）")
+            if mode == "read-only" or net == "关":
+                lines.append("  ⚠ 这个宿主的会话能读、能分析，但发不了飞书")
+    return lines
+
+
 def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
     stats = collector.poll_once()
     logging.info("poll: %s", stats)
@@ -188,7 +305,8 @@ def cmd_poll(args) -> int:
     cfg, store, source, sink, roster, security = _build(args)
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
-    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker)
+    dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker,
+                                                          _notifier(cfg, source, args))
     _cycle(collector, dispatcher)
     return 0
 
@@ -215,6 +333,19 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
     if new.sink != old.sink:
         logging.warning("sink 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s", new.sink, old.sink)
         new.sink = old.sink
+    if new.source.enabled != old.source.enabled:
+        logging.warning("[source] enabled 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s",
+                        new.source.enabled, old.source.enabled)
+        new.source.enabled = old.source.enabled
+    for h in CLI_HOSTS:
+        # 宿主的 sink 是启动时建的：开关、命令、工作目录、settings 要重启；模型、档位、超时、并发下一轮生效
+        for k in HOST_RESTART_KEYS:
+            if getattr(new.hosts[h], k) != getattr(old.hosts[h], k):
+                logging.warning("[hosts.%s] %s 改了，需要重启 sheepdog 才生效；本次沿用 %r", h, k, getattr(old.hosts[h], k))
+                setattr(new.hosts[h], k, getattr(old.hosts[h], k))
+        sink = dispatcher.sinks.get(h)
+        if sink is not None and hasattr(sink, "update_config"):
+            sink.update_config(new.hosts[h])
     collector.cfg = dispatcher.cfg = new
     dispatcher.playbook = Playbook.from_config(new)  # 代回前缀、等待分钟数等占位符跟着新配置
     if hasattr(source, "max_pages"):
@@ -231,8 +362,9 @@ def cmd_run(args) -> int:
     cfg, store, source, sink, roster, security = _build(args)
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
-    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker)
-    logging.info("sheepdog 常驻运行，间隔 %ss，sink=%s", args.interval or cfg.poll_interval_seconds, sink.name)
+    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args))
+    logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
+                 "、".join(f"{h}={s.name}" for h, s in sink.items()))
     last_prune = 0.0
     while True:
         try:
@@ -240,7 +372,7 @@ def cmd_run(args) -> int:
             cfg = _reload_config(cfg, args, store, source, collector, dispatcher)
             # 每轮重读名册：改名册不必重启；改坏了沿用上一份有效名册并报错，常驻进程不退出
             try:
-                collector.roster = dispatcher.roster = load_roster(cfg.roster_file, cfg.roster_required)
+                collector.roster = dispatcher.roster = load_checked_roster(cfg)
             except RosterError as e:
                 logging.error("名册无效，沿用上一份: %s", e)
             # 安全规则同样每轮现读，改坏了沿用上一份有效规则
@@ -253,7 +385,7 @@ def cmd_run(args) -> int:
                 logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
-                pruned = store.prune(cfg.retention_days, cfg.receipts_dir)
+                pruned = store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir)
                 last_prune = time.time()
                 if any(pruned.values()):
                     logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,
@@ -377,7 +509,13 @@ def cmd_sessions(args) -> int:
         uncertain.setdefault(u["topic_id"], []).append(u)
     for t in rows:
         mode = _MODE.get(t["kind"], t["kind"] or "-")
-        print(f"- {t['title']}  [{t['state']}]  mode={mode}  topic={t['topic_id']}  conversation={t['conversation_id'] or '-'}")
+        host = rules.topic_host(t)
+        model, effort = rules.model_effort(t)
+        cols = (f"  宿主={host}  模型={(model or '（宿主默认）') + ('' if t['model'] or not model else '（默认）')}"
+                + (f"  档位={(effort or '（宿主默认）') + ('' if t['effort'] or not effort else '（默认）')}"
+                   if host != ANTIGRAVITY else ""))
+        print(f"- {t['title']}  [{t['state']}]  mode={mode}  topic={t['topic_id']}  conversation={t['conversation_id'] or '-'}"
+              + cols)
         print(f"  职责: {t['duty']}")
         anchors = json.loads(t["anchors_json"] or "[]")
         projects = [a.removeprefix("project:") for a in anchors if a.startswith("project:")]
@@ -413,6 +551,15 @@ def cmd_sessions(args) -> int:
             print(f"  进展: {t['summary']}")
         if t["state"] != sm.CLOSED and (status := rules.rules_status(t)):
             print(f"  规则: {status}")
+        if host != ANTIGRAVITY:
+            run = store.latest_run_for_topic(t["topic_id"])
+            if run is not None:
+                extra = f"，下次重试 {run['retry_at']}" if run["state"] == "retry_wait" else ""
+                err = f"（{run['error_kind']}：{(run['error'] or '')[:120]}）" if run["error_kind"] else ""
+                print(f"  最近一轮: {run['batch_id']} [{run['state']}] 第 {run['attempts'] or 0} 次，"
+                      f"开始 {run['started_at']}{extra}{err}")
+                if run["denials"]:
+                    print(f"  被拒的工具: {', '.join(json.loads(run['denials']))}")
         for u in uncertain.get(t["topic_id"], []):
             print(f"  ⚠ 批次 {u['batch_id']} 发送中断、不确定是否送达（{u['sent_at']}），确认后: sheepdog redeliver --batch {u['batch_id']}")
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
@@ -603,26 +750,30 @@ def cmd_new_session(args) -> int:
             chats = [_parse_chat(c) for c in args.chat]
             ids = [i for i in (args.message_ids or "").split(",") if i.strip()]
             Dispatcher(cfg, store, sink, roster, security).new_session(
-                args.key, args.title, args.duty, chats, ids, args.note, validate_only=True)
+                args.key, args.title, args.duty, chats, ids, args.note, validate_only=True,
+                host=args.host, model=args.model, effort=args.effort)
         except ValueError as e:
             print(f"new-session 被拒绝: {e}", file=sys.stderr)
             return 2
         return _queued(args, store, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
-                                                    "chats": chats, "message_ids": ids, "note": args.note})
+                                                    "chats": chats, "message_ids": ids, "note": args.note,
+                                                    "host": args.host, "model": args.model, "effort": args.effort})
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
     d.sync_roster()
     try:
         chats = [_parse_chat(c) for c in args.chat]
-        r = d.new_session(args.key, args.title, args.duty, chats, (args.message_ids or "").split(","), args.note)
+        r = d.new_session(args.key, args.title, args.duty, chats, (args.message_ids or "").split(","), args.note,
+                          host=args.host, model=args.model, effort=args.effort)
     except ValueError as e:
         print(f"new-session 被拒绝: {e}", file=sys.stderr)
         return 2
     except SinkError as e:
         print(f"new-session 失败（没有建会话）: {e}", file=sys.stderr)
         return 1
-    print(f"已新开 {r['title']} -> {r['conversation_id']}（topic {r['topic_id']}，只记在账本，不写名册）")
+    print(f"已新开 {r['title']} -> {r['conversation_id']}（{HOST_LABEL.get(r['host'], r['host'])}，topic {r['topic_id']}，"
+          "只记在账本，不写名册）")
     if r["queued"] or args.note:
         print(f"已排队 {r['queued']} 条消息{'和 note' if args.note else ''}，sheepdog 下一轮投递")
     return 0
@@ -766,10 +917,43 @@ def cmd_reply_card(args) -> int:
     return 0
 
 
+def _show_topic(cfg, store: Store, topic_id: str, limit: int) -> int:
+    """sheepdog show --topic（7.18 第 9 条）：这个会话最近几轮的问答（读对应宿主的记录），最后一行告诉人去哪里接着看。"""
+    t = store.get_topic(topic_id)
+    if t is None:
+        print(f"topic {topic_id} 不存在", file=sys.stderr)
+        return 2
+    if not t["conversation_id"]:
+        print(f"{topic_id} 还没有会话")
+        return 0
+    host = Dispatcher.topic_host(t)
+    if host == ANTIGRAVITY:
+        sink = AgentApiSink()
+    else:
+        sink = SINK_CLASSES[host](cfg.hosts[host], store, cfg.runs_dir)
+    print(f"{t['title']}（{HOST_LABEL.get(host, host)}，topic {topic_id}，会话 {t['conversation_id']}）")
+    items = sink.history(t["conversation_id"], limit)
+    if not items:
+        print("（记录里没有问答，可能会话记录不在本机，或者还没跑过）")
+    for role, text, ts in items:
+        text = (text or "").strip()
+        lines = text.splitlines() or [""]
+        more = f"\n  …（还有 {len(lines) - 20} 行）" if len(lines) > 20 else ""
+        print(f"[{role}] {ts}\n  " + "\n  ".join(lines[:20]) + more)
+    full_title = f"{cfg.session.title_prefix} {t['title']}".strip()  # 新建时给会话起的标题带前缀
+    print(f"接着看：{sink.resume_hint(t['conversation_id'], full_title)}")
+    return 0
+
+
 def cmd_show(args) -> int:
-    """打印账本里一条消息的完整正文（送进会话的长消息会截断，7.16）。"""
+    """打印账本里一条消息的完整正文（送进会话的长消息会截断，7.16）；--topic 打印会话最近几轮问答（7.18）。"""
     cfg = load_config()
     store = Store(cfg.db_path)
+    if args.topic:
+        return _show_topic(cfg, store, args.topic, args.limit)
+    if not args.message_id:
+        print("要给 message_id，或者 --topic <topic>", file=sys.stderr)
+        return 2
     r = store.get_message(args.message_id)
     if r is None:
         print(f"账本里没有 {args.message_id}（可能已超过保留期被清理）", file=sys.stderr)
@@ -778,6 +962,29 @@ def cmd_show(args) -> int:
     print(f"{where} | {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）| {r['create_time']} | {r['route']}/{r['reason']}"
           + (f" | 回复 {r['reply_to']}" if r["reply_to"] else ""))
     print(r["content"] or "")
+    return 0
+
+
+INJECT_ID_PREFIX = "om_test_inject_"
+
+
+def cmd_inject(args) -> int:
+    """测试环境（7.18）：不拉 IM 时，把一条合成消息当作刚收到的 IM 消息入账，走正常的路由和归属。"""
+    cfg = load_config()
+    if cfg.source.enabled:
+        print("inject 被拒绝: 只在 [source] enabled = false（测试环境，不拉 IM）时可用", file=sys.stderr)
+        return 2
+    roster = _roster(cfg)
+    security = _security(cfg)
+    store = Store(cfg.db_path)
+    mid = INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
+    mentions = [Mention(id=cfg.self_open_id, name="主人")] if args.at_me and cfg.self_open_id else []
+    m = Message(message_id=mid, chat_id=args.chat, chat_name=args.chat_name, chat_type=args.chat_type,
+                sender_id=args.sender, sender_name=args.sender_name, sender_type=args.sender_type, content=args.text,
+                msg_type="text", create_time=now_iso(), mentions=mentions, reply_to=args.reply_to)
+    Collector(cfg, store, NullSource(), roster, security).ingest([m])
+    r = store.get_message(mid)
+    print(f"已放进账本 {mid}：{r['route']}/{r['reason']} -> {r['topic_id'] or '-'}（sheepdog 下一轮投递）")
     return 0
 
 
@@ -879,6 +1086,9 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--chat", action="append", default=[], help="oc_xxx 或 oc_xxx:all，可重复")
     sp.add_argument("--message-ids", default="")
     sp.add_argument("--note", default="", help="为什么开（会作为创建原因记下，并排进它的队列）")
+    sp.add_argument("--host", default=ANTIGRAVITY, choices=HOSTS, help="会话宿主，默认 antigravity；建好后不能换")
+    sp.add_argument("--model", default="", help="模型；留空 = 这个宿主的默认值")
+    sp.add_argument("--effort", default="", help="推理档位（只对 codex / claude）；留空 = 这个宿主的默认值")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
     sp.set_defaults(func=cmd_new_session)
 
@@ -912,8 +1122,22 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(func=cmd_reply_card)
 
     sp = sub.add_parser("show")
-    sp.add_argument("message_id")
+    sp.add_argument("message_id", nargs="?", default="")
+    sp.add_argument("--topic", default="", help="打印这个会话最近几轮的问答")
+    sp.add_argument("--limit", type=int, default=6, help="--topic 时最多打印几条")
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("inject")
+    sp.add_argument("--text", required=True)
+    sp.add_argument("--chat", default="oc_test_inject", help="聊天 ID（默认 oc_test_inject）")
+    sp.add_argument("--chat-name", default="测试聊天")
+    sp.add_argument("--chat-type", default="p2p", choices=("p2p", "group"))
+    sp.add_argument("--sender", default="ou_test_inject", help="发送人 open_id")
+    sp.add_argument("--sender-name", default="测试同事")
+    sp.add_argument("--sender-type", default="user", choices=("user", "app", "bot"))
+    sp.add_argument("--at-me", action="store_true", help="群消息里 @主人")
+    sp.add_argument("--reply-to", default="")
+    sp.set_defaults(func=cmd_inject)
 
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)

@@ -12,6 +12,7 @@ key = "demo_requests"                       # topic_id = "tp_demo_requests"
 mode = "managed"
 conversation_id = "00000000-0000-4000-8000-000000000001"
 title = "示例：需求对接"                       # 现有标题，仅展示
+host = "antigravity"                         # 会话宿主：antigravity（默认）| codex | claude；建好后不能换
 duty = "跟进同事提来的需求：整理要点、起草回复。不负责审批和生产操作。"
 authority = ""                               # 主人在该会话里给过的授权原话；空 = 未明确授权，对外只起草
 self_polling = "每 10 分钟自己巡检一次需求私聊"   # 该会话自己的 IM 巡检，没有就留空
@@ -51,3 +52,16 @@ duty = "接手周报整理：汇总各群进展，周五起草周报。不负责
 chat_id = "oc_test_demo_weekly"
 name = "示例周报群"
 all_messages = false
+
+# Codex / Claude 会话（7.18）：host 写 codex 或 claude，配置里对应的 [hosts.*] 要先 enabled = true，否则名册报错。
+# model / effort 留空 = 用配置里这个宿主的默认值。conversation_id 留空由 sheepdog 新建，也可以填一个现有的
+# Codex 线程编号 / Claude 会话编号来接管它。要换宿主：退休旧会话、新开一个（predecessor_conversation_id）。
+# [[session]]
+# key = "demo_design"
+# mode = "managed"
+# conversation_id = ""
+# host = "codex"
+# model = ""                                 # 留空 = [hosts.codex] model
+# effort = "xhigh"                           # 这个会话单独用更高的推理档位
+# title = "示例：架构设计"
+# duty = "复杂代码和架构设计：读代码、出方案。不负责对外发送。"

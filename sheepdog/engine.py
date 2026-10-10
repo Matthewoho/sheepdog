@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import session as sm
-from .config import Config
+from .config import ANTIGRAVITY, Config
 from .models import Message
 from .playbook import Playbook
 from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
@@ -19,9 +19,10 @@ from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstr
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
-from .sink import Sink, SinkError
+from .sink import RunResult, Sink, SinkError
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
+from .sink.cli_host import RECEIPT_FENCE, extract_receipt
 from .store import SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
 
 log = logging.getLogger("sheepdog")
@@ -83,6 +84,11 @@ def predecessor_topic_id(topic_id: str) -> str:
     return topic_id + ".prev"
 MUTED_REFRESH_MINUTES = 30
 MAX_RETRIES = 3
+# 命令行宿主连续写锁冲突多久提示总线（7.18 第 6 条）；登录失效的提醒同一原因多久发一次
+LOCK_ALERT_MINUTES = 60
+LOGIN_NOTICE_HOURS = 24
+HOST_LABEL = {"antigravity": "Antigravity", "codex": "Codex", "claude": "Claude"}
+LOGIN_COMMAND = {"codex": "codex login", "claude": "claude auth login"}
 
 
 def _now() -> datetime:
@@ -307,19 +313,8 @@ class Collector:
                 self._sender_cache[message_id] = ""
         return self._sender_cache.get(message_id) == me
 
-    def poll_once(self) -> dict:
-        started = _now()
-        wm = _parse(self.store.get_meta("watermark"))
-        pending_start = _parse(self.store.get_meta("partial_start"))
-        if pending_start:
-            start = pending_start  # 上一轮没拉完：从原 start 重拉（按 message_id 去重）
-        elif wm:
-            start = wm - timedelta(seconds=self.cfg.overlap_seconds)
-        else:
-            start = started - timedelta(minutes=self.cfg.initial_lookback_minutes)
-        # 固定窗口 [start, started]：翻页期间新来的消息留给下一轮，水位线只推进到 started（7.16）
-        msgs = self.source.fetch_since(start.isoformat(timespec="seconds"), started.isoformat(timespec="seconds"))
-        partial = bool(getattr(self.source, "last_fetch_partial", False))
+    def ingest(self, msgs: list[Message]) -> dict:
+        """一批消息入账：路由 → 归属 → 安全闸 → 等待 / 主人发言 / 防循环。poll_once 和 sheepdog inject 共用。"""
         ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
         self._dynamic = dynamic_owners(self.store)
         self._refresh_cooling()
@@ -354,6 +349,23 @@ class Collector:
                     stats["changed"] += 1
                 else:
                     self.store.touch(m.message_id)
+
+        return stats
+
+    def poll_once(self) -> dict:
+        started = _now()
+        wm = _parse(self.store.get_meta("watermark"))
+        pending_start = _parse(self.store.get_meta("partial_start"))
+        if pending_start:
+            start = pending_start  # 上一轮没拉完：从原 start 重拉（按 message_id 去重）
+        elif wm:
+            start = wm - timedelta(seconds=self.cfg.overlap_seconds)
+        else:
+            start = started - timedelta(minutes=self.cfg.initial_lookback_minutes)
+        # 固定窗口 [start, started]：翻页期间新来的消息留给下一轮，水位线只推进到 started（7.16）
+        msgs = self.source.fetch_since(start.isoformat(timespec="seconds"), started.isoformat(timespec="seconds"))
+        partial = bool(getattr(self.source, "last_fetch_partial", False))
+        stats = self.ingest(msgs)
 
         self._tag_read_status()
         self._check_owner_reactions()
@@ -675,11 +687,15 @@ class Collector:
 
 # ======================= Dispatcher =======================
 class Dispatcher:
-    def __init__(self, cfg: Config, store: Store, sink: Sink, roster: Roster | None = None,
-                 security: SecurityConfig | None = None, acker=None):
+    def __init__(self, cfg: Config, store: Store, sink: Sink | dict, roster: Roster | None = None,
+                 security: SecurityConfig | None = None, acker=None, notifier=None):
         self.cfg = cfg
         self.store = store
-        self.sink = sink
+        # 按宿主取 sink（7.18）：{antigravity: ..., codex: ..., claude: ...}；只给一个时就是 antigravity 的
+        self.sinks: dict[str, Sink] = dict(sink) if isinstance(sink, dict) else {ANTIGRAVITY: sink}
+        # 经机器人给主人发一条私聊（登录失效提醒）；notifier(text)，没有就只记日志
+        self.notifier = notifier
+        self._host_warned: set[str] = set()
         # 确认表情（7.9）：投递成功后以主人身份点表情
         self.acker = acker
         self.roster = roster or Roster()
@@ -687,6 +703,76 @@ class Dispatcher:
         self.security = security or SecurityConfig()
         # 业务文字每次组装 prompt 时从 playbook 现读，改完下一批生效
         self.playbook = Playbook.from_config(cfg)
+
+    @property
+    def sink(self) -> Sink:
+        return self.sinks[ANTIGRAVITY]
+
+    # ---------- 宿主（7.18） ----------
+    @staticmethod
+    def topic_host(t) -> str:
+        return (t["host"] if t is not None and "host" in t.keys() else None) or ANTIGRAVITY
+
+    def sink_for(self, t) -> Sink:
+        host = self.topic_host(t)
+        sink = self.sinks.get(host)
+        if sink is None:
+            raise SinkError(f"宿主 {host} 没开（配置里 [hosts.{host}] enabled = false），{t['topic_id']} 的信号排队")
+        return sink
+
+    def model_effort(self, t) -> tuple[str, str]:
+        """这个会话这一轮用的模型和档位：会话自己的，留空就用宿主的默认值（每轮现取配置，改了下一轮生效）。"""
+        host = self.topic_host(t)
+        model = (t["model"] if t is not None and "model" in t.keys() else "") or ""
+        effort = (t["effort"] if t is not None and "effort" in t.keys() else "") or ""
+        if host == ANTIGRAVITY:
+            return model or self.cfg.session.model, ""
+        h = self.cfg.hosts[host]
+        return model or h.model, effort or h.effort
+
+    def _send(self, t, content: str, batch_id: str = "") -> None:
+        sink = self.sink_for(t)
+        if self.topic_host(t) == ANTIGRAVITY:
+            sink.send_message(t["conversation_id"], content)  # agentapi 投递行为不变
+            return
+        model, effort = self.model_effort(t)
+        sink.send_message(t["conversation_id"], content, batch_id=batch_id, topic_id=t["topic_id"],
+                          model=model, effort=effort)
+
+    def _new_conversation(self, host: str, topic_id: str, title: str, prompt: str, model: str, effort: str,
+                          batch_id: str = "") -> str:
+        """新建会话。batch_id：开场这一轮属于哪个批次（命令行宿主从这一轮的回答里取回执块时用）。"""
+        sink = self.sinks.get(host)
+        if sink is None:
+            raise SinkError(f"宿主 {host} 没开（配置里 [hosts.{host}] enabled = false）")
+        if host == ANTIGRAVITY:
+            return sink.new_conversation(title, prompt, model or self.cfg.session.model)  # agentapi 行为不变
+        h = self.cfg.hosts[host]
+        return sink.new_conversation(title, prompt, model or h.model, effort or h.effort, topic_id=topic_id,
+                                     batch_id=batch_id)
+
+    def conversation_host(self, conversation_id: str) -> str:
+        """一个会话编号属于哪个宿主（退休前任时用）：账本里查不到就当 Antigravity（P0.5 以来的老会话）。"""
+        return self.store.host_of_conversation(conversation_id) or ANTIGRAVITY
+
+    def _predecessor_paths(self, conversation_id: str) -> tuple[str, str]:
+        """前任会话的记录文件和目录，写进接手会话的开场（successor.md）。"""
+        if not conversation_id:
+            return "", ""
+        host = self.conversation_host(conversation_id)
+        sink = self.sinks.get(host)
+        if host != ANTIGRAVITY and hasattr(sink, "record_files"):
+            files = sink.record_files(conversation_id)
+            return (str(files[-1]), str(files[-1].parent)) if files else ("", "")
+        return str(transcript_path(conversation_id)), str(conversation_dir(conversation_id))
+
+    def _busy(self, t) -> str:
+        """命令行宿主这一轮能不能开：宿主不可用、会话还在跑、并发已满时返回排队原因。"""
+        sink = self.sinks.get(self.topic_host(t))
+        if sink is None:
+            return f"宿主 {self.topic_host(t)} 没开（[hosts.{self.topic_host(t)}] enabled = false）"
+        busy = getattr(sink, "busy", None)
+        return busy(t["conversation_id"] or "") if busy else ""
 
     @property
     def bus_title(self) -> str:
@@ -723,7 +809,8 @@ class Dispatcher:
                           s.key, s.topic_id)
                 continue
             if t is None:
-                self.store.create_topic(s.topic_id, s.display_title, s.kind, s.duty, sm.ACTIVE)
+                self.store.create_topic(s.topic_id, s.display_title, s.kind, s.duty, sm.ACTIVE, s.host, s.model,
+                                        s.effort)
                 t = self.store.get_topic(s.topic_id)
                 report["created"].append(s.topic_id)
             chat_ids = [c.chat_id for c in s.chats]
@@ -738,7 +825,18 @@ class Dispatcher:
                 "title": s.display_title, "kind": s.kind, "duty": s.duty,
                 "conversation_id": cid,
                 "anchors_json": json.dumps(chat_ids + sorted(set(keep)), ensure_ascii=False),
+                "model": s.model or None, "effort": s.effort or None,
             }
+            # 已有会话不能换宿主（7.18）：要换就退休旧的、新开一个，走接手流程
+            host = self.topic_host(t)
+            if host != s.host:
+                if t["conversation_id"] and cid == t["conversation_id"]:
+                    if s.topic_id not in self._host_warned:
+                        self._host_warned.add(s.topic_id)
+                        log.error("名册条目 %s 的 host 从 %s 改成了 %s：已有会话不能换宿主，沿用 %s；"
+                                  "要换就退休旧会话、新开一个（接手流程）", s.key, host, s.host, host)
+                else:
+                    fields["host"] = s.host
             if t["conversation_id"] and t["conversation_id"] != fields["conversation_id"]:
                 # 换了会话：新会话没收过 onboarding，旧批次的回执也不再等
                 fields.update(onboarded_at=None, pending_batch_id=None)
@@ -802,6 +900,9 @@ class Dispatcher:
             if t["kind"] == DYNAMIC and new_state == sm.CLOSED:
                 self._dynamic_closed(t["topic_id"], "回执 done")
             return
+        sink = self.sinks.get(self.topic_host(t))
+        if sink is not None and hasattr(sink, "run_active") and sink.run_active(batch):
+            return  # 命令行宿主这一轮还在后台跑（或等重试）：跑完由 _finish_run 收尾，不按回执超时算
         sent = _parse(t["dispatched_at"])
         if sent and _now() - sent > timedelta(minutes=self.cfg.session.receipt_timeout_minutes):
             if adopted:
@@ -858,7 +959,10 @@ class Dispatcher:
     def _check_human(self, t) -> None:
         if not t["conversation_id"]:
             return
-        last = self.sink.last_human_activity(t["conversation_id"])
+        sink = self.sinks.get(self.topic_host(t))
+        if sink is None:
+            return
+        last = sink.last_human_activity(t["conversation_id"])
         recent = bool(last and _now() - last < timedelta(minutes=self.cfg.session.human_attach_minutes))
         if recent and sm.can(t["state"], "human_attach") and t["state"] != sm.RUNNING:
             self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "human_attach"))
@@ -891,7 +995,7 @@ class Dispatcher:
         prompt = bootstrap_prompt(self.playbook, t["title"], self.cfg.session.bus_title, t["topic_id"], self.roster,
                                   self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes,
                                   open_dynamic_topics(self.store))
-        cid = self.sink.new_conversation(t["title"], prompt, self.cfg.session.model)
+        cid = self._new_conversation(self.topic_host(t), t["topic_id"], t["title"], prompt, "", "")
         self.store.update_topic(t["topic_id"], conversation_id=cid, rules_hash=self.rules_hash(t))
         self.store.set_meta("roster_notify_bus", "0")
         log.info("新建 session %s -> %s", t["title"], cid)
@@ -908,7 +1012,7 @@ class Dispatcher:
                     cid, _, flag = a.partition(":")
                     chats.append(RosterChat(cid, "", flag == "all"))
             return RosterSession(key=t["topic_id"].removeprefix("tp_"), mode=MANAGED, title=t["title"],
-                                 duty=t["duty"] or "", chats=chats)
+                                 duty=t["duty"] or "", chats=chats, host=self.topic_host(t))
         return None
 
     def standing_rules(self, t, for_hash: bool = False) -> str:
@@ -954,9 +1058,11 @@ class Dispatcher:
                 report[tid] = "跳过：还没 onboarding（onboarding 本身含现行规则）"
             elif not (rules := self.standing_rules(t)):
                 report[tid] = "跳过：没有可发的规则"
+            elif busy := self._busy(t):
+                report[tid] = f"排队：{busy}（下一批会带上完整规则）"
             else:
                 try:
-                    self.sink.send_message(t["conversation_id"], rules_update_message(rules))
+                    self._send(t, rules_update_message(rules))
                 except SinkError as e:
                     report[tid] = f"失败：{e}"
                     continue
@@ -971,8 +1077,7 @@ class Dispatcher:
             raise SinkError(f"{t['topic_id']} 不在名册里，不能 onboarding")
         bid = self._new_batch_id("o", t["topic_id"])
         w = self.cfg.watch
-        self.sink.send_message(t["conversation_id"],
-                               onboarding_prompt(self.playbook, s, bid, w.remind_minutes, w.expire_minutes))
+        self._send(t, onboarding_prompt(self.playbook, s, bid, w.remind_minutes, w.expire_minutes), bid)
         ts = now_iso()
         self.store.record_dispatch(bid, t["topic_id"], [])
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
@@ -990,7 +1095,14 @@ class Dispatcher:
             log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
             res["waiting_spawn"] = True
             return res
+        busy = self._busy(t) if t["conversation_id"] else ""
+        if busy:
+            # 命令行宿主（7.18）：宿主不可用 / 会话还在跑上一轮 / 并发已满 → 排队，下一轮再看
+            log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], busy, len(rows))
+            res["queued"] = busy
+            return res
         roster_update = ""
+        batch_id = ""
         try:
             if t["kind"] == ADOPTED and not t["onboarded_at"]:
                 # 第一次收消息前先发 onboarding；消息等它回执或超时后下一轮再投
@@ -1016,12 +1128,13 @@ class Dispatcher:
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
-                                  quotes=quotes, max_lines=self.cfg.session.max_message_lines)
+                                  quotes=quotes, max_lines=self.cfg.session.max_message_lines,
+                                  cli_host=self.topic_host(t) != ANTIGRAVITY)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
-            self.sink.send_message(t["conversation_id"], prompt)
+            self._send(t, prompt, batch_id)
         except SinkError as e:
-            if self.store.get_dispatch(batch_id) is not None:
+            if batch_id and self.store.get_dispatch(batch_id) is not None:
                 self.store.set_dispatch_state(batch_id, "failed", str(e))
             self._fail(t, None, str(e))
             res["error"] = str(e)
@@ -1071,7 +1184,9 @@ class Dispatcher:
             t = self.store.get_topic(d["topic_id"])
             ids = json.loads(d["message_ids"] or "[]")
             rows = [r for r in (self.store.get_message(i) for i in ids) if r is not None]
-            if t is not None and t["conversation_id"] and transcript_contains(t["conversation_id"], d["batch_id"]):
+            sink = self.sinks.get(self.topic_host(t)) if t is not None else None
+            contains = getattr(sink, "transcript_contains", None) or transcript_contains
+            if t is not None and t["conversation_id"] and contains(t["conversation_id"], d["batch_id"]):
                 self.store.set_dispatch_state(d["batch_id"], "sent")
                 self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
                                         [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
@@ -1082,9 +1197,159 @@ class Dispatcher:
                 log.warning("批次 %s（%s）发送中断，不确定是否送达，不自动重发；确认后用 sheepdog redeliver --batch %s",
                             d["batch_id"], d["topic_id"], d["batch_id"])
 
+    # ---------- 命令行宿主收尾（7.18） ----------
+    def collect_runs(self) -> list[RunResult]:
+        """收各命令行宿主已经结束的运行，按结果处理回执、写锁、登录失效、超时、失败。"""
+        done: list[RunResult] = []
+        for host, sink in self.sinks.items():
+            collect = getattr(sink, "collect_finished", None)
+            if collect is None:
+                continue
+            try:
+                results = collect()
+            except Exception as e:  # 一个宿主出错不影响别的
+                log.warning("收 %s 的运行结果失败: %s", host, e)
+                continue
+            for r in results:
+                try:
+                    self._finish_run(r)
+                except Exception as e:
+                    log.warning("处理 %s 一轮 %s 的结果失败: %s", host, r.batch_id, e)
+                done.append(r)
+            # 登录失效按宿主的状态提醒，不按某一轮：新建会话时失效的那一轮不经过 _finish_run，也要提醒到
+            reason = getattr(sink, "unavailable_reason", None)
+            if reason is not None and (why := reason()):
+                self._login_notice(host, why)
+        self._check_lock_streaks()
+        return done
+
+    def _bus_hint(self, reason: str, text: str) -> None:
+        self.store.add_system_message(BUS_TOPIC_ID, reason, text)
+
+    def _finish_run(self, r: RunResult) -> None:
+        t = self.store.get_topic(r.topic_id) if r.topic_id else None
+        label = HOST_LABEL.get(r.host, r.host)
+        name = (t["title"] if t is not None else "") or r.topic_id or r.conversation_id
+        if r.denials:
+            log.warning("%s 会话 %s 这一轮被拒的工具 / 请求：%s", label, r.topic_id, ", ".join(r.denials))
+        if r.state == "retry_wait":
+            return
+        d = self.store.get_dispatch(r.batch_id)
+        mine = t is not None and d is not None and t["pending_batch_id"] == r.batch_id
+        if r.state == "done":
+            if d is None or t is None:
+                return  # 新建会话的开场、push-rules：没有批次要收
+            p = self.receipt_path(t["topic_id"], r.batch_id)
+            if not p.exists():
+                receipt, bad = extract_receipt(r.answer)
+                if receipt is not None:
+                    try:
+                        write_receipt(self.cfg, t["topic_id"], r.batch_id, receipt)
+                        log.info("从 %s 回答里取到回执块 %s/%s", label, t["topic_id"], r.batch_id)
+                    except ValueError as e:
+                        bad = str(e)
+                if bad:
+                    log.warning("%s/%s 的回执块格式不对，按没有处理：%s", t["topic_id"], r.batch_id, bad)
+            if not p.exists() and mine and t["state"] == sm.RUNNING:
+                # 这一轮已经跑完、会话没交回执也没附回执块：不必再等，直接走回执超时的处理
+                log.info("%s/%s 这一轮结束了，但没有回执（也没有 %s 块）", t["topic_id"], r.batch_id, RECEIPT_FENCE)
+                if t["kind"] in MANAGED_KINDS:
+                    self._miss(t, r.batch_id)
+                elif t["kind"] != RETIRED:
+                    self._fail(t, r.batch_id, "命令行会话这一轮结束时没有回执")
+            return
+        if mine and t["kind"] == RETIRED:
+            # 退休通知没跑完：不会有交接回执了，记失败、提示总线补发（退休通知不自动重发）
+            self.store.finish_dispatch(r.batch_id, "failed", error=f"{r.error_kind}: {r.error[-300:]}")
+            self.store.update_topic(t["topic_id"], pending_batch_id=None)
+            self._bus_hint("host_failed", f"⚠️ 给「{name}」的退休通知没送到（{label} {r.state}/{r.error_kind}）："
+                                          f"{r.error[-200:]}；稍后用 `sheepdog retire --topic {t['topic_id']}` 补发")
+            return
+        if r.state in ("locked", "failed") and r.error_kind in ("locked", "auth"):
+            # 写锁冲突视同主人正在用；登录失效整个宿主排队。两种都是这一轮根本没跑：批次退回排队，一律不算失败
+            if mine:
+                self.store.finish_dispatch(r.batch_id, "failed", error=f"{r.error_kind}：退回排队")
+                self.store.requeue_batch(r.batch_id)
+                fields = {"pending_batch_id": None}
+                if r.batch_id.startswith("o"):
+                    fields["onboarded_at"] = None  # 登记通知没送到，下次重发
+                if r.error_kind == "locked" and sm.can(t["state"], "human_attach"):
+                    fields["state"] = sm.transition(t["state"], "human_attach")
+                elif t["state"] == sm.RUNNING:
+                    fields["state"] = sm.ACTIVE
+                self.store.update_topic(t["topic_id"], **fields)
+            if r.error_kind != "auth":  # 登录失效的提醒在 collect_runs 里按宿主状态统一发
+                log.info("%s 会话 %s 写锁冲突（有别人在用这个线程），视同主人正在用，批次 %s 退回排队",
+                         label, r.topic_id, r.batch_id)
+            return
+        if r.state == "timeout":
+            if mine:
+                self.store.finish_dispatch(r.batch_id, "failed", error=r.error)
+                state = t["state"]
+                for ev in ("error", "retries_exhausted"):
+                    if sm.can(state, ev):
+                        state = sm.transition(state, ev)
+                self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+            self._bus_hint("host_timeout", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮超时：{r.error}。"
+                                           f"会话已标 attention，确认后用 `sheepdog session-reset --topic {r.topic_id}` 复位。")
+            return
+        # 容量满重试用完：批次退回排队、会话标 attention（不再自动重发，免得同一批次一轮轮撞容量），给总线提示；
+        # 不自动换模型。其他失败：照普通投递失败处理（退回排队，累计 3 次标 attention）
+        if mine and r.error_kind == "capacity":
+            self.store.finish_dispatch(r.batch_id, "failed", error=r.error[-1000:])
+            self.store.requeue_batch(r.batch_id)
+            state = t["state"]
+            for ev in ("error", "retries_exhausted"):
+                if sm.can(state, ev):
+                    state = sm.transition(state, ev)
+            self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+        elif mine:
+            self._fail(t, r.batch_id, f"{label} {r.error_kind}: {r.error[-300:]}")
+        self._bus_hint("host_failed", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮失败"
+                                      f"（{r.error_kind}）：{r.error[-300:]}")
+
+    def _login_notice(self, host: str, reason: str) -> None:
+        """登录失效：经机器人给主人发一条「需要你重新登录」，同一宿主 24 小时只发一次。"""
+        key = f"login_notice:{host}"
+        last = _parse(self.store.get_meta(key))
+        if last and _now() - last < timedelta(hours=LOGIN_NOTICE_HOURS):
+            return
+        self.store.set_meta(key, now_iso())
+        label = HOST_LABEL.get(host, host)
+        text = (f"🐕 汇报 · 需要你重新登录 {label} [{BUS_TOPIC_ID}]\n"
+                f"{label} 会话跑不了：{(reason or '').strip()[-200:]}\n"
+                f"在终端跑 `{LOGIN_COMMAND.get(host, host + ' login')}`；之后 sheepdog 会自己再试，期间这个宿主的批次排队。")
+        log.warning("需要主人重新登录 %s：%s", label, reason[-200:])
+        if self.notifier is None:
+            return
+        try:
+            self.notifier(text)
+        except Exception as e:
+            log.warning("给主人发登录提醒失败: %s", e)
+
+    def _check_lock_streaks(self) -> None:
+        """命令行会话连续写锁冲突满 60 分钟：提示总线一次（同一段连续冲突只提示一次）。"""
+        for t in self.store.list_topics():
+            sink = self.sinks.get(self.topic_host(t))
+            since_fn = getattr(sink, "lock_streak_since", None)
+            if since_fn is None or not t["conversation_id"] or t["state"] == sm.CLOSED:
+                continue
+            since = since_fn(t["conversation_id"])
+            if since is None or _now() - since < timedelta(minutes=LOCK_ALERT_MINUTES):
+                continue
+            key = f"lock_alert:{t['conversation_id']}"
+            mark = since.isoformat(timespec="seconds")
+            if self.store.get_meta(key) == mark:
+                continue
+            self.store.set_meta(key, mark)
+            self._bus_hint("host_locked", f"⚠️ {HOST_LABEL.get(self.topic_host(t))} 会话「{t['title']}」（topic "
+                                          f"`{t['topic_id']}`）从 {mark} 起一直被别人占着（写锁冲突），信号在排队。"
+                                          "可能是主人在应用里开着这个线程。")
+
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
         self._recover_sending()
+        self.collect_runs()
         self.sync_roster()
         self.ensure_bus_topic()
         tids = [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
@@ -1126,14 +1391,18 @@ class Dispatcher:
 
     # ---------- 总线新开会话（7.10） ----------
     def new_session(self, key: str, title: str, duty: str, chats: list[tuple[str, bool]],
-                    message_ids: list[str] | None = None, note: str = "", validate_only: bool = False) -> dict:
+                    message_ids: list[str] | None = None, note: str = "", validate_only: bool = False,
+                    host: str = "", model: str = "", effort: str = "") -> dict:
         """总线临时新开一个专属会话：只写账本（kind = dynamic），不写名册。
 
         先做全部校验（key、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward 规则排队。
         """
         key, title, duty, note = key.strip(), title.strip(), duty.strip(), (note or "").strip()
+        host, model, effort = (host or ANTIGRAVITY).strip(), (model or "").strip(), (effort or "").strip()
         if not _KEY_RE.match(key) or key == "bus":
             raise ValueError("--key 只允许 [a-z0-9_-]，且不能是 bus")
+        # 宿主没开直接报错，说清是哪个（7.18）；额度 max_new_sessions_per_day 所有宿主共用
+        self.cfg.check_host(host)
         topic_id = "tp_" + key
         if self.roster.by_key(key) is not None:
             raise ValueError(f"key {key!r} 已在名册里")
@@ -1173,12 +1442,12 @@ class Dispatcher:
 
         full_title = f"{self.cfg.session.title_prefix} {title}".strip()
         s = RosterSession(key=key, mode=MANAGED, title=title, duty=duty,
-                          chats=[RosterChat(cid, "", al) for cid, al in chats])
+                          chats=[RosterChat(cid, "", al) for cid, al in chats], host=host, model=model, effort=effort)
         prompt = adopted_bootstrap(self.playbook, s, full_title, "", self.cfg.watch.remind_minutes,
                                    self.cfg.watch.expire_minutes)
-        cid = self.sink.new_conversation(full_title, prompt, self.cfg.session.model)
+        cid = self._new_conversation(host, topic_id, full_title, prompt, model, effort)
         ts = now_iso()
-        self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE)
+        self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE, host, model, effort)
         self.store.update_topic(topic_id, conversation_id=cid, spawned_at=ts, onboarded_at=ts, origin_note=note or None,
                                 anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False))
         self.store.update_topic(topic_id, rules_hash=self.rules_hash(self.store.get_topic(topic_id)))
@@ -1186,8 +1455,8 @@ class Dispatcher:
         if ids or note:
             forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
                              escalation_open_hours=self.cfg.escalation.open_hours)
-        log.info("总线新开会话 %s -> %s（%d 条消息排队）", topic_id, cid, len(ids))
-        return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids)}
+        log.info("总线新开会话 %s（%s）-> %s（%d 条消息排队）", topic_id, host, cid, len(ids))
+        return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids), "host": host}
 
     # ---------- 新建与接手（7.2） ----------
     def spawn(self, key: str) -> dict:
@@ -1204,6 +1473,7 @@ class Dispatcher:
         t = self.store.get_topic(s.topic_id)
         if t["spawned_at"]:
             return {"skipped": f"已于 {t['spawned_at']} 新建 {t['conversation_id']}"}
+        self.cfg.check_host(s.host)
         title = f"{self.cfg.session.title_prefix} {s.display_title}".strip()
         report: dict = {}
         if s.predecessor_conversation_id and s.retire_predecessor:
@@ -1211,10 +1481,9 @@ class Dispatcher:
         read_bid = self._new_batch_id("h", s.topic_id) if s.predecessor_conversation_id else ""
         prompt = adopted_bootstrap(
             self.playbook, s, title, read_bid, self.cfg.watch.remind_minutes, self.cfg.watch.expire_minutes,
-            str(transcript_path(s.predecessor_conversation_id)) if s.predecessor_conversation_id else "",
-            str(conversation_dir(s.predecessor_conversation_id)) if s.predecessor_conversation_id else "",
+            *self._predecessor_paths(s.predecessor_conversation_id),
         )
-        cid = self.sink.new_conversation(title, prompt, self.cfg.session.model)
+        cid = self._new_conversation(s.host, s.topic_id, title, prompt, s.model, s.effort, read_bid)
         ts = now_iso()
         # bootstrap 已含职责与规则，等同 onboarding
         fields = dict(conversation_id=cid, spawned_at=ts, onboarded_at=ts, pending_batch_id=None,
@@ -1233,23 +1502,28 @@ class Dispatcher:
         pt = self.store.get_topic(pid)
         if pt is not None and pt["conversation_id"] == s.predecessor_conversation_id:
             return f"已发过（{pid}）"
-        # 先发退休通知，失败就整个 spawn 失败，不新建接手会话
+        # 先发退休通知，失败就整个 spawn 失败，不新建接手会话。
+        # 前任按它自己的宿主发（换宿主也走这条：退休旧的、新开一个）
         bid = self._send_retirement(pid, f"{s.display_title}（前任）", s.predecessor_conversation_id,
-                                    successor_title, s.topic_id)
+                                    successor_title, s.topic_id, self.conversation_host(s.predecessor_conversation_id))
         return f"已发送 {bid}"
 
     def _send_retirement(self, record_id: str, title: str, conversation_id: str, successor_title: str,
-                         successor_topic_id: str | None) -> str:
+                         successor_topic_id: str | None, host: str = ANTIGRAVITY) -> str:
         """给一个会话发退休通知（retire.md）。record_id 是记录它的 retired topic（closed，不再投递）；
-        它的交接回执到达后转给 successor_topic_id，没有接手会话时转总线。"""
+        它的交接回执到达后转给 successor_topic_id，没有接手会话时转总线。host 是被退休会话的宿主。"""
         if self.store.get_topic(record_id) is None:
-            self.store.create_topic(record_id, title, RETIRED, "已退休，由接手会话继续", sm.CLOSED)
+            self.store.create_topic(record_id, title, RETIRED, "已退休，由接手会话继续", sm.CLOSED, host)
         bid = self._new_batch_id("r", record_id)
-        self.sink.send_message(conversation_id, retirement_prompt(self.playbook, record_id, title, bid,
-                                                                  successor_title, successor_topic_id or BUS_TOPIC_ID))
+        rec = self.store.get_topic(record_id)
+        rec = {**dict(rec), "conversation_id": conversation_id, "host": host}
+        if busy := self._busy(rec):
+            raise SinkError(f"退休通知发不出去：{busy}")
+        self._send(rec, retirement_prompt(self.playbook, record_id, title, bid, successor_title,
+                                          successor_topic_id or BUS_TOPIC_ID, cli_host=host != ANTIGRAVITY), bid)
         self.store.record_dispatch(bid, record_id, [])
         self.store.update_topic(record_id, conversation_id=conversation_id, kind=RETIRED, state=sm.CLOSED,
-                                pending_batch_id=bid, dispatched_at=now_iso(),
+                                pending_batch_id=bid, dispatched_at=now_iso(), host=host,
                                 anchors_json=json.dumps([f"successor:{successor_topic_id or BUS_TOPIC_ID}"]))
         log.info("已给 %s 发退休通知 %s（记录 %s）", conversation_id, bid, record_id)
         return bid
@@ -1295,7 +1569,8 @@ class Dispatcher:
         if not successor_title:
             successor_title = (f"{self.cfg.session.title_prefix} {st['title']}".strip() if st and succ != BUS_TOPIC_ID
                                else "总线（会转给合适的会话）")
-        bid = self._send_retirement(record, title, cid, successor_title, succ)
+        bid = self._send_retirement(record, title, cid, successor_title, succ,
+                                    self.topic_host(t) if t is not None else self.conversation_host(cid))
         result = {"record_topic": record, "conversation_id": cid, "batch": bid, "successor": succ or BUS_TOPIC_ID}
         if t is not None and t["kind"] == DYNAMIC and t["state"] != sm.CLOSED:
             close_session(self.store, t["topic_id"])
