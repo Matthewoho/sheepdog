@@ -123,9 +123,17 @@ CLI_RECEIPT_HINT = (f"跑不了 `sheepdog receipt`（比如写不了 sheepdog �
                     f"围栏标记 `{RECEIPT_FENCE}`，内容和 `--json` 的回执 JSON 一样，sheepdog 在这一轮结束时读取。")
 
 
+def with_cli(text: str, cli: str) -> str:
+    """把代码生成的文字里「`sheepdog <子命令>」换成配置的命令名（cli_name，已按 shell 规则加好引号）。
+
+    只用在 sheepdog 自己生成的说明文字上，不碰 IM 消息正文。程序名、日志这类描述性文字不经过这里。
+    """
+    return text if not cli or cli == "sheepdog" else text.replace("`sheepdog ", f"`{cli} ")
+
+
 # ---------- sheepdog 接口说明（软件接口文档，由代码生成） ----------
 def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: int, extra: list[str] = (),
-                      cli_host: bool = False) -> str:
+                      cli_host: bool = False, cli: str = "sheepdog") -> str:
     lines = [
         "## sheepdog 接口说明",
         "### 回执",
@@ -168,7 +176,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "附未结列表；判断后用 `sheepdog forward --topic <topic> --message-ids <主人那条消息>` 转交（不需要 --quote）。",
         ]
     lines += list(extra)
-    return "\n".join(lines)
+    return with_cli("\n".join(lines), cli)
 
 
 # ---------- 各类开场 prompt ----------
@@ -182,7 +190,7 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
         pb.render("bus.md", roster=roster_table(roster, dynamic), **v),
         pb.render("common.md", **v),
         overlay,
-        interface_section(topic_id, bus=True, remind=remind, expire=expire),
+        interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli),
         "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -199,7 +207,7 @@ def standing_rules_bus(pb: Playbook, plain_title: str, roster_text: str, overlay
     v = dict(session_title=plain_title, topic_id="tp_bus")
     return _join(pb.render("security.md", **v), pb.render("bus.md", roster=roster_text, **v),
                  pb.render("common.md", **v), overlay,
-                 interface_section("tp_bus", bus=True, remind=remind, expire=expire))
+                 interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli))
 
 
 def _cli_host_rules(pb: Playbook, s: RosterSession) -> str:
@@ -215,7 +223,8 @@ def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], ex
     v = dict(session_title=s.display_title, topic_id=s.topic_id)
     return _join(pb.render("security.md", **v), _onboarding_body(pb, s), pb.render("common.md", **v),
                  _cli_host_rules(pb, s),
-                 interface_section(s.topic_id, bus=False, remind=remind, expire=expire, cli_host=s.is_cli_host))
+                 interface_section(s.topic_id, bus=False, remind=remind, expire=expire, cli_host=s.is_cli_host,
+                                   cli=pb.cli))
 
 
 def rules_update_message(rules: str) -> str:
@@ -243,7 +252,8 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
         _onboarding_body(pb, s),
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
         _cli_host_rules(pb, s),
-        interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=confirm, cli_host=s.is_cli_host),
+        interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=confirm, cli_host=s.is_cli_host,
+                          cli=pb.cli),
     )
 
 
@@ -269,7 +279,8 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
                   predecessor_transcript=predecessor_transcript, predecessor_dir=predecessor_dir, **v)
         if s.predecessor_conversation_id else "",
         _cli_host_rules(pb, s),
-        interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host),
+        interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host,
+                          cli=pb.cli),
         "" if s.predecessor_conversation_id else "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -281,13 +292,13 @@ def retirement_prompt(pb: Playbook, prev_topic_id: str, prev_title: str, batch_i
         f"[sheepdog] 退休通知（topic `{prev_topic_id}`，批次 `{batch_id}`；接手会话 topic `{successor_topic_id}`）",
         pb.render("retire.md", successor_title=successor_title, batch_id=batch_id,
                   session_title=prev_title, topic_id=prev_topic_id),
-        "\n".join([
+        with_cli("\n".join([
             "## sheepdog 接口说明",
             f"交接回执：`sheepdog receipt --topic {prev_topic_id} --batch {batch_id} --json "
             f"'{{\"status\":\"done\",\"summary\":\"...\"}}'`",
             *([CLI_RECEIPT_HINT] if cli_host else []),
             "sheepdog 会把回执原样转给接手会话；之后不再往这里投递信号。",
-        ]),
+        ]), pb.cli),
     )
 
 
@@ -350,7 +361,7 @@ def quote_line(quoted) -> str:
     return f"↪ 回复的是：{_person(quoted['sender_name'], quoted['sender_id'])}：{text[:80] + ('…' if len(text) > 80 else '')}"
 
 
-def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200) -> str:
+def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200, cli: str = "sheepdog") -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -377,8 +388,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     for t in tags:
         if t.startswith("watch:"):
             wid = t.removeprefix("watch:")
-            lines.append(f"（这是你登记等待 #{wid} 的人发来的。真等到了就 `sheepdog watch-done --id {wid}` 或回执 anchors 写 "
-                         f"`watch_done:{wid}`；没确认的话，下次回执后继续等待并从这次回复重新计时）")
+            lines.append(with_cli(f"（这是你登记等待 #{wid} 的人发来的。真等到了就 `sheepdog watch-done --id {wid}` 或回执 "
+                                  f"anchors 写 `watch_done:{wid}`；没确认的话，下次回执后继续等待并从这次回复重新计时）", cli))
     if banner:
         lines.append(banner)  # 警示在正文之前
     content = (row["content"] or "").strip()
@@ -386,7 +397,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     lines += ["> " + ln for ln in body[:max_lines]] or ["> (空)"]
     if len(body) > max_lines:
         # 长消息截断时明说（7.16）：之前固定只送前 40 行且没有任何提示
-        lines.append(f"…（后面还有 {len(body) - max_lines} 行未显示，用 `sheepdog show {row['message_id']}` 看全文）")
+        lines.append(with_cli(f"…（后面还有 {len(body) - max_lines} 行未显示，用 `sheepdog show {row['message_id']}` 看全文）",
+                              cli))
     if row["link"]:
         lines.append(f"链接：{row['link']}")
     lines.append(f"message_id: `{row['message_id']}`" + (f"（回复 `{row['reply_to']}`）" if row["reply_to"] else ""))
@@ -406,22 +418,22 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
     quotes = quotes or {}
-    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines)
-              for r in rows]
+    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
+                       pb.cli) for r in rows]
     if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
         for r in inbox[:15]:
             owner = f"，主人最近发言 {r['owner_last']}" if "owner_last" in r.keys() and r["owner_last"] else ""
             parts.append(f"- 「{r['chat_name'] or r['chat_id']}」未读 {r['unread'] or 0} / 共 {r['total']}，最近 {r['last_time']}{owner}")
-        parts.append("如需查看某个群：`sheepdog inbox --chat <群名>`。")
+        parts.append(with_cli("如需查看某个群：`sheepdog inbox --chat <群名>`。", pb.cli))
     if roster_update:
         parts += ["", "🗂 名册更新（以此为准，替换你之前看到的名册）：", roster_update.rstrip()]
     if context_only:
         parts += ["", "这批只有主人本人的发言，作为背景，不需要回执。"]
     else:
         tail = "处理完成后提交回执" + ("（可选）" if receipt_optional else "")
-        parts += ["", f"{tail}：`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '...'`"]
+        parts += ["", with_cli(f"{tail}：`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '...'`", pb.cli)]
         if cli_host:
             parts.append(f"跑不了这条命令就在回答末尾附 ```{RECEIPT_FENCE} 回执块（内容同 --json）。")
     for name in ("security_footer.md", "batch_footer.md"):

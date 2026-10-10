@@ -49,7 +49,14 @@ class Playbook:
             "reply_suffix": cfg.session.reply_suffix or "",
             "watch_remind_minutes": "/".join(str(m) for m in w.remind_minutes),
             "watch_expire_minutes": str(w.expire_minutes),
+            # 会话在终端里敲的 sheepdog 命令（cli_name，已加好 shell 引号）；playbook 里写 {{cli}}
+            "cli": cfg.cli_command,
         })
+
+    @property
+    def cli(self) -> str:
+        """给会话看的命令名：默认 sheepdog，测试环境可以是一个只连测试配置的包装脚本。"""
+        return self.base_vars.get("cli") or "sheepdog"
 
     def read(self, name: str) -> str:
         try:

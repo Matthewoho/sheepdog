@@ -4,6 +4,10 @@
 # 「我」的 open_id（lark-cli auth status 可查）
 self_open_id = "ou_test_replace_me"
 
+# 会话在自己终端里敲的 sheepdog 命令：提示词里所有「去跑 sheepdog …」的命令文字、playbook 里的 {{cli}} 都用它。
+# 测试环境改成一个只连测试配置的包装脚本的绝对路径（带空格也行，会自动加引号）。下一轮生效
+cli_name = "sheepdog"
+
 poll_interval_seconds = 60
 # 每次拉取向前重叠的秒数（防止搜索索引延迟漏消息，按 message_id 去重）
 overlap_seconds = 180

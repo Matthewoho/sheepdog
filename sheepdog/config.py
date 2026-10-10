@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -328,6 +329,9 @@ class Config:
     bus: BusConfig = field(default_factory=BusConfig)
     owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
+    # 会话在自己终端里敲的 sheepdog 命令（提示词里所有「去跑 sheepdog …」的命令文字都用它）。
+    # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
+    cli_name: str = "sheepdog"
     source: SourceConfig = field(default_factory=SourceConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
@@ -345,6 +349,11 @@ class Config:
     def runs_dir(self) -> Path:
         """命令行宿主每轮的输入、输出、错误（7.18）：runs/<batch_id>.in / .out / .err"""
         return self.state_dir / "runs"
+
+    @property
+    def cli_command(self) -> str:
+        """cli_name 按 shell 规则加好引号（路径带空格时用引号括起来），直接拼进给会话看的命令里。"""
+        return shlex.quote(self.cli_name)
 
     def host_enabled(self, host: str) -> bool:
         return host == ANTIGRAVITY or (host in self.hosts and self.hosts[host].enabled)
@@ -428,6 +437,9 @@ def load_config(path: Path | None = None) -> Config:
     cfg.bus.validate()
     cfg.owner_context.validate()
     cfg.loop_guard.validate()
+    if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
+        raise ConfigError("cli_name 必须是非空字符串")
+    cfg.cli_name = cfg.cli_name.strip()
     cfg.source.validate()
     for h in cfg.hosts.values():
         h.validate()

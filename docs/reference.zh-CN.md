@@ -117,7 +117,7 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 - **怎么跑**：一轮是一个后台进程（自成进程组），不卡主循环。Codex 由 sheepdog 自己的 runner 起一个 `codex app-server`（JSON-RPC over stdio）：`initialize` → `thread/start`（新建，带 `threadSource: "user"`，再 `thread/name/set` 设标题）或 `thread/resume`（续接）→ `turn/start` → 等 `turn/completed`，跑完关掉。Claude 是 `claude -p --output-format json`，新建用 `--session-id` 预定编号、`-n` 设标题，续接用 `--resume`。输入、输出、错误在 `state_dir/runs/<batch_id>.in/.out/.err`，运行记录在账本 `runs` 表。同一会话同一时间只跑一轮；超过 `max_concurrent` 的批次排队。
 - **权限不归 sheepdog 管**：不传任何沙箱、审批、权限参数，全部来自宿主自己的配置（Codex 看 `~/.codex/config.toml`；Claude 看用户设置、workdir 下的设置，或 `settings` 指的文件，sheepdog 只传文件名）。Codex 发来的审批请求一律拒绝，方法名记进运行记录。`sheepdog doctor` 会列出每个宿主的命令、登录状态、Codex 的 `sandbox_mode` 和网络开关；只读或网络关着时提示「能读、能分析，但发不了飞书」。
 - **回执**：会话可能写不了 sheepdog 的状态目录，所以也可以在回答末尾附一个 ```` ```sheepdog-receipt ```` 块（内容同 `--json`）。一轮结束时：会话自己交过回执就以它为准；没交就取回执块；都没有就按回执超时处理。写法在 playbook 的 `cli_host.md`，只发给这两类会话。
-- **出错**：按输出内容认，不靠退出码。容量满 / 5xx：同一批次 5、10、20 分钟后重试，最多 3 次，还不行会话标 attention、提示总线，不换模型。写锁冲突（你在 Codex 应用里开过这个线程：应用对本次启动以来打开过的每条线程都持锁，切走也不放，关掉应用才放）：视同主人正在用，批次退回排队，连续 60 分钟提示总线，提示里的说明文字来自 playbook 的 `host_locked.md`。登录失效：这个宿主整体排队，经机器人给你发一条「需要你重新登录」（24 小时一次）。超过 `timeout_minutes`：杀掉整个进程组，会话标 attention。Claude 的 `permission_denials` 记日志，并在 `sheepdog sessions` 里显示。
+- **出错**：按输出内容认，不靠退出码。容量满 / 5xx：同一批次 5、10、20 分钟后重试，最多 3 次，还不行会话标 attention、提示总线，不换模型。写锁冲突（你在 Codex 应用里开过这个线程：应用对本次启动以来打开过的每条线程都持锁，切走也不放，关掉应用才放）：视同主人正在用，批次退回排队（一条不丢）；连续 60 分钟提示总线，并经机器人私聊提醒你关掉 Codex 应用（同一段冲突只提醒一次，同一会话 24 小时最多一次），说明文字来自 playbook 的 `host_locked.md`。登录失效：这个宿主整体排队，经机器人给你发一条「需要你重新登录」（24 小时一次）。超过 `timeout_minutes`：杀掉整个进程组，会话标 attention。Claude 的 `permission_denials` 记日志，并在 `sheepdog sessions` 里显示。
 - **你在用时让路**：Codex 读线程的 rollout 文件（`~/.codex/sessions/**/rollout-*-<编号>.jsonl`），Claude 读 `~/.claude/projects/*/<编号>.jsonl`；sheepdog 自己发的（带 `[sheepdog]` 头的）和第一条开场不算，其他用户消息算你的发言。另外有交互式 `claude --resume <编号>` 在跑也算你在用。
 - **重启**：`runs` 里还在跑的，进程还活着、命令行对得上就继续等；已经退出的按输出文件收尾；一律不重发。
 - **查看**：`sheepdog sessions` 多了宿主、模型、档位三列和最近一轮的状态；`sheepdog show --topic tp_x` 打印最近几轮问答，并告诉你去哪接着看（Codex：应用里的同名线程；Claude：在 workdir 里跑 `claude --resume <编号>`）。
@@ -267,7 +267,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `cli_host.md` | 只发给 Codex / Claude 会话（common.md 之后）：回执块怎么写、发不了 IM 时怎么办 | `{{host}}` |
 | `host_locked.md` | 命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明（为什么锁、怎么放锁） | `{{host}}` `{{since}}` |
 
-通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}`。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
+通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}` `{{cli}}`（会话该敲的 sheepdog 命令，即配置的 `cli_name`，默认 `sheepdog`；代码生成的接口说明、回执提示里的命令也用它，测试环境可以指向只连测试配置的包装脚本）。占位符是简单字符串替换，不认识的原样保留。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
 
 相关参数在 `config.toml`：`session.reply_suffix` / `reply_card_width`（代回卡片）、`session.reply_prefix`（旧）、`[watch] remind_minutes / expire_minutes`、`routing.drop_bot_message_prefixes`（机器人消息以这些前缀开头就丢弃，防止会话找你的私聊被推回总线）。
 
@@ -294,7 +294,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及 Codex / Claude 登录失效时经机器人私聊你一条「需要你重新登录」（24 小时最多一次），sheepdog 对 IM 只读。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的两类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次），sheepdog 对 IM 只读。
 
 清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 

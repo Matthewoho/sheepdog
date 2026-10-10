@@ -13,7 +13,7 @@ from . import session as sm
 from .config import ANTIGRAVITY, Config
 from .models import Message
 from .playbook import Playbook
-from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
+from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
@@ -87,6 +87,8 @@ MAX_RETRIES = 3
 # 命令行宿主连续写锁冲突多久提示总线（7.18 第 6 条）；登录失效的提醒同一原因多久发一次
 LOCK_ALERT_MINUTES = 60
 LOGIN_NOTICE_HOURS = 24
+# 写锁满 60 分钟给主人的提醒：同一个会话 24 小时内最多一次
+LOCK_NOTICE_HOURS = 24
 HOST_LABEL = {"antigravity": "Antigravity", "codex": "Codex", "claude": "Claude"}
 LOGIN_COMMAND = {"codex": "codex login", "claude": "claude auth login"}
 
@@ -239,7 +241,8 @@ class Collector:
         self.store.add_system_message(
             BUS_TOPIC_ID, "loop_guard",
             f"⚠️ 疑似循环：{name}（`{m.chat_id}`），{lg.window_minutes:g} 分钟内代回 {n} 次，已暂停 {lg.cooldown_minutes:g} 分钟。"
-            f"期间该聊天除主人以外的消息只进 Inbox；手动解除：`sheepdog loops --clear {m.chat_id}`")
+            + with_cli(f"期间该聊天除主人以外的消息只进 Inbox；手动解除：`sheepdog loops --clear {m.chat_id}`",
+                     self.cfg.cli_command))
 
     def _decide_inner(self, m: Message, ctx: RouteContext):
         d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids,
@@ -614,7 +617,8 @@ class Collector:
                     BUS_TOPIC_ID, "escalation_list",
                     f"主人引用回复了一条认不出来源的消息（message_id `{m.reply_to}`）：{quoted}\n"
                     f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
-                    f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。")
+                    + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。",
+                               self.cfg.cli_command))
                 log.info("主人的回复 %s 引用了认不出来源的消息 %s，投总线", m.message_id, m.reply_to)
                 return d
         else:
@@ -630,7 +634,8 @@ class Collector:
         lines = [f"主人的回复 `{m.message_id}` 没有引用具体问题，当前未结的「需要你定」{len(opens)} 条："]
         lines += [f"- topic `{e['topic_id']}` | {e['asked_at']} | message_id `{e['message_id']}` | {escalation_summary(e)}"
                   for e in opens] or ["- （无）"]
-        lines.append("判断它回答的是哪一条后，用 `sheepdog forward --topic <topic> --message-ids " + m.message_id + "` 转交。")
+        lines.append(with_cli("判断它回答的是哪一条后，用 `sheepdog forward --topic <topic> --message-ids " + m.message_id
+                              + "` 转交。", self.cfg.cli_command))
         self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "\n".join(lines))
         log.info("主人的回复 %s 无法确定回答哪条（未结 %d 条），投总线", m.message_id, len(opens))
         return d
@@ -1224,7 +1229,8 @@ class Dispatcher:
         return done
 
     def _bus_hint(self, reason: str, text: str) -> None:
-        self.store.add_system_message(BUS_TOPIC_ID, reason, text)
+        # 提示里的 `sheepdog …` 命令换成配置的 cli_name（会话在自己终端里敲的那个）
+        self.store.add_system_message(BUS_TOPIC_ID, reason, with_cli(text, self.cfg.cli_command))
 
     def _finish_run(self, r: RunResult) -> None:
         t = self.store.get_topic(r.topic_id) if r.topic_id else None
@@ -1308,6 +1314,15 @@ class Dispatcher:
         self._bus_hint("host_failed", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮失败"
                                       f"（{r.error_kind}）：{r.error[-300:]}")
 
+    def _notify_owner(self, text: str, what: str) -> None:
+        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟）；没有发送渠道时只记日志。"""
+        if self.notifier is None:
+            return
+        try:
+            self.notifier(with_cli(text, self.cfg.cli_command))
+        except Exception as e:
+            log.warning("给主人发%s失败: %s", what, e)
+
     def _login_notice(self, host: str, reason: str) -> None:
         """登录失效：经机器人给主人发一条「需要你重新登录」，同一宿主 24 小时只发一次。"""
         key = f"login_notice:{host}"
@@ -1320,15 +1335,14 @@ class Dispatcher:
                 f"{label} 会话跑不了：{(reason or '').strip()[-200:]}\n"
                 f"在终端跑 `{LOGIN_COMMAND.get(host, host + ' login')}`；之后 sheepdog 会自己再试，期间这个宿主的批次排队。")
         log.warning("需要主人重新登录 %s：%s", label, reason[-200:])
-        if self.notifier is None:
-            return
-        try:
-            self.notifier(text)
-        except Exception as e:
-            log.warning("给主人发登录提醒失败: %s", e)
+        self._notify_owner(text, "登录提醒")
 
     def _check_lock_streaks(self) -> None:
-        """命令行会话连续写锁冲突满 60 分钟：提示总线一次（同一段连续冲突只提示一次）。"""
+        """命令行会话连续写锁冲突满 60 分钟：提示总线一次，并经机器人提醒主人一次（同一段连续冲突各只一次）。
+
+        一段连续冲突从第一次撞锁算起，到有一轮不再撞锁为止；之后再被锁重新计时。
+        给主人的提醒另有上限：同一个会话 24 小时内最多一次（被上限挡住的，过了 24 小时、还锁着就补发）。
+        """
         for t in self.store.list_topics():
             sink = self.sinks.get(self.topic_host(t))
             since_fn = getattr(sink, "lock_streak_since", None)
@@ -1337,18 +1351,33 @@ class Dispatcher:
             since = since_fn(t["conversation_id"])
             if since is None or _now() - since < timedelta(minutes=LOCK_ALERT_MINUTES):
                 continue
-            key = f"lock_alert:{t['conversation_id']}"
             mark = since.isoformat(timespec="seconds")
-            if self.store.get_meta(key) == mark:
-                continue
-            self.store.set_meta(key, mark)
             label = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
             # 机制事实写在这里；为什么会锁、怎么放锁属于对人的说明，放 playbook 的 host_locked.md
             why = self.playbook.render("host_locked.md", host=label, session_title=t["title"], topic_id=t["topic_id"],
                                        since=mark)
-            self._bus_hint("host_locked", f"⚠️ {label} 会话「{t['title']}」（topic `{t['topic_id']}`）从 {mark} 起"
-                                          f"一直写锁冲突（already has an active writer），信号在排队。"
-                                          + (f"\n{why}" if why else ""))
+            fact = (f"{label} 会话「{t['title']}」（topic `{t['topic_id']}`）从 {mark} 起一直写锁冲突"
+                    f"（already has an active writer），信号在排队，一条不丢。")
+            key = f"lock_alert:{t['conversation_id']}"
+            if self.store.get_meta(key) != mark:
+                self.store.set_meta(key, mark)
+                self._bus_hint("host_locked", "⚠️ " + fact + (f"\n{why}" if why else ""))
+            self._lock_notice(t, mark, f"🐕 汇报 · {label} 会话被占着 [{BUS_TOPIC_ID}]\n{fact}" + (f"\n{why}" if why else ""))
+
+    def _lock_notice(self, t, mark: str, text: str) -> None:
+        key = f"lock_notice:{t['conversation_id']}"
+        try:
+            last = json.loads(self.store.get_meta(key) or "{}")
+        except json.JSONDecodeError:
+            last = {}
+        if last.get("mark") == mark:
+            return  # 这一段连续冲突已经提醒过
+        at = _parse(last.get("at") or "")
+        if at and _now() - at < timedelta(hours=LOCK_NOTICE_HOURS):
+            return  # 24 小时上限：还锁着的话，过了 24 小时再提醒
+        self.store.set_meta(key, json.dumps({"mark": mark, "at": now_iso()}))
+        log.warning("会话 %s 写锁冲突满 %d 分钟，提醒主人", t["topic_id"], LOCK_ALERT_MINUTES)
+        self._notify_owner(text, "写锁提醒")
 
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
@@ -1440,7 +1469,8 @@ class Dispatcher:
                 raise ValueError(f"账本里没有消息 {i}")
             if row["security_action"] == HOLD:
                 raise ValueError(f"消息 {i} 被安全规则拦截，不能随 new-session 转交；"
-                                 "先新开会话，再用 sheepdog forward --quote \"<主人原话>\" 转")
+                                 + with_cli("先新开会话，再用 `sheepdog forward --quote \"<主人原话>\"` 转",
+                                            self.cfg.cli_command))
         if validate_only:
             return {"topic_id": topic_id}
 

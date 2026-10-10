@@ -936,6 +936,160 @@ class EngineHostTest(HostBase):
         self.assertTrue(any("交接完毕" in (r["content"] or "") for r in rows))
 
 
+    def _locked_run(self, bid: str, minutes_ago: float, state: str = "locked") -> None:
+        ts = (datetime.now().astimezone() - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
+        self.store.add_run(bid, "tp_cx", "codex", "thr_test_existing", "resume", "", "", "")
+        self.store.update_run(bid, state=state, started_at=ts, ended_at=ts,
+                              error_kind="locked" if state == "locked" else None)
+
+    def test_lock_reminder_to_owner(self):
+        d = self.ready()
+        # 不满 60 分钟：不提醒
+        self._locked_run("b_test_k1", 30)
+        d._check_lock_streaks()
+        self.assertEqual((self.notices, self.bus_hints("写锁冲突")), ([], []))
+        # 同一段连续冲突满 60 分钟：总线提示一次、提醒主人一次
+        self._locked_run("b_test_k0", 61)
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("Codex 设计", self.notices[0])
+        self.assertIn("FX-HOST-LOCKED host=Codex", self.notices[0])
+        self.assertIn("一条不丢", self.notices[0])
+        # 还锁着：不重复提醒
+        self._locked_run("b_test_k2", 10)
+        d._check_lock_streaks()
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(len(self.bus_hints("写锁冲突")), 1)
+        # 解锁（一轮跑成功），之后又被锁满 60 分钟：重新计时；24 小时内同一会话不再提醒，过了 24 小时再提醒
+        self._locked_run("b_test_k3", 9, state="done")
+        self._locked_run("b_test_k4", 8)  # 新一段冲突，还不满 60 分钟
+        d._check_lock_streaks()
+        self.assertEqual(len(self.bus_hints("写锁冲突")), 1)
+        self.store.update_run("b_test_k3", started_at=(datetime.now().astimezone() - timedelta(minutes=90))
+                              .isoformat(timespec="seconds"))
+        self.store.update_run("b_test_k4", started_at=(datetime.now().astimezone() - timedelta(minutes=65))
+                              .isoformat(timespec="seconds"))
+        d._check_lock_streaks()
+        self.assertEqual(len(self.bus_hints("写锁冲突")), 2)  # 新一段冲突，总线照常提示
+        self.assertEqual(len(self.notices), 1)  # 24 小时上限
+        meta = json.loads(self.store.get_meta("lock_notice:thr_test_existing"))
+        meta["at"] = (datetime.now().astimezone() - timedelta(hours=25)).isoformat(timespec="seconds")
+        self.store.set_meta("lock_notice:thr_test_existing", json.dumps(meta))
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 2)
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 2)
+
+    def test_lock_reminder_after_unlock_more_than_a_day_later(self):
+        d = self.ready()
+        self._locked_run("b_test_m1", 120)
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 1)
+        meta = json.loads(self.store.get_meta("lock_notice:thr_test_existing"))
+        meta["at"] = (datetime.now().astimezone() - timedelta(hours=30)).isoformat(timespec="seconds")
+        self.store.set_meta("lock_notice:thr_test_existing", json.dumps(meta))
+        self._locked_run("b_test_m2", 50, state="done")  # 解锁
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 1)
+        self._locked_run("b_test_m3", 45)  # 再锁，不满 60 分钟不提醒
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 1)
+        self.store.update_run("b_test_m3", started_at=(datetime.now().astimezone() - timedelta(minutes=61))
+                              .isoformat(timespec="seconds"))
+        self.store.update_run("b_test_m2", started_at=(datetime.now().astimezone() - timedelta(minutes=70))
+                              .isoformat(timespec="seconds"))
+        d._check_lock_streaks()
+        self.assertEqual(len(self.notices), 2)
+
+
+class CliNameTest(HostBase):
+    CLI = "/tmp/sheep dog test/bin/sheepdog-test"
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.cli_name = self.CLI
+        self.cfg.playbook_dir = str(REPO / "examples" / "playbook")  # 示例 playbook 里的 {{cli}} 也要换过来
+        self.quoted = "'/tmp/sheep dog test/bin/sheepdog-test'"
+
+    def assert_no_bare(self, text: str):
+        self.assertNotIn("`sheepdog ", text)
+        self.assertNotIn("$(sheepdog ", text)
+        self.assertNotIn("{{cli}}", text)
+        self.assertIn(f"`{self.quoted} ", text)
+
+    def test_prompts_use_cli_name(self):
+        from sheepdog.prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
+                                      retirement_prompt)
+        self.assertEqual(self.cfg.cli_command, self.quoted)
+        pb = Playbook.from_config(self.cfg)
+        self.assertEqual(pb.cli, self.quoted)
+        s = parse_roster(cx_roster(conversation_id="", predecessor_conversation_id="thr_test_pre")).sessions[0]
+        texts = {
+            "bus": bootstrap_prompt(pb, "总线", "总线", BUS_TOPIC_ID, None, "", [15, 30], 60),
+            "onboarding": onboarding_prompt(pb, s, "o1", [15, 30], 60),
+            "adopted": adopted_bootstrap(pb, s, "t", "h1", [15, 30], 60, "/x", "/y"),
+            "retire": retirement_prompt(pb, "tp_x.prev", "前任", "r1", "接手", "tp_x", cli_host=True),
+            "rules": standing_rules_managed(pb, s, [15, 30], 60),
+        }
+        self.store.upsert_message(msg(message_id="om_test_long", content="\n".join(["行"] * 30),
+                                      reply_to="", chat_type="group"), "dispatch", "at_me", ["watch:7"], "tp_cx")
+        row = self.store.get_message("om_test_long")
+        inbox = [{"chat_name": "群", "chat_id": "oc_test_g", "unread": 1, "total": 2, "last_time": "x", "owner_last": ""}]
+        texts["batch"] = batch_prompt(pb, "tp_cx", "b1", [row], inbox, "Codex 设计", max_lines=5, cli_host=True)
+        for name, text in texts.items():
+            with self.subTest(name):
+                self.assert_no_bare(text)
+        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch b1", texts["batch"])
+        self.assertIn(f"`{self.quoted} watch-done --id 7`", texts["batch"])
+        self.assertIn(f"`{self.quoted} show om_test_long`", texts["batch"])
+        self.assertIn(f"`{self.quoted} inbox --chat", texts["batch"])
+        self.assertIn(f"`{self.quoted} reply-card`", texts["batch"])  # batch_footer.md 的 {{cli}}
+        self.assertIn(f"跑不了 `{self.quoted} receipt`", texts["retire"])  # 命令行宿主的回执提示
+        self.assertIn(f"`{self.quoted} forward`", texts["bus"])  # bus.md 的 {{cli}}
+        self.assertIn("`sheepdog-receipt`", texts["rules"])  # 围栏标记不是命令，不换
+
+    def test_default_cli_name_unchanged(self):
+        self.cfg.cli_name = "sheepdog"
+        pb = Playbook.from_config(self.cfg)
+        s = parse_roster(cx_roster()).sessions[0]
+        text = standing_rules_managed(pb, s, [15, 30], 60)
+        self.assertIn("`sheepdog receipt --topic tp_cx", text)
+        self.assertIn("`sheepdog watch`", text)
+
+    def test_engine_and_cli_texts(self):
+        d = Dispatcher(self.cfg, self.store, {"antigravity": FakeSink()})
+        d._bus_hint("x", "稍后用 `sheepdog retire --topic tp_x` 补发")
+        row = self.store.conn.execute("SELECT content FROM messages WHERE topic_id=?", (BUS_TOPIC_ID,)).fetchone()
+        self.assertIn(f"`{self.quoted} retire --topic tp_x`", row["content"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("sheepdog.actions.is_resident", return_value=False):
+            cli._queued(mock.Mock(dry_run=False), self.store, self.cfg, "push_rules", {"topic": ""})
+        self.assertIn(f"`{self.quoted} actions`", out.getvalue())
+
+    def test_config_doctor_and_reload(self):
+        cfg_path = self.root / "config.toml"
+        cfg_path.write_text(f'state_dir = "{self.root / "state"}"\ncli_name = "  "\n', encoding="utf-8")
+        with self.assertRaisesRegex(ConfigError, "cli_name"):
+            load_config()
+        cfg_path.write_text(f'state_dir = "{self.root / "state"}"\n', encoding="utf-8")
+        old = load_config()
+        self.assertEqual(old.cli_name, "sheepdog")
+        self.assertIn("（默认）", cli.cli_name_report(old))
+        wrapper = self.root / "sheep dog" / "sheepdog-test"
+        wrapper.parent.mkdir()
+        cfg_path.write_text(f'state_dir = "{self.root / "state"}"\ncli_name = "{wrapper}"\n', encoding="utf-8")
+        st = Store(old.db_path)
+        d = Dispatcher(old, st, {"antigravity": FakeSink()})
+        new = cli._reload_config(old, mock.Mock(), st, FakeSource([]), Collector(old, st, FakeSource([])), d)
+        self.assertEqual(new.cli_name, str(wrapper))  # 热加载：下一轮生效
+        self.assertEqual(d.playbook.cli, f"'{wrapper}'")
+        self.assertIn("✗ 找不到", cli.cli_name_report(new))
+        wrapper.write_text("#!/bin/sh\n")
+        self.assertIn(f"-> {wrapper} ✓", cli.cli_name_report(new))
+        st.close()
+
+
 # ======================= 命令行 =======================
 class CliTest(HostBase):
     def write_cfg(self, extra: str = "") -> None:

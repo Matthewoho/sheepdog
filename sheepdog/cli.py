@@ -60,6 +60,7 @@ from .engine import (DYNAMIC, HOST_LABEL, RETIRED, Collector, Dispatcher, add_wa
                      close_session, escalation_summary, forward_messages, open_escalations, write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
+from .prompts import with_cli
 from .roster import Roster, RosterError, check_hosts, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
@@ -171,6 +172,7 @@ def cmd_doctor(args) -> int:
     print(f"sheepdog {__version__}")
     print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
     print(f"状态目录: {cfg.state_dir}")
+    print(cli_name_report(cfg))
     print(f"self_open_id: {'✓ 已配置' if cfg.self_open_id else '✗ 未配置（@我/回复我 判定会失效）'}")
     ok &= bool(cfg.self_open_id)
     if cfg.source.enabled:
@@ -226,6 +228,17 @@ def cmd_doctor(args) -> int:
     for name in missing:
         print(f"  ✗ 缺 {name}：{PLAYBOOK_FILES[name]}")
     return 0 if ok else 1
+
+
+def cli_name_report(cfg) -> str:
+    """doctor：给会话看的命令名（cli_name）；不是默认的 sheepdog 时再看它解析到的路径在不在。"""
+    line = f"cli_name: {cfg.cli_name}"
+    if cfg.cli_name == "sheepdog":
+        return line + "（默认）"
+    name = cfg.cli_name
+    path = Path(name).expanduser() if ("/" in name or name.startswith("~")) else None
+    found = (str(path) if path.is_file() else "") if path is not None else (shutil.which(name) or "")
+    return line + (f" -> {found} ✓" if found else f" ✗ 找不到（会话敲这条命令会失败）：{path or name}")
 
 
 def _codex_sandbox() -> tuple[str, str]:
@@ -311,12 +324,12 @@ def cmd_poll(args) -> int:
     return 0
 
 
-def _queued(args, store: Store, kind: str, payload: dict) -> int | None:
+def _queued(args, store: Store, cfg, kind: str, payload: dict) -> int | None:
     """不在常驻进程里、又不是 --dry-run：入队并返回退出码 0；否则返回 None 表示本地执行（7.12）。"""
     if getattr(args, "dry_run", False) or actions.is_resident():
         return None
     aid = actions.enqueue(store, kind, payload)
-    print(f"动作 #{aid}（{kind}）{actions.QUEUED_HINT}")
+    print(f"动作 #{aid}（{kind}）{with_cli(actions.QUEUED_HINT, cfg.cli_command)}")
     return 0
 
 
@@ -435,7 +448,7 @@ def cmd_inbox_clear(args) -> int:
 
 def cmd_init(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
-    if (rc := _queued(args, store, "init", {})) is not None:
+    if (rc := _queued(args, store, cfg, "init", {})) is not None:
         return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
@@ -461,7 +474,7 @@ def cmd_spawn(args) -> int:
         if s is None or not s.to_spawn:
             print(f"spawn 被拒绝: {args.key} 不是名册里 conversation_id 留空的 managed 条目", file=sys.stderr)
             return 2
-    if (rc := _queued(args, store, "spawn", {"key": args.key})) is not None:
+    if (rc := _queued(args, store, cfg, "spawn", {"key": args.key})) is not None:
         return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
@@ -561,7 +574,8 @@ def cmd_sessions(args) -> int:
                 if run["denials"]:
                     print(f"  被拒的工具: {', '.join(json.loads(run['denials']))}")
         for u in uncertain.get(t["topic_id"], []):
-            print(f"  ⚠ 批次 {u['batch_id']} 发送中断、不确定是否送达（{u['sent_at']}），确认后: sheepdog redeliver --batch {u['batch_id']}")
+            print(f"  ⚠ 批次 {u['batch_id']} 发送中断、不确定是否送达（{u['sent_at']}），"
+                  + with_cli(f"确认后: `sheepdog redeliver --batch {u['batch_id']}`", cfg.cli_command))
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
     return 0
 
@@ -605,7 +619,7 @@ def cmd_watch(args) -> int:
     w = cfg.watch
     remind = "/".join(map(str, w.remind_minutes)) or "-"
     print(f"已登记等待 #{wid}：对方回复会直接推给 {args.topic}；{remind} 分钟提醒，{w.expire_minutes} 分钟到期。"
-          f"取消：sheepdog unwatch --id {wid}")
+          + with_cli(f"取消：`sheepdog unwatch --id {wid}`", cfg.cli_command))
     return 0
 
 
@@ -755,7 +769,7 @@ def cmd_new_session(args) -> int:
         except ValueError as e:
             print(f"new-session 被拒绝: {e}", file=sys.stderr)
             return 2
-        return _queued(args, store, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
+        return _queued(args, store, cfg, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
                                                     "chats": chats, "message_ids": ids, "note": args.note,
                                                     "host": args.host, "model": args.model, "effort": args.effort})
     if args.dry_run:
@@ -784,7 +798,7 @@ def cmd_push_rules(args) -> int:
     if args.topic and not args.dry_run and not actions.is_resident() and store.get_topic(args.topic) is None:
         print(f"push-rules 被拒绝: topic {args.topic} 不存在", file=sys.stderr)
         return 2
-    if (rc := _queued(args, store, "push_rules", {"topic": args.topic or ""})) is not None:
+    if (rc := _queued(args, store, cfg, "push_rules", {"topic": args.topic or ""})) is not None:
         return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
@@ -811,7 +825,7 @@ def cmd_retire(args) -> int:
     if target == "tp_bus":
         print("retire 被拒绝: 总线不能退休", file=sys.stderr)
         return 2
-    if (rc := _queued(args, store, "retire", {"target": target, "successor_title": args.successor_title})) is not None:
+    if (rc := _queued(args, store, cfg, "retire", {"target": target, "successor_title": args.successor_title})) is not None:
         return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
