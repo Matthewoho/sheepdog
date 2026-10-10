@@ -1498,7 +1498,7 @@ class Dispatcher:
     def _audit_commands(self) -> None:
         """K3：增量扫 [audit] topics 对应会话新跑的命令，命中 danger_patterns 的记下来，再按会话合并报警。"""
         a = self.cfg.audit
-        patterns = a.patterns
+        patterns, ignores = a.patterns, a.ignores
         if patterns:
             for tid in a.topics:
                 t = self.store.get_topic(tid)
@@ -1509,6 +1509,9 @@ class Dispatcher:
                 def handle(off: int, d: dict, tid=tid, host=host, cid=cid) -> None:
                     for c in commands_in(host, d, off):
                         pat = first_match(c.text, patterns)
+                        if pat and (skip := first_match(c.text, ignores)):
+                            log.info("会话 %s 的命令命中 %s，但也命中忽略规则 %s，不报", tid, pat, skip)
+                            continue
                         shown = redact(c.text)
                         if pat and self.store.add_audit_hit(tid, cid, c.step, shown, pat, c.at):
                             log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, pat, shown)

@@ -251,6 +251,18 @@ DEFAULT_DANGER_PATTERNS = [
     r"kubectl (apply|delete)",
 ]
 
+# 命中 danger_patterns 但同时命中这些的不报（7.19 K3 误报）：查帮助、知识库记录脚本、sheepdog 自己的命令
+# （含 forward 的备注）、IM 收发、dry-run。对整条命令判断，不逐段拆
+DEFAULT_IGNORE_PATTERNS = [
+    r"(^|\s)--help(\s|$)",
+    r"(^|\s)-h(\s|$)",
+    r"context_memory\.py",
+    r"pkm\.py",
+    r"(^|[\s/])sheepdog\s",
+    r"lark-cli\s+im\s",
+    r"--dry-run",
+]
+
 
 @dataclass
 class AuditConfig:
@@ -259,6 +271,8 @@ class AuditConfig:
     topics: list[str] = field(default_factory=lambda: ["tp_bus"])
     # 正则列表，对整理过的命令文本做 search；空列表 = 不审计
     danger_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_DANGER_PATTERNS))
+    # 命中 danger_patterns 但也命中其中任一条的不报（整条命令判断）；空列表 = 不忽略
+    ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
     # 命中后另外提醒这些会话「别重复操作，先核对现场」（topic_id）
     also_notify: list[str] = field(default_factory=list)
 
@@ -267,18 +281,23 @@ class AuditConfig:
             v = getattr(self, k)
             if not isinstance(v, list) or not all(isinstance(x, str) and x.startswith("tp_") for x in v):
                 raise ConfigError(f"[audit] {k} 必须是 topic_id 列表（tp_ 开头）")
-        v = self.danger_patterns
-        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
-            raise ConfigError("[audit] danger_patterns 必须是非空字符串列表")
-        for x in v:
-            try:
-                re.compile(x)
-            except re.error as e:
-                raise ConfigError(f"[audit] danger_patterns 里的 {x!r} 不是有效正则: {e}") from e
+        for k in ("danger_patterns", "ignore_patterns"):
+            v = getattr(self, k)
+            if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+                raise ConfigError(f"[audit] {k} 必须是非空字符串列表")
+            for x in v:
+                try:
+                    re.compile(x)
+                except re.error as e:
+                    raise ConfigError(f"[audit] {k} 里的 {x!r} 不是有效正则: {e}") from e
 
     @property
     def patterns(self) -> list[re.Pattern]:
         return [re.compile(x) for x in self.danger_patterns]
+
+    @property
+    def ignores(self) -> list[re.Pattern]:
+        return [re.compile(x) for x in self.ignore_patterns]
 
 
 # Codex 配置档名：只是一个名字，拼进 ~/.codex/<名字>.config.toml，不许带路径或其他字符；

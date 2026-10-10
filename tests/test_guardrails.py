@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from sheepdog import cli, guard
-from sheepdog.config import DEFAULT_DANGER_PATTERNS, AuditConfig, ConfigError, load_config
+from sheepdog.config import DEFAULT_DANGER_PATTERNS, DEFAULT_IGNORE_PATTERNS, AuditConfig, ConfigError, load_config
 from sheepdog.engine import BUS_TOPIC_ID, Dispatcher
 from sheepdog.prompts import DEFAULT_COMPACTION_NOTE, RULES_UPDATE_HEADER
 from sheepdog.sink.agentapi import transcript_path
@@ -247,7 +247,8 @@ class ReminderTest(GuardBase):
         self.assertIn("每批红线:", text)
         self.assertIn("2 个会话：bus, ghost", text)
         self.assertIn("没有对应的会话（key 写错了？）：ghost", text)
-        self.assertIn(f"命令审计: 审 tp_bus，{len(DEFAULT_DANGER_PATTERNS)} 条危险命令", text)
+        self.assertIn(f"命令审计: 审 tp_bus，{len(DEFAULT_DANGER_PATTERNS)} 条危险命令、"
+                      f"{len(DEFAULT_IGNORE_PATTERNS)} 条忽略规则", text)
         self.assertIn("提示 tp_release", text)
 
 
@@ -350,6 +351,38 @@ class AuditTest(GuardBase):
         self.assertIn("FX-AUDIT-OFFENDER", self.sink.to("conv_test_bus")[-1])
         self.assertIn("--secret=***", self.sink.to("conv_test_bus")[-1])
 
+    # 真实误报（10-10 总线记录，去掉了真实 ID、人名、服务名）
+    HELP = "gcloud builds approve --help 2>&1 | head -n 20"
+    PKM = ('python3 .agents/skills/personal-knowledge-assistant/scripts/context_memory.py add-atom --type fact '
+           '--subject "service:fx-bff" --predicate "traffic_updated_to_latest" --object "经主人授权，已执行 gcloud run '
+           'services update-traffic 将测试环境 fx-bff 流量 100% 切至最新 Revision (当前生效为 fx-bff-00042-abc)，'
+           '实测 HTTP 响应正常；已用卡片代回对方私聊通知验收，并在 sheepdog 登记 watch #81。" '
+           '--source-ref "lark:om_test_fx1" --confidence high --sensitivity internal')
+    REAL = ["gcloud builds triggers run 0980fx-9bc4 --project=fx-project --region=asia-east1 --branch=main",
+            'curl -s -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "Content-Type: '
+            'application/json" https://cloudbuild.googleapis.com/v1/projects/fx-project/locations/asia-east1/builds/'
+            'ccb4fx:approve -d \'{"approvalResult": {"decision": "APPROVED"}}\'']
+
+    def test_ignore_patterns_drop_known_false_positives(self):
+        noise = [self.HELP, self.PKM,
+                 "lark-cli im +messages-send --as bot --user-id ou_test_me --text '总线 22:59 跑了 gh pr merge 12'",
+                 "lark-cli im +messages-reply --message-id om_test_x --text 'kubectl apply 已经停了'",
+                 'sheepdog forward --topic tp_release --message-ids om_test_x --note "别再 builds triggers run 了"',
+                 "lark-cli approval tasks approve --as user --dry-run --data '{}'"]
+        self.append("conv_test_bus", *[run_command(c, step=i) for i, c in enumerate(noise + self.REAL)])
+        self.d.dispatch_once()
+        self.assertEqual([h["command"] for h in self.hits()], [guard.redact(guard.normalize(c)) for c in self.REAL])
+        self.assertEqual(len(self.notices), 1)
+        self.assertNotIn("--help", self.notices[0])
+        self.assertNotIn("context_memory", self.notices[0])
+        self.assertIn("cloudbuild.googleapis.com", self.notices[0])  # 命令截到 200 字，:approve 在截掉的部分
+
+    def test_empty_ignore_patterns_restores_alerts(self):
+        self.cfg.audit = AuditConfig(ignore_patterns=[])
+        self.append("conv_test_bus", run_command(self.HELP, step=1), run_command(self.PKM, step=2))
+        self.d.dispatch_once()
+        self.assertEqual([h["step"] for h in self.hits()], ["1:0", "2:0"])
+
     def test_codex_command_execution_and_code_mode(self):
         rollout = Path(self.tmp.name) / "codex" / "rollout-2026-10-10T00-00-00-thr_test_2.jsonl"
         rollout.parent.mkdir(parents=True)
@@ -439,7 +472,7 @@ class GuardUnitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "config.toml"
             for bad in ('[audit]\ndanger_patterns = ["(unclosed"]\n', '[audit]\ntopics = ["bus"]\n',
-                        '[audit]\nalso_notify = "tp_release"\n'):
+                        '[audit]\nalso_notify = "tp_release"\n', '[audit]\nignore_patterns = ["[bad"]\n'):
                 p.write_text(f'state_dir = "{d}/s"\n' + bad, encoding="utf-8")
                 with self.assertRaises(ConfigError, msg=bad):
                     load_config(p)
@@ -447,6 +480,7 @@ class GuardUnitTest(unittest.TestCase):
             p.write_text(f'state_dir = "{d}/s"\n' + src, encoding="utf-8")
             cfg = load_config(p)
             self.assertEqual(cfg.audit.danger_patterns, DEFAULT_DANGER_PATTERNS)
+            self.assertEqual(cfg.audit.ignore_patterns, DEFAULT_IGNORE_PATTERNS)
             self.assertEqual((cfg.audit.topics, cfg.audit.also_notify), (["tp_bus"], []))
 
     def test_example_playbook_renders(self):

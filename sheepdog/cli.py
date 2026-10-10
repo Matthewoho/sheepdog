@@ -248,7 +248,8 @@ def guard_report(cfg, store: Store, pb: Playbook) -> list[str]:
         lines.append(f"  ⚠ 这些红线文件没有对应的会话（key 写错了？）：{', '.join(stale)}")
     a = cfg.audit
     if a.danger_patterns and a.topics:
-        lines.append(f"命令审计: 审 {', '.join(a.topics)}，{len(a.danger_patterns)} 条危险命令；命中后私聊主人、提示犯规会话"
+        lines.append(f"命令审计: 审 {', '.join(a.topics)}，{len(a.danger_patterns)} 条危险命令、{len(a.ignore_patterns)} 条忽略规则；"
+                     f"命中后私聊主人、提示犯规会话"
                      + (f"、提示 {', '.join(a.also_notify)}" if a.also_notify else ""))
     else:
         lines.append("命令审计: 关（[audit] topics 或 danger_patterns 为空）")

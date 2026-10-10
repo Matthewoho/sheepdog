@@ -237,12 +237,14 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
   1. 经机器人私聊你：哪个会话、几点、什么命令（截到 200 字，`--data`、`token=`、`password=`、`secret` 之后的值隐去）；
   2. 给犯规的会话排一条系统提示（事实由 sheepdog 写，后面附 playbook 的 `audit_offender.md`）；
   3. 给 `[audit] also_notify` 里的会话各排一条系统提示（附 `audit_notify.md`）。
+  命中 danger_patterns、但同时命中任一条 `ignore_patterns` 的不报。默认忽略：查帮助（`--help`、`-h`）、知识库记录脚本（`context_memory.py`、`pkm.py`）、sheepdog 自己的命令（包括 forward 的备注）、IM 收发（`lark-cli im`，消息正文里提到这些命令名）、`--dry-run`。忽略判断对整条命令做，不逐段拆：一条复合命令里如果既有危险命令、又有 `lark-cli im`（或其他忽略项），会被一起忽略。这是为了让总线写复盘记录、发消息时提到命令名不误报而接受的取舍。
   同一条命令按（会话、step）去重；同一个会话 10 分钟内的命中合并：第一条马上报，之后 10 分钟内的攒到窗口结束一起报，同一条命令文本只列一行、标次数。
 
 ```toml
 [audit]
 topics = ["tp_bus"]            # 审哪些会话
 danger_patterns = [ ... ]      # 正则；不配就是代码里的默认一份（见 examples/config.example.toml）；[] = 关
+ignore_patterns = [ ... ]      # 同时命中就不报；不配就是代码里的默认一份；[] = 不忽略
 also_notify = []               # 另外提醒哪些会话「别重复操作，先核对现场」
 ```
 

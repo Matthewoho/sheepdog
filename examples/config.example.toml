@@ -113,6 +113,18 @@ danger_patterns = [
   "gh workflow run",
   "kubectl (apply|delete)",
 ]
+# 命中 danger_patterns 但同时命中其中任一条的不报：查帮助、知识库记录脚本、sheepdog 自己的命令（含 forward 的备注）、
+# IM 收发（消息正文里提到这些命令名）、dry-run。对整条命令判断：一条复合命令里既有危险命令又有 lark-cli im，会被一起忽略。
+# 不配就是下面这一份；[] = 不忽略
+ignore_patterns = [
+  '(^|\s)--help(\s|$)',
+  '(^|\s)-h(\s|$)',
+  'context_memory\.py',
+  'pkm\.py',
+  '(^|[\s/])sheepdog\s',
+  'lark-cli\s+im\s',
+  '--dry-run',
+]
 also_notify = []               # 比如负责发布的会话的 topic_id
 
 [ack]
