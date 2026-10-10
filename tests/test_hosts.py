@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,7 +22,8 @@ from sheepdog.engine import BUS_TOPIC_ID, Collector, Dispatcher, write_receipt
 from sheepdog.prompts import is_sheepdog_prompt, standing_rules_managed
 from sheepdog.roster import RosterError, check_hosts, parse_roster
 from sheepdog.sink import SinkError
-from sheepdog.sink.agentapi import DryRunSink
+from sheepdog.security import SecurityConfig
+from sheepdog.sink.agentapi import DryRunSink, transcript_path
 from sheepdog.sink.claude import ClaudeSink
 from sheepdog.sink.cli_host import classify_error, extract_receipt
 from sheepdog.sink.codex import CodexSink
@@ -794,6 +795,7 @@ class EngineHostTest(HostBase):
 
     def test_login_failure_on_new_session_still_notifies(self):
         os.environ["FAKE_CODEX_MODE"] = "logout"
+        self.cfg.hosts["codex"].ask_owner_before_new = False  # 这里测登录提醒，不测「先问主人」
         d = self.ready()
         tid = d.new_session("cxnew", "新的", "职责", [], host="codex")["conversation_id"]
         self.assertTrue(tid)
@@ -875,6 +877,7 @@ class EngineHostTest(HostBase):
         self.assertEqual(self.store.get_dispatch("b_test_s3")["state"], "uncertain")
 
     def test_new_session_host_checks_and_shared_quota(self):
+        self.cfg.hosts["codex"].ask_owner_before_new = False  # 「先问主人」另有 OwnerConsentTest
         d = self.ready()
         self.cfg.hosts["claude"].enabled = False
         with self.assertRaisesRegex(ValueError, "宿主 claude 没开"):
@@ -1126,6 +1129,113 @@ class CliNameTest(HostBase):
         wrapper.write_text("#!/bin/sh\n")
         self.assertIn(f"-> {wrapper} ✓", cli.cli_name_report(new))
         st.close()
+
+
+class OwnerConsentTest(HostBase):
+    """7.18（19:0x）：新开 Codex / Claude 会话前先问主人，new-session 必须带核对过的 --quote。"""
+    SAID = "可以，用 Codex 开一个做 API 限流设计"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["ANTIGRAVITY_APP_DATA_DIR"] = str(self.home / "ag")
+        self.ag = FakeSink()
+        self.cx = self.codex()
+        self.d = Dispatcher(self.cfg, self.store, {"antigravity": self.ag, "codex": self.cx}, parse_roster({}),
+                            SecurityConfig())
+        self.d.ensure_bus_topic()
+        self.store.update_topic(BUS_TOPIC_ID, conversation_id="conv_test_bus")
+        self.bus_says(self.SAID, minutes_ago=3)
+
+    def bus_says(self, text: str, minutes_ago: float) -> None:
+        """总线 transcript：第 0 步是开场（不算），之后是主人亲口说的。"""
+        ts = lambda m: (datetime.now(tz=timezone.utc) - timedelta(minutes=m)).isoformat()  # noqa: E731
+        p = transcript_path("conv_test_bus")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            if p.stat().st_size == 0:
+                f.write(json.dumps({"step_index": 0, "type": "USER_INPUT", "created_at": ts(600),
+                                    "content": "总线开场（sheepdog 写的）"}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"step_index": 1, "type": "USER_INPUT", "created_at": ts(minutes_ago),
+                                "content": f"<USER_REQUEST>{text}</USER_REQUEST>"}, ensure_ascii=False) + "\n")
+
+    def opening(self) -> str:
+        self.wait(self.cx)
+        return next(r for r in self.codex_requests() if r.get("method") == "turn/start")["params"]["input"][0]["text"]
+
+    def test_without_quote_rejected(self):
+        with self.assertRaises(ValueError) as e:
+            self.d.new_session("cx1", "限流设计", "职责", [], host="codex")
+        self.assertIn("新开 Codex 会话要先问主人：发『需要你定』写清为什么用、做什么，拿到主人同意后，用 --quote 带上他的原话再开",
+                      str(e.exception))
+        self.assertIsNone(self.store.get_topic("tp_cx1"))
+        self.assertEqual(self.codex_requests(), [])
+
+    def test_unverified_quote_rejected(self):
+        for bad in ("主人没说过这句", ""):
+            with self.subTest(bad), self.assertRaisesRegex(ValueError, "要先问主人"):
+                self.d.new_session("cx1", "限流设计", "职责", [], host="codex", quote=bad)
+        # 主人的话，但超过回看时长
+        self.bus_says("很久以前说的同意", minutes_ago=60 * 30)
+        with self.assertRaisesRegex(ValueError, "核对没通过"):
+            self.d.new_session("cx1", "限流设计", "职责", [], host="codex", quote="很久以前说的同意")
+        self.assertEqual(self.codex_requests(), [])
+
+    def test_quote_from_bus_passes_and_goes_into_opening(self):
+        r = self.d.new_session("cx1", "限流设计", "职责", [], host="codex", quote="用 Codex 开一个")
+        self.assertEqual(self.store.get_topic("tp_cx1")["conversation_id"], r["conversation_id"])
+        text = self.opening()
+        self.assertIn("### 主人同意开这个会话\n✅ 主人原话（已核对：主人在总线里亲口说过）：\n> 用 Codex 开一个", text)
+
+    def test_quote_from_owner_lark_reply_passes(self):
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.store.upsert_message(msg(message_id="om_test_own1", sender_id=ME, chat_type="p2p", content="同意，开 Codex 吧",
+                                      create_time=now), "dispatch", "owner_reply", ["owner_verified"], BUS_TOPIC_ID)
+        # 主人账号发给别人的普通消息（没有 owner_verified）不算
+        self.store.upsert_message(msg(message_id="om_test_own2", sender_id=ME, content="我跟同事说的：开 Claude",
+                                      create_time=now), "self", "self", [], None)
+        with self.assertRaisesRegex(ValueError, "核对没通过"):
+            self.d.new_session("cx2", "x", "y", [], host="codex", quote="开 Claude")
+        self.d.new_session("cx1", "限流设计", "职责", [], host="codex", quote="同意，开 Codex 吧")
+        self.assertIn("✅ 主人原话（已核对：主人本人账号在飞书上的回复）：\n> 同意，开 Codex 吧", self.opening())
+
+    def test_switch_off_needs_no_quote(self):
+        self.cfg.hosts["codex"].ask_owner_before_new = False  # 热加载：dispatcher 每轮用新配置
+        self.d.new_session("cx1", "限流设计", "职责", [], host="codex")
+        self.assertNotIn("主人同意开这个会话", self.opening())
+
+    def test_antigravity_spawn_and_forward_unaffected(self):
+        self.d.new_session("ag1", "普通", "职责", [])
+        self.assertEqual(self.ag.created[-1][0], "[managed] 普通")
+        self.assertNotIn("主人同意开这个会话", self.ag.created[-1][1])
+        # 名册里主人亲手写的 codex 会话：spawn 不走这道门
+        d = Dispatcher(self.cfg, self.store, {"antigravity": self.ag, "codex": self.cx},
+                       parse_roster(cx_roster(conversation_id="")), SecurityConfig())
+        d.sync_roster()
+        rep = d.spawn("cx")
+        self.assertTrue(rep["conversation_id"].startswith("thr_test_"))
+        # 往已有的 codex 会话 forward 不用再问
+        from sheepdog.engine import forward_messages
+        forward_messages(self.store, "tp_cx", [], note="补充一句")
+        rows = self.store.conn.execute("SELECT content FROM messages WHERE topic_id='tp_cx'").fetchall()
+        self.assertTrue(any("补充一句" in r["content"] for r in rows))
+
+    def test_queued_path_checks_before_enqueue(self):
+        (self.root / "config.toml").write_text(
+            f'self_open_id = "{ME}"\nstate_dir = "{self.root / "state"}"\nplaybook_dir = "{FIXTURES}"\n'
+            f'sink = "dryrun"\n[hosts.codex]\nenabled = true\nworkdir = "{self.work}"\n', encoding="utf-8")
+        args = ["new-session", "--key", "cxq", "--title", "限流设计", "--duty", "职责", "--host", "codex"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch("sheepdog.actions.is_resident", return_value=False):
+            self.assertEqual(cli.main(args), 2)
+            self.assertEqual(cli.main(args + ["--quote", "没说过"]), 2)
+            self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+            self.assertEqual(cli.main(args + ["--quote", "用 Codex 开一个"]), 0)
+        self.assertIn("要先问主人", err.getvalue())
+        rows = self.store.conn.execute("SELECT * FROM actions").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]["args_json"])["quote"], "用 Codex 开一个")
+        self.assertEqual(self.codex_requests(), [])  # 入队不建会话
 
 
 # ======================= 命令行 =======================

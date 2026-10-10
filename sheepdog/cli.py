@@ -15,7 +15,7 @@
   sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
   sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
   sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...]
-                       [--host antigravity|codex|claude] [--model M] [--effort E] [--dry-run]
+                       [--host antigravity|codex|claude] [--model M] [--effort E] [--quote 主人原话] [--dry-run]
                                                          总线临时新开一个专属会话（只在账本里）
   sheepdog close-session --topic T                       收掉总线新开的会话
   sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
@@ -279,7 +279,8 @@ def host_report(cfg, store: Store) -> list[str]:
         exe = shutil.which(hc.executable) or (hc.executable if Path(hc.executable).expanduser().is_file() else "")
         lines.append(f"{label}: 命令 {exe or '✗ 找不到 ' + hc.executable}；workdir {hc.workdir}"
                      f"{'' if hc.workdir_path.is_dir() else ' ✗ 不存在'}；默认模型 {hc.model or '（宿主默认）'} / "
-                     f"档位 {hc.effort or '（宿主默认）'}；超时 {hc.timeout_minutes:g} 分钟，并发 {hc.max_concurrent}")
+                     f"档位 {hc.effort or '（宿主默认）'}；超时 {hc.timeout_minutes:g} 分钟，并发 {hc.max_concurrent}；"
+                     f"新开先问主人 {'开' if hc.ask_owner_before_new else '关'}")
         u = store.get_meta(f"host_unavailable:{h}")
         if u:
             lines.append(f"  ⚠ 标为不可用：{json.loads(u).get('reason', '')}")
@@ -763,15 +764,17 @@ def cmd_new_session(args) -> int:
         try:
             chats = [_parse_chat(c) for c in args.chat]
             ids = [i for i in (args.message_ids or "").split(",") if i.strip()]
+            # 新开 Codex / Claude 会话的主人原话也在入队前核对（7.18）：被拒就不入队
             Dispatcher(cfg, store, sink, roster, security).new_session(
                 args.key, args.title, args.duty, chats, ids, args.note, validate_only=True,
-                host=args.host, model=args.model, effort=args.effort)
+                host=args.host, model=args.model, effort=args.effort, quote=args.quote)
         except ValueError as e:
             print(f"new-session 被拒绝: {e}", file=sys.stderr)
             return 2
         return _queued(args, store, cfg, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
                                                     "chats": chats, "message_ids": ids, "note": args.note,
-                                                    "host": args.host, "model": args.model, "effort": args.effort})
+                                                    "host": args.host, "model": args.model, "effort": args.effort,
+                                                    "quote": args.quote})
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
@@ -779,7 +782,7 @@ def cmd_new_session(args) -> int:
     try:
         chats = [_parse_chat(c) for c in args.chat]
         r = d.new_session(args.key, args.title, args.duty, chats, (args.message_ids or "").split(","), args.note,
-                          host=args.host, model=args.model, effort=args.effort)
+                          host=args.host, model=args.model, effort=args.effort, quote=args.quote)
     except ValueError as e:
         print(f"new-session 被拒绝: {e}", file=sys.stderr)
         return 2
@@ -1103,6 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--host", default=ANTIGRAVITY, choices=HOSTS, help="会话宿主，默认 antigravity；建好后不能换")
     sp.add_argument("--model", default="", help="模型；留空 = 这个宿主的默认值")
     sp.add_argument("--effort", default="", help="推理档位（只对 codex / claude）；留空 = 这个宿主的默认值")
+    sp.add_argument("--quote", default="", help="主人同意开这个会话的原话（codex / claude 且 ask_owner_before_new 时必填，"
+                                                "核对同 forward）")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
     sp.set_defaults(func=cmd_new_session)
 

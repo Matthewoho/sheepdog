@@ -113,6 +113,8 @@ sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊�
 
 每个会话有一个宿主（`host`）：`antigravity`（默认，经 App 的 agentapi）、`codex`、`claude`。名册 `[[session]]` 可以写 `host`、`model`、`effort`，`new-session` 有同名参数；留空就用配置里这个宿主的默认值。已有会话不能换宿主，要换就退休旧的、新开一个（接手流程）。`max_new_sessions_per_day` 是所有宿主共用的一个额度。
 
+- **新开先问主人**：`[hosts.*] ask_owner_before_new` 默认 true，这时 `new-session --host codex|claude` 必须带 `--quote "<主人原话>"`。核对同 forward：总线里你亲口说过，或你本人账号在飞书上的回复，回看时长同 `quote_max_age_hours`。不带或核对不通过就拒绝（在终端里入队的，入队时就拒）；通过了，原话会以「✅ 主人原话（已核对…）」写进新会话的开场。只管新开：`spawn`（名册里你亲手写的会话）和往已有会话 forward 都不受影响。改了下一轮生效。
+
 - **配置**：`[hosts.codex]`、`[hosts.claude]`，默认 `enabled = false`；启用时 `workdir` 必填。`model`、`effort`、`timeout_minutes`、`max_concurrent` 下一轮生效，`enabled`、`command`、`workdir`、`settings` 要重启。没启用的宿主，new-session 和名册引用直接报错。
 - **怎么跑**：一轮是一个后台进程（自成进程组），不卡主循环。Codex 由 sheepdog 自己的 runner 起一个 `codex app-server`（JSON-RPC over stdio）：`initialize` → `thread/start`（新建，带 `threadSource: "user"`，再 `thread/name/set` 设标题）或 `thread/resume`（续接）→ `turn/start` → 等 `turn/completed`，跑完关掉。Claude 是 `claude -p --output-format json`，新建用 `--session-id` 预定编号、`-n` 设标题，续接用 `--resume`。输入、输出、错误在 `state_dir/runs/<batch_id>.in/.out/.err`，运行记录在账本 `runs` 表。同一会话同一时间只跑一轮；超过 `max_concurrent` 的批次排队。
 - **权限不归 sheepdog 管**：不传任何沙箱、审批、权限参数，全部来自宿主自己的配置（Codex 看 `~/.codex/config.toml`；Claude 看用户设置、workdir 下的设置，或 `settings` 指的文件，sheepdog 只传文件名）。Codex 发来的审批请求一律拒绝，方法名记进运行记录。`sheepdog doctor` 会列出每个宿主的命令、登录状态、Codex 的 `sandbox_mode` 和网络开关；只读或网络关着时提示「能读、能分析，但发不了飞书」。

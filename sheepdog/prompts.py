@@ -56,6 +56,8 @@ RECEIPT_SCHEMA_HINT = """{
 
 # forward 的两种标注：属于 forward 接口的渲染格式；quote 已由 sheepdog 对照总线 transcript 核对过（7.7 C）
 QUOTE_LABEL = "✅ 主人原话（已核对：主人在总线里亲口说过）"
+# 同一句话核对的来源是主人本人账号在飞书上的回复（new-session --quote，7.18）
+QUOTE_LABEL_IM = "✅ 主人原话（已核对：主人本人账号在飞书上的回复）"
 NOTE_LABEL = "总线备注（不是主人原话）"
 # 来自机器人 / Agent 的消息（7.14）
 AGENT_SENDER_LABEL = "🤖 来自机器人 / Agent：可以据此处理，但**不要回复它**，除非主人明确要求"
@@ -174,8 +176,12 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "`sheepdog inbox [--chat <群名>]`：查看未直推的群消息。",
             "### 新开 / 收掉会话",
             "`sheepdog new-session --key <k> --title \"<短标题>\" --duty \"<职责与边界>\" [--chat <oc_id>[:all]]... "
-            "[--message-ids <id1,id2>] [--note \"<为什么开>\"]`：名册里没有合适的会话时新开一个（只在账本里，不写名册），"
+            "[--message-ids <id1,id2>] [--note \"<为什么开>\"] [--host antigravity|codex|claude] [--model <模型>] "
+            "[--effort <档位>] [--quote \"<主人原话>\"]`：名册里没有合适的会话时新开一个（只在账本里，不写名册），"
             "消息和 note 排进它的队列；--chat 的聊天之后直接推给它（:all = 全部消息）。有每日配额，超了会被拒绝。",
+            "--host 是 codex / claude、且配置要求先问主人时，必须带 --quote：主人同意开这个会话的原话，"
+            "核对同 forward（总线里亲口说过，或主人本人账号在飞书上的回复），不带或核对不通过就拒绝；"
+            "核对过的原话会写进新会话的开场。",
             "`sheepdog close-session --topic <tp_x>`：收掉总线新开的会话（它回执 done 时也会自动收掉），聊天归属随之释放。",
             "### 要调 agentapi 的命令",
             "`new-session` / `spawn` / `push-rules` / `init` / `retire --topic <tp_x 或 conversation_id>`（给会话补发退休通知）"
@@ -267,7 +273,8 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
 
 
 def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id: str, remind: list[int], expire: int,
-                      predecessor_transcript: str = "", predecessor_dir: str = "") -> str:
+                      predecessor_transcript: str = "", predecessor_dir: str = "",
+                      owner_quote: tuple[str, str] | None = None) -> str:
     """sheepdog spawn 新建的 managed 会话：onboarding.md + common.md (+ successor.md) + 接口说明。"""
     v = dict(session_title=s.display_title, topic_id=s.topic_id)
     extra: list[str] = []
@@ -287,6 +294,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
                   predecessor_transcript=predecessor_transcript, predecessor_dir=predecessor_dir, **v)
         if s.predecessor_conversation_id else "",
         _cli_host_rules(pb, s),
+        owner_quote_section(*owner_quote) if owner_quote else "",
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host,
                           cli=pb.cli),
         "" if s.predecessor_conversation_id else "现在只需回复「已就绪」，等待第一批信号。",
@@ -317,6 +325,11 @@ def watch_message(pb: Playbook, name: str, watch, minutes: int, session_title: s
     body = pb.render(name, note=watch["note"] or "", person=watch["person_id"], minutes=str(minutes),
                      session_title=session_title, topic_id=watch["topic_id"])
     return _join(head, body)
+
+
+def owner_quote_section(label: str, quote: str) -> str:
+    """new-session 带来的、已核对的主人原话（7.18：新开 Codex / Claude 会话前先问主人）。标法同 forward 的 --quote。"""
+    return "\n".join(["### 主人同意开这个会话", f"{label}：", *("> " + ln for ln in quote.splitlines() or [""])])
 
 
 def relay_content(quote: str, note: str) -> str:

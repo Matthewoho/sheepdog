@@ -126,6 +126,10 @@ effort = "high"                # 默认推理档位
 workdir = "~/sheepdog-work"    # 会话的工作目录，启用时必填
 timeout_minutes = 60           # 一轮最多跑多久，超过就杀掉，会话标 attention
 max_concurrent = 2             # 这个宿主同时最多跑几轮，超过的批次排队
+# 新开这个宿主的会话前先问主人：true 时 new-session --host codex 必须带 --quote "<主人原话>"，
+# 核对同 forward（总线里亲口说过，或你本人账号在飞书上的回复），不带或核对不通过就拒绝。
+# 只管新开：名册里你亲手写的会话（spawn）、往已有会话转交消息都不受影响。改了下一轮生效
+ask_owner_before_new = true
 
 [hosts.claude]
 enabled = false
@@ -135,4 +139,5 @@ effort = "high"
 workdir = "~/sheepdog-work"
 timeout_minutes = 60
 max_concurrent = 2
+ask_owner_before_new = true    # 同上：new-session --host claude 必须带核对过的 --quote
 # settings = "~/.config/sheepdog/claude-settings.json"   # 可选，原样传 --settings；sheepdog 不写它的内容

@@ -260,6 +260,9 @@ class HostConfig:
     timeout_minutes: float = 60   # 一轮最多跑多久，超过就杀掉整个进程组
     max_concurrent: int = 2       # 这个宿主同时最多跑几轮，超过的批次排队
     settings: str = ""            # 只给 Claude
+    # 新开这个宿主的会话前要先问主人（7.18，19:0x）：new-session --host <它> 必须带核对过的 --quote 主人原话。
+    # 只管新开；spawn（名册里主人亲手写的）和往已有会话 forward 不受影响
+    ask_owner_before_new: bool = True
 
     @property
     def executable(self) -> str:
@@ -273,6 +276,8 @@ class HostConfig:
         where = f"[hosts.{self.name}]"
         if not isinstance(self.enabled, bool):
             raise ConfigError(f"{where} enabled 必须是 true/false")
+        if not isinstance(self.ask_owner_before_new, bool):
+            raise ConfigError(f"{where} ask_owner_before_new 必须是 true/false")
         for k in ("command", "model", "effort", "workdir", "settings"):
             if not isinstance(getattr(self, k), str):
                 raise ConfigError(f"{where} {k} 必须是字符串")

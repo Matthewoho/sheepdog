@@ -55,7 +55,8 @@ def execute(dispatcher, kind: str, args: dict) -> object:
     if kind == "new_session":
         return d.new_session(args["key"], args["title"], args["duty"], [tuple(c) for c in args.get("chats", [])],
                              args.get("message_ids", []), args.get("note", ""), host=args.get("host", ""),
-                             model=args.get("model", ""), effort=args.get("effort", ""))
+                             model=args.get("model", ""), effort=args.get("effort", ""),
+                             quote=args.get("quote", ""))
     if kind == "push_rules":
         return d.push_rules(args.get("topic") or None)
     if kind == "retire":

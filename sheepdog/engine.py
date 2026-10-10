@@ -13,7 +13,8 @@ from . import session as sm
 from .config import ANTIGRAVITY, Config
 from .models import Message
 from .playbook import Playbook
-from .prompts import (ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
+from .prompts import (QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt,
+                      bootstrap_prompt, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
@@ -1425,10 +1426,12 @@ class Dispatcher:
     # ---------- 总线新开会话（7.10） ----------
     def new_session(self, key: str, title: str, duty: str, chats: list[tuple[str, bool]],
                     message_ids: list[str] | None = None, note: str = "", validate_only: bool = False,
-                    host: str = "", model: str = "", effort: str = "") -> dict:
+                    host: str = "", model: str = "", effort: str = "", quote: str = "") -> dict:
         """总线临时新开一个专属会话：只写账本（kind = dynamic），不写名册。
 
-        先做全部校验（key、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward 规则排队。
+        先做全部校验（key、宿主、主人原话、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward
+        规则排队。宿主是 codex / claude 且 [hosts.*] ask_owner_before_new = true 时，必须带核对过的主人原话 quote
+        （7.18，19:0x），原话写进新会话的开场。
         """
         key, title, duty, note = key.strip(), title.strip(), duty.strip(), (note or "").strip()
         host, model, effort = (host or ANTIGRAVITY).strip(), (model or "").strip(), (effort or "").strip()
@@ -1436,6 +1439,7 @@ class Dispatcher:
             raise ValueError("--key 只允许 [a-z0-9_-]，且不能是 bus")
         # 宿主没开直接报错，说清是哪个（7.18）；额度 max_new_sessions_per_day 所有宿主共用
         self.cfg.check_host(host)
+        owner_quote = self._owner_consent(host, quote)
         topic_id = "tp_" + key
         if self.roster.by_key(key) is not None:
             raise ValueError(f"key {key!r} 已在名册里")
@@ -1478,7 +1482,7 @@ class Dispatcher:
         s = RosterSession(key=key, mode=MANAGED, title=title, duty=duty,
                           chats=[RosterChat(cid, "", al) for cid, al in chats], host=host, model=model, effort=effort)
         prompt = adopted_bootstrap(self.playbook, s, full_title, "", self.cfg.watch.remind_minutes,
-                                   self.cfg.watch.expire_minutes)
+                                   self.cfg.watch.expire_minutes, owner_quote=owner_quote)
         cid = self._new_conversation(host, topic_id, full_title, prompt, model, effort)
         ts = now_iso()
         self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE, host, model, effort)
@@ -1491,6 +1495,26 @@ class Dispatcher:
                              escalation_open_hours=self.cfg.escalation.open_hours)
         log.info("总线新开会话 %s（%s）-> %s（%d 条消息排队）", topic_id, host, cid, len(ids))
         return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids), "host": host}
+
+    def _owner_consent(self, host: str, quote: str) -> tuple[str, str] | None:
+        """新开 Codex / Claude 会话前先问主人（7.18，19:0x）：开关打开时 quote 必须是核对过的主人原话。
+
+        返回 (标注, 原话) 写进开场；不需要问（Antigravity，或开关关着）时返回 None；不带或核对不通过抛 ValueError。
+        """
+        quote = (quote or "").strip()
+        if host == ANTIGRAVITY or not self.cfg.hosts[host].ask_owner_before_new:
+            return None
+        label = HOST_LABEL.get(host, host)
+        ask = with_cli(f"新开 {label} 会话要先问主人：发『需要你定』写清为什么用、做什么，拿到主人同意后，"
+                       f"用 --quote 带上他的原话再开（`sheepdog new-session ... --host {host} --quote \"<主人原话>\"`）",
+                       self.cfg.cli_command)
+        if not quote:
+            raise ValueError(ask)
+        max_age = self.security.quote_max_age_hours if self.security is not None else SecurityConfig().quote_max_age_hours
+        source = owner_quote_verifier(self.store, max_age, self.cfg.self_open_id)(quote)
+        if not source:
+            raise ValueError(f"--quote 核对没通过：这句话在总线里和主人的飞书回复里都找不到原文。{ask}")
+        return source, quote
 
     # ---------- 新建与接手（7.2） ----------
     def spawn(self, key: str) -> dict:
@@ -1740,6 +1764,37 @@ def bus_quote_verifier(store: Store, max_age_hours: float):
 
     def verify(quote: str) -> bool:
         return bool(cid) and quote_verified(quote, transcript_path(cid), max_age_hours)
+    return verify
+
+
+def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
+    """主人原话核对（new-session --quote，7.18）：先按 forward 的办法查总线 transcript 里主人亲口说的；
+    再查账本里主人本人账号在飞书上的回复（发送人由 IM 账号核实，带 owner_verified 标记）。回看时长同 forward。
+
+    返回 verify(quote) -> 标注：核对通过时是「✅ 主人原话（已核对…）」，不通过是空串。
+    """
+    in_bus = bus_quote_verifier(store, max_age_hours)
+
+    def verify(quote: str) -> str:
+        q = " ".join((quote or "").split())
+        if not q:
+            return ""
+        if in_bus(quote):
+            return QUOTE_LABEL
+        if not self_open_id:
+            return ""
+        cutoff = _now() - timedelta(hours=max_age_hours)
+        rows = store.conn.execute("SELECT content, create_time, tags_json FROM messages WHERE sender_id=?",
+                                  (self_open_id,)).fetchall()
+        for r in rows:
+            if OWNER_VERIFIED_TAG not in json.loads(r["tags_json"] or "[]"):
+                continue
+            ts = _parse(r["create_time"] or "")
+            if ts is None or ts.tzinfo is None or ts < cutoff:
+                continue
+            if any(q in " ".join(b.split()) for b in message_bodies(r["content"] or "")):
+                return QUOTE_LABEL_IM
+        return ""
     return verify
 
 
