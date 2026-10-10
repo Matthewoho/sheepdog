@@ -65,7 +65,8 @@ while True:
     elif method == "thread/resume":
         THREAD = params.get("threadId", "")
         if MODE == "locked":
-            send({"id": rid, "error": {"code": -32000, "message": f"thread {THREAD} already has an active writer"}})
+            # 和 15:54 实测的报错一模一样（Codex 应用自己的 app-server 持锁时）
+            send({"id": rid, "error": {"code": -32600, "message": f"thread {THREAD} already has an active writer"}})
             continue
         send({"id": rid, "result": {"thread": {"id": THREAD}}})
     elif method == "turn/start":

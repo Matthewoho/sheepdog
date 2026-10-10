@@ -135,17 +135,47 @@ class HostBase(unittest.TestCase):
             return []
         return [json.loads(x) for x in self.claude_log.read_text(encoding="utf-8").splitlines() if x.strip()]
 
-    def write_rollout(self, thread_id: str, events: list[tuple[str, str, str]]) -> Path:
-        """Codex rollout 文件：events = [(时间, 类型 user_message/agent_message, 正文)]。"""
+    def write_rollout(self, thread_id: str, events: list[tuple[str, str, str]], legacy: bool = False,
+                      injected: list[tuple[str, str]] = ()) -> Path:
+        """手写的 Codex rollout 文件（结构照 codex-cli 0.153.4 app-server 建的线程，不拷真实文件）。
+
+        events = [(时间, user_message / agent_message, 正文)]。legacy=False 写成 event_msg/item_completed 的
+        UserMessage / AgentMessage，并像真实文件一样带上 response_item 和其他杂项条目；legacy=True 写老格式
+        event_msg/user_message、agent_message（exec 建的线程）。injected = [(时间, 正文)]：response_item 里
+        role=user 的系统注入内容（不是主人说的话）。
+        """
         d = self.home / ".codex" / "sessions" / "2026" / "10" / "10"
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"rollout-2026-10-10T10-00-00-{thread_id}.jsonl"
+        rows = [{"timestamp": "2026-10-10T02:00:00Z", "type": "session_meta", "payload": {"id": thread_id}},
+                {"timestamp": "2026-10-10T02:00:00Z", "type": "event_msg", "payload": {"type": "task_started"}},
+                {"timestamp": "2026-10-10T02:00:00Z", "type": "turn_context", "payload": {"model": "gpt-6-astra"}}]
+        for ts, text in injected:
+            rows.append({"timestamp": ts, "type": "response_item",
+                         "payload": {"type": "message", "role": "user",
+                                     "content": [{"type": "input_text", "text": text}]}})
+        for i, (ts, kind, text) in enumerate(events):
+            if legacy:
+                rows.append({"timestamp": ts, "type": "event_msg", "payload": {"type": kind, "message": text}})
+                continue
+            role = "user" if kind == "user_message" else "assistant"
+            rows.append({"timestamp": ts, "type": "response_item",
+                         "payload": {"type": "message", "role": role,
+                                     "content": [{"type": "input_text" if role == "user" else "output_text",
+                                                  "text": text}]}})
+            if kind == "user_message":
+                item = {"type": "UserMessage", "id": f"item_{i}",
+                        "content": [{"type": "text", "text": text, "text_elements": []}]}
+            else:  # AgentMessage 的段 type 是大写的 Text；拆成两段，验证会拼起来
+                half = len(text) // 2
+                item = {"type": "AgentMessage", "id": f"item_{i}", "phase": "final_answer",
+                        "content": [{"type": "Text", "text": text[:half]}, {"type": "Text", "text": text[half:]}]}
+            rows.append({"timestamp": ts, "type": "event_msg", "payload": {"type": "item_completed", "item": item}})
+        rows += [{"timestamp": "2026-10-10T02:59:00Z", "type": "event_msg", "payload": {"type": "token_count"}},
+                 {"timestamp": "2026-10-10T02:59:00Z", "type": "event_msg", "payload": {"type": "task_complete"}}]
         with p.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"timestamp": "2026-10-10T02:00:00Z", "type": "session_meta",
-                                "payload": {"id": thread_id}}) + "\n")
-            for ts, kind, text in events:
-                f.write(json.dumps({"timestamp": ts, "type": "event_msg",
-                                    "payload": {"type": kind, "message": text}}, ensure_ascii=False) + "\n")
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
         return p
 
 
@@ -369,6 +399,9 @@ class CodexSinkTest(HostBase):
         self.wait(s)
         [res] = s.collect_finished()
         self.assertEqual((res.state, res.error_kind), ("locked", "locked"))
+        # 实测报错在 thread/resume 的 JSON-RPC error 里（code -32600），不在 turn 的 error 里
+        self.assertIn("thread/resume: thread thr_test_l already has an active writer", res.error)
+        self.assertNotIn("turn/start", [r.get("method") for r in self.codex_requests()])
         self.assertIsNotNone(s.lock_streak_since("thr_test_l"))
         self.assertIsNotNone(s.last_human_activity("thr_test_l"))  # 撞上写锁视同主人正在用
 
@@ -465,6 +498,33 @@ class CodexSinkTest(HostBase):
         self.assertEqual([h[0] for h in hist], ["问", "问"])
         self.write_rollout("thr_test_h2", [("2026-10-10T02:00:01Z", "user_message", "初始提示词")])
         self.assertIsNone(s.last_human_activity("thr_test_h2"))
+
+    def test_injected_response_items_are_not_the_owner(self):
+        s = self.codex()
+        self.write_rollout("thr_test_inj", [
+            ("2026-10-10T02:00:01Z", "user_message", "初始提示词"),
+            ("2026-10-10T02:00:30Z", "agent_message", "已就绪，等第一批信号"),
+            ("2026-10-10T02:10:00Z", "user_message", "[sheepdog] 新信号批次 `b_test_y`（topic `tp_cx`，共 1 条）"),
+        ], injected=[("2026-10-10T02:40:00Z", "<recommended_plugins>...</recommended_plugins> b_test_only_ri"),
+                     ("2026-10-10T02:41:00Z", "# AGENTS.md instructions for /work\n<environment_context>...")])
+        self.assertIsNone(s.last_human_activity("thr_test_inj"))
+        self.assertTrue(s.transcript_contains("thr_test_inj", "b_test_y"))
+        self.assertFalse(s.transcript_contains("thr_test_inj", "b_test_only_ri"))
+        hist = s.history("thr_test_inj")
+        self.assertEqual([h[0] for h in hist], ["问", "答", "问"])  # response_item 不重复计入
+        self.assertEqual(hist[1][1], "已就绪，等第一批信号")  # 两段 Text 拼起来
+
+    def test_legacy_rollout_format(self):
+        s = self.codex()
+        self.write_rollout("thr_test_lg", [
+            ("2026-10-10T02:00:01Z", "user_message", "初始提示词"),
+            ("2026-10-10T02:05:00Z", "agent_message", "好"),
+            ("2026-10-10T02:10:00Z", "user_message", "[sheepdog] 新信号批次 `b_test_lg`"),
+            ("2026-10-10T02:20:00Z", "user_message", "主人：等一下"),
+        ], legacy=True)
+        self.assertEqual(s.last_human_activity("thr_test_lg"), datetime.fromisoformat("2026-10-10T02:20:00+00:00"))
+        self.assertTrue(s.transcript_contains("thr_test_lg", "b_test_lg"))
+        self.assertEqual(len(s.history("thr_test_lg", 10)), 4)
 
 
 # ======================= Claude 命令行 =======================
@@ -713,7 +773,9 @@ class EngineHostTest(HostBase):
         self.store.conn.commit()
         d._check_lock_streaks()
         d._check_lock_streaks()
-        self.assertEqual(len(self.bus_hints("写锁冲突")), 1)
+        [hint] = self.bus_hints("写锁冲突")
+        self.assertIn("FX-HOST-LOCKED host=Codex title=Codex 设计 topic=tp_cx since=2000-01-01T00:00:00+08:00",
+                      hint["content"])
 
     def test_login_failure_queues_and_notifies_once(self):
         os.environ["FAKE_CODEX_MODE"] = "logout"

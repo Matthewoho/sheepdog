@@ -85,12 +85,12 @@ def _parse(ts: str | None) -> datetime | None:
     return d if d.tzinfo else d.astimezone()
 
 
-def _text_of(content) -> str:
-    """消息内容：字符串，或 [{type, text}] 列表。"""
+def _text_of(content, sep: str = "\n") -> str:
+    """消息内容：字符串，或 [{type, text}] 列表（各段 text 用 sep 连起来）。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(x.get("text", "") for x in content if isinstance(x, dict) and isinstance(x.get("text"), str))
+        return sep.join(x.get("text", "") for x in content if isinstance(x, dict) and isinstance(x.get("text"), str))
     return ""
 
 

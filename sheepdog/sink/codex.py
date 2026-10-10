@@ -125,8 +125,15 @@ class CodexSink(CliHostSink):
         return found[-1:]
 
     def _turns(self, conversation_id: str) -> list[tuple[str, str, str]]:
-        """rollout 里的用户消息和回答：(角色 user/agent, 时间, 正文)。"""
-        out: list[tuple[str, str, str]] = []
+        """rollout 里的一问一答：(角色 user/agent, 时间, 正文)。
+
+        以 event_msg 的 item_completed 为准：item.type 是 UserMessage / AgentMessage，正文是 content 里各段 text
+        拼起来（UserMessage 的段 type 是 "text"，AgentMessage 的是 "Text"，键都是 text）。
+        老格式 event_msg 的 user_message / agent_message（exec 建的线程）只在文件里没有 item_completed 时才用，免得重复。
+        response_item 里 role=user 的条目混着系统注入的内容（插件推荐、AGENTS.md、环境信息），一律不读。
+        """
+        items: list[tuple[str, str, str]] = []
+        legacy: list[tuple[str, str, str]] = []
         for p in self._record_files(conversation_id):
             for d in self._jsonl(p):
                 if d.get("type") != "event_msg":
@@ -135,15 +142,23 @@ class CodexSink(CliHostSink):
                 ts = d.get("timestamp") or ""
                 if pl.get("type") == "item_completed":
                     item = pl.get("item") or {}
-                    if item.get("type") == "UserMessage":
-                        out.append(("user", ts, _text_of(item.get("content"))))
-                    elif item.get("type") == "AgentMessage":
-                        out.append(("agent", ts, _text_of(item.get("content"))))
+                    role = {"UserMessage": "user", "AgentMessage": "agent"}.get(item.get("type"))
+                    if role:
+                        items.append((role, ts, _text_of(item.get("content"), "")))  # 各段直接拼起来
                 elif pl.get("type") == "user_message" and isinstance(pl.get("message"), str):
-                    out.append(("user", ts, pl["message"]))
+                    legacy.append(("user", ts, pl["message"]))
                 elif pl.get("type") == "agent_message" and isinstance(pl.get("message"), str):
-                    out.append(("agent", ts, pl["message"]))
-        return out
+                    legacy.append(("agent", ts, pl["message"]))
+        return items or legacy
+
+    def transcript_contains(self, conversation_id: str, text: str) -> bool:
+        """发送中断恢复：runs 里有、且起过进程就算；否则在 rollout 的用户消息（同 _turns 的口径）里找批次号。"""
+        if not text:
+            return False
+        r = self.store.get_run(text)
+        if r is not None and r["pid"]:
+            return True
+        return any(text in body for role, _, body in self._turns(conversation_id) if role == "user")
 
     def _user_entries(self, conversation_id: str) -> list[tuple[str, str]]:
         return [(ts, text) for role, ts, text in self._turns(conversation_id) if role == "user"]

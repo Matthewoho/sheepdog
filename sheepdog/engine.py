@@ -1342,9 +1342,13 @@ class Dispatcher:
             if self.store.get_meta(key) == mark:
                 continue
             self.store.set_meta(key, mark)
-            self._bus_hint("host_locked", f"⚠️ {HOST_LABEL.get(self.topic_host(t))} 会话「{t['title']}」（topic "
-                                          f"`{t['topic_id']}`）从 {mark} 起一直被别人占着（写锁冲突），信号在排队。"
-                                          "可能是主人在应用里开着这个线程。")
+            label = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
+            # 机制事实写在这里；为什么会锁、怎么放锁属于对人的说明，放 playbook 的 host_locked.md
+            why = self.playbook.render("host_locked.md", host=label, session_title=t["title"], topic_id=t["topic_id"],
+                                       since=mark)
+            self._bus_hint("host_locked", f"⚠️ {label} 会话「{t['title']}」（topic `{t['topic_id']}`）从 {mark} 起"
+                                          f"一直写锁冲突（already has an active writer），信号在排队。"
+                                          + (f"\n{why}" if why else ""))
 
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
