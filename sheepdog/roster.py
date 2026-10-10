@@ -26,7 +26,7 @@ KNOWN = "known"
 _KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
                  "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats"}
-_CHAT_KEYS = {"chat_id", "name", "all_messages"}
+_CHAT_KEYS = {"chat_id", "thread_id", "name", "all_messages"}
 
 
 class RosterError(ValueError):
@@ -39,6 +39,8 @@ class RosterChat:
     name: str = ""
     # true：该聊天里除自己发的以外全部推给本会话；false：只推 dispatch 级消息
     all_messages: bool = False
+    # 非空时只负责这个聊天里的指定话题；空值表示整个聊天的默认归属。
+    thread_id: str = ""
 
 
 @dataclass
@@ -81,15 +83,15 @@ class Roster:
     sessions: list[RosterSession] = field(default_factory=list)
 
     def __post_init__(self):
-        # chat_id → (会话, 聊天)，只收 managed 会话
-        self._owner: dict[str, tuple[RosterSession, RosterChat]] = {}
+        # (chat_id, thread_id) → (会话, 聊天)，只收 managed 会话
+        self._owner: dict[tuple[str, str], tuple[RosterSession, RosterChat]] = {}
         for s in self.sessions:
             if s.mode == MANAGED:
                 for c in s.chats:
-                    self._owner[c.chat_id] = (s, c)
+                    self._owner[c.chat_id, c.thread_id] = (s, c)
 
-    def owner_of(self, chat_id: str) -> tuple[RosterSession, RosterChat] | None:
-        return self._owner.get(chat_id)
+    def owner_of(self, chat_id: str, thread_id: str = "") -> tuple[RosterSession, RosterChat] | None:
+        return self._owner.get((chat_id, thread_id)) or self._owner.get((chat_id, ""))
 
     def by_key(self, key: str) -> RosterSession | None:
         return next((s for s in self.sessions if s.key == key), None)
@@ -132,7 +134,7 @@ def parse_roster(data: dict) -> Roster:
 
     sessions: list[RosterSession] = []
     keys: set[str] = set()
-    chat_owner: dict[str, str] = {}
+    chat_owner: dict[tuple[str, str], str] = {}
     for i, raw in enumerate(raw_sessions):
         where = f"session[{i}]"
         unknown = set(raw) - _SESSION_KEYS
@@ -181,13 +183,16 @@ def parse_roster(data: dict) -> Roster:
             if unknown:
                 raise RosterError(f"{cw}: 未知键 {sorted(unknown)}")
             chat = RosterChat(chat_id=_str(rc, "chat_id", cw), name=_str(rc, "name", cw),
-                              all_messages=_bool(rc, "all_messages", cw))
+                              all_messages=_bool(rc, "all_messages", cw), thread_id=_str(rc, "thread_id", cw))
             if not chat.chat_id:
                 raise RosterError(f"{cw}: chat_id 不能为空")
-            if chat.chat_id in chat_owner:
-                raise RosterError(f"{cw}: chat_id {chat.chat_id} 已属于 {chat_owner[chat.chat_id]}，"
-                                  "同一个聊天只能属于一个 managed 会话")
-            chat_owner[chat.chat_id] = key
+            if "thread_id" in rc and not chat.thread_id:
+                raise RosterError(f"{cw}: thread_id 不能为空；负责整个聊天时省略这个字段")
+            scope = (chat.chat_id, chat.thread_id)
+            if scope in chat_owner:
+                raise RosterError(f"{cw}: chat_id {chat.chat_id} thread_id {chat.thread_id!r} 已属于 {chat_owner[scope]}，"
+                                  "同一个聊天或话题只能属于一个 managed 会话")
+            chat_owner[scope] = key
             s.chats.append(chat)
         sessions.append(s)
     # 前任不能同时还是名册里某个会话，否则既要退休又要投递

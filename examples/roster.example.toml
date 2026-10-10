@@ -4,8 +4,10 @@
 # 每个 [[session]] 是一个已经在工作的 Agent 会话：
 #   mode = "managed"：sheepdog 按聊天归属把 IM 消息推给它（永远不新建会话、不改标题）
 #   mode = "known"  ：只登记给总线看，从不投递；总线遇到相关的事只建议你去那里处理
-# 校验（失败直接报错退出）：key 唯一且只含 [a-z0-9_-]、不能是 bus；同一个 chat_id 只能属于一个会话；
+# 校验（失败直接报错退出）：key 唯一且只含 [a-z0-9_-]、不能是 bus；同一聊天或话题只能属于一个会话；
 # managed 必须有 conversation_id；known 不能有 chats；不认识的字段一律报错。
+# 聊天绑定可加 thread_id = "omt_test_ticket"：同群不同话题可以分别交给不同会话。
+# 指定话题优先于全群默认归属。需要接收无 @ 的 QA 状态回复时使用 all_messages = true。
 
 [[session]]
 key = "demo_requests"                       # topic_id = "tp_demo_requests"

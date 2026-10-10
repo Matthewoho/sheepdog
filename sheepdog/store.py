@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS messages (
     dispatch_state TEXT,               -- pending | delivered | acked | failed | missed（adopted 回执超时）
                                        -- | uncertain（所在批次发送中断、不确定是否送达，不自动重发）
                                        -- | context（主人本人的发言作为背景已送达，不要回执）
+                                       -- | notification（已保留给原生宿主通知队列，不交给 Dispatcher）
     batch_id       TEXT,
     inbox_cleared  INTEGER DEFAULT 0,
     note           TEXT,               -- 未用（早期转交说明，转达改为 sheepdog 消息）
@@ -179,6 +180,21 @@ CREATE TABLE IF NOT EXISTS actions (
     result       TEXT,
     error        TEXT
 );
+
+-- Native-host outbox: host acceptance and observed work completion are separate.
+CREATE TABLE IF NOT EXISTS notifications (
+    id              TEXT PRIMARY KEY,
+    topic_id        TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    state           TEXT NOT NULL,  -- prepared | sending | accepted | complete | cancelled
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    reference       TEXT,
+    result          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notification_target ON notifications(conversation_id, state);
+
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -426,12 +442,13 @@ class Store:
             return c.execute("UPDATE loop_events SET cleared_at=? WHERE chat_id=? AND cleared_at IS NULL",
                              (now_iso(), chat_id)).rowcount
 
-    def last_delivered_topic(self, chat_id: str, since_iso: str) -> str | None:
+    def last_delivered_topic(self, chat_id: str, since_iso: str, thread_id: str = "") -> str | None:
         """since 之后最近一次把这个聊天（别人发的）消息投递出去的 topic。"""
         row = self.conn.execute(
             """SELECT m.topic_id FROM messages m JOIN dispatches d ON d.batch_id = m.batch_id
-               WHERE m.chat_id=? AND m.route='dispatch' AND m.reason != 'owner_context' AND d.sent_at >= ?
-               ORDER BY d.sent_at DESC LIMIT 1""", (chat_id, since_iso)).fetchone()
+               WHERE m.chat_id=? AND COALESCE(m.thread_id, '')=?
+                 AND m.route='dispatch' AND m.reason != 'owner_context' AND d.sent_at >= ?
+               ORDER BY d.sent_at DESC LIMIT 1""", (chat_id, thread_id, since_iso)).fetchone()
         return row["topic_id"] if row else None
 
     # ---------- inbox ----------
@@ -650,14 +667,15 @@ class Store:
         where = "" if include_closed else "WHERE closed_at IS NULL"
         return self.conn.execute(f"SELECT * FROM watches {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-    def match_watch(self, person_id: str, chat_id: str) -> sqlite3.Row | None:
+    def match_watch(self, person_id: str, chat_id: str, topic_id: str | None = None) -> sqlite3.Row | None:
         """同一人有多条有效等待时取最新的一条。"""
         if not person_id:
             return None
         return self.conn.execute(
             """SELECT * FROM watches WHERE closed_at IS NULL AND person_id=? AND (chat_id IS NULL OR chat_id=?)
+               AND (? IS NULL OR topic_id=?)
                ORDER BY started_at DESC, id DESC LIMIT 1""",
-            (person_id, chat_id),
+            (person_id, chat_id, topic_id, topic_id),
         ).fetchone()
 
     def update_watch(self, watch_id: int, **fields) -> None:

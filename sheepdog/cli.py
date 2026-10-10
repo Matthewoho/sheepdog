@@ -808,6 +808,41 @@ def cmd_session_reset(args) -> int:
     return 0
 
 
+def cmd_notifications(args) -> int:
+    from .notifications import NotificationQueue, NotificationError
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    try:
+        roster = _roster(cfg)
+        queue = NotificationQueue(store, roster)
+        if args.action == "prepare":
+            if args.collect:
+                source = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages,
+                                       chat_ids=[c.chat_id for s in roster.managed if s.conversation_id for c in s.chats])
+                Collector(cfg, store, source, roster, _security(cfg)).poll_once()
+            result = queue.prepare()
+        elif args.action == "list":
+            result = queue.items(include_closed=args.all)
+        elif args.action == "start":
+            result = queue.start(args.id)
+        elif args.action == "accept":
+            queue.accept(args.id, args.reference)
+            result = {"id": args.id, "state": "accepted"}
+        elif args.action == "complete":
+            queue.complete(args.id, args.summary)
+            result = {"id": args.id, "state": "complete"}
+        else:
+            queue.cancel(args.id)
+            result = {"id": args.id, "state": "cancelled"}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except NotificationError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -940,6 +975,23 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("session-reset")
     sp.add_argument("--topic", required=True)
     sp.set_defaults(func=cmd_session_reset)
+
+    sp = sub.add_parser("notifications", help="Durable outbox for native Codex host tools")
+    ns = sp.add_subparsers(dest="action", required=True)
+    np = ns.add_parser("prepare")
+    np.add_argument("--collect", action="store_true", help="Collect Lark events before preparing")
+    np.set_defaults(func=cmd_notifications)
+    np = ns.add_parser("list")
+    np.add_argument("--all", action="store_true")
+    np.set_defaults(func=cmd_notifications)
+    for action in ("start", "accept", "complete", "cancel"):
+        np = ns.add_parser(action)
+        np.add_argument("--id", required=True)
+        if action == "accept":
+            np.add_argument("--reference", required=True)
+        elif action == "complete":
+            np.add_argument("--summary", required=True)
+        np.set_defaults(func=cmd_notifications)
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

@@ -133,7 +133,7 @@ def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
     """
     if d.route == SELF or d.reason == "self_escalation" or msg.chat_id in ignore_chat_ids:
         return d, None
-    owner = roster.owner_of(msg.chat_id) if roster else None
+    owner = roster.owner_of(msg.chat_id, msg.thread_id) if roster else None
     if owner:
         sess, chat = owner
         if chat.all_messages or d.route == DISPATCH:
@@ -242,7 +242,10 @@ class Collector:
         # 自己发的、升级私聊、ignore_chat_ids 不受影响
         if d.route == SELF or d.reason == "self_escalation" or m.chat_id in self.cfg.routing.ignore_chat_ids:
             return d, topic_id, None
-        w = self.store.match_watch(m.sender_id, m.chat_id)
+        owner = self.roster.owner_of(m.chat_id, m.thread_id) if self.roster else None
+        # A sender/chat watch is broader than an explicitly owned QA/approval thread.
+        scoped_topic = owner[0].topic_id if owner and owner[1].thread_id else None
+        w = self.store.match_watch(m.sender_id, m.chat_id, scoped_topic)
         if w:
             return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"], w
         return d, topic_id, None
@@ -399,15 +402,15 @@ class Collector:
         # 会话以主人身份代回的（带代回前缀）不送
         return not is_agent_reply(m.content, oc)
 
-    def _owner_context_target(self, chat_id: str) -> str | None:
+    def _owner_context_target(self, chat_id: str, thread_id: str = "") -> str | None:
         """去向：名册 / 总线新开的聊天归属 → 它；否则 follow_hours 内最近处理过该聊天的会话（含总线）；都没有 → 不送。"""
-        owner = self.roster.owner_of(chat_id) if self.roster else None
+        owner = self.roster.owner_of(chat_id, thread_id) if self.roster else None
         if owner is not None:
             return owner[0].topic_id
         if chat_id in self._dynamic:
             return self._dynamic[chat_id][0]
         since = (_now() - timedelta(hours=self.cfg.owner_context.follow_hours)).isoformat(timespec="seconds")
-        tid = self.store.last_delivered_topic(chat_id, since)
+        tid = self.store.last_delivered_topic(chat_id, since, thread_id)
         if not tid:
             return None
         t = self.store.get_topic(tid)
@@ -418,7 +421,7 @@ class Collector:
     def _owner_context(self, m: Message) -> None:
         if not self._owner_context_wanted(m):
             return
-        topic_id = self._owner_context_target(m.chat_id)
+        topic_id = self._owner_context_target(m.chat_id, m.thread_id)
         if not topic_id:
             return
         # 回复的是哪条由投递时统一附的「↪ 回复的是」说明（7.15）
@@ -431,7 +434,7 @@ class Collector:
         old_text = old["content"] or ""
         if is_agent_reply(old_text, self.cfg.owner_context):
             return  # 原文是会话代回的
-        topic_id = self._owner_context_target(m.chat_id)
+        topic_id = self._owner_context_target(m.chat_id, m.thread_id)
         if not topic_id:
             return
         where = "私聊" if m.chat_type == "p2p" else f"群「{m.chat_name or m.chat_id}」"
@@ -491,7 +494,7 @@ class Collector:
 
     def _owner_reaction_target(self, row) -> str | None:
         """名册 / 总线新开的聊天归属优先，否则送给投递过这条消息的会话。"""
-        owner = self.roster.owner_of(row["chat_id"]) if self.roster else None
+        owner = self.roster.owner_of(row["chat_id"], row["thread_id"] or "") if self.roster else None
         if owner is not None:
             return owner[0].topic_id
         if row["chat_id"] in self._dynamic:

@@ -32,7 +32,7 @@ On top of routing:
 - **Ask the human.** When a session is unsure, it DMs you through a bot. You can answer in the bus session or reply right in Lark. sheepdog verifies the reply came from your account and routes it back to the session that asked.
 - **Waiting on others.** A session registers a wait (`sheepdog watch`); the reply is routed straight back to it, with reminders at 15 / 30 minutes and a report to you at 60 (all configurable).
 - **Project anchoring.** Sessions ask which project a request belongs to and record it, so information doesn't scatter.
-- **Agent replies as cards.** Anything an agent sends on your behalf goes out as a card with a small grey marker in the bottom-right corner (`[🐕Sheepdog Reply]`), so people can tell it from you.
+- **Attributed agent replies.** The default playbook uses cards with a small grey marker (`[🐕Sheepdog Reply]`). [Ordinary text/post replies](examples/playbook-ordinary.md) can keep the same attribution.
 - **Security gate.** Configurable rules tag or hold suspicious messages (credential requests, permission grants, destructive or production actions, "the boss already approved" claims, prompt injection) before any session sees them.
 
 ## How it works
@@ -49,7 +49,7 @@ Lark (lark-cli, as you)
 
 - Sessions report back after every batch with a structured receipt (`handled`, `needs_decision`, `waiting_external`, `done`), which drives a per-session state machine.
 - If you start typing in a session, sheepdog pauses deliveries to it and catches up 15 minutes after you stop.
-- Source (where messages come from), Sink (where sessions live) and Store are interfaces. Today only Lark, Google Antigravity and SQLite are implemented.
+- Source (where messages come from), Sink (where sessions live) and Store are interfaces. The sidecar uses Lark, Google Antigravity and SQLite. A [native Codex consumer](docs/session-notifications.md) can notify explicitly bound existing Codex conversations.
 
 **Mechanism lives in code, rules live in your config.** Every business rule (how agent replies are marked, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
 
@@ -57,9 +57,26 @@ Lark (lark-cli, as you)
 
 - Python ≥ 3.11 (standard library only)
 - [`lark-cli`](https://github.com/larksuite/cli) (`npm install -g @larksuite/cli`), logged in with your user identity
-- The [Google Antigravity](https://antigravity.google) desktop app. sheepdog creates and messages sessions through the app's built-in `agentapi`, which only works inside the app's own processes, so sheepdog runs as an Antigravity sidecar.
+- For the sidecar: the [Google Antigravity](https://antigravity.google) desktop app. sheepdog creates and messages sessions through the app's built-in `agentapi`, which only works inside the app's own processes, so sheepdog runs as an Antigravity sidecar.
 
-## Quick start
+## Codex Desktop
+
+Use the [Sheepdog Codex skill](skills/sheepdog-codex/SKILL.md) in a host exposing
+native conversation send/read/wait tools. It consumes a durable outbox and records
+host acceptance separately from the worker's checked result; uncertain sends are
+held for reconciliation. Antigravity is not required for this mode.
+
+Bind an existing conversation in `roster.toml`; an optional `thread_id` on a chat
+binding distinguishes QA/approval tickets within the same group. Set
+`all_messages = true` to include bot replies without an @mention or parent message.
+Then run `sheepdog notifications prepare --collect` through the native skill.
+See [setup, receipt states and limits](docs/session-notifications.md).
+
+The standalone CLI cannot invoke Codex Desktop tools. A recurring check must run
+in a host that provides them. Claude/terminal adapters and native approval events
+are not implemented.
+
+## Quick start (Antigravity)
 
 ```bash
 uv tool install .            # or: pipx install .
@@ -125,7 +142,7 @@ Pruning covers messages, delivery records, escalations, bot message sources, rea
 
 ## Status
 
-Early and opinionated: built around one person's daily workflow, Lark plus Google Antigravity. The Source / Sink interfaces are there for other chat tools and agent hosts, but none are implemented yet.
+Early and opinionated: built around one person's daily workflow, Lark plus Google Antigravity. The Source / Sink interfaces are there for other chat tools and agent hosts, and native Codex notifications are available through the bundled host skill.
 
 ## Development
 
