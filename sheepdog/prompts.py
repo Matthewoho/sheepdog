@@ -70,7 +70,9 @@ def _join(*parts: str) -> str:
 
 # ---------- 名册数据渲染 ----------
 def chats_text(s: RosterSession) -> str:
-    return "\n".join(f"- {c.name or c.chat_id}（`{c.chat_id}`，{'全部消息' if c.all_messages else '仅 dispatch 级消息'}）"
+    return "\n".join(f"- {c.name or c.chat_id}（`{c.chat_id}`，"
+                     f"{('话题 `' + c.thread_id + '`，') if c.thread_id else ''}"
+                     f"{'全部消息' if c.all_messages else '仅 dispatch 级消息'}）"
                      for c in s.chats) or "- （无）"
 
 
@@ -93,7 +95,8 @@ def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
             lines.append(f"  职责：{s.duty}")
         if s.mode == MANAGED and s.chats:
             lines.append("  负责的聊天：" + "、".join(
-                f"{c.name or c.chat_id}（{'全部消息' if c.all_messages else '仅 dispatch 级'}）" for c in s.chats))
+                f"{c.name or c.chat_id}（{('话题 `' + c.thread_id + '`，') if c.thread_id else ''}"
+                f"{'全部消息' if c.all_messages else '仅 dispatch 级'}）" for c in s.chats))
     for t in dynamic or []:
         lines.append(f"- 「{t['title']}」 topic `{t['topic_id']}` | conversation `{t['conversation_id'] or '-'}` | "
                      f"dynamic（总线新开，{t['created_at']}）")

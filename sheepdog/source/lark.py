@@ -69,8 +69,9 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
 
 
 class LarkCliSource:
-    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3):
+    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3, chat_ids: list[str] | None = None):
         self.tz = tz
+        self.chat_ids = chat_ids
         self.binary = shutil.which(binary) or binary
         self.max_pages = max_pages
         # 可重试错误的首次退避秒数，之后每次翻倍
@@ -111,6 +112,11 @@ class LarkCliSource:
     # ---------- Source 接口 ----------
     def fetch_since(self, start_iso: str, end_iso: str | None = None) -> list[Message]:
         args = ["im", "+messages-search", "--start", start_iso, "--page-size", "50", "--format", "json", "--no-reactions"]
+        if self.chat_ids is not None:
+            if not self.chat_ids:
+                self.last_fetch_partial = False
+                return []
+            args += ["--chat-id", ",".join(sorted(set(self.chat_ids)))]
         if end_iso:
             args += ["--end", end_iso]
         out: list[Message] = []

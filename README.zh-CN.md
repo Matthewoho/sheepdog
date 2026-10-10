@@ -61,6 +61,39 @@
 
 ## 快速开始
 
+### Codex Desktop：通知已有工作对话
+
+无需 Antigravity。将提测或审批的聊天话题绑定到已有 Codex 对话，再在具有原生
+`send_message_to_thread`、`read_thread`、`wait_threads` 工具的 Codex 宿主中运行
+[Sheepdog Codex skill](skills/sheepdog-codex/SKILL.md)。配置与名册沿用下方的模板；
+此模式用 `sheepdog notifications prepare --collect` 采集并入队，不运行 Antigravity 的
+`init` / `run`。队列区分待发送、宿主接收、工作完成；发送结果不确定时不自动重发。
+
+```toml
+[[session]]
+key = "qa_ticket"
+mode = "managed"
+conversation_id = "00000000-0000-4000-8000-000000000004"
+title = "QA ticket owner"
+duty = "收到提测回复后核实实际状态，在已有授权内处理并回执。"
+[[session.chats]]
+chat_id = "oc_test_qa_group"
+thread_id = "omt_test_qa_ticket"
+all_messages = true
+```
+
+`thread_id` 可区分同群不同单据；精确话题优先于群默认归属及其他任务的群级等待。
+`all_messages = true` 包含没有 @ 或 `reply_to` 的 QA 机器人回复，仍遵守忽略群、防循环
+和安全闸。外部消息不扩大授权。未绑定的事件不会自动发往任意 Codex 对话。
+
+普通飞书消息使用 `--markdown`（消息类型 `post`）或 `--text`，并保留代回后缀。
+可按 [普通消息示例](examples/playbook-ordinary.md) 修改个人 playbook。完整流程与状态
+含义见 [工作事件通知](docs/session-notifications.md)。CLI 单独运行不能调用桌面的原生
+工具；需要在支持这些工具的 Codex 宿主中调用 skill，或由用户配置宿主定期运行。
+Claude、其他终端和原生审批事件源仍需独立适配。
+
+### Antigravity
+
 ```bash
 uv tool install .            # 或者：pipx install .
 mkdir -p ~/.config/sheepdog
