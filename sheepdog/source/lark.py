@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import time
 
 from ..models import Mention, Message
 from . import SourceError
+
+log = logging.getLogger("sheepdog")
 
 # 飞书 @所有人 在 mentions 里的标识
 _AT_ALL_IDS = {"all", "@_all"}
@@ -70,13 +73,21 @@ class LarkCliSource:
         self.tz = tz
         self.binary = shutil.which(binary) or binary
         self.max_pages = max_pages
+        # 可重试错误的首次退避秒数，之后每次翻倍
+        self.backoff = 2.0
         # 最近一次 fetch_since 是否没拉完（7.16）：has_more 却缺 page_token，或翻到上限仍 has_more
         self.last_fetch_partial = False
         self.retries = retries
 
     # ---------- 底层调用 ----------
+    @staticmethod
+    def _retryable(err: dict) -> bool:
+        """限流、标了 retryable 的，以及网络类错误（如 TLS handshake timeout）都按退避重试。"""
+        subtype = str(err.get("subtype") or "").lower()
+        return bool(err.get("retryable")) or subtype == "rate_limit" or err.get("type") == "network" or "timeout" in subtype
+
     def _run(self, args: list[str]) -> dict:
-        delay = 2.0
+        delay = self.backoff
         last_err = ""
         for attempt in range(self.retries):
             proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=120)
@@ -89,8 +100,8 @@ class LarkCliSource:
                 return data.get("data") or {}
             err = data.get("error") or {}
             last_err = f"{err.get('type')}/{err.get('subtype')}: {err.get('message')}"
-            # 仅对可重试错误退避（如 429）
-            if err.get("retryable") or err.get("subtype") == "rate_limit":
+            if self._retryable(err) and attempt + 1 < self.retries:
+                log.warning("lark-cli %s 第 %d 次失败（%s），%.0f 秒后重试", " ".join(args[:2]), attempt + 1, last_err, delay)
                 time.sleep(delay)
                 delay *= 2
                 continue

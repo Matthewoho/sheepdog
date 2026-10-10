@@ -260,8 +260,11 @@ def cmd_run(args) -> int:
                                  {k: v for k, v in pruned.items() if v})
         except KeyboardInterrupt:
             return 0
-        except Exception:  # 单轮失败不退出，下一轮从水位线续跑
-            logging.exception("本轮失败")
+        except Exception as e:  # 单轮失败不退出，下一轮从水位线续跑
+            if getattr(args, "verbose", False):
+                logging.exception("本轮失败")
+            else:
+                logging.error("本轮失败（下一轮从水位线续跑）: %s: %s", type(e).__name__, e)
         time.sleep(args.interval or cfg.poll_interval_seconds)
 
 
