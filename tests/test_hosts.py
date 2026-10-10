@@ -1012,11 +1012,12 @@ class CliNameTest(HostBase):
         self.cfg.playbook_dir = str(REPO / "examples" / "playbook")  # 示例 playbook 里的 {{cli}} 也要换过来
         self.quoted = "'/tmp/sheep dog test/bin/sheepdog-test'"
 
-    def assert_no_bare(self, text: str):
+    def assert_no_bare(self, text: str, has_cli: bool = True):
         self.assertNotIn("`sheepdog ", text)
         self.assertNotIn("$(sheepdog ", text)
         self.assertNotIn("{{cli}}", text)
-        self.assertIn(f"`{self.quoted} ", text)
+        if has_cli:
+            self.assertIn(f"`{self.quoted} ", text)
 
     def test_prompts_use_cli_name(self):
         from sheepdog.prompts import (adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt,
@@ -1037,25 +1038,62 @@ class CliNameTest(HostBase):
         row = self.store.get_message("om_test_long")
         inbox = [{"chat_name": "群", "chat_id": "oc_test_g", "unread": 1, "total": 2, "last_time": "x", "owner_last": ""}]
         texts["batch"] = batch_prompt(pb, "tp_cx", "b1", [row], inbox, "Codex 设计", max_lines=5, cli_host=True)
+        ag = parse_roster(cx_roster(host="antigravity")).sessions[0]
+        texts["ag_rules"] = standing_rules_managed(pb, ag, [15, 30], 60)
+        texts["ag_batch"] = batch_prompt(pb, "tp_cx", "b2", [row], [], "Codex 设计")
         for name, text in texts.items():
             with self.subTest(name):
-                self.assert_no_bare(text)
-        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch b1", texts["batch"])
+                self.assert_no_bare(text, has_cli=name != "retire")  # 命令行宿主的退休通知里只剩回执块，没有命令
+        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch b2", texts["ag_batch"])
+        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch <批次ID>", texts["ag_rules"])
         self.assertIn(f"`{self.quoted} watch-done --id 7`", texts["batch"])
         self.assertIn(f"`{self.quoted} show om_test_long`", texts["batch"])
         self.assertIn(f"`{self.quoted} inbox --chat", texts["batch"])
         self.assertIn(f"`{self.quoted} reply-card`", texts["batch"])  # batch_footer.md 的 {{cli}}
-        self.assertIn(f"跑不了 `{self.quoted} receipt`", texts["retire"])  # 命令行宿主的回执提示
+        self.assertIn("回执一律写成回执块", texts["retire"])  # 命令行宿主的回执提示
         self.assertIn(f"`{self.quoted} forward`", texts["bus"])  # bus.md 的 {{cli}}
         self.assertIn("`sheepdog-receipt`", texts["rules"])  # 围栏标记不是命令，不换
 
     def test_default_cli_name_unchanged(self):
         self.cfg.cli_name = "sheepdog"
         pb = Playbook.from_config(self.cfg)
-        s = parse_roster(cx_roster()).sessions[0]
+        s = parse_roster(cx_roster(host="antigravity")).sessions[0]
         text = standing_rules_managed(pb, s, [15, 30], 60)
         self.assertIn("`sheepdog receipt --topic tp_cx", text)
         self.assertIn("`sheepdog watch`", text)
+
+    def test_cli_host_receipt_only_via_block(self):
+        """7.18 第三层实测：命令行宿主会话写不了状态目录，回执只给回执块这一种写法，不再让它先试回执命令。"""
+        from sheepdog.prompts import adopted_bootstrap, batch_prompt, onboarding_prompt, retirement_prompt
+        pb = Playbook.from_config(self.cfg)
+        self.store.upsert_message(msg(message_id="om_test_rb"), "dispatch", "at_me", [], "tp_cx")
+        row = self.store.get_message("om_test_rb")
+        for host in ("codex", "claude"):
+            with self.subTest(host):
+                s = parse_roster(cx_roster(host=host)).sessions[0]
+                sp = parse_roster(cx_roster(host=host, conversation_id="",
+                                            predecessor_conversation_id="thr_test_pre")).sessions[0]
+                batch = batch_prompt(pb, "tp_cx", "b1", [row], [], "Codex 设计", cli_host=True)
+                texts = [batch, standing_rules_managed(pb, s, [15, 30], 60), onboarding_prompt(pb, s, "o1", [15, 30], 60),
+                         adopted_bootstrap(pb, sp, "t", "h1", [15, 30], 60),
+                         retirement_prompt(pb, "tp_x.prev", "前任", "r1", "接手", "tp_x", cli_host=True)]
+                for text in texts:
+                    self.assertNotIn(f"`{self.quoted} receipt", text)
+                    self.assertNotIn("receipt --topic", text)
+                    self.assertIn("```sheepdog-receipt", text)
+                self.assertIn("在这一轮回答的最末尾附 ```sheepdog-receipt 回执块（内容同 receipt --json 的 JSON）", batch)
+                self.assertIn("不算受阻", batch)
+                # 其他命令照旧列出
+                self.assertIn(f"`{self.quoted} watch --topic tp_cx", texts[1])
+                self.assertIn(f"`{self.quoted} watch-done --id <id>`", texts[1])
+        ag_batch = batch_prompt(pb, "tp_cx", "b1", [row], [], "Codex 设计")
+        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch b1 --json '...'`", ag_batch)
+        self.assertNotIn("```sheepdog-receipt", ag_batch)
+        ag = parse_roster(cx_roster(host="antigravity")).sessions[0]
+        self.assertIn(f"`{self.quoted} receipt --topic tp_cx --batch o1 --json '{{\"status\":\"handled\",\"summary\":\"...\"}}'`",
+                      onboarding_prompt(pb, ag, "o1", [15, 30], 60))
+        self.assertIn(f"交接回执：`{self.quoted} receipt --topic tp_x.prev --batch r1",
+                      retirement_prompt(pb, "tp_x.prev", "前任", "r1", "接手", "tp_x"))
 
     def test_engine_and_cli_texts(self):
         d = Dispatcher(self.cfg, self.store, {"antigravity": FakeSink()})

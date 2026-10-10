@@ -117,10 +117,18 @@ def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
     return "\n".join(lines)
 
 
-# 命令行宿主（Codex / Claude）会话交回执的另一种办法（7.18 第 5 条）：回答末尾附一个回执块
+# 命令行宿主（Codex / Claude）会话交回执的办法（7.18 第 5 条）：一律在回答末尾附一个回执块。
+# 它们多半写不了 sheepdog 的状态目录，回执命令注定失败；只给回执块这一种写法，免得会话把「交不了回执命令」当成受阻
 RECEIPT_FENCE = "sheepdog-receipt"
-CLI_RECEIPT_HINT = (f"跑不了 `sheepdog receipt`（比如写不了 sheepdog 的状态目录）时，在这一轮回答的末尾附一个回执块："
-                    f"围栏标记 `{RECEIPT_FENCE}`，内容和 `--json` 的回执 JSON 一样，sheepdog 在这一轮结束时读取。")
+CLI_RECEIPT_HINT = (f"回执一律写成回执块：在这一轮回答的最末尾附一个围栏标记为 `{RECEIPT_FENCE}` 的代码块，"
+                    f"内容就是回执 JSON（同 receipt --json 的 JSON），sheepdog 在这一轮结束时读取。这是正常交法，不用跑回执命令。")
+
+
+def receipt_lines(cli_host: bool, topic_id: str, batch_id: str, example: str) -> list[str]:
+    """怎么交这一批的回执：Antigravity 会话跑回执命令；命令行宿主会话附回执块（example 是回执 JSON 示例）。"""
+    if cli_host:
+        return [f"在这一轮回答的最末尾附回执块（批次 `{batch_id}`）：", f"```{RECEIPT_FENCE}", example, "```"]
+    return [f"`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '{example}'`"]
 
 
 def with_cli(text: str, cli: str) -> str:
@@ -137,11 +145,12 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
     lines = [
         "## sheepdog 接口说明",
         "### 回执",
-        f"每批处理完提交回执（JSON 写成单行）：`sheepdog receipt --topic {topic_id} --batch <批次ID> --json '<回执JSON>'`",
+        (f"每批处理完交回执。{CLI_RECEIPT_HINT}回执 JSON 的格式：" if cli_host else
+         f"每批处理完提交回执（JSON 写成单行）：`sheepdog receipt --topic {topic_id} --batch <批次ID> --json '<回执JSON>'`"),
         "```",
         RECEIPT_SCHEMA_HINT,
         "```",
-        *([CLI_RECEIPT_HINT, f"```{RECEIPT_FENCE}", '{"status": "handled", "summary": "..."}', "```"] if cli_host else []),
+        *(["例如：", f"```{RECEIPT_FENCE}", '{"status": "handled", "summary": "..."}', "```"] if cli_host else []),
         ("没有提交回执会被判定为处理失败并重投。" if bus else "回执可选：没回执不会重投，只记一次「未回执」。"),
         "anchors 会存进会话记录；`project:` 开头的条目在 `sheepdog sessions` 里显示为关联项目。",
         "### 等别人回复",
@@ -245,7 +254,7 @@ def _onboarding_body(pb: Playbook, s: RosterSession) -> str:
 def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: list[int], expire: int) -> str:
     """接管现有会话的登记通知（只发一次）。"""
     confirm = ["### 确认登记",
-               f"`sheepdog receipt --topic {s.topic_id} --batch {batch_id} --json '{{\"status\":\"handled\",\"summary\":\"...\"}}'`"]
+               *receipt_lines(s.is_cli_host, s.topic_id, batch_id, '{"status":"handled","summary":"..."}')]
     return _join(
         pb.render("security.md", session_title=s.display_title, topic_id=s.topic_id),
         f"[sheepdog] 登记通知（topic `{s.topic_id}`，批次 `{batch_id}`）",
@@ -266,8 +275,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
         extra = [
             "### 接手",
             "读完前任上下文后用这个批次回执；回执之前信号排队，不会丢：",
-            f"`sheepdog receipt --topic {s.topic_id} --batch {read_batch_id} --json "
-            f"'{{\"status\":\"needs_decision\",\"summary\":\"...\"}}'`",
+            *receipt_lines(s.is_cli_host, s.topic_id, read_batch_id, '{"status":"needs_decision","summary":"..."}'),
             "前任的交接回执到达后，sheepdog 会以「前任交接回执」原样转给你。",
         ]
     return _join(
@@ -294,9 +302,9 @@ def retirement_prompt(pb: Playbook, prev_topic_id: str, prev_title: str, batch_i
                   session_title=prev_title, topic_id=prev_topic_id),
         with_cli("\n".join([
             "## sheepdog 接口说明",
-            f"交接回执：`sheepdog receipt --topic {prev_topic_id} --batch {batch_id} --json "
-            f"'{{\"status\":\"done\",\"summary\":\"...\"}}'`",
-            *([CLI_RECEIPT_HINT] if cli_host else []),
+            *(["交接回执：", *receipt_lines(True, prev_topic_id, batch_id, '{"status":"done","summary":"..."}'),
+               CLI_RECEIPT_HINT] if cli_host else
+              ["交接回执：" + receipt_lines(False, prev_topic_id, batch_id, '{"status":"done","summary":"..."}')[0]]),
             "sheepdog 会把回执原样转给接手会话；之后不再往这里投递信号。",
         ]), pb.cli),
     )
@@ -433,9 +441,13 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts += ["", "这批只有主人本人的发言，作为背景，不需要回执。"]
     else:
         tail = "处理完成后提交回执" + ("（可选）" if receipt_optional else "")
-        parts += ["", with_cli(f"{tail}：`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '...'`", pb.cli)]
         if cli_host:
-            parts.append(f"跑不了这条命令就在回答末尾附 ```{RECEIPT_FENCE} 回执块（内容同 --json）。")
+            # 命令行宿主会话只给回执块这一种写法（写不了状态目录，回执命令注定失败；7.18 第三层实测）
+            parts += ["", f"{tail}：在这一轮回答的最末尾附 ```{RECEIPT_FENCE} 回执块（内容同 receipt --json 的 JSON）。"
+                          "这是正常交法，不算受阻。"]
+        else:
+            parts += ["", with_cli(f"{tail}：`sheepdog receipt --topic {topic_id} --batch {batch_id} --json '...'`",
+                                   pb.cli)]
     for name in ("security_footer.md", "batch_footer.md"):
         footer = pb.render(name, session_title=session_title, topic_id=topic_id)
         if footer:
