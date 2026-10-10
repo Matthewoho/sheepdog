@@ -67,6 +67,7 @@ from .sink import SinkError
 from .sink.agentapi import AgentApiSink, DryRunSink
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
+from .sink.codex_profile import ProfileError, profile_overrides
 from .source import NullSource
 from .source.lark import LarkCliSource
 from .store import Store, now_iso
@@ -308,8 +309,15 @@ def host_report(cfg, store: Store) -> list[str]:
             lines.append("  提示: Codex 应用侧边栏只列登记过的项目下的线程；新建的线程要重开应用才看得到")
             sb = _codex_sandbox(hc.profile)
             mode, net = sb["mode"], sb["net"]
-            lines.append(f"  配置档: {('profile = ' + hc.profile + '（codex -p ' + hc.profile + '）') if hc.profile else '没设（只用用户配置）'}"
-                         f"；读的是 {sb['file']}")
+            if hc.profile:
+                lines.append(f"  配置档: profile = {hc.profile}，读的是 {sb['file']}；sheepdog 把它展开成 -c 参数传给自己起的 "
+                             "app-server（主人在 Codex 应用里的会话不受影响）")
+                try:
+                    lines.append("  展开: " + " ".join(profile_overrides(hc.profile)))
+                except ProfileError as e:
+                    lines.append(f"  ✗ 配置档有问题，这个宿主的每一轮都会直接失败：{e}")
+            else:
+                lines.append(f"  配置档: 没设（只用用户配置 {sb['file']}）")
             lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}，writable_roots = {sb['roots']}"
                          "（来自 Codex 自己的配置，sheepdog 只传配置档名，不传任何权限参数）")
             if mode == "read-only" or net == "关":

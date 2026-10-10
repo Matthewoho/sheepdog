@@ -1300,6 +1300,21 @@ class Dispatcher:
             self._bus_hint("host_timeout", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮超时：{r.error}。"
                                            f"会话已标 attention，确认后用 `sheepdog session-reset --topic {r.topic_id}` 复位。")
             return
+        if r.error_kind == "config":
+            # Codex 配置档读不到 / 解析失败（7.18）：这一轮根本没起 app-server，不重试；批次退回排队、会话标 attention，
+            # 等主人修好配置档再 session-reset
+            if mine:
+                self.store.finish_dispatch(r.batch_id, "failed", error=r.error[-1000:])
+                self.store.requeue_batch(r.batch_id)
+                state = t["state"]
+                for ev in ("error", "retries_exhausted"):
+                    if sm.can(state, ev):
+                        state = sm.transition(state, ev)
+                self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+            self._bus_hint("host_config", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮没跑起来，配置档有问题："
+                                          f"{r.error[-500:]}。批次已退回排队、会话标 attention；修好配置档后用 "
+                                          f"`sheepdog session-reset --topic {r.topic_id}` 复位（`sheepdog doctor` 能看到同样的问题）。")
+            return
         # 容量满重试用完：批次退回排队、会话标 attention（不再自动重发，免得同一批次一轮轮撞容量），给总线提示；
         # 不自动换模型。其他失败：照普通投递失败处理（退回排队，累计 3 次标 attention）
         if mine and r.error_kind == "capacity":

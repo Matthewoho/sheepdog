@@ -239,7 +239,7 @@ class AckConfig:
 
 
 # Codex 配置档名：只是一个名字，拼进 ~/.codex/<名字>.config.toml，不许带路径或其他字符；
-# 也不许以「-」开头，免得命令行里被 codex 当成另一个参数（比如 -c）
+# 也不许以「-」开头
 _PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
 
 # 会话宿主（7.18）：antigravity 走 App 的 agentapi；codex / claude 走各自的命令行，在后台跑
@@ -264,8 +264,8 @@ class HostConfig:
     timeout_minutes: float = 60   # 一轮最多跑多久，超过就杀掉整个进程组
     max_concurrent: int = 2       # 这个宿主同时最多跑几轮，超过的批次排队
     settings: str = ""            # 只给 Claude
-    # 只给 Codex：Codex 自己的配置档名（~/.codex/<profile>.config.toml，codex -p <profile> 叠在用户配置上面）。
-    # 权限内容全在那份文件里，sheepdog 只传名字；空 = 不传。改了要重启
+    # 只给 Codex：Codex 配置档名。sheepdog 读 ~/.codex/<profile>.config.toml，展开成 -c 参数传给自己起的 app-server
+    # （app-server 不接受 -p）；权限内容全在那份文件里，主人在 Codex 应用里的会话不受影响。空 = 不用配置档。改了要重启
     profile: str = ""
     # 新开这个宿主的会话前要先问主人（7.18，19:0x）：new-session --host <它> 必须带核对过的 --quote 主人原话。
     # 只管新开；spawn（名册里主人亲手写的）和往已有会话 forward 不受影响

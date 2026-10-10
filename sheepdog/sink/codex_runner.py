@@ -9,6 +9,8 @@
 调用序列：initialize → initialized →（thread/start{cwd, model, threadSource:"user"} + thread/name/set | thread/resume）
 → turn/start → 等 turn/completed。
 thread/start、thread/resume、turn/start 都不带任何沙箱、审批相关的键：权限全部来自 Codex 自己的配置。
+设了配置档（--profile）时，app-server 的命令行是 [codex, <配置档展开的 -c ...>, "app-server"]（见 codex_profile.py；
+app-server 不接受 -p）。配置档读不到、解析失败时这一轮直接失败，result 带 "error_kind": "config"，不起 app-server。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import subprocess
 import sys
 
 from .. import __version__
+from .codex_profile import ProfileError, app_server_argv
 
 # 服务端请求 → 拒绝时回的 result（按 app-server 协议各自的格式）；不认识的回 JSON-RPC error
 DECLINE = {
@@ -30,12 +33,6 @@ DECLINE = {
     "item/tool/requestUserInput": {"answers": {}},
     "mcpServer/elicitation/request": {"action": "decline"},
 }
-
-
-def app_server_argv(codex: str, profile: str = "") -> list[str]:
-    """起 app-server 的命令行。-p 是 codex 的全局参数，要放在子命令 app-server 前面；除此之外不传任何参数
-    （沙箱、审批、网络都来自 Codex 自己的配置和配置档）。"""
-    return [codex, *(["-p", profile] if profile else []), "app-server"]
 
 
 def thread_start_params(cwd: str, model: str) -> dict:
@@ -158,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--title", default="")
     ap.add_argument("--model", default="")
     ap.add_argument("--effort", default="")
-    ap.add_argument("--profile", default="", help="Codex 配置档名：codex -p <名字> app-server（权限全在那份配置档里）")
+    ap.add_argument("--profile", default="", help="Codex 配置档名：读 ~/.codex/<名字>.config.toml，展开成 -c 传给 app-server")
     a = ap.parse_args(argv)
 
     def emit(obj: dict) -> None:
@@ -168,7 +165,12 @@ def main(argv: list[str] | None = None) -> int:
     with open(a.inp, encoding="utf-8") as f:
         text = f.read()
     try:
-        proc = subprocess.Popen(app_server_argv(a.codex, a.profile), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        cmd = app_server_argv(a.codex, a.profile)
+    except ProfileError as e:
+        emit({"event": "result", "status": "error", "errors": [str(e)], "error_kind": "config"})
+        return 1
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=None, text=True, bufsize=1, cwd=a.cwd)
     except OSError as e:
         emit({"event": "result", "status": "error", "errors": [f"codex app-server 起不来：{e}"]})

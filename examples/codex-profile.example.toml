@@ -1,7 +1,9 @@
 # Codex 配置档示例：让 sheepdog 驱动的 Codex 会话能自己用 lark-cli 发飞书、写 sheepdog 的状态目录。
 # 用法：复制到 ~/.codex/sheepdog.config.toml，sheepdog 配置里写 [hosts.codex] profile = "sheepdog"。
-# sheepdog 起 `codex -p sheepdog app-server`，Codex 把这份文件叠在 ~/.codex/config.toml 上面。
-# 这些权限由你自己决定、自己维护：sheepdog 不读写这份文件的内容（doctor 只读来显示），也不传任何沙箱、审批参数。
+# sheepdog 读这份文件，把每一项展开成 -c 参数传给它自己起的 `codex app-server`（叠在 ~/.codex/config.toml 上面），
+# 例如 -c sandbox_mode="workspace-write"；你自己在 Codex 应用里的会话不受影响。
+# 这些权限由你自己决定、自己维护：sheepdog 只读、原样展开，不改这份文件，也不传任何别的沙箱、审批参数。
+# 只支持字符串、布尔、整数、浮点和它们的数组；键只能是 [A-Za-z0-9_-]，写了日期或表的数组会按配置档错误处理。
 
 # 能写工作目录和下面列出的目录，其他地方只读
 sandbox_mode = "workspace-write"

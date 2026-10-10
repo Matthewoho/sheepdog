@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -17,10 +16,7 @@ from pathlib import Path
 from ..store import now_iso
 from . import SinkError
 from .cli_host import CliHostSink, _text_of
-
-
-def codex_home() -> Path:
-    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+from .codex_profile import codex_home
 
 
 class CodexSink(CliHostSink):
@@ -100,6 +96,8 @@ class CodexSink(CliHostSink):
             if e.get("event") == "error" and not e.get("will_retry"):
                 seen_errors.append(e.get("message") or "")
             elif e.get("event") == "result":
+                if e.get("error_kind"):
+                    res["error_kind"] = e["error_kind"]  # runner 自己认出来的错误类型（配置档出错）
                 res.update(ok=e.get("status") == "completed", answer=e.get("answer") or "",
                            errors=[x for x in e.get("errors") or [] if x], denials=list(e.get("declined") or []))
                 res["conversation_id"] = e.get("thread_id") or res["conversation_id"]

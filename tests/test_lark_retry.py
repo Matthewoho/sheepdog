@@ -39,7 +39,9 @@ class RetryTest(unittest.TestCase):
     def fetch(self, outputs):
         with tempfile.TemporaryDirectory() as t:
             script = fake_cli(Path(t), outputs)
-            with mock.patch("sheepdog.source.lark.time.sleep") as sleep:
+            # 只替换 lark.py 自己引用的 time：patch time.sleep 会连 subprocess 等子进程退出时的内部 sleep 一起记下，偶发多出 0.001
+            with mock.patch("sheepdog.source.lark.time") as fake_time:
+                sleep = fake_time.sleep
                 try:
                     got = LarkCliSource(binary=str(script)).fetch_since("2026-01-01T09:00:00+08:00", "2026-01-01T11:00:00+08:00")
                 except SourceError as e:

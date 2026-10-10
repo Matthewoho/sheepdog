@@ -531,11 +531,32 @@ class CodexSinkTest(HostBase):
 
 
 class CodexProfileTest(HostBase):
-    """[hosts.codex] profile：只传配置档名（codex -p <名字> app-server），不传任何沙箱、审批参数。"""
-    FORBIDDEN_TOKENS = ("-c", "--config", "--sandbox", "-s", "-a", "--ask-for-approval", "--full-auto")
-    FORBIDDEN_SUBSTR = ("--dangerously", "danger-full-access", "bypass")
+    """[hosts.codex] profile：sheepdog 读 ~/.codex/<profile>.config.toml，展开成 -c 传给 app-server（app-server 不接受
+    -p，20:05 实测）。-c 只能来自配置档展开，除此之外不传任何沙箱、审批参数。"""
+    FORBIDDEN_TOKENS = ("-p", "--profile", "--config", "--sandbox", "-s", "-a", "--ask-for-approval", "--full-auto")
+    FORBIDDEN_SUBSTR = ("--dangerously", "danger-full-access")
+    PROFILE = """# 测试用配置档
+sandbox_mode = "workspace-write"
+model_reasoning_summary = "say \\"hi\\" \\\\ done"
+max_tokens = 4096
+temperature = 0.5
+tags = [["a", "b"], [1, 2]]
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["/tmp/lark cli", "/tmp/state"]
+"""
+
+    def write_profile(self, name: str, text: str) -> Path:
+        d = self.home / ".codex"
+        d.mkdir(exist_ok=True)
+        p = d / f"{name}.config.toml"
+        p.write_text(text, encoding="utf-8")
+        return p
 
     def app_server_argvs(self) -> list[list[str]]:
+        if not self.codex_argv_log.exists():
+            return []
         return [json.loads(x) for x in self.codex_argv_log.read_text(encoding="utf-8").splitlines() if x.strip()]
 
     def check_argv(self, argv: list[str]) -> None:
@@ -544,33 +565,91 @@ class CodexProfileTest(HostBase):
             for bad in self.FORBIDDEN_SUBSTR:
                 self.assertNotIn(bad, tok, argv)
 
-    def run_one(self) -> tuple[list[str], list[str]]:
+    def run_one(self, expect: str = "done"):
         s = self.codex()
         s.send_message("thr_test_pf", "x", batch_id="b_test_pf", topic_id="tp_cx", model="gpt-6-astra", effort="high")
         self.wait(s)
         [res] = s.collect_finished()
-        self.assertEqual(res.state, "done")
-        runner = s._argv(self.store.get_run("b_test_pf"), Path("x.in"))
+        self.assertEqual(res.state, expect, res.error)
         for r in self.codex_requests():
             self.assertFalse(all_keys(r.get("params") or {}) & FORBIDDEN_CODEX_KEYS, r)
-        return runner, self.app_server_argvs()[-1]
+        runner = s._argv(self.store.get_run("b_test_pf"), Path("x.in"))
+        self.assertNotIn("-c", runner)  # runner 自己的命令行里没有 -c
+        return res, runner
 
-    def test_no_profile_no_p(self):
-        runner, app = self.run_one()
+    def test_no_profile_is_plain_app_server(self):
+        self.run_one()
+        [app] = self.app_server_argvs()
         self.assertEqual(app, ["app-server"])
-        self.assertNotIn("--profile", runner)
-        self.check_argv(runner)
-        self.check_argv(app)
 
-    def test_profile_goes_before_app_server(self):
+    def test_profile_expanded_to_c_only(self):
+        import tomllib
+        self.write_profile("sheepdog_test-1", self.PROFILE)
         self.cfg.hosts["codex"].profile = "sheepdog_test-1"
-        runner, app = self.run_one()
-        self.assertEqual(app, ["-p", "sheepdog_test-1", "app-server"])
-        self.assertEqual(runner[runner.index("--profile") + 1], "sheepdog_test-1")
-        self.check_argv(runner)
+        self.run_one()
+        [app] = self.app_server_argvs()
+        self.assertEqual(app[-1], "app-server")
         self.check_argv(app)
-        # 命令行里唯一的短参数就是 -p <profile>
-        self.assertEqual([t for t in app if t.startswith("-")], ["-p"])
+        flags = app[:-1]
+        self.assertEqual(flags[0::2], ["-c"] * (len(flags) // 2))  # app-server 前面只有一对对 -c
+        pairs = [x.split("=", 1) for x in flags[1::2]]
+        self.assertEqual([k for k, _ in pairs], ["sandbox_mode", "model_reasoning_summary", "max_tokens", "temperature",
+                                                 "tags", "sandbox_workspace_write.network_access",
+                                                 "sandbox_workspace_write.writable_roots"])
+        self.assertEqual(flags[1], 'sandbox_mode="workspace-write"')
+        self.assertIn("sandbox_workspace_write.network_access=true", flags)
+        self.assertIn('sandbox_workspace_write.writable_roots=["/tmp/lark cli", "/tmp/state"]', flags)
+        # 展开结果和文件内容一一对应：每个值按 TOML 读回来，等于配置档里同一路径的值
+        data = tomllib.loads(self.PROFILE)
+        for k, lit in pairs:
+            want = data
+            for part in k.split("."):
+                want = want[part]
+            self.assertEqual(tomllib.loads(f"v = {lit}")["v"], want, k)
+        self.assertEqual(len(pairs), 7)
+
+    def test_profile_problems_fail_without_retry(self):
+        self.cfg.hosts["codex"].profile = "missing"
+        res, _ = self.run_one(expect="failed")
+        self.assertEqual(res.error_kind, "config")
+        self.assertIn("missing.config.toml 不存在", res.error)
+        self.assertEqual(self.app_server_argvs(), [])  # 没起 app-server
+        self.assertFalse(self.codex().run_active("b_test_pf"))  # 不重试
+        from sheepdog.sink.codex_profile import ProfileError, profile_overrides
+        bad = {"broken": "sandbox_mode = \n", "date": "when = 2026-10-10\n", "aot": "[[x]]\na = 1\n",
+               "quoted": '"a.b" = 1\n'}
+        for name, text in bad.items():
+            with self.subTest(name):
+                self.write_profile(name, text)
+                with self.assertRaises(ProfileError):
+                    profile_overrides(name)
+
+    def test_config_error_marks_attention_and_tells_bus(self):
+        self.cfg.hosts["codex"].profile = "missing"
+        cx = self.codex()
+        roster = parse_roster(cx_roster())
+        d = Dispatcher(self.cfg, self.store, {"antigravity": FakeSink(), "codex": cx}, roster)
+        d.sync_roster()
+        d.ensure_bus_topic()
+        self.store.update_topic("tp_cx", onboarded_at=now_iso())
+        Collector(self.cfg, self.store, FakeSource([[msg(message_id="om_test_pf1", chat_id="oc_test_cx_p2p",
+                                                          chat_type="p2p")]]), roster).poll_once()
+        d.dispatch_once()
+        self.wait(cx)
+        d.dispatch_once()
+        self.assertEqual(self.store.get_topic("tp_cx")["state"], sm.ATTENTION)
+        self.assertEqual(self.store.get_message("om_test_pf1")["dispatch_state"], "pending")
+        hints = [r["content"] for r in self.store.conn.execute("SELECT content FROM messages WHERE topic_id=?",
+                                                                (BUS_TOPIC_ID,)) if "配置档有问题" in r["content"]]
+        self.assertEqual(len(hints), 1)
+        self.assertIn("missing.config.toml 不存在", hints[0])
+        self.assertEqual(self.app_server_argvs(), [])
+
+    def test_fake_codex_rejects_p_like_the_real_one(self):
+        import subprocess
+        out = subprocess.run([str(self.bin / "codex"), "-p", "x", "app-server"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--profile only applies to runtime commands", out.stderr)
 
     def test_profile_validation(self):
         for bad in ("a b", "../x", "x.y", "名字", "-c"):
@@ -595,15 +674,17 @@ class CodexProfileTest(HostBase):
         self.assertIn("sandbox_mode = read-only", text)
         self.cfg.hosts["codex"].profile = "sheepdog"
         text = "\n".join(cli.host_report(self.cfg, self.store))
-        self.assertIn("profile = sheepdog（codex -p sheepdog）", text)
+        self.assertIn("配置档: profile = sheepdog", text)
+        self.assertIn("展开成 -c 参数传给自己起的 app-server", text)
         self.assertIn("sandbox_mode = 读不到，网络 读不到，writable_roots = 读不到", text)
-        (codex_dir / "sheepdog.config.toml").write_text(
-            'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
-            'writable_roots = ["/tmp/lark", "/tmp/state"]\n', encoding="utf-8")
+        self.assertIn("✗ 配置档有问题，这个宿主的每一轮都会直接失败", text)
+        self.write_profile("sheepdog", 'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
+                                       'writable_roots = ["/tmp/lark", "/tmp/state"]\n')
         text = "\n".join(cli.host_report(self.cfg, self.store))
         self.assertIn("sandbox_mode = workspace-write，网络 开，writable_roots = /tmp/lark, /tmp/state", text)
+        self.assertIn('展开: -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true', text)
+        self.assertNotIn("✗", text)
         self.assertNotIn("发不了飞书", text)
-        self.assertEqual((codex_dir / "sheepdog.config.toml").read_text(encoding="utf-8").count("writable_roots"), 1)
 
     def test_profile_change_needs_restart(self):
         p = self.root / "config.toml"
@@ -620,6 +701,7 @@ class CodexProfileTest(HostBase):
         st.close()
 
     def test_example_profile_file(self):
+        from sheepdog.sink.codex_profile import flatten
         import tomllib
         data = tomllib.loads((REPO / "examples" / "codex-profile.example.toml").read_text(encoding="utf-8"))
         self.assertEqual(data["sandbox_mode"], "workspace-write")
@@ -627,6 +709,7 @@ class CodexProfileTest(HostBase):
         self.assertTrue(ws["network_access"])
         self.assertTrue(any(r.endswith("/.lark-cli") for r in ws["writable_roots"]))
         self.assertTrue(any(r.endswith("/.local/state/sheepdog") for r in ws["writable_roots"]))
+        self.assertEqual(len(flatten(data)), 3)  # 示例能原样展开
         self.assertIn("reply-card", (REPO / "examples" / "playbook" / "cli_host.md").read_text(encoding="utf-8"))
 
 

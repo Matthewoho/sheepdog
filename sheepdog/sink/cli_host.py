@@ -325,7 +325,7 @@ class CliHostSink:
             self.clear_unavailable()
             return self._result(run, "done", answer=parsed.get("answer") or "", denials=denials)
         errors = "\n".join(parsed.get("errors") or []) or err_text.strip() or "进程退出，没有结果"
-        kind = classify_error(errors + "\n" + err_text)
+        kind = parsed.get("error_kind") or classify_error(errors + "\n" + err_text)
         attempts = run["attempts"] or 1
         if kind == "capacity" and attempts <= len(RETRY_MINUTES):
             wait = RETRY_MINUTES[attempts - 1]

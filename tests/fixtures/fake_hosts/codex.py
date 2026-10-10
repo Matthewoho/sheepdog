@@ -2,7 +2,7 @@
 
 行为由环境变量控制（测试进程改 os.environ，子进程继承）：
   FAKE_CODEX_LOG     收到的每条消息追加一行 JSON（测试据此检查完整的请求参数）
-  FAKE_CODEX_ARGV_LOG  每次启动追加一行命令行参数（JSON 列表）
+  FAKE_CODEX_ARGV_LOG  每次启动追加一行命令行参数（JSON 列表，含收到的 -c）
   FAKE_CODEX_MODE    ok | approval | capacity | retrying | locked | logout | slow | nothread
   FAKE_CODEX_ANSWER  ok 时最后一条 agentMessage 的正文
 """
@@ -47,10 +47,19 @@ if os.environ.get("FAKE_CODEX_ARGV_LOG"):
     with open(os.environ["FAKE_CODEX_ARGV_LOG"], "a", encoding="utf-8") as f:
         f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\n")
 args = sys.argv[1:]
-if args[:1] == ["-p"] and len(args) >= 3:  # 全局参数 -p <配置档> 在子命令前面
+if "-p" in args or "--profile" in args:
+    # 和真的 codex-cli 0.153.4 一样：app-server 不接受 -p（2026-10-10 20:05 实测原文）
+    sys.stderr.write("Error: --profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, "
+                     "`codex review`, `codex resume`, `codex queue`, `codex archive`, `codex delete`, `codex unarchive`, "
+                     "`codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`.\n")
+    sys.exit(2)
+while args[:1] == ["-c"] and len(args) >= 3:  # 全局参数 -c key=value（可以有多个）在子命令前面
+    if "=" not in args[1]:
+        sys.stderr.write(f"Error: -c 需要 key=value，收到 {args[1]!r}\n")
+        sys.exit(2)
     args = args[2:]
 if args != ["app-server"]:
-    sys.stderr.write(f"fake codex: 只认 [-p <profile>] app-server，收到 {sys.argv[1:]}\n")
+    sys.stderr.write(f"fake codex: 只认 [-c key=value]... app-server，收到 {sys.argv[1:]}\n")
     sys.exit(2)
 
 THREAD = ""
