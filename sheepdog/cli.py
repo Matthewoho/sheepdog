@@ -312,14 +312,16 @@ def host_report(cfg, store: Store) -> list[str]:
             if hc.profile:
                 lines.append(f"  配置档: profile = {hc.profile}，读的是 {sb['file']}；sheepdog 把它展开成 -c 参数传给自己起的 "
                              "app-server（主人在 Codex 应用里的会话不受影响）")
+                lines.append("  提示: 配置档只对之后新开的 Codex 会话生效；改了配置档，老会话要退休换新才会跟着变")
                 try:
                     lines.append("  展开: " + " ".join(profile_overrides(hc.profile)))
                 except ProfileError as e:
                     lines.append(f"  ✗ 配置档有问题，这个宿主的每一轮都会直接失败：{e}")
             else:
                 lines.append(f"  配置档: 没设（只用用户配置 {sb['file']}）")
-            lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}，writable_roots = {sb['roots']}"
-                         "（来自 Codex 自己的配置，sheepdog 只传配置档名，不传任何权限参数）")
+            source = (f"来自配置档 {sb['file']}，sheepdog 展开成 -c 传给自己起的 app-server" if hc.profile
+                      else "来自 Codex 用户配置，sheepdog 不传权限参数")
+            lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}，writable_roots = {sb['roots']}（{source}）")
             if mode == "read-only" or net == "关":
                 lines.append("  ⚠ 这个宿主的会话能读、能分析，但发不了飞书")
     return lines

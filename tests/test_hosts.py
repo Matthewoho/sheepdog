@@ -672,6 +672,8 @@ writable_roots = ["/tmp/lark cli", "/tmp/state"]
         text = "\n".join(cli.host_report(self.cfg, self.store))
         self.assertIn("配置档: 没设", text)
         self.assertIn("sandbox_mode = read-only", text)
+        self.assertIn("（来自 Codex 用户配置，sheepdog 不传权限参数）", text)
+        self.assertNotIn("只对之后新开", text)
         self.cfg.hosts["codex"].profile = "sheepdog"
         text = "\n".join(cli.host_report(self.cfg, self.store))
         self.assertIn("配置档: profile = sheepdog", text)
@@ -681,7 +683,10 @@ writable_roots = ["/tmp/lark cli", "/tmp/state"]
         self.write_profile("sheepdog", 'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
                                        'writable_roots = ["/tmp/lark", "/tmp/state"]\n')
         text = "\n".join(cli.host_report(self.cfg, self.store))
-        self.assertIn("sandbox_mode = workspace-write，网络 开，writable_roots = /tmp/lark, /tmp/state", text)
+        self.assertIn("sandbox_mode = workspace-write，网络 开，writable_roots = /tmp/lark, /tmp/state"
+                      f"（来自配置档 {codex_dir / 'sheepdog.config.toml'}，sheepdog 展开成 -c 传给自己起的 app-server）", text)
+        self.assertIn("提示: 配置档只对之后新开的 Codex 会话生效；改了配置档，老会话要退休换新才会跟着变", text)
+        self.assertNotIn("只传配置档名", text)
         self.assertIn('展开: -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true', text)
         self.assertNotIn("✗", text)
         self.assertNotIn("发不了飞书", text)
@@ -836,6 +841,18 @@ class ParsingTest(unittest.TestCase):
         b = standing_rules_managed(pb, ag, [15, 30], 60)
         self.assertNotIn("FX-CLI-HOST", b)
         self.assertNotIn("sheepdog-receipt", b)
+
+    def test_playbook_comments_stripped_and_host_locked_example(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "batch_footer.md").write_text("<!-- 维护者注释\n第二行 -->\nFOOT {{topic_id}}<!-- 行内 -->",
+                                                      encoding="utf-8")
+            self.assertEqual(Playbook(Path(d)).render("batch_footer.md", topic_id="tp_x"), "FOOT tp_x")
+        text = Playbook(REPO / "examples" / "playbook").render("host_locked.md", host="Codex")
+        self.assertNotIn("<!--", text)
+        self.assertNotIn("26.1007.21159", text)  # 版本只在注释里，不发给人
+        for frag in ("切到别的线程也不会马上放", "闲置满 3 小时", "10 条以上别的线程", "关掉 Codex 应用", "一条不丢"):
+            self.assertIn(frag, text)
+        self.assertIn("26.1007.21159", (REPO / "examples" / "playbook" / "host_locked.md").read_text(encoding="utf-8"))
 
     def test_example_playbook_cli_host(self):
         text = (REPO / "examples" / "playbook" / "cli_host.md").read_text(encoding="utf-8")

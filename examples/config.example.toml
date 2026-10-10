@@ -129,6 +129,8 @@ timeout_minutes = 60           # 一轮最多跑多久，超过就杀掉，会�
 # 传给它自己起的 `codex app-server`（叠在 ~/.codex/config.toml 上面）；你自己在 Codex 应用里的会话不受影响。
 # 会话能不能写文件、能不能上网（比如自己用 lark-cli 发飞书），全看那份文件；sheepdog 原样展开，不增不减，
 # 不传任何别的沙箱、审批参数。配置档读不到或解析失败时，这个宿主的每一轮都直接失败（doctor 能看到）。
+# 配置档只对之后新开的 Codex 会话生效：Codex 建线程时把沙箱策略记在线程上，之后换 -c 续接也沿用旧的；
+# 改了配置档，老会话要退休换新才会跟着变。
 # 示例内容见 examples/codex-profile.example.toml。只能是字母、数字、下划线、减号；留空 = 不用配置档
 profile = ""
 max_concurrent = 2             # 这个宿主同时最多跑几轮，超过的批次排队

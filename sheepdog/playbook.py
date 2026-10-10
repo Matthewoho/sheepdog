@@ -33,6 +33,8 @@ PLAYBOOK_FILES: dict[str, str] = {
 }
 
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+# <!-- ... --> 是写给维护者看的注释（比如某个数字来自哪个版本），渲染时去掉，不发给会话和主人
+_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
 class Playbook:
@@ -66,7 +68,7 @@ class Playbook:
 
     def render(self, name: str, **variables: str) -> str:
         """读 name 并替换占位符。通用占位符 session_title、topic_id 由调用方按会话传入。"""
-        text = self.read(name)
+        text = _COMMENT.sub("", self.read(name))
         if not text.strip():
             return ""
         values = {**self.base_vars, **{k: "" if v is None else str(v) for k, v in variables.items()}}
