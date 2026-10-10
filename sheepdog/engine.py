@@ -12,9 +12,10 @@ from pathlib import Path
 from . import session as sm
 from .config import ANTIGRAVITY, Config
 from .models import Message
-from .playbook import Playbook
-from .prompts import (QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap, batch_prompt,
-                      bootstrap_prompt, onboarding_prompt, with_cli,
+from .guard import AUDIT, COMPACTION, commands_in, first_match, is_compaction, local_hhmm, redact, scan_jsonl
+from .playbook import REMINDERS_DIR, Playbook
+from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
+                      batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
@@ -49,6 +50,8 @@ OWNER_VERIFIED_TAG = "owner_verified"
 # 主人本人的发言作为背景送给负责的会话（7.13）：不点表情、不要回执、不改状态
 OWNER_CONTEXT = "owner_context"
 ESCALATION_TAG_PREFIX = "escalation:"
+# 命令审计（7.19 K3）：同一个会话 10 分钟内的命中合并成一条报
+AUDIT_MERGE_MINUTES = 10
 
 
 def open_escalations(store: Store, open_hours: float, topic_id: str | None = None) -> list:
@@ -709,6 +712,8 @@ class Dispatcher:
         self.security = security or SecurityConfig()
         # 业务文字每次组装 prompt 时从 playbook 现读，改完下一批生效
         self.playbook = Playbook.from_config(cfg)
+        # 这一轮里各会话的记录文件（护栏用，每轮清空）
+        self._record_cache: dict[tuple[str, str], Path | None] = {}
 
     @property
     def sink(self) -> Sink:
@@ -752,10 +757,13 @@ class Dispatcher:
         if sink is None:
             raise SinkError(f"宿主 {host} 没开（配置里 [hosts.{host}] enabled = false）")
         if host == ANTIGRAVITY:
-            return sink.new_conversation(title, prompt, model or self.cfg.session.model)  # agentapi 行为不变
-        h = self.cfg.hosts[host]
-        return sink.new_conversation(title, prompt, model or h.model, effort or h.effort, topic_id=topic_id,
-                                     batch_id=batch_id)
+            cid = sink.new_conversation(title, prompt, model or self.cfg.session.model)  # agentapi 行为不变
+        else:
+            h = self.cfg.hosts[host]
+            cid = sink.new_conversation(title, prompt, model or h.model, effort or h.effort, topic_id=topic_id,
+                                        batch_id=batch_id)
+        self._read_from_start(topic_id, cid)
+        return cid
 
     def conversation_host(self, conversation_id: str) -> str:
         """一个会话编号属于哪个宿主（退休前任时用）：账本里查不到就当 Antigravity（P0.5 以来的老会话）。"""
@@ -1002,7 +1010,8 @@ class Dispatcher:
                                   self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes,
                                   open_dynamic_topics(self.store))
         cid = self._new_conversation(self.topic_host(t), t["topic_id"], t["title"], prompt, "", "")
-        self.store.update_topic(t["topic_id"], conversation_id=cid, rules_hash=self.rules_hash(t))
+        self.store.update_topic(t["topic_id"], conversation_id=cid, rules_hash=self.rules_hash(t),
+                                compacted_at=None)
         self.store.set_meta("roster_notify_bus", "0")
         log.info("新建 session %s -> %s", t["title"], cid)
         return self.store.get_topic(t["topic_id"])
@@ -1038,6 +1047,8 @@ class Dispatcher:
     def rules_status(self, t) -> str:
         if t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS:
             return ""
+        if t["compacted_at"]:
+            return f"上下文 {t['compacted_at']} 被压缩过（下一批带上完整规则）"
         if not t["rules_hash"]:
             return "未记录（下一批带上完整规则）"
         return "最新" if t["rules_hash"] == self.rules_hash(t) else "待更新（下一批带上完整规则）"
@@ -1068,11 +1079,11 @@ class Dispatcher:
                 report[tid] = f"排队：{busy}（下一批会带上完整规则）"
             else:
                 try:
-                    self._send(t, rules_update_message(rules))
+                    self._send(t, rules_update_message(rules, self._compaction_note(t)))
                 except SinkError as e:
                     report[tid] = f"失败：{e}"
                     continue
-                self.store.update_topic(tid, rules_hash=self.rules_hash(t))
+                self.store.update_topic(tid, rules_hash=self.rules_hash(t), compacted_at=None)
                 report[tid] = "已发送"
         return report
 
@@ -1087,7 +1098,8 @@ class Dispatcher:
         ts = now_iso()
         self.store.record_dispatch(bid, t["topic_id"], [])
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "dispatch"),
-                                pending_batch_id=bid, dispatched_at=ts, onboarded_at=ts, rules_hash=self.rules_hash(t))
+                                pending_batch_id=bid, dispatched_at=ts, onboarded_at=ts, rules_hash=self.rules_hash(t),
+                                compacted_at=None)
         log.info("topic %s: 已发 onboarding %s", t["topic_id"], bid)
         return bid
 
@@ -1135,7 +1147,9 @@ class Dispatcher:
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
-                                  cli_host=self.topic_host(t) != ANTIGRAVITY)
+                                  cli_host=self.topic_host(t) != ANTIGRAVITY,
+                                  rules_note=self._compaction_note(t) if rules_update else "",
+                                  reminder=self.reminder(t))
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -1150,8 +1164,9 @@ class Dispatcher:
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
         if rules_update:
-            self.store.update_topic(t["topic_id"], rules_hash=new_hash)
-            log.info("topic %s: 规则已更新，随批次 %s 送达", t["topic_id"], batch_id)
+            self.store.update_topic(t["topic_id"], rules_hash=new_hash, compacted_at=None)
+            log.info("topic %s: 规则已更新，随批次 %s 送达%s", t["topic_id"], batch_id,
+                     "（压缩后重推）" if t["compacted_at"] else "")
         res.update(self._complete_delivery(t, batch_id, signals, context))
         return res
 
@@ -1395,6 +1410,166 @@ class Dispatcher:
         log.warning("会话 %s 写锁冲突满 %d 分钟，提醒主人", t["topic_id"], LOCK_ALERT_MINUTES)
         self._notify_owner(text, "写锁提醒")
 
+    # ---------- 护栏（7.19） ----------
+    def _record_file(self, t) -> Path | None:
+        """这个会话在宿主那边的记录文件：命令行宿主问 sink，Antigravity 是 brain/<编号>/…/transcript.jsonl。"""
+        cid = t["conversation_id"]
+        if not cid:
+            return None
+        # 同一轮里两种用途共用一次查找（Codex 找 rollout 要遍历 sessions 目录）
+        key = (self.topic_host(t), cid)
+        if key in self._record_cache:
+            return self._record_cache[key]
+        sink = self.sinks.get(self.topic_host(t))
+        files_fn = getattr(sink, "record_files", None)
+        if files_fn is not None:
+            files = files_fn(cid)
+            path = Path(files[-1]) if files else None
+        else:
+            path = transcript_path(cid) if self.topic_host(t) == ANTIGRAVITY else None
+        self._record_cache[key] = path
+        return path
+
+    def _read_from_start(self, topic_id: str, conversation_id: str) -> None:
+        """sheepdog 自己刚建的会话：两种用途都从头读（第一轮跑的命令也要审）。记录文件还没有，路径先空着。"""
+        if not topic_id or not conversation_id:
+            return
+        for purpose in (COMPACTION, AUDIT):
+            self.store.set_cursor(topic_id, purpose, conversation_id, "", 0)
+
+    def _follow(self, t, purpose: str, handle) -> None:
+        """增量读一个会话的记录：每个会话、每种用途记一个偏移，只读新写的完整行。
+
+        - 没有偏移，或者偏移记的是别的会话编号（名册改指了一个已有的会话）：从现在的末尾开始，不翻旧账；
+        - sheepdog 自己建的会话（_read_from_start）、记录文件换了、文件变短了：从头读。
+        """
+        path = self._record_file(t)
+        if path is None:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        tid, cid = t["topic_id"], t["conversation_id"]
+        cur = self.store.get_cursor(tid, purpose)
+        if cur is None or cur["conversation_id"] != cid:
+            self.store.set_cursor(tid, purpose, cid, str(path), size)
+            return
+        offset = cur["byte_offset"] or 0
+        if cur["path"] != str(path) or size < offset:
+            offset = 0
+        elif offset == size:
+            return
+        self.store.set_cursor(tid, purpose, cid, str(path), scan_jsonl(path, offset, purpose, handle))
+
+    def _scan_compactions(self) -> None:
+        """K2：会话记录里出现了新的压缩点，就清空它的规则指纹，下一批带上完整规则（规则前加一句为什么又发）。"""
+        for t in self.store.list_topics():
+            if (t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS) or t["state"] == sm.CLOSED \
+                    or not t["conversation_id"]:
+                continue
+            host = self.topic_host(t)
+            found: list[dict] = []
+            self._follow(t, COMPACTION, lambda _off, d: found.append(d) if is_compaction(host, d) else None)
+            if found:
+                self.store.update_topic(t["topic_id"], rules_hash=None, compacted_at=now_iso())
+                log.info("topic %s: 检测到压缩（%d 处），下一批带上完整规则", t["topic_id"], len(found))
+
+    def _compaction_note(self, t) -> str:
+        if not t["compacted_at"]:
+            return ""
+        v = dict(session_title=self._session_title(t), topic_id=t["topic_id"])
+        return self.playbook.render("rules_after_compaction.md", **v) or DEFAULT_COMPACTION_NOTE
+
+    @staticmethod
+    def reminder_key(topic_id: str) -> str:
+        """红线文件的 key：总线是 bus，其他是名册 key / 总线新开时起的 key（topic_id 去掉 tp_）。"""
+        key = "bus" if topic_id == BUS_TOPIC_ID else topic_id.removeprefix("tp_")
+        return key if _KEY_RE.match(key) else ""
+
+    def reminder(self, t) -> str:
+        """K1：这个会话的红线（reminders/<key>.md），附在每一批的最末尾；没有文件就空。"""
+        key = self.reminder_key(t["topic_id"])
+        if not key:
+            return ""
+        return self.playbook.render(f"{REMINDERS_DIR}/{key}.md", session_title=self._session_title(t),
+                                    topic_id=t["topic_id"])
+
+    def _audit_commands(self) -> None:
+        """K3：增量扫 [audit] topics 对应会话新跑的命令，命中 danger_patterns 的记下来，再按会话合并报警。"""
+        a = self.cfg.audit
+        patterns = a.patterns
+        if patterns:
+            for tid in a.topics:
+                t = self.store.get_topic(tid)
+                if t is None or t["state"] == sm.CLOSED or not t["conversation_id"]:
+                    continue
+                host, cid = self.topic_host(t), t["conversation_id"]
+
+                def handle(off: int, d: dict, tid=tid, host=host, cid=cid) -> None:
+                    for c in commands_in(host, d, off):
+                        pat = first_match(c.text, patterns)
+                        shown = redact(c.text)
+                        if pat and self.store.add_audit_hit(tid, cid, c.step, shown, pat, c.at):
+                            log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, pat, shown)
+
+                self._follow(t, AUDIT, handle)
+        self._flush_audit()
+
+    def _flush_audit(self) -> None:
+        """没报过的命中按会话报：上次报警满 10 分钟（或从没报过）才报，期间新命中的攒起来合并成一条。"""
+        groups: dict[str, list] = {}
+        for h in self.store.pending_audit_hits():
+            groups.setdefault(h["topic_id"], []).append(h)
+        for tid, hits in groups.items():
+            last = _parse(self.store.last_audit_notice(tid))
+            if last and _now() - last < timedelta(minutes=AUDIT_MERGE_MINUTES):
+                continue
+            self._send_audit(tid, hits)
+            self.store.mark_audit_notified([h["id"] for h in hits])
+
+    def _send_audit(self, tid: str, hits: list) -> None:
+        """经机器人私聊主人；给犯规的会话、[audit] also_notify 的会话各排一条系统提示。事实在这里，措辞在 playbook。"""
+        t = self.store.get_topic(tid)
+        title = (self._session_title(t) if t is not None else "") or tid
+        label = HOST_LABEL.get(self.topic_host(t), self.topic_host(t)) if t is not None else ""
+        # 同一条命令（脱敏后一样）只列一行，后面标次数
+        seen: dict[str, list] = {}
+        for h in hits:
+            seen.setdefault(h["command"], []).append(h)
+        lines = []
+        for cmd, hs in seen.items():
+            times = "、".join(dict.fromkeys(local_hhmm(h["ran_at"]) for h in hs if h["ran_at"]))
+            lines.append(f"- {times + ' ' if times else ''}`{cmd}`" + (f"（{len(hs)} 次）" if len(hs) > 1 else ""))
+        commands = "\n".join(lines)
+        notify = [x for x in self.cfg.audit.also_notify if x != tid and self._audit_target_ok(x)]
+        cli = self.cfg.cli_command
+        # 1. 主人
+        offender_ok = t is not None and self._audit_target_ok(tid)
+        done = (["已提示这个会话停手"] if offender_ok else []) + ([f"已告诉 {'、'.join(notify)} 别重复操作"] if notify else [])
+        self._notify_owner(f"🐕 汇报 · 会话跑了危险命令 [{tid}]\n「{title}」（topic `{tid}`{'，' + label if label else ''}）"
+                           f"跑了下面的命令（命中 [audit] danger_patterns）：\n{commands}"
+                           + (f"\n{'；'.join(done)}。" if done else ""),
+                           "危险命令报警")
+        # 2. 犯规的会话
+        if offender_ok:
+            why = self.playbook.render("audit_offender.md", session_title=title, topic_id=tid, commands=commands)
+            text = f"⚠️ sheepdog 在你的会话记录里看到你跑了下面的命令（命中危险命令清单）：\n{commands}"
+            self.store.add_system_message(tid, "audit_offender", with_cli(text + (f"\n{why}" if why else ""), cli))
+        # 3. 要另外知会的会话
+        for x in notify:
+            xt = self.store.get_topic(x)
+            why = self.playbook.render("audit_notify.md", session_title=self._session_title(xt), topic_id=x,
+                                       commands=commands, offender_title=title, offender_topic=tid)
+            text = f"⚠️ 「{title}」（topic `{tid}`）跑了下面的命令：\n{commands}"
+            self.store.add_system_message(x, "audit_notify", with_cli(text + (f"\n{why}" if why else ""), cli))
+        log.warning("危险命令报警：%s 共 %d 条，已知会 %s", tid, len(hits), "、".join(["主人", tid] + notify))
+
+    def _audit_target_ok(self, topic_id: str) -> bool:
+        """系统提示只排给还在投递的会话（总线、名册 managed、总线新开的），否则会被退回总线。"""
+        t = self.store.get_topic(topic_id)
+        return t is not None and t["state"] != sm.CLOSED and (topic_id == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS)
+
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
         self._recover_sending()
@@ -1409,6 +1584,13 @@ class Dispatcher:
         self._check_handovers()
         self._tick_watches(set(tids))
         self._expire_escalations()
+        # 护栏（7.19）：增量读会话记录，压缩了就清指纹（这一轮的批次就带上完整规则）；危险命令报警（系统提示这一轮就排上）
+        self._record_cache = {}
+        for step in (self._scan_compactions, self._audit_commands):
+            try:
+                step()
+            except Exception as e:  # 护栏出错不能挡住投递
+                log.warning("护栏检查出错（%s）: %s", step.__name__, e)
 
         rows = self.store.pending_dispatch()
         groups: dict[str, list] = {}
@@ -1503,7 +1685,7 @@ class Dispatcher:
         self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE, host, model, effort)
         self.store.update_topic(topic_id, conversation_id=cid, spawned_at=ts, onboarded_at=ts, origin_note=note or None,
                                 anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False))
-        self.store.update_topic(topic_id, rules_hash=self.rules_hash(self.store.get_topic(topic_id)))
+        self.store.update_topic(topic_id, rules_hash=self.rules_hash(self.store.get_topic(topic_id)), compacted_at=None)
         self.store.set_meta("roster_notify_bus", "1")
         if ids or note:
             forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
@@ -1560,7 +1742,7 @@ class Dispatcher:
         ts = now_iso()
         # bootstrap 已含职责与规则，等同 onboarding
         fields = dict(conversation_id=cid, spawned_at=ts, onboarded_at=ts, pending_batch_id=None,
-                      state=sm.ACTIVE, retries=0, rules_hash=self.rules_hash(t))
+                      state=sm.ACTIVE, retries=0, rules_hash=self.rules_hash(t), compacted_at=None)
         if read_bid:
             # 「读完前任上下文」的回执作为一个不含消息的批次：回执前信号排队
             self.store.record_dispatch(read_bid, s.topic_id, [])

@@ -30,7 +30,16 @@ PLAYBOOK_FILES: dict[str, str] = {
     # 命令行宿主（7.18）
     "cli_host.md": "只发给 Codex / Claude 会话（排在 common.md 之后）：回执块怎么写、发不了 IM 时怎么办，可用 {{host}}",
     "host_locked.md": "命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明，可用 {{host}} {{since}}",
+    # 护栏（7.19）
+    "rules_after_compaction.md": "检测到宿主压缩、下一批重推完整规则时，规则前的那句话（缺了用代码里的一句默认话）",
+    "audit_offender.md": "会话跑了危险命令时，给它的系统提示里附的话，可用 {{commands}}",
+    "audit_notify.md": "会话跑了危险命令时，给 [audit] also_notify 会话的提示里附的话，"
+                       "可用 {{commands}} {{offender_title}} {{offender_topic}}",
 }
+
+# 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
+# 可选，不在 PLAYBOOK_FILES 里（缺了不算缺），doctor 单独列出哪些会话有
+REMINDERS_DIR = "reminders"
 
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 # <!-- ... --> 是写给维护者看的注释（比如某个数字来自哪个版本），渲染时去掉，不发给会话和主人
@@ -73,6 +82,14 @@ class Playbook:
             return ""
         values = {**self.base_vars, **{k: "" if v is None else str(v) for k, v in variables.items()}}
         return _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), text).strip()
+
+    def reminder_keys(self) -> list[str]:
+        """reminders/ 下有内容的红线文件对应的 key。"""
+        d = self.directory / REMINDERS_DIR
+        if not d.is_dir():
+            return []
+        return sorted(p.stem for p in d.glob("*.md") if p.is_file() and _COMMENT.sub("", self.read(
+            f"{REMINDERS_DIR}/{p.name}")).strip())
 
     def missing(self) -> list[str]:
         return [n for n in PLAYBOOK_FILES if not self.read(n).strip()]

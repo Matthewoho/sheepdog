@@ -44,6 +44,8 @@ REASON_LABEL = {
     "loop_guard": "疑似循环",
     "collect_partial": "采集不完整",
     "escalation_list": "未结的「需要你定」",
+    "audit_offender": "危险命令提醒",
+    "audit_notify": "别的会话跑了危险命令",
 }
 
 RECEIPT_SCHEMA_HINT = """{
@@ -212,6 +214,8 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
 
 # 规则同步（7.11）
 RULES_UPDATE_HEADER = "📌 规则已更新（以下为现行完整规则，取代之前的版本）"
+# 检测到宿主压缩后重推规则时，规则前面那句话（7.19 K2）：playbook 的 rules_after_compaction.md 优先，没有就用这句
+DEFAULT_COMPACTION_NOTE = "你的上下文刚被压缩过，以下是现行完整规则，以此为准。"
 # 总线常驻规则算指纹时 {{roster}} 用这句占位：名册变化走「名册更新」，不触发整份规则重发
 ROSTER_HASH_STUB = "（名册另行同步，以最近一次「名册更新」为准）"
 
@@ -242,8 +246,9 @@ def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], ex
                                    cli=pb.cli))
 
 
-def rules_update_message(rules: str) -> str:
-    return _join(f"[sheepdog] {RULES_UPDATE_HEADER}", rules)
+def rules_update_message(rules: str, note: str = "") -> str:
+    """push-rules 发的整份规则；note 是压缩后重推时规则前那句话（7.19 K2），放在头一行之后。"""
+    return _join(f"[sheepdog] {RULES_UPDATE_HEADER}", note, rules)
 
 
 def _onboarding_body(pb: Playbook, s: RosterSession) -> str:
@@ -430,11 +435,16 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
-                 cli_host: bool = False) -> str:
+                 cli_host: bool = False, rules_note: str = "", reminder: str = "") -> str:
+    """rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
+    7.19 K1），附在整批最末尾。"""
     parts = []
     if rules_update:
-        # 规则变了：完整现行规则放在这批最前面（7.11）
-        parts += [f"{RULES_UPDATE_HEADER}", "", rules_update.strip(), "", "---", ""]
+        # 规则变了：完整现行规则放在这批最前面（7.11）；压缩后重推时头一行之后先说一句为什么又发
+        parts += [f"{RULES_UPDATE_HEADER}", ""]
+        if rules_note:
+            parts += [rules_note.strip(), ""]
+        parts += [rules_update.strip(), "", "---", ""]
     parts += [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
@@ -465,4 +475,6 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         footer = pb.render(name, session_title=session_title, topic_id=topic_id)
         if footer:
             parts += ["", footer]
+    if reminder:
+        parts += ["", reminder]
     return "\n".join(parts)

@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS topics (
     host             TEXT DEFAULT 'antigravity',  -- 会话宿主（7.18）：antigravity | codex | claude；建好后不能换
     model            TEXT,             -- 这个会话的模型；空 = 宿主默认值（每轮现取配置）
     effort           TEXT,             -- 这个会话的推理档位；空 = 宿主默认值
+    compacted_at     TEXT,             -- 检测到宿主压缩的时间（7.19 K2）；下一批带上完整规则后清空
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -207,6 +208,32 @@ CREATE TABLE IF NOT EXISTS runs (
     answer          TEXT               -- 这一轮最后的回答
 );
 CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(host, state);
+
+-- 增量读会话记录（7.19 K2、K3）：每个会话、每种用途（compaction 压缩检测 / audit 命令审计）记读到的字节偏移。
+-- 会话编号或记录文件变了、文件变短了，就从头读
+CREATE TABLE IF NOT EXISTS transcript_cursors (
+    topic_id        TEXT NOT NULL,
+    purpose         TEXT NOT NULL,
+    conversation_id TEXT,
+    path            TEXT,
+    byte_offset     INTEGER DEFAULT 0,
+    updated_at      TEXT,
+    PRIMARY KEY (topic_id, purpose)
+);
+
+-- 会话跑过的危险命令（7.19 K3）。同一条命令按（会话、step）去重；notified_at 为空 = 还没报
+CREATE TABLE IF NOT EXISTS audit_hits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id        TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    step            TEXT NOT NULL,
+    command         TEXT NOT NULL,     -- 已脱敏、已截断
+    pattern         TEXT,
+    ran_at          TEXT,
+    detected_at     TEXT NOT NULL,
+    notified_at     TEXT,
+    UNIQUE (conversation_id, step)
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -220,7 +247,7 @@ MIGRATIONS = {
                  ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
-               ("model", "TEXT"), ("effort", "TEXT")],
+               ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
 }
@@ -753,6 +780,40 @@ class Store:
         return self.conn.execute("SELECT * FROM runs WHERE topic_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1",
                                  (topic_id,)).fetchone()
 
+    # ---------- 会话记录的增量读与命令审计（7.19） ----------
+    def get_cursor(self, topic_id: str, purpose: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM transcript_cursors WHERE topic_id=? AND purpose=?",
+                                 (topic_id, purpose)).fetchone()
+
+    def set_cursor(self, topic_id: str, purpose: str, conversation_id: str, path: str, offset: int) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT INTO transcript_cursors(topic_id,purpose,conversation_id,path,byte_offset,updated_at)
+                         VALUES(?,?,?,?,?,?) ON CONFLICT(topic_id,purpose) DO UPDATE SET
+                         conversation_id=excluded.conversation_id, path=excluded.path, byte_offset=excluded.byte_offset,
+                         updated_at=excluded.updated_at""",
+                      (topic_id, purpose, conversation_id, path, offset, now_iso()))
+
+    def add_audit_hit(self, topic_id: str, conversation_id: str, step: str, command: str, pattern: str,
+                      ran_at: str) -> bool:
+        """记一条命中；同一会话同一 step 已记过就返回 False。"""
+        with self.tx() as c:
+            cur = c.execute("""INSERT OR IGNORE INTO audit_hits(topic_id,conversation_id,step,command,pattern,ran_at,
+                               detected_at) VALUES(?,?,?,?,?,?,?)""",
+                            (topic_id, conversation_id, step, command, pattern, ran_at, now_iso()))
+            return cur.rowcount > 0
+
+    def pending_audit_hits(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM audit_hits WHERE notified_at IS NULL ORDER BY id").fetchall()
+
+    def last_audit_notice(self, topic_id: str) -> str:
+        row = self.conn.execute("SELECT MAX(notified_at) FROM audit_hits WHERE topic_id=?", (topic_id,)).fetchone()
+        return row[0] or ""
+
+    def mark_audit_notified(self, ids: list[int]) -> None:
+        ts = now_iso()
+        with self.tx() as c:
+            c.executemany("UPDATE audit_hits SET notified_at=? WHERE id=?", [(ts, i) for i in ids])
+
     # ---------- 保留期清理 ----------
     # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
     PRUNE_SQL = {
@@ -769,6 +830,7 @@ class Store:
         "actions": "DELETE FROM actions WHERE done_at IS NOT NULL AND done_at < ?",
         "loop_events": "DELETE FROM loop_events WHERE until < ?",
         "runs": "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at < ? AND state NOT IN ('running','retry_wait')",
+        "audit_hits": "DELETE FROM audit_hits WHERE notified_at IS NOT NULL AND notified_at < ?",
     }
 
     def prune(self, retention_days: int, receipts_dir: Path | None = None,

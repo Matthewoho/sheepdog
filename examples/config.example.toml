@@ -95,6 +95,26 @@ cooldown_minutes = 30    # 冷却期间该聊天除你以外的消息只进 Inbo
 # 总线每天最多临时新开几个专属会话（sheepdog new-session）；0 = 禁止总线新开
 max_new_sessions_per_day = 5
 
+[audit]
+# 命令审计：每轮增量读这些会话的记录（Antigravity transcript / Codex rollout / Claude 记录），
+# 看它们新跑的命令；命中 danger_patterns 就经机器人私聊你，给犯规的会话排一条系统提示（措辞在 playbook 的 audit_offender.md），
+# 并提示 also_notify 里的会话别重复操作（audit_notify.md）。同一个会话 10 分钟内的命中合并成一条。
+# 第一次看某个会话时从它记录的末尾开始，不翻旧账。改了下一轮生效；danger_patterns = [] 等于关掉
+topics = ["tp_bus"]
+# 正则，对整理过的命令文本（续行合并、空白压成一个空格）做 search；不配就是下面这一份
+danger_patterns = [
+  "builds triggers run",
+  "builds .*approve|:approve",
+  "add-iam-policy-binding|remove-iam-policy-binding",
+  "run services update-traffic",
+  "secrets versions (access|add)",
+  "lark-cli approval tasks (approve|reject)",
+  "gh pr merge",
+  "gh workflow run",
+  "kubectl (apply|delete)",
+]
+also_notify = []               # 比如负责发布的会话的 topic_id
+
 [ack]
 # 确认表情：消息送达会话后，以你的身份在消息下点这个表情；你回复后撤下。删掉整段 = 关闭
 # 这是 sheepdog 唯一的 IM 写操作（只加 / 撤这个表情）

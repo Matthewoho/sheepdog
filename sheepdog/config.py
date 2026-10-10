@@ -238,6 +238,49 @@ class AckConfig:
                 raise ConfigError(f"[ack] {k} 必须是字符串列表")
 
 
+# 会话跑了这些命令就报警（7.19 K3）：示例配置里写的也是这一份
+DEFAULT_DANGER_PATTERNS = [
+    r"builds triggers run",
+    r"builds .*approve|:approve",
+    r"add-iam-policy-binding|remove-iam-policy-binding",
+    r"run services update-traffic",
+    r"secrets versions (access|add)",
+    r"lark-cli approval tasks (approve|reject)",
+    r"gh pr merge",
+    r"gh workflow run",
+    r"kubectl (apply|delete)",
+]
+
+
+@dataclass
+class AuditConfig:
+    """[audit]（7.19 K3）：每轮增量读这些会话的记录，命令命中 danger_patterns 就报警。热加载，下一轮生效。"""
+    # 审计哪些会话（topic_id）
+    topics: list[str] = field(default_factory=lambda: ["tp_bus"])
+    # 正则列表，对整理过的命令文本做 search；空列表 = 不审计
+    danger_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_DANGER_PATTERNS))
+    # 命中后另外提醒这些会话「别重复操作，先核对现场」（topic_id）
+    also_notify: list[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        for k in ("topics", "also_notify"):
+            v = getattr(self, k)
+            if not isinstance(v, list) or not all(isinstance(x, str) and x.startswith("tp_") for x in v):
+                raise ConfigError(f"[audit] {k} 必须是 topic_id 列表（tp_ 开头）")
+        v = self.danger_patterns
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ConfigError("[audit] danger_patterns 必须是非空字符串列表")
+        for x in v:
+            try:
+                re.compile(x)
+            except re.error as e:
+                raise ConfigError(f"[audit] danger_patterns 里的 {x!r} 不是有效正则: {e}") from e
+
+    @property
+    def patterns(self) -> list[re.Pattern]:
+        return [re.compile(x) for x in self.danger_patterns]
+
+
 # Codex 配置档名：只是一个名字，拼进 ~/.codex/<名字>.config.toml，不许带路径或其他字符；
 # 也不许以「-」开头
 _PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
@@ -346,6 +389,7 @@ class Config:
     bus: BusConfig = field(default_factory=BusConfig)
     owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
     # 会话在自己终端里敲的 sheepdog 命令（提示词里所有「去跑 sheepdog …」的命令文字都用它）。
     # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
     cli_name: str = "sheepdog"
@@ -436,6 +480,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.owner_context, data.get("owner_context", {}))
         _apply(cfg.loop_guard, data.get("loop_guard", {}))
         _apply(cfg.source, data.get("source", {}))
+        _apply(cfg.audit, data.get("audit", {}))
         hosts = data.get("hosts", {})
         if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
             raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -454,6 +499,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.bus.validate()
     cfg.owner_context.validate()
     cfg.loop_guard.validate()
+    cfg.audit.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

@@ -228,7 +228,31 @@ def cmd_doctor(args) -> int:
                                           else f"缺 {len(missing)} 个（对应段落为空）"))
     for name in missing:
         print(f"  ✗ 缺 {name}：{PLAYBOOK_FILES[name]}")
+    for line in guard_report(cfg, Store(cfg.db_path), pb):
+        print(line)
     return 0 if ok else 1
+
+
+def guard_report(cfg, store: Store, pb: Playbook) -> list[str]:
+    """doctor 的护栏一节（7.19）：哪些会话有每批红线（K1），命令审计的配置（K3）。"""
+    keys = pb.reminder_keys()
+    live = {"bus"} | {t["topic_id"].removeprefix("tp_") for t in store.list_topics()
+                      if t["kind"] in ("adopted", "dynamic") and t["state"] != sm.CLOSED}
+    try:
+        live |= {s.key for s in load_checked_roster(cfg).managed}
+    except RosterError:
+        pass
+    lines = [f"每批红线: {pb.directory / 'reminders'} " + ("（没有，批次末尾不附红线）" if not keys
+                                                          else f"✓ {len(keys)} 个会话：{', '.join(keys)}")]
+    if stale := [k for k in keys if k not in live]:
+        lines.append(f"  ⚠ 这些红线文件没有对应的会话（key 写错了？）：{', '.join(stale)}")
+    a = cfg.audit
+    if a.danger_patterns and a.topics:
+        lines.append(f"命令审计: 审 {', '.join(a.topics)}，{len(a.danger_patterns)} 条危险命令；命中后私聊主人、提示犯规会话"
+                     + (f"、提示 {', '.join(a.also_notify)}" if a.also_notify else ""))
+    else:
+        lines.append("命令审计: 关（[audit] topics 或 danger_patterns 为空）")
+    return lines
 
 
 def cli_name_report(cfg) -> str:

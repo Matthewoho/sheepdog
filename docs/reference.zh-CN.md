@@ -224,6 +224,32 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
 - 接口说明（命令用法）也在指纹里：代码升级加了新命令时，已有会话同样会收到一次。
 - `sheepdog sessions` 显示每个会话的规则是「最新」「待更新」还是「未记录」；`sheepdog push-rules [--topic tp_x] [--dry-run]` 不等新消息立即发（对总线也可以；known、已关闭、还没 onboarding 的跳过）。
 
+## 护栏：压缩后重推规则、每批红线、危险命令报警
+
+会话的上下文被宿主压缩以后，开场时给的规则可能整段丢掉，会话自己不知道。sheepdog 每轮增量读各会话的记录（每个会话、每种用途记一个读到的字节偏移，存在账本 `transcript_cursors` 表；只读新写的完整行，不整份重读），补三道护栏：
+
+- **压缩后重推规则**：记录里出现新的压缩点，就清空这个会话的规则指纹，下一批带上完整现行规则（同「规则改了自动同步」），规则前加一句话说明为什么又发，这句话来自 playbook 的 `rules_after_compaction.md`，没有这个文件就用一句默认话。日志写「检测到压缩」；`sheepdog sessions` 在送达前显示「上下文 … 被压缩过」。认的压缩点：
+  - Antigravity：一行 `"type": "CHECKPOINT"`，content 以 `# Resuming from a compaction` 开头；
+  - Codex：`type = response_item` 且 `payload.type = compaction`（老文件里的顶层 `type = compacted` 也认）；
+  - Claude：`"subtype": "compact_boundary"`（没核实过，有就认）。
+- **每批红线**：playbook 下的 `reminders/<key>.md`（key 是名册的 key，总线是 `bus`，总线新开的会话用它自己的 key）存在就附在这个会话每一批的最末尾（footer 之后）。只附普通批次，开场、登记通知、退休通知、规则更新不附。可用通用占位符。`sheepdog doctor` 列出哪些会话有红线，以及没有对应会话的红线文件。
+- **危险命令报警**：每轮增量扫 `[audit] topics` 对应会话新跑的命令（Antigravity 是 PLANNER_RESPONSE 里 `run_command` 的 CommandLine；Codex 是 CommandExecution，以及代码模式里 `exec_command({cmd: "..."})` 的命令；Claude 是 Bash 工具调用，没核实过）。命令先整理（续行合并、空白压成一个空格），再和 `danger_patterns` 逐条正则 search。命中后：
+  1. 经机器人私聊你：哪个会话、几点、什么命令（截到 200 字，`--data`、`token=`、`password=`、`secret` 之后的值隐去）；
+  2. 给犯规的会话排一条系统提示（事实由 sheepdog 写，后面附 playbook 的 `audit_offender.md`）；
+  3. 给 `[audit] also_notify` 里的会话各排一条系统提示（附 `audit_notify.md`）。
+  同一条命令按（会话、step）去重；同一个会话 10 分钟内的命中合并：第一条马上报，之后 10 分钟内的攒到窗口结束一起报，同一条命令文本只列一行、标次数。
+
+```toml
+[audit]
+topics = ["tp_bus"]            # 审哪些会话
+danger_patterns = [ ... ]      # 正则；不配就是代码里的默认一份（见 examples/config.example.toml）；[] = 关
+also_notify = []               # 另外提醒哪些会话「别重复操作，先核对现场」
+```
+
+- 第一次看某个会话的记录时从末尾开始，不翻旧账；sheepdog 自己新建的会话从头读（第一轮跑的命令也审）；记录文件换了或变短了从头读；名册把 topic 改指到另一个已有会话时，同样从那个会话记录的末尾开始。
+- `[audit]` 热加载，下一轮生效。
+- 这是事后报警，不是拦截：命令已经跑了。真正挡住要靠会话宿主自己的命令权限和凭据。
+
 ## 确认表情：看到就点，回复后撤下
 
 配置 `[ack]` 段后开启，没有这一段就完全不动：
@@ -268,6 +294,10 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
 | `cli_host.md` | 只发给 Codex / Claude 会话（common.md 之后）：回执块怎么写、发不了 IM 时怎么办 | `{{host}}` |
 | `host_locked.md` | 命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明（为什么锁、怎么放锁） | `{{host}}` `{{since}}` |
+| `rules_after_compaction.md` | 检测到宿主压缩、重推完整规则时放在规则前的一句话（缺了用代码里的一句默认话） | — |
+| `audit_offender.md` | 会话跑了危险命令时，给它的系统提示里附的话 | `{{commands}}` |
+| `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` |
+| `reminders/<key>.md` | 可选：这个会话每一批最末尾附的红线（key 是名册 key，总线是 `bus`） | — |
 
 通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}` `{{cli}}`（会话该敲的 sheepdog 命令，即配置的 `cli_name`，默认 `sheepdog`；代码生成的接口说明、回执提示里的命令也用它，测试环境可以指向只连测试配置的包装脚本）。占位符是简单字符串替换，不认识的原样保留。`<!-- ... -->` 是写给维护者的注释，渲染时去掉。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。
 
@@ -296,9 +326,9 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及经机器人私聊你的两类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次），sheepdog 对 IM 只读。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条），sheepdog 对 IM 只读。
 
-清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
+清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 
