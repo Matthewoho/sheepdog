@@ -238,6 +238,10 @@ class AckConfig:
                 raise ConfigError(f"[ack] {k} 必须是字符串列表")
 
 
+# Codex 配置档名：只是一个名字，拼进 ~/.codex/<名字>.config.toml，不许带路径或其他字符；
+# 也不许以「-」开头，免得命令行里被 codex 当成另一个参数（比如 -c）
+_PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
+
 # 会话宿主（7.18）：antigravity 走 App 的 agentapi；codex / claude 走各自的命令行，在后台跑
 ANTIGRAVITY = "antigravity"
 CLI_HOSTS = ("codex", "claude")
@@ -260,6 +264,9 @@ class HostConfig:
     timeout_minutes: float = 60   # 一轮最多跑多久，超过就杀掉整个进程组
     max_concurrent: int = 2       # 这个宿主同时最多跑几轮，超过的批次排队
     settings: str = ""            # 只给 Claude
+    # 只给 Codex：Codex 自己的配置档名（~/.codex/<profile>.config.toml，codex -p <profile> 叠在用户配置上面）。
+    # 权限内容全在那份文件里，sheepdog 只传名字；空 = 不传。改了要重启
+    profile: str = ""
     # 新开这个宿主的会话前要先问主人（7.18，19:0x）：new-session --host <它> 必须带核对过的 --quote 主人原话。
     # 只管新开；spawn（名册里主人亲手写的）和往已有会话 forward 不受影响
     ask_owner_before_new: bool = True
@@ -278,11 +285,16 @@ class HostConfig:
             raise ConfigError(f"{where} enabled 必须是 true/false")
         if not isinstance(self.ask_owner_before_new, bool):
             raise ConfigError(f"{where} ask_owner_before_new 必须是 true/false")
-        for k in ("command", "model", "effort", "workdir", "settings"):
+        for k in ("command", "model", "effort", "workdir", "settings", "profile"):
             if not isinstance(getattr(self, k), str):
                 raise ConfigError(f"{where} {k} 必须是字符串")
         if self.settings and self.name != "claude":
             raise ConfigError(f"{where} settings 只给 Claude 用")
+        if self.profile and self.name != "codex":
+            raise ConfigError(f"{where} profile 只给 Codex 用")
+        if self.profile and not _PROFILE_RE.fullmatch(self.profile):
+            raise ConfigError(f"{where} profile 只能是字母、数字、下划线、减号（[A-Za-z0-9_-]+），且不能以减号开头，"
+                              f"收到 {self.profile!r}")
         t = self.timeout_minutes
         if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
             raise ConfigError(f"{where} timeout_minutes 必须是正数")

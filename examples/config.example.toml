@@ -125,6 +125,11 @@ model = "gpt-6-astra"          # 默认模型；名册和 new-session 可以逐�
 effort = "high"                # 默认推理档位
 workdir = "~/sheepdog-work"    # 会话的工作目录，启用时必填
 timeout_minutes = 60           # 一轮最多跑多久，超过就杀掉，会话标 attention
+# Codex 自己的配置档名（可选，改了要重启）：sheepdog 起 `codex -p <profile> app-server`，Codex 把
+# ~/.codex/<profile>.config.toml 叠在用户配置上面。会话能不能写文件、能不能上网（比如自己用 lark-cli 发飞书），
+# 全看那份文件，sheepdog 只传名字，不传任何沙箱、审批参数。示例内容见 examples/codex-profile.example.toml。
+# 只能是字母、数字、下划线、减号；留空 = 不传 -p，只用 ~/.codex/config.toml
+profile = ""
 max_concurrent = 2             # 这个宿主同时最多跑几轮，超过的批次排队
 # 新开这个宿主的会话前先问主人：true 时 new-session --host codex 必须带 --quote "<主人原话>"，
 # 核对同 forward（总线里亲口说过，或你本人账号在飞书上的回复），不带或核对不通过就拒绝。

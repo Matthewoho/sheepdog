@@ -32,6 +32,12 @@ DECLINE = {
 }
 
 
+def app_server_argv(codex: str, profile: str = "") -> list[str]:
+    """起 app-server 的命令行。-p 是 codex 的全局参数，要放在子命令 app-server 前面；除此之外不传任何参数
+    （沙箱、审批、网络都来自 Codex 自己的配置和配置档）。"""
+    return [codex, *(["-p", profile] if profile else []), "app-server"]
+
+
 def thread_start_params(cwd: str, model: str) -> dict:
     # threadSource = "user"：Codex 应用自己建的线程都带这个来源标记，有助于出现在应用侧边栏；它不是权限参数
     p: dict = {"cwd": cwd, "threadSource": "user"}
@@ -152,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--title", default="")
     ap.add_argument("--model", default="")
     ap.add_argument("--effort", default="")
+    ap.add_argument("--profile", default="", help="Codex 配置档名：codex -p <名字> app-server（权限全在那份配置档里）")
     a = ap.parse_args(argv)
 
     def emit(obj: dict) -> None:
@@ -161,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     with open(a.inp, encoding="utf-8") as f:
         text = f.read()
     try:
-        proc = subprocess.Popen([a.codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(app_server_argv(a.codex, a.profile), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=None, text=True, bufsize=1, cwd=a.cwd)
     except OSError as e:
         emit({"event": "result", "status": "error", "errors": [f"codex app-server 起不来：{e}"]})

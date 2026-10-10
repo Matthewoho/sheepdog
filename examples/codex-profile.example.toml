@@ -1,0 +1,16 @@
+# Codex 配置档示例：让 sheepdog 驱动的 Codex 会话能自己用 lark-cli 发飞书、写 sheepdog 的状态目录。
+# 用法：复制到 ~/.codex/sheepdog.config.toml，sheepdog 配置里写 [hosts.codex] profile = "sheepdog"。
+# sheepdog 起 `codex -p sheepdog app-server`，Codex 把这份文件叠在 ~/.codex/config.toml 上面。
+# 这些权限由你自己决定、自己维护：sheepdog 不读写这份文件的内容（doctor 只读来显示），也不传任何沙箱、审批参数。
+
+# 能写工作目录和下面列出的目录，其他地方只读
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+# 放开网络：lark-cli 要连飞书
+network_access = true
+# 额外可写的目录，写绝对路径：lark-cli 的登录态目录、sheepdog 的状态目录（交回执、登记等待要写这里）
+writable_roots = [
+  "/Users/<你的用户名>/.lark-cli",
+  "/Users/<你的用户名>/.local/state/sheepdog",
+]

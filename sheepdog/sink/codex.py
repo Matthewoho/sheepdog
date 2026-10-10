@@ -43,6 +43,8 @@ class CodexSink(CliHostSink):
             argv += ["--model", run["model"]]
         if run["effort"]:
             argv += ["--effort", run["effort"]]
+        if self.hcfg.profile:
+            argv += ["--profile", self.hcfg.profile]
         return argv
 
     def new_conversation(self, title: str, prompt: str, model: str = "", effort: str = "", *,

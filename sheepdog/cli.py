@@ -87,7 +87,7 @@ class _Abort(Exception):
 
 SINK_CLASSES = {"codex": CodexSink, "claude": ClaudeSink}
 # 这些宿主配置要重启才生效（sink 是启动时建的）；model / effort / timeout_minutes / max_concurrent 下一轮生效
-HOST_RESTART_KEYS = ("enabled", "command", "workdir", "settings")
+HOST_RESTART_KEYS = ("enabled", "command", "workdir", "settings", "profile")
 
 
 def load_checked_roster(cfg) -> Roster:
@@ -241,17 +241,23 @@ def cli_name_report(cfg) -> str:
     return line + (f" -> {found} ✓" if found else f" ✗ 找不到（会话敲这条命令会失败）：{path or name}")
 
 
-def _codex_sandbox() -> tuple[str, str]:
-    """Codex 生效的 sandbox_mode 和网络开关：从 ~/.codex/config.toml 读（CODEX_HOME 可改），读不到就写「读不到」。"""
-    p = codex_home() / "config.toml"
+def _codex_sandbox(profile: str = "") -> dict:
+    """Codex 生效的沙箱设置（只读）：设了 profile 读 ~/.codex/<profile>.config.toml，没设读 ~/.codex/config.toml
+    （CODEX_HOME 可改根目录）。返回 {file, mode, net, roots}；文件读不到时各项都是「读不到」，文件里没写的项是「没写」。"""
+    p = codex_home() / (f"{profile}.config.toml" if profile else "config.toml")
     try:
         with p.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError):
-        return "读不到", "读不到"
+        return {"file": str(p), "mode": "读不到", "net": "读不到", "roots": "读不到"}
+    missing = "没写（沿用用户配置）" if profile else "没写"
+    ws = data.get("sandbox_workspace_write") or {}
     mode = data.get("sandbox_mode")
-    net = (data.get("sandbox_workspace_write") or {}).get("network_access")
-    return (str(mode) if mode else "读不到"), ("读不到" if net is None else ("开" if net else "关"))
+    net = ws.get("network_access")
+    roots = ws.get("writable_roots")
+    return {"file": str(p), "mode": str(mode) if mode else missing,
+            "net": missing if net is None else ("开" if net else "关"),
+            "roots": missing if roots is None else (", ".join(map(str, roots)) if roots else "（空）")}
 
 
 def _claude_login(exe: str) -> str:
@@ -300,8 +306,12 @@ def host_report(cfg, store: Store) -> list[str]:
             else:
                 lines.append(f"  登录: ✓ 最近一次运行（{last['ended_at']}）没有登录类报错")
             lines.append("  提示: Codex 应用侧边栏只列登记过的项目下的线程；新建的线程要重开应用才看得到")
-            mode, net = _codex_sandbox()
-            lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}（来自 Codex 自己的配置，sheepdog 不传任何权限参数）")
+            sb = _codex_sandbox(hc.profile)
+            mode, net = sb["mode"], sb["net"]
+            lines.append(f"  配置档: {('profile = ' + hc.profile + '（codex -p ' + hc.profile + '）') if hc.profile else '没设（只用用户配置）'}"
+                         f"；读的是 {sb['file']}")
+            lines.append(f"  沙箱: sandbox_mode = {mode}，网络 {net}，writable_roots = {sb['roots']}"
+                         "（来自 Codex 自己的配置，sheepdog 只传配置档名，不传任何权限参数）")
             if mode == "read-only" or net == "关":
                 lines.append("  ⚠ 这个宿主的会话能读、能分析，但发不了飞书")
     return lines
