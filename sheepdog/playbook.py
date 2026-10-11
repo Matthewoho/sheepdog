@@ -40,6 +40,10 @@ PLAYBOOK_FILES: dict[str, str] = {
 # 可选文件：缺了用代码里的默认值，不算缺（doctor 不报）
 OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "agent_sender_label.md": "机器人 / Agent 发来的消息上的标注（回不回、怎么回）；缺了用代码里的默认值「🤖 来自机器人 / Agent」",
+    # 会话卡在 attention（7.21）：事实由代码拼，这里只放对人的说明；缺了只发事实
+    "attention_notice.md": "会话进入 attention 时私聊主人的通知末尾附的话，可用 {{host}} {{reason}} {{since}} {{queued}} "
+                           "{{auto_recover}}（yes / no）",
+    "attention_recovered.md": "会话自动恢复时私聊主人的通知末尾附的话，可用 {{host}} {{evidence}} {{queued}}",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。

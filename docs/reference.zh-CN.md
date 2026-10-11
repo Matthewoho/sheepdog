@@ -33,7 +33,7 @@ Source (lark-cli, user 身份)
                                                                └── 回执 ◄────────┘  sheepdog receipt
 ```
 
-- **Session 状态机**：`active → running → (active | waiting_human | blocked | closed)`，以及 `human_attached`（你在 session 里发言后暂停投递）、`failed → attention`（重试耗尽）。状态由 session 每批提交的回执驱动。
+- **Session 状态机**：`active → running → (active | waiting_human | blocked | closed)`，以及 `human_attached`（你在 session 里发言后暂停投递）、`failed → attention`（重试耗尽，attention 期间信号只排队；见下文「会话卡住（attention）」）。状态由 session 每批提交的回执驱动。
 - **可插拔**：`Source`（消息源）、`Sink`（session 投递）、`Store`（账本）都是接口，当前实现分别为 lark-cli、SQLite，以及三种会话宿主：Antigravity `agentapi`（默认）、Codex（`codex app-server`）、Claude（`claude -p`）。后两种默认关闭，见下文「Codex 和 Claude 会话」。
 
 ## 安装
@@ -146,6 +146,19 @@ sheepdog reply-card --text-file body.md     # 正文从文件读；- 表示标�
 - **免打扰群里回复你的消息照常直推**：「回复我」与「@我」同级，在免打扰判断之前；关键人发言仍受免打扰约束。
 - **长消息**：每条最多带 `session.max_message_lines` 行（默认 200），超过的末尾提示「后面还有 N 行未显示，用 `sheepdog show <message_id>` 看全文」。
 - **配置热加载**：`run` 每轮重读 config.toml；改坏了沿用上一份并记 WARNING；轮询间隔、关键词、路由、ack、watch、loop_guard、owner_context 等下一轮生效；`state_dir`、`sink` 改了只提示需要重启。名册和安全规则同样每轮重读，playbook 每次组装 prompt 时现读。
+
+## 会话卡住（attention）：告诉你，能自己好的自动解开
+
+会话连续失败满 3 次（总线回执超时、投递失败、Codex / Claude 这一轮失败或超时、Codex 配置档有问题、容量满重试用完）就进 attention：不再投递，新来的信号只排队，一条不丢。账本 topics 表记下进入的时间 `attention_at` 和原因 `attention_reason`（`receipt_timeout` / `no_receipt` / `send_failed` / `host_failed` / `host_timeout` / `config` / `capacity`；老账本启动时自动补这两列）。`sheepdog sessions` 和 `sheepdog doctor` 都会列出卡住的会话、从几点起、为什么、会不会自动恢复。
+
+- **告诉你**：任何会话进入 attention（不论原因），经机器人私聊你一条：哪个会话、原因、从几点起没回应（最后一次回执或会话记录里最后一次动作，按 `timezone_offset` 显示，默认北京时间）、排了几条信号、会不会自动恢复。同一次 attention 只发一次。末尾附 playbook 的 `attention_notice.md`（可选，缺了只发事实）。原来给总线的系统提示照旧；卡住的就是总线自己时，这条提示不发给它自己（它收不到），只私聊你。
+- **自动恢复，只限回执超时**：因回执超时卡住的会话，出现下面任一证据就自动回到可投递，同一轮补送排队的信号，日志写「会话恢复，自动解除 attention（依据：…）」：
+  - 晚到的回执：它交了任何一批的回执，包括已经判超时的那批；
+  - 会话又有新动作：进 attention 之后，会话记录里又出现了动作（复用护栏的增量读）。Antigravity 看 `PLANNER_RESPONSE` 和工具调用的执行行（`GENERIC`，source 是 MODEL），Codex 看 `item_completed`，时间都要晚于进 attention 的时间；断网时写的 `ERROR_MESSAGE` 不算。Claude 的记录格式没核实过，只认晚到的回执。
+
+  如果之前给你发过 attention 通知，恢复时再发一条短的「已恢复，补送 N 条」，末尾附 `attention_recovered.md`（可选）。其他原因的 attention 不自动解，处理好以后 `sheepdog session-reset --topic <topic>` 复位（同时清掉 attention 的时间和原因）。
+- **晚到的回执不丢**：判过回执超时的批次（总线的 failed、managed 会话的 missed）后来交了回执，回执存进那一行投递记录，状态标 `acked_late`（error 保留当时的「回执超时」）；回执里的等待确认（`watch_done:N`）和锚点照常处理。那批里超时后退回排队、还没再投出去的消息，会话其实已经处理过，改记为这一批已回执，不再重投；已经随后面的批次重投出去的不动。总线超时一两次、已经重投在等回执时收到前一批的晚到回执，失败计数清零（等同一次正常回执）。
+- **已知局限**：恢复看的是「会话还活着」，不是「这一批处理完了」；会话恢复后补送的信号仍按正常回执和超时走。回执超时一律 20 分钟、3 次就 attention 的阈值没改。
 
 ## 引用回复按引用走
 
@@ -299,6 +312,8 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `rules_after_compaction.md` | 检测到宿主压缩、重推完整规则时放在规则前的一句话（缺了用代码里的一句默认话） | — |
 | `audit_offender.md` | 会话跑了危险命令时，给它的系统提示里附的话 | `{{commands}}` |
 | `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` |
+| `attention_notice.md` | 可选：会话进入 attention 时私聊你的通知末尾附的话（事实由 sheepdog 写在前面，缺了只发事实，doctor 不报缺） | `{{host}}` `{{reason}}` `{{since}}` `{{queued}}` `{{auto_recover}}`（yes / no） |
+| `attention_recovered.md` | 可选：会话自动恢复时私聊你的通知末尾附的话 | `{{host}}` `{{evidence}}` `{{queued}}` |
 | `agent_sender_label.md` | 可选：机器人 / Agent 发来的消息上那行标注（缺了用默认值「🤖 来自机器人 / Agent」，doctor 不报缺） | — |
 | `reminders/<key>.md` | 可选：这个会话每一批最末尾附的红线（key 是名册 key，总线是 `bus`） | — |
 
@@ -329,7 +344,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条），sheepdog 对 IM 只读。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次），sheepdog 对 IM 只读。
 
 清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 

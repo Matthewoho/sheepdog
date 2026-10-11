@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS topics (
     model            TEXT,             -- 这个会话的模型；空 = 宿主默认值（每轮现取配置）
     effort           TEXT,             -- 这个会话的推理档位；空 = 宿主默认值
     compacted_at     TEXT,             -- 检测到宿主压缩的时间（7.19 K2）；下一批带上完整规则后清空
+    attention_at     TEXT,             -- 进入 attention 的时间（7.21）；解除后清空
+    attention_reason TEXT,             -- 进入 attention 的原因（机器可读）：receipt_timeout | no_receipt | send_failed
+                                       -- | host_failed | host_timeout | config | capacity；只有 receipt_timeout 会自动恢复
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -90,6 +93,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     sent_at     TEXT NOT NULL,
     state       TEXT NOT NULL,         -- sending（已记、正在发）| sent | acked | failed | missed | context
                                        -- | uncertain（发送中断、transcript 里找不到，等人工 redeliver）| redelivered
+                                       -- | acked_late（判过回执超时以后回执才到，7.21；error 保留当时的超时原因）
     receipt     TEXT,
     error       TEXT
 );
@@ -247,7 +251,8 @@ MIGRATIONS = {
                  ("security_action", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
-               ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT")],
+               ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
+               ("attention_reason", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
 }
@@ -579,6 +584,37 @@ class Store:
     def set_dispatch_state(self, batch_id: str, state: str, error: str | None = None) -> None:
         with self.tx() as c:
             c.execute("UPDATE dispatches SET state=?, error=COALESCE(?, error) WHERE batch_id=?", (state, error, batch_id))
+
+    def timed_out_dispatches(self, topic_id: str, error_prefix: str) -> list[sqlite3.Row]:
+        """这个会话判过回执超时的批次（failed / missed，error 以 error_prefix 开头），按发送时间排。"""
+        return self.conn.execute(
+            "SELECT * FROM dispatches WHERE topic_id=? AND state IN ('failed','missed') AND error LIKE ? ORDER BY sent_at",
+            (topic_id, error_prefix + "%")).fetchall()
+
+    def ack_late_messages(self, batch_id: str, message_ids: list[str]) -> int:
+        """晚到回执（7.21）：这批里超时后退回排队、还没再投出去的消息，会话其实已经处理过了——改记为这一批已回执，
+        不再重投；已经随别的批次再投出去的不动。超时没重投的（adopted 的 missed）一并改成 acked。返回改了几条。"""
+        with self.tx() as c:
+            n = 0
+            for mid in message_ids:
+                n += c.execute(
+                    """UPDATE messages SET dispatch_state='acked', batch_id=?
+                       WHERE message_id=? AND reason != 'owner_context'
+                         AND ((dispatch_state='pending' AND batch_id IS NULL) OR (dispatch_state='missed' AND batch_id=?))""",
+                    (batch_id, mid, batch_id)).rowcount
+            return n
+
+    def last_receipt(self, topic_id: str) -> sqlite3.Row | None:
+        """这个会话最近一次交了回执的批次（含晚到的）。"""
+        return self.conn.execute(
+            """SELECT * FROM dispatches WHERE topic_id=? AND state IN ('acked','acked_late') AND receipt IS NOT NULL
+                 AND receipt != '' ORDER BY sent_at DESC LIMIT 1""", (topic_id,)).fetchone()
+
+    def count_pending_signals(self, topic_id: str) -> int:
+        """排给这个会话、还没投出去的信号（不含主人发言的背景）。"""
+        return self.conn.execute(
+            """SELECT COUNT(*) FROM messages WHERE route='dispatch' AND dispatch_state='pending'
+                 AND reason != 'owner_context' AND topic_id=?""", (topic_id,)).fetchone()[0]
 
     def requeue_messages(self, message_ids: list[str]) -> None:
         """人工确认后重发（redeliver）：把这些消息放回待推。"""

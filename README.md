@@ -176,7 +176,7 @@ Code holds the mechanism; business rules live in these files. Full reference (Ch
 | Work output | written by the sessions to the owner's own notes and task tracker | no |
 
 - What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup.
-- sheepdog only reads from Lark, with two kinds of exception: adding and removing the "seen" reaction (`[ack]`, off unless configured), and bot DMs to the owner: Codex or Claude CLI logged out, the Codex app holding a write lock for 60 minutes, and command-audit alerts.
+- sheepdog only reads from Lark, with two kinds of exception: adding and removing the "seen" reaction (`[ack]`, off unless configured), and bot DMs to the owner: Codex or Claude CLI logged out, the Codex app holding a write lock for 60 minutes, command-audit alerts, and a session stuck in attention (plus a short note when it recovers on its own).
 - sheepdog itself never writes to the owner's notes or task tracker.
 - A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
 

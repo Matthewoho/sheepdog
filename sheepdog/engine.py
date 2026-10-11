@@ -6,13 +6,14 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import session as sm
 from .config import ANTIGRAVITY, Config
 from .models import Message
-from .guard import AUDIT, COMPACTION, commands_in, first_match, is_compaction, local_hhmm, redact, scan_jsonl
+from .guard import (ACTIVITY, AUDIT, COMPACTION, activity_at, commands_in, first_match, is_compaction,
+                    last_activity_at, local_hhmm, redact, scan_jsonl)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
                       batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
@@ -95,6 +96,50 @@ LOGIN_NOTICE_HOURS = 24
 LOCK_NOTICE_HOURS = 24
 HOST_LABEL = {"antigravity": "Antigravity", "codex": "Codex", "claude": "Claude"}
 LOGIN_COMMAND = {"codex": "codex login", "claude": "claude auth login"}
+
+# 会话卡在 attention（7.21）：topics.attention_reason 的取值。只有回执超时会自动恢复，其他要人手动 session-reset
+RECEIPT_TIMEOUT = "回执超时"          # dispatches.error：判回执超时的批次以它开头，晚到的回执按它找回来
+ACKED_LATE = "acked_late"             # dispatches.state：判过回执超时以后回执才到
+ATTN_RECEIPT_TIMEOUT = "receipt_timeout"
+ATTN_NO_RECEIPT = "no_receipt"        # 命令行会话这一轮跑完了，但没交回执
+ATTN_SEND_FAILED = "send_failed"      # 投递本身失败（agentapi 发送失败、宿主没开等）
+ATTN_HOST_FAILED = "host_failed"      # 命令行宿主这一轮失败
+ATTN_HOST_TIMEOUT = "host_timeout"    # 命令行宿主这一轮超过 timeout_minutes
+ATTN_CONFIG = "config"                # Codex 配置档读不到 / 解析失败
+ATTN_CAPACITY = "capacity"            # 容量满、重试用完
+ATTENTION_REASONS = {
+    ATTN_RECEIPT_TIMEOUT: "回执超时", ATTN_NO_RECEIPT: "这一轮跑完了但没交回执", ATTN_SEND_FAILED: "投递失败",
+    ATTN_HOST_FAILED: "宿主这一轮失败", ATTN_HOST_TIMEOUT: "宿主这一轮超时", ATTN_CONFIG: "Codex 配置档有问题",
+    ATTN_CAPACITY: "容量满、重试用完",
+}
+AUTO_RECOVER_REASONS = {ATTN_RECEIPT_TIMEOUT}
+
+
+def attention_reason_label(reason: str | None) -> str:
+    return ATTENTION_REASONS.get(reason or "", reason or "原因没记录（老账本）")
+
+
+def auto_recovers(reason: str | None) -> bool:
+    return (reason or "") in AUTO_RECOVER_REASONS
+
+
+def attention_notice_key(topic_id: str) -> str:
+    """meta 键：值是发通知时那次 attention 的 attention_at。同一次 attention 只发一次，恢复时据此决定发不发「已恢复」。"""
+    return f"attention_notice:{topic_id}"
+
+
+def display_time(dt: datetime | None, offset: str = "+08:00") -> str:
+    """给人看的时间：换到配置的时区（timezone_offset），+08:00 标「北京时间」。"""
+    if dt is None:
+        return ""
+    try:
+        sign = -1 if offset.startswith("-") else 1
+        hh, _, mm = offset.lstrip("+-").partition(":")
+        tz = timezone(sign * timedelta(hours=int(hh), minutes=int(mm or 0)))
+    except ValueError:
+        tz, offset = timezone(timedelta(hours=8)), "+08:00"
+    label = "北京时间" if offset == "+08:00" else f"UTC{offset}"
+    return f"{dt.astimezone(tz).strftime('%m-%d %H:%M')}（{label}）"
 
 
 def _now() -> datetime:
@@ -902,13 +947,8 @@ class Dispatcher:
             fields = {"state": new_state, "pending_batch_id": None, "retries": 0,
                       "summary": receipt.get("summary", t["summary"])}
             self._watches_after_receipt(t["topic_id"], batch, receipt.get("anchors") or [])
-            if receipt.get("anchors"):
-                # 回执带来的锚点只作记录；聊天归属（oc_ 开头）只能由名册 / new-session 决定，回执改不了；
-                # watch_done:N 是确认等待用的，不存
-                extra = {a for a in receipt["anchors"]
-                         if isinstance(a, str) and not a.startswith(("oc_", "watch_done:"))}
-                anchors = sorted(set(json.loads(t["anchors_json"] or "[]")) | extra)
-                fields["anchors_json"] = json.dumps(anchors, ensure_ascii=False)
+            if anchors := self._receipt_anchors(t, receipt):
+                fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
             log.info("回执 %s/%s: %s -> %s", t["topic_id"], batch, status, new_state)
             if t["kind"] == DYNAMIC and new_state == sm.CLOSED:
@@ -922,7 +962,19 @@ class Dispatcher:
             if adopted:
                 self._miss(t, batch)
             else:
-                self._fail(t, batch, "回执超时")
+                self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
+
+    @staticmethod
+    def _receipt_anchors(t, receipt: dict) -> str:
+        """回执带来的锚点并进会话的锚点，返回新的 anchors_json；没有新锚点返回空串。
+
+        回执带来的锚点只作记录；聊天归属（oc_ 开头）只能由名册 / new-session 决定，回执改不了；
+        watch_done:N 是确认等待用的，不存。"""
+        if not isinstance(receipt.get("anchors"), list) or not receipt["anchors"]:
+            return ""
+        extra = {a for a in receipt["anchors"] if isinstance(a, str) and not a.startswith(("oc_", "watch_done:"))}
+        anchors = sorted(set(json.loads(t["anchors_json"] or "[]")) | extra)
+        return json.dumps(anchors, ensure_ascii=False)
 
     def _dynamic_closed(self, topic_id: str, why: str) -> None:
         """dynamic 会话收掉：聊天归属随之释放（之后的消息回总线），总线下一批附最新名册。"""
@@ -951,14 +1003,16 @@ class Dispatcher:
     def _miss(self, t, batch: str) -> None:
         """adopted 会话回执超时：只记一次未回执、回到可投递，不重投（避免往大上下文里重复灌消息）。"""
         self._watches_after_receipt(t["topic_id"], batch, [])
-        self.store.finish_dispatch(batch, "missed", error="回执超时（adopted 不重投）")
+        self.store.finish_dispatch(batch, "missed", error=f"{RECEIPT_TIMEOUT}（adopted 不重投）")
         self.store.mark_batch_state(batch, "missed")
         missed = (t["receipt_missed"] or 0) + 1
         self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "receipt_missed"),
                                 pending_batch_id=None, receipt_missed=missed)
         log.info("topic %s 批次 %s 未回执（累计 %d 次），不重投", t["topic_id"], batch, missed)
 
-    def _fail(self, t, batch: str | None, error: str) -> None:
+    def _fail(self, t, batch: str | None, error: str, reason: str) -> None:
+        """投递失败一次：批次退回排队，累计 MAX_RETRIES 次标 attention。reason 是这一次失败的原因（ATTN_*），
+        进 attention 时记进 topics.attention_reason——连续几次原因不同时，以压垮它的最后一次为准。"""
         retries = (t["retries"] or 0) + 1
         state = sm.transition(t["state"], "error") if sm.can(t["state"], "error") else t["state"]
         if batch:
@@ -966,8 +1020,203 @@ class Dispatcher:
             self.store.requeue_batch(batch)
         if retries >= MAX_RETRIES and sm.can(state, "retries_exhausted"):
             state = sm.transition(state, "retries_exhausted")
-        self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None, retries=retries)
+        self._set_state(t, state, reason, error, pending_batch_id=None, retries=retries)
         log.warning("topic %s 投递失败(%s)，第 %d 次，状态 %s", t["topic_id"], error, retries, state)
+
+    @staticmethod
+    def _exhaust(state: str) -> str:
+        """这一轮不再重试：running → failed → attention（走得通几步走几步）。"""
+        for ev in ("error", "retries_exhausted"):
+            if sm.can(state, ev):
+                state = sm.transition(state, ev)
+        return state
+
+    # ---------- 卡在 attention：告知主人、自动恢复（7.21） ----------
+    def _set_state(self, t, state: str, reason: str, detail: str = "", **fields) -> None:
+        """改会话状态。从别的状态进入 attention 时记下时间和原因（reason 是 ATTN_*），并私聊主人一次。"""
+        entering = state == sm.ATTENTION and t["state"] != sm.ATTENTION
+        if entering:
+            fields.update(attention_at=now_iso(), attention_reason=reason)
+        self.store.update_topic(t["topic_id"], state=state, **fields)
+        if entering:
+            nt = self.store.get_topic(t["topic_id"])
+            if auto_recovers(reason):
+                self._mark_activity_start(nt)
+            self._attention_entered(nt, detail)
+
+    def _last_alive(self, t) -> tuple[datetime | None, str]:
+        """会话最后一次有回应的时间和依据：最近一次回执，或会话记录里最后一次动作，取晚的那个。"""
+        best: tuple[datetime | None, str] = (None, "")
+        d = self.store.last_receipt(t["topic_id"])
+        if d is not None:
+            at = None
+            try:
+                at = _parse(str(json.loads(d["receipt"]).get("received_at") or ""))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            if at is None:
+                p = self.receipt_path(t["topic_id"], d["batch_id"])
+                try:
+                    at = datetime.fromtimestamp(p.stat().st_mtime).astimezone()
+                except OSError:
+                    at = None
+            if at is not None and at.tzinfo is not None:
+                best = (at, "最后一次回执")
+        path = self._record_file(t)
+        at = last_activity_at(self.topic_host(t), path) if path is not None else None
+        if at is not None and (best[0] is None or at > best[0]):
+            best = (at, "会话记录里最后一次动作")
+        return best
+
+    def _attention_entered(self, t, detail: str = "") -> None:
+        """会话进入 attention（不论原因）：经机器人私聊主人一次。事实在这里拼，对人的说明在 playbook 的 attention_notice.md。"""
+        tid = t["topic_id"]
+        key = attention_notice_key(tid)
+        if self.store.get_meta(key) == t["attention_at"]:
+            return
+        host = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
+        title = self._session_title(t) or tid
+        reason = attention_reason_label(t["attention_reason"])
+        since_dt, basis = self._last_alive(t)
+        since = display_time(since_dt, self.cfg.timezone_offset)
+        queued = self.store.count_pending_signals(tid)
+        auto = auto_recovers(t["attention_reason"])
+        if auto:
+            how = ("会自动恢复：它交来任何一批的回执（包括已经判超时的那批）"
+                   + ("，或会话记录里又有新动作" if self._record_file(t) is not None
+                      and self.topic_host(t) in (ANTIGRAVITY, "codex") else "")
+                   + "，sheepdog 就自动解除、补送排队的信号。")
+        else:
+            how = f"不会自动恢复：处理好以后用 `sheepdog session-reset --topic {tid}` 复位，排队的信号随后补送。"
+        detail = " ".join((detail or "").split())
+        lines = [f"🐕 汇报 · 会话卡住了 [{BUS_TOPIC_ID}]",
+                 f"「{title}」（topic `{tid}`，{host}）进入 attention：{reason}"
+                 + (f"（累计失败 {t['retries']} 次）" if t["retries"] else "")
+                 + (f"，{detail[-200:]}" if detail and detail != reason else "") + "。",
+                 (f"从{since}起没回应（依据：{basis}）" if since else "没有回执或动作记录，看不出从几点起没回应")
+                 + f"；排着 {queued} 条信号，暂不投递。",
+                 how]
+        why = self.playbook.render("attention_notice.md", session_title=title, topic_id=tid, host=host, reason=reason,
+                                   since=since, queued=str(queued), auto_recover="yes" if auto else "no")
+        if why:
+            lines.append(why)
+        log.warning("会话 %s 进入 attention（%s），%d 条信号排队", tid, t["attention_reason"], queued)
+        if self._notify_owner("\n".join(lines), "attention 通知"):
+            self.store.set_meta(key, t["attention_at"] or "")
+
+    def _mark_activity_start(self, t) -> None:
+        """回执超时进 attention 时，「新动作」的读取偏移从记录现在的末尾开始（之后只看新写的行）。"""
+        path = self._record_file(t)
+        if path is None or not t["conversation_id"]:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        self.store.set_cursor(t["topic_id"], ACTIVITY, t["conversation_id"], str(path), size)
+
+    def _activity_since(self, t) -> datetime | None:
+        """进 attention 之后会话记录里的第一个新动作（7.21）。复用护栏的增量读；时间早于 attention_at 的不算。"""
+        if self.topic_host(t) not in (ANTIGRAVITY, "codex"):
+            return None  # 没有能认的记录，只认晚到的回执
+        since = _parse(t["attention_at"] or "")
+        if since is None or since.tzinfo is None:
+            return None
+        found: list[datetime] = []
+        host = self.topic_host(t)
+
+        def handle(_off: int, d: dict) -> None:
+            at = activity_at(host, d)
+            if at is not None and at > since:
+                found.append(at)
+
+        self._follow(t, ACTIVITY, handle)
+        return min(found) if found else None
+
+    def _late_receipts(self, t) -> list[tuple[str, dict]]:
+        """判过回执超时的批次后来又交了回执：回执存进那一行 dispatch、标 acked_late；那批里退回排队、还没再投出去的
+        消息会话已经处理过，改记为已回执、不再重投；回执里的等待确认和锚点照常处理。返回 [(批次号, 回执)]，按发送时间。"""
+        out: list[tuple[str, dict]] = []
+        for d in self.store.timed_out_dispatches(t["topic_id"], RECEIPT_TIMEOUT):
+            p = self.receipt_path(t["topic_id"], d["batch_id"])
+            if not p.exists():
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8")
+                receipt = json.loads(raw)
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning("晚到的回执 %s/%s 读不了，先跳过: %s", t["topic_id"], d["batch_id"], e)
+                continue
+            if not isinstance(receipt, dict):
+                receipt = {}
+            self.store.finish_dispatch(d["batch_id"], ACKED_LATE, raw, error=d["error"] or "")
+            n = self.store.ack_late_messages(d["batch_id"], json.loads(d["message_ids"] or "[]"))
+            anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
+            self._watches_after_receipt(t["topic_id"], d["batch_id"], anchors)
+            if new := self._receipt_anchors(t, receipt):
+                self.store.update_topic(t["topic_id"], anchors_json=new)
+                t = self.store.get_topic(t["topic_id"])
+            log.info("回执晚到 %s/%s: %s（判超时以后才到；其中 %d 条消息不再重投）", t["topic_id"], d["batch_id"],
+                     receipt.get("status", "-"), n)
+            out.append((d["batch_id"], receipt))
+        return out
+
+    def _check_recovery(self, t) -> None:
+        """会话恢复的证据（7.21）：晚到的回执，或进 attention 之后会话记录里又有新动作。
+
+        - 因回执超时卡在 attention 的：有证据就自动解除、回到可投递，这一轮就补送排队的信号；
+        - 因回执超时 failed、或已经重投在等回执的：晚到的回执清零失败计数（同一次正常回执）；
+        - 其他原因的 attention 不自动解，晚到的回执照样记下。
+        """
+        if t is None or t["state"] == sm.CLOSED:
+            return
+        late = self._late_receipts(t)
+        t = self.store.get_topic(t["topic_id"])
+        if t["state"] == sm.ATTENTION:
+            if not auto_recovers(t["attention_reason"]):
+                return
+            if late:
+                evidence = f"晚到的回执（批次 {'、'.join(b for b, _ in late)}）"
+            elif (at := self._activity_since(t)) is not None:
+                evidence = f"会话记录在 {display_time(at, self.cfg.timezone_offset)} 又有新动作"
+            else:
+                return
+            self._recover(t, evidence, late[-1][1] if late else None)
+        elif late and t["kind"] not in MANAGED_KINDS:
+            fields: dict = {"retries": 0}
+            if t["state"] == sm.FAILED:
+                fields["state"] = sm.transition(t["state"], "reset")
+            if not t["pending_batch_id"]:
+                fields["summary"] = late[-1][1].get("summary", t["summary"])
+            self.store.update_topic(t["topic_id"], **fields)
+
+    def _recover(self, t, evidence: str, receipt: dict | None) -> None:
+        tid = t["topic_id"]
+        state = sm.ACTIVE
+        fields: dict = {"retries": 0, "pending_batch_id": None, "attention_at": None, "attention_reason": None}
+        if receipt is not None:
+            # 照回执本来会带来的状态走（handled → active，needs_decision → waiting_human …），都可投递
+            status = receipt.get("status", "handled")
+            if (t["kind"] == ADOPTED or tid == BUS_TOPIC_ID) and status == "done":
+                status = "handled"
+            target = sm.TRANSITIONS.get(sm.RECEIPT_EVENTS.get(status, "receipt_handled"), {}).get(sm.RUNNING)
+            state = target if target in sm.DISPATCHABLE else sm.ACTIVE
+            fields["summary"] = receipt.get("summary", t["summary"])
+        self.store.update_topic(tid, state=state, **fields)
+        queued = self.store.count_pending_signals(tid)
+        log.warning("会话恢复，自动解除 attention（依据：%s）：%s -> %s，%d 条信号这一轮补送", evidence, tid, state, queued)
+        key = attention_notice_key(tid)
+        notified = bool(t["attention_at"]) and self.store.get_meta(key) == t["attention_at"]
+        self.store.set_meta(key, "")
+        if not notified:
+            return
+        host = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
+        title = self._session_title(t) or tid
+        text = (f"🐕 汇报 · 会话已恢复 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）已恢复，补送 {queued} 条。"
+                f"依据：{evidence}。")
+        why = self.playbook.render("attention_recovered.md", session_title=title, topic_id=tid, host=host,
+                                   evidence=evidence, queued=str(queued))
+        self._notify_owner(text + (f"\n{why}" if why else ""), "恢复通知")
 
     # ---------- 人类接管 ----------
     def _check_human(self, t) -> None:
@@ -1156,7 +1405,7 @@ class Dispatcher:
         except SinkError as e:
             if batch_id and self.store.get_dispatch(batch_id) is not None:
                 self.store.set_dispatch_state(batch_id, "failed", str(e))
-            self._fail(t, None, str(e))
+            self._fail(t, None, str(e), ATTN_SEND_FAILED)
             res["error"] = str(e)
             return res
 
@@ -1244,7 +1493,12 @@ class Dispatcher:
         self._check_lock_streaks()
         return done
 
-    def _bus_hint(self, reason: str, text: str) -> None:
+    def _bus_hint(self, reason: str, text: str, about: str = "") -> None:
+        """给总线排一条系统提示。about 是提示说的是哪个会话：说的就是总线自己、而总线已经卡在 attention 时不发——
+        它收不到，信号只会排在队里（7.21）；这种情况由 _attention_entered 私聊主人。"""
+        if about == BUS_TOPIC_ID and (b := self.store.get_topic(BUS_TOPIC_ID)) is not None and b["state"] == sm.ATTENTION:
+            log.info("总线自己进了 attention，这条提示（%s）不发给它自己", reason)
+            return
         # 提示里的 `sheepdog …` 命令换成配置的 cli_name（会话在自己终端里敲的那个）
         self.store.add_system_message(BUS_TOPIC_ID, reason, with_cli(text, self.cfg.cli_command))
 
@@ -1278,7 +1532,7 @@ class Dispatcher:
                 if t["kind"] in MANAGED_KINDS:
                     self._miss(t, r.batch_id)
                 elif t["kind"] != RETIRED:
-                    self._fail(t, r.batch_id, "命令行会话这一轮结束时没有回执")
+                    self._fail(t, r.batch_id, "命令行会话这一轮结束时没有回执", ATTN_NO_RECEIPT)
             return
         if mine and t["kind"] == RETIRED:
             # 退休通知没跑完：不会有交接回执了，记失败、提示总线补发（退休通知不自动重发）
@@ -1307,13 +1561,10 @@ class Dispatcher:
         if r.state == "timeout":
             if mine:
                 self.store.finish_dispatch(r.batch_id, "failed", error=r.error)
-                state = t["state"]
-                for ev in ("error", "retries_exhausted"):
-                    if sm.can(state, ev):
-                        state = sm.transition(state, ev)
-                self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+                self._set_state(t, self._exhaust(t["state"]), ATTN_HOST_TIMEOUT, r.error, pending_batch_id=None)
             self._bus_hint("host_timeout", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮超时：{r.error}。"
-                                           f"会话已标 attention，确认后用 `sheepdog session-reset --topic {r.topic_id}` 复位。")
+                                           f"会话已标 attention，确认后用 `sheepdog session-reset --topic {r.topic_id}` 复位。",
+                           about=r.topic_id)
             return
         if r.error_kind == "config":
             # Codex 配置档读不到 / 解析失败（7.18）：这一轮根本没起 app-server，不重试；批次退回排队、会话标 attention，
@@ -1321,38 +1572,33 @@ class Dispatcher:
             if mine:
                 self.store.finish_dispatch(r.batch_id, "failed", error=r.error[-1000:])
                 self.store.requeue_batch(r.batch_id)
-                state = t["state"]
-                for ev in ("error", "retries_exhausted"):
-                    if sm.can(state, ev):
-                        state = sm.transition(state, ev)
-                self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+                self._set_state(t, self._exhaust(t["state"]), ATTN_CONFIG, r.error, pending_batch_id=None)
             self._bus_hint("host_config", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮没跑起来，配置档有问题："
                                           f"{r.error[-500:]}。批次已退回排队、会话标 attention；修好配置档后用 "
-                                          f"`sheepdog session-reset --topic {r.topic_id}` 复位（`sheepdog doctor` 能看到同样的问题）。")
+                                          f"`sheepdog session-reset --topic {r.topic_id}` 复位（`sheepdog doctor` 能看到同样的问题）。",
+                           about=r.topic_id)
             return
         # 容量满重试用完：批次退回排队、会话标 attention（不再自动重发，免得同一批次一轮轮撞容量），给总线提示；
         # 不自动换模型。其他失败：照普通投递失败处理（退回排队，累计 3 次标 attention）
         if mine and r.error_kind == "capacity":
             self.store.finish_dispatch(r.batch_id, "failed", error=r.error[-1000:])
             self.store.requeue_batch(r.batch_id)
-            state = t["state"]
-            for ev in ("error", "retries_exhausted"):
-                if sm.can(state, ev):
-                    state = sm.transition(state, ev)
-            self.store.update_topic(t["topic_id"], state=state, pending_batch_id=None)
+            self._set_state(t, self._exhaust(t["state"]), ATTN_CAPACITY, r.error, pending_batch_id=None)
         elif mine:
-            self._fail(t, r.batch_id, f"{label} {r.error_kind}: {r.error[-300:]}")
+            self._fail(t, r.batch_id, f"{label} {r.error_kind}: {r.error[-300:]}", ATTN_HOST_FAILED)
         self._bus_hint("host_failed", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮失败"
-                                      f"（{r.error_kind}）：{r.error[-300:]}")
+                                      f"（{r.error_kind}）：{r.error[-300:]}", about=r.topic_id)
 
-    def _notify_owner(self, text: str, what: str) -> None:
-        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟）；没有发送渠道时只记日志。"""
+    def _notify_owner(self, text: str, what: str) -> bool:
+        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟、会话卡住）；没有发送渠道时只记日志。返回发出去没有。"""
         if self.notifier is None:
-            return
+            return False
         try:
             self.notifier(with_cli(text, self.cfg.cli_command))
         except Exception as e:
             log.warning("给主人发%s失败: %s", what, e)
+            return False
+        return True
 
     def _login_notice(self, host: str, reason: str) -> None:
         """登录失效：经机器人给主人发一条「需要你重新登录」，同一宿主 24 小时只发一次。"""
@@ -1575,20 +1821,27 @@ class Dispatcher:
 
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
+        # 这一轮里各会话的记录文件（自动恢复和护栏共用）
+        self._record_cache = {}
         self._recover_sending()
         self.collect_runs()
         self.sync_roster()
         self.ensure_bus_topic()
         tids = [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
                                  if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED]
-        # 先处理回执与超时（总线超时会把批次退回待推）、前任交接回执、等待计时，再取待推消息
+        # 先看卡住的会话有没有恢复（7.21：解开了这一轮就补送），再处理回执与超时（总线超时会把批次退回待推）、
+        # 前任交接回执、等待计时，再取待推消息
+        for tid in tids:
+            try:
+                self._check_recovery(self.store.get_topic(tid))
+            except Exception as e:  # 自动恢复出错不能挡住投递
+                log.warning("检查会话 %s 是否恢复时出错: %s", tid, e)
         for tid in tids:
             self._check_receipt(self.store.get_topic(tid))
         self._check_handovers()
         self._tick_watches(set(tids))
         self._expire_escalations()
         # 护栏（7.19）：增量读会话记录，压缩了就清指纹（这一轮的批次就带上完整规则）；危险命令报警（系统提示这一轮就排上）
-        self._record_cache = {}
         for step in (self._scan_compactions, self._audit_commands):
             try:
                 step()

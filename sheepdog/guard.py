@@ -1,4 +1,4 @@
-"""会话记录的增量读：认出宿主压缩点（7.19 K2）和会话跑过的命令（7.19 K3）。
+"""会话记录的增量读：认出宿主压缩点（7.19 K2）、会话跑过的命令（7.19 K3）和会话的动作（7.21 自动恢复）。
 
 这里只放机制：各宿主记录格式的解析、按字节偏移增量读、命令文本的整理与脱敏。
 命中以后发什么话、发给谁由 engine 组装，措辞在 playbook。
@@ -15,6 +15,13 @@
     有的线程只有这一条、没有 CommandExecution（10-10 的线程里见过），所以两种都认
 - Claude（**没核实过**，有就认）：压缩点 `"subtype": "compact_boundary"`；命令是 assistant 消息里
   `{"type": "tool_use", "name": "Bash", "input": {"command": "..."}}`
+
+会话的动作（7.21：attention 之后又有动作 = 会话恢复了）：
+- Antigravity：`PLANNER_RESPONSE`（模型的回答，工具调用在它的 tool_calls 里），以及 `{"type": "GENERIC", "source": "MODEL"}`
+  （工具调用的执行行）；时间看 created_at（UTC，Z 结尾）。断网时只会写 `ERROR_MESSAGE`（source 是 SYSTEM），不算
+  （2026-10-12 对着 10-11 晚上卡住的总线记录核过）
+- Codex：`{"type": "event_msg", "payload": {"type": "item_completed"}}`，时间看顶层 timestamp
+- Claude：记录格式没核实过，不认，只认晚到的回执
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from .config import ANTIGRAVITY
 # transcript_cursors.purpose
 COMPACTION = "compaction"
 AUDIT = "audit"
+ACTIVITY = "activity"
 
 AG_COMPACTION_PREFIX = "# Resuming from a compaction"
 
@@ -38,7 +46,10 @@ AG_COMPACTION_PREFIX = "# Resuming from a compaction"
 _NEEDLES = {
     COMPACTION: (b"CHECKPOINT", b"compaction", b"compacted", b"compact_boundary"),
     AUDIT: (b"run_command", b"CommandExecution", b"custom_tool_call", b"tool_use"),
+    ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
 }
+# 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
+LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
 
 
 @dataclass
@@ -86,6 +97,57 @@ def is_compaction(host: str, d: dict) -> bool:
     if host == "claude":
         return d.get("subtype") == "compact_boundary"  # 没核实过
     return False
+
+
+# ---------- 会话的动作（7.21） ----------
+def parse_ts(ts: str) -> datetime | None:
+    """记录里的时间（多为 UTC 的 Z 结尾）转成带时区的 datetime；认不出或不带时区就是 None。"""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def activity_at(host: str, d: dict) -> datetime | None:
+    """这一行是会话的动作就返回它的时间，否则 None。"""
+    if host == ANTIGRAVITY:
+        kind = d.get("type")
+        if kind == "PLANNER_RESPONSE" or (kind == "GENERIC" and d.get("source") == "MODEL"):
+            return parse_ts(str(d.get("created_at") or ""))
+        return None
+    if host == "codex":
+        pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        if d.get("type") == "event_msg" and pl.get("type") == "item_completed":
+            return parse_ts(str(d.get("timestamp") or ""))
+    return None  # Claude 的记录格式没核实过，不认
+
+
+def last_activity_at(host: str, path: Path, tail: int = LAST_ACTIVITY_TAIL) -> datetime | None:
+    """记录末尾 tail 字节里最后一次动作的时间；读不了、没有就是 None。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    start = max(0, size - tail)
+    found: list[datetime] = []
+
+    def handle(_off: int, d: dict) -> None:
+        if (at := activity_at(host, d)) is not None:
+            found.append(at)
+
+    if start:
+        # 从中间开始读：先跳到下一个完整行的行首
+        try:
+            with path.open("rb") as f:
+                f.seek(start)
+                start += len(f.readline())
+        except OSError:
+            return None
+    scan_jsonl(path, start, ACTIVITY, handle)
+    return max(found) if found else None
 
 
 # ---------- 命令 ----------

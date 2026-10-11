@@ -56,7 +56,8 @@ from . import actions
 from .ack import Acker
 from .card import build_reply_card
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, load_config
-from .engine import (DYNAMIC, HOST_LABEL, RETIRED, Collector, Dispatcher, add_watch, bus_quote_verifier,
+from .engine import (DYNAMIC, HOST_LABEL, RETIRED, Collector, Dispatcher, add_watch, attention_notice_key,
+                     attention_reason_label, auto_recovers, bus_quote_verifier,
                      close_session, escalation_summary, forward_messages, open_escalations, write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
@@ -229,6 +230,8 @@ def cmd_doctor(args) -> int:
     for name in missing:
         print(f"  ✗ 缺 {name}：{PLAYBOOK_FILES[name]}")
     for line in guard_report(cfg, Store(cfg.db_path), pb):
+        print(line)
+    for line in attention_report(cfg, store):
         print(line)
     return 0 if ok else 1
 
@@ -622,8 +625,30 @@ def cmd_sessions(args) -> int:
         for u in uncertain.get(t["topic_id"], []):
             print(f"  ⚠ 批次 {u['batch_id']} 发送中断、不确定是否送达（{u['sent_at']}），"
                   + with_cli(f"确认后: `sheepdog redeliver --batch {u['batch_id']}`", cfg.cli_command))
+        if t["state"] == sm.ATTENTION:
+            print("  " + attention_line(t, cfg.cli_command))
         print(f"  最近活动: {t['last_active']}  待回执批次: {t['pending_batch_id'] or '-'}  重试: {t['retries']}")
     return 0
+
+
+def attention_line(t, cli_command: str = "sheepdog") -> str:
+    """一个卡在 attention 的会话：从几点起、为什么、会不会自动恢复（7.21）。"""
+    reason = t["attention_reason"]
+    how = ("会自动恢复（晚到的回执或会话记录里的新动作）" if auto_recovers(reason)
+           else with_cli(f"不会自动恢复，处理好以后 `sheepdog session-reset --topic {t['topic_id']}`", cli_command))
+    return (f"attention: 自 {t['attention_at'] or '（没记录）'}，原因 {attention_reason_label(reason)}"
+            f"（{reason or '-'}），{how}")
+
+
+def attention_report(cfg, store: Store) -> list[str]:
+    """doctor：卡在 attention 的会话（7.21）。"""
+    stuck = [t for t in store.list_topics() if t["state"] == sm.ATTENTION]
+    if not stuck:
+        return ["attention: 没有卡住的会话"]
+    lines = [f"attention: ⚠ {len(stuck)} 个会话卡住，信号在排队"]
+    for t in stuck:
+        lines.append(f"  - {t['title']}（{t['topic_id']}）{attention_line(t, cfg.cli_command).removeprefix('attention: ')}")
+    return lines
 
 
 def cmd_receipt(args) -> int:
@@ -1072,7 +1097,9 @@ def cmd_session_reset(args) -> int:
     if not sm.can(t["state"], "reset"):
         print(f"当前状态 {t['state']} 无需复位")
         return 0
-    store.update_topic(args.topic, state=sm.transition(t["state"], "reset"), retries=0, pending_batch_id=None)
+    store.update_topic(args.topic, state=sm.transition(t["state"], "reset"), retries=0, pending_batch_id=None,
+                       attention_at=None, attention_reason=None)
+    store.set_meta(attention_notice_key(args.topic), "")
     print("已复位为 active")
     return 0
 
