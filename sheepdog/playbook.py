@@ -37,6 +37,11 @@ PLAYBOOK_FILES: dict[str, str] = {
                        "可用 {{commands}} {{offender_title}} {{offender_topic}}",
 }
 
+# 可选文件：缺了用代码里的默认值，不算缺（doctor 不报）
+OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
+    "agent_sender_label.md": "机器人 / Agent 发来的消息上的标注（回不回、怎么回）；缺了用代码里的默认值「🤖 来自机器人 / Agent」",
+}
+
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
 # 可选，不在 PLAYBOOK_FILES 里（缺了不算缺），doctor 单独列出哪些会话有
 REMINDERS_DIR = "reminders"

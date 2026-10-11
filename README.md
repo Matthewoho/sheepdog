@@ -2,80 +2,137 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-**sheepdog is a work assistant that runs on your own machine.** You are the shepherd, your AI agent sessions are the flock, and sheepdog keeps the flock together.
+sheepdog is a work assistant that runs on the owner's own machine. Every minute it pulls new messages from Lark (Feishu), hands each one to the AI session responsible for it, and tracks the state of those sessions. When something needs the owner's decision, the session asks the owner in Lark through a bot.
 
-Its first job: watch your work chat (Lark / Feishu today), hand each request to the agent session that owns it, keep those sessions on track, and bring back only the decisions that need you. You observe, guide and decide. The agents collect, triage, handle and draft.
+The name: the owner is the shepherd, the AI sessions are the flock, and sheepdog keeps the flock together.
 
-## Why
+## Workflow
 
-If most of your work arrives through chat, it arrives scattered: DMs, @mentions, threads in dozens of groups. One AI chat can't hold all of it, and a dozen AI chats with nobody routing between them is not much better.
+1. Collect: once a minute, pull new messages with lark-cli as the owner and record them in a local ledger (SQLite).
+2. Route: use the roster and rules to pick a session, or park the message in the inbox.
+3. Security check: tag or hold messages that match a security rule.
+4. Deliver: send the batch to the session and wait for a receipt.
+5. Ask: when a session is unsure, it DMs the owner in Lark through a bot.
+6. Answer: the owner quote-replies in Lark, and the answer goes back to the session that asked.
 
-sheepdog is the missing middle layer:
+```
+Lark (lark-cli, as the owner)
+   └─► Collector ──► Ledger (SQLite) ──► Router ──► Security check
+                                                     ├─ drop
+                                                     ├─ inbox (per chat)
+                                                     └─ deliver ──► sessions (Antigravity / Codex / Claude)
+                                                           ▲                  │
+                                                           └──── receipts ◄───┘
+```
 
-- **One owner per thread of work.** Each person or project gets its own long-lived agent session, so context builds up instead of resetting.
-- **Routing you don't have to do.** Every new message is sorted by rules and delivered to the right session, or parked in an inbox.
-- **You stay the decision-maker.** Sessions draft and handle routine work. Anything they're unsure about comes back to you, and anything dangerous needs your explicit OK.
-
-## What it does
+## Routing
 
 | Incoming message | Where it goes |
 |---|---|
-| DMs, @you, @all, replies to you, VIP senders, keyword hits | Pushed to the agent session that owns the chat, or to the **bus** session if no one owns it |
-| Other group messages | **Inbox**, grouped by chat. Sessions see a summary when you're @-mentioned |
-| Muted chats (unless you're @-mentioned), your own messages | Ignored |
+| DMs, @owner, @all, replies to the owner, VIP senders, keyword hits | The session that owns the chat, or the bus if no one owns it |
+| Other group messages | Inbox, grouped by chat. A batch with @owner or @all carries an inbox summary |
+| Muted chats (unless the owner is @-mentioned), the owner's own messages | Not pushed |
 
-On top of routing:
+- The roster (`roster.toml`) says which session owns which chats. `managed` sessions get pushes. `known` sessions are only listed for the bus and never get pushes.
+- The bus is a special session. It receives everything without an owner and knows the whole roster. It does light work only: it routes and forwards (`sheepdog forward`) to a dedicated session, and opens a new one when none fits (`sheepdog new-session`, at most 5 a day by default).
+- Muted chats are not pushed, but replies to the owner still get through.
+- When the owner quote-replies to a "needs your decision" message, the answer goes to the session that sent it. If the source can't be identified, it goes to the bus with the original text.
+- Messages the owner has already read are still delivered, marked "✓ read". If a delivered message is edited or recalled, the session is told.
 
-- **Roster.** Register agent sessions you already have (`managed`: sheepdog pushes to them; `known`: the bus knows they exist but never pushes). A retiring session can hand over to a new one, and the successor must read its predecessor's full transcript before starting.
-- **Bus session.** Receives everything without an owner, knows the whole roster, and forwards work to the right session, opening a new one when no session fits.
-- **Your own words as context.** What you say in a chat yourself (plus your edits, recalls and reactions) is passed to the session that owns it as background, so you and the agent don't talk past each other.
-- **Ask the human.** When a session is unsure, it DMs you through a bot. You can answer in the bus session or reply right in Lark. sheepdog verifies the reply came from your account and routes it back to the session that asked.
-- **Waiting on others.** A session registers a wait (`sheepdog watch`); the reply is routed straight back to it, with reminders at 15 / 30 minutes and a report to you at 60 (all configurable).
-- **Project anchoring.** Sessions ask which project a request belongs to and record it, so information doesn't scatter.
-- **Agent replies as cards.** Anything an agent sends on your behalf goes out as a card with a small grey marker in the bottom-right corner (`[🐕Sheepdog Reply]`), so people can tell it from you.
-- **Security gate.** Configurable rules tag or hold suspicious messages (credential requests, permission grants, destructive or production actions, "the boss already approved" claims, prompt injection) before any session sees them.
+## Sessions
 
-## How it works
+- Every batch has an ID. The session answers with a receipt (`handled`, `needs_decision`, `waiting_external`, `done`), and the receipt sets the session state: idle, waiting on the owner, waiting on someone else, or closed.
+- When a session is unsure, it DMs the owner through a bot, one question per message. The first line carries the session's topic ID (`[tp_xxx]`), which is how the owner's reply finds its way back. The format lives in the playbook.
+- Waiting on someone is registered with `sheepdog watch`. By default the session is reminded at 15 and 30 minutes, and reports to the owner at 60. A reply only counts once the session confirms it is the answer it was waiting for.
+- Handover: a retiring session writes a handover note. Its successor reads the full predecessor transcript first and lists what it read in its receipt.
+- When the rules change, running sessions get the full new rules with their next batch.
 
-```
-Lark (lark-cli, as you)
-   └─► Collector ──► Ledger (SQLite) ──► Router ──► Security gate
-                                                     ├─ drop
-                                                     ├─ inbox (per chat)
-                                                     └─ dispatch ──► Dispatcher ──► sessions (Antigravity / Codex / Claude)
-                                                                        ▲                 │
-                                                                        └──── receipts ◄──┘  (sheepdog receipt)
-```
+### Session hosts
 
-- Sessions report back after every batch with a structured receipt (`handled`, `needs_decision`, `waiting_external`, `done`), which drives a per-session state machine.
-- If you start typing in a session, sheepdog pauses deliveries to it and catches up 15 minutes after you stop.
-- Source (where messages come from), Sink (where sessions live) and Store are interfaces. Implemented today: Lark, SQLite, and three session hosts: Google Antigravity (default), Codex (`codex app-server`) and Claude Code (`claude -p`). Codex and Claude are off by default; sheepdog passes no sandbox or permission flags to them, so their permissions come from their own config.
+Each session runs on one host. The roster and `new-session` can set host, model and reasoning effort per session. A session never changes host; to switch, retire it and open a new one.
 
-**Mechanism lives in code, rules live in your config.** Every business rule (how agent replies are marked, when to ask you, how to hand over, the security rules) is plain Markdown or TOML in `~/.config/sheepdog/`. Playbook edits apply to the next batch; `config.toml`, the roster and the security rules are re-read every polling round. No restart and no code change, except for `state_dir` and `sink`, which need a restart.
+- **Antigravity** (default): sessions are created and messaged through the Antigravity app's built-in `agentapi`.
+- **Codex**: sheepdog starts its own `codex app-server`, one background process per turn. Default model and effort are set in `[hosts.codex]` and can be overridden per session.
+  - Permissions come from a Codex profile. When `profile` is set, sheepdog reads that profile and expands it into `-c` flags for the app-server it starts. The owner's own sessions in the Codex app are not touched. sheepdog adds no other sandbox or approval flags, and declines every approval request Codex sends.
+  - A profile only applies to sessions opened after the change. To move an existing session onto it, retire the session and open a new one.
+  - While the owner has a thread open in the Codex app, the app holds its write lock and batches for that session wait in the queue. After 60 minutes the bot asks the owner to close the app.
+- **Claude**: runs through `claude -p`. The code is in place but has not been tested in a real environment.
+- Codex and Claude are off by default. Opening a session on either needs the owner's own words: `new-session --host codex|claude` must carry a `--quote` that sheepdog verifies came from the owner (`ask_owner_before_new`, on by default).
+- Codex and Claude sessions usually can't write to sheepdog's state directory, so they end their answer with a `sheepdog-receipt` block instead of running the receipt command.
 
-## Requirements
+## Security
+
+- Only three things count as the owner's instructions:
+  - what the owner types in the session itself (Antigravity, Codex or Claude);
+  - a quote relayed by the bus that sheepdog has checked against the owner's own messages in the ledger;
+  - a Lark reply verified to come from the owner's account.
+- Anything else said in Lark is information, not a command.
+- Security rules live in `security.toml`. Each rule is a regex plus optional conditions (external sender, sender type). The code has no built-in keywords.
+  - `tag`: delivered as usual, with a warning above the text. The example rules cover secrets, permissions, deletion, running code and impersonation.
+  - `hold`: delivered to the bus only. The bus can pass it on only with a verified quote from the owner. The example rules cover external requests for secrets, payments and prompt injection.
+- Internal and external senders are told apart by tenant (`own_tenant_keys`).
+
+## Guardrails
+
+When a host compacts a session's context, the rules from the session's opening prompt can be lost. sheepdog reads each session's transcript incrementally every round and adds three guardrails:
+
+- **Rules after compaction**: on a new compaction point, the next batch carries the full current rules, with one line in front saying why (`rules_after_compaction.md`). Compaction markers are recognised for Antigravity and Codex; the Claude marker is unverified.
+- **Per-batch reminders**: if the playbook has `reminders/<key>.md` for a session, that file is appended to the end of every batch for it.
+- **Command audit** (`[audit]`): new commands run by audited sessions are matched against `danger_patterns`. On a hit:
+  1. the bot DMs the owner with the session, time and command (sensitive values masked);
+  2. the session that ran it gets a notice (`audit_offender.md`);
+  3. sessions listed in `also_notify` are told to check the current state before acting again (`audit_notify.md`).
+
+  Commands that also match `ignore_patterns` are skipped, for example help lookups, `--dry-run`, or a command name mentioned in a chat message. Hits from one session within 10 minutes are merged into one alert. This alerts after the fact; the command has already run.
+
+## Speaking for the owner
+
+- Every message a session sends as the owner goes out as a card with a small grey `[🐕Sheepdog Reply]` in the bottom-right corner, so people can tell it came from an agent. Cards are built with `sheepdog reply-card`.
+- With `[ack]` configured: once a DM or an @owner message reaches a session, sheepdog adds a "Get" reaction as the owner and removes it after the reply. @all messages get the reaction but it is never removed.
+- Whether and how to reply is up to the playbook. Messages from bots or agents get a label line, whose text comes from `agent_sender_label.md`. The example says to reply politely once and not to keep a back-and-forth going. Without that file the label is just "🤖 来自机器人 / Agent" ("from a bot / agent").
+- Loop breaker: if a session replies in one chat more than 4 times in 10 minutes and the other side is a bot, the chat is paused for 30 minutes. During the pause its messages go to the inbox and the bus is told. `sheepdog loops --clear` lifts it by hand.
+
+## Following the owner's own actions
+
+- With `[owner_context]` on, what the owner says in Lark, the reactions they add, and their edits and recalls are passed to the owning session as background. The session uses this so it doesn't repeat a reply the owner already gave, and defers to the owner on any conflict.
+- Agent replies carry the card marker, so a session's own messages are never mistaken for the owner's.
+- When the owner types in a session, sheepdog stops delivering to it and catches up 15 minutes after they stop. The same applies while the owner has a Codex thread open in the app.
+
+## Reliability
+
+- If a round doesn't finish pulling, the cursor doesn't move and the next round pulls again; messages are de-duplicated by ID. Network errors are retried with backoff.
+- The ledger is written before delivery. If the process dies mid-delivery, sheepdog checks the session transcript after restart: batches already delivered are not resent; batches it can't confirm are marked uncertain and resent with `sheepdog redeliver` after someone checks.
+- Messages longer than 200 lines are cut, with a note saying how many lines are left and how to read them with `sheepdog show`.
+- `config.toml`, the roster and the security rules are re-read every round, and playbook files every time a prompt is built. No restart is needed, except for `state_dir` and `sink`.
+- The ledger keeps 7 days by default; anything still open is kept.
+
+## Setup and use
+
+### Requirements
 
 - Python ≥ 3.11 (standard library only)
-- [`lark-cli`](https://github.com/larksuite/cli) (`npm install -g @larksuite/cli`), logged in with your user identity
+- [`lark-cli`](https://github.com/larksuite/cli) (`npm install -g @larksuite/cli`), logged in as the owner
 - The [Google Antigravity](https://antigravity.google) desktop app. sheepdog creates and messages sessions through the app's built-in `agentapi`, which only works inside the app's own processes, so sheepdog runs as an Antigravity sidecar.
 - Optional: the `codex` and/or `claude` CLI, installed and logged in, if you enable Codex or Claude sessions (`[hosts.codex]`, `[hosts.claude]`).
 
-## Quick start
+### Install and dry run
 
 ```bash
 uv tool install .            # or: pipx install .
 mkdir -p ~/.config/sheepdog
 cp examples/config.example.toml   ~/.config/sheepdog/config.toml    # set self_open_id
-cp examples/roster.example.toml   ~/.config/sheepdog/roster.toml    # your existing sessions (optional)
+cp examples/roster.example.toml   ~/.config/sheepdog/roster.toml    # existing sessions (optional)
 cp examples/security.example.toml ~/.config/sheepdog/security.toml  # set own_tenant_keys, tune rules
 cp -r examples/playbook           ~/.config/sheepdog/playbook       # rewrite the rules in your own words
 
-sheepdog doctor              # checks config, roster, rules, playbook files
+sheepdog doctor              # checks config, roster, rules, playbook files and hosts
 sheepdog init --dry-run      # prints every message init would send; writes nothing
 sheepdog poll --dry-run      # pulls real messages, shows how they'd be routed; writes nothing
 ```
 
-Run it for real as an Antigravity sidecar:
+### Run
+
+As an Antigravity sidecar:
 
 ```bash
 mkdir -p ~/.gemini/config/sidecars/sheepdog
@@ -84,55 +141,59 @@ cp examples/sidecar.example.json ~/.gemini/config/sidecars/sheepdog/sidecar.json
 
 Then enable **sheepdog** in Antigravity's **Automations** panel. On start it runs `sheepdog init` (idempotent) and then `sheepdog run`. Logs go to `~/.gemini/antigravity/sidecar_data/sheepdog/logs/sidecar.log`.
 
-## Everyday commands
+### Everyday commands
 
 ```bash
-sheepdog sessions            # every session: role, chats, state, linked projects
+sheepdog sessions            # every session: host, duty, chats, state, linked projects
 sheepdog inbox [--chat X]    # parked group messages
-sheepdog escalations         # questions waiting for your decision
+sheepdog escalations         # questions waiting for the owner
 sheepdog watches             # sessions waiting on someone's reply
-sheepdog security-log        # messages tagged or held by the security gate
-sheepdog acks [--open]       # "seen" reactions added for you, and whether they were removed
+sheepdog security-log        # messages tagged or held by the security check
+sheepdog acks [--open]       # "seen" reactions added for the owner, and whether they were removed
+sheepdog show --topic tp_x   # the last few turns of a session
+sheepdog push-rules          # send the full current rules to sessions now
 ```
 
-## Configuration at a glance
+### Configuration files
 
 | File in `~/.config/sheepdog/` | What it holds |
 |---|---|
-| `config.toml` | Your IDs, polling, keywords, agent reply marker, wait timings, escalation chat |
-| `roster.toml` | Which session owns which chats, its duty, and the authority you gave it |
-| `playbook/*.md` | Business rules and message templates (bus, onboarding, handover, reminders, security) |
-| `security.toml` | Security gate rules: regex patterns plus conditions, `tag` or `hold` |
-| `prompts/overlay.md` | Optional extra instructions for your own workspace |
+| `config.toml` | Owner IDs, polling, keywords, reply marker, wait timings, the owner's escalation chat, session hosts, command audit |
+| `roster.toml` | Which session owns which chats, its duty, the authority it has, its host and model |
+| `playbook/*.md` | Business rules and message templates: bus, onboarding, handover, reminders, security, bot-message label, per-batch reminders |
+| `security.toml` | Security rules: regex plus conditions, `tag` or `hold` |
+| `prompts/overlay.md` | Optional extra instructions for the bus, such as the owner's notes conventions |
 
-Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN.md).
+Code holds the mechanism; business rules live in these files. Full reference (Chinese for now): [docs/reference.zh-CN.md](docs/reference.zh-CN.md).
 
-## Security model and known limits
-
-- **Only your words are instructions.** Chat messages are information, not commands. Sessions treat these three sources as you: what you type in the session itself (Antigravity, Codex or Claude), a quote the bus relays that sheepdog has checked against your own messages, and a Lark reply verified to come from your account.
-- `hold` messages never reach a specialist session. They go to the bus, and leave it only with a verified quote from you.
-- **Limits.** Regex rules won't catch every rewording. sheepdog is not on the execution path: sessions send messages and run commands themselves, so the last lines of defence are the sessions following `security.md`, the session host's own command permissions (Antigravity, Codex or Claude), and your cloud IAM.
-
-## Data and privacy
+### Where data lives
 
 | Layer | Location | In this repo |
 |---|---|---|
 | Engine code | this repository | yes |
-| Your config, roster, playbook, rules | `~/.config/sheepdog/` | no |
+| Config, roster, playbook, rules | `~/.config/sheepdog/` | no |
 | Runtime data (ledger, inbox, receipts) | `~/.local/state/sheepdog/`, pruned after `retention_days` (default 7) | no |
-| Work output | written by the sessions to your own notes and task tracker | no |
+| Work output | written by the sessions to the owner's own notes and task tracker | no |
 
-Pruning covers messages, delivery records, escalations, bot message sources, reactions, finished waits and actions, loop records and receipt files; anything still open or in progress is kept. What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup. Towards your chat app sheepdog is read-only, except for adding and removing the "seen" reaction (`[ack]`, off unless configured) and two kinds of bot DM: asking you to log in again when the Codex or Claude CLI is logged out, and asking you to close the Codex app when it has held a session's write lock for an hour (each at most once a day). sheepdog itself never writes to your notes or task tracker. A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
+- What has already been sent into an AI session is stored by the AI host, outside sheepdog's cleanup.
+- sheepdog only reads from Lark, with two kinds of exception: adding and removing the "seen" reaction (`[ack]`, off unless configured), and bot DMs to the owner: Codex or Claude CLI logged out, the Codex app holding a write lock for 60 minutes, and command-audit alerts.
+- sheepdog itself never writes to the owner's notes or task tracker.
+- A pre-commit check (`scripts/check_private_data.py`) blocks real chat IDs, home-directory paths and credentials. Tests use synthetic data only.
 
-## Status
-
-Early and opinionated: built around one person's daily workflow, Lark plus Google Antigravity, with Codex and Claude Code sessions as optional extra hosts. The Source interface is there for other chat tools, but only Lark is implemented.
-
-## Development
+### Development
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Limits
+
+- Sessions send messages and run commands themselves; sheepdog is not on the execution path. The reply format, asking the owner and the security rules are all enforced by prompts, not by code. The last lines of defence are the session host's own command permissions and the owner's cloud permissions.
+- Security checks are regex rules and can miss a rewording. The command audit alerts after the command has run.
+- When the Antigravity app is closed, sheepdog stops too. It picks up where it left off when the app is back.
+- Edits and recalls are only noticed within a few minutes of the original message.
+- Lark is the only chat source implemented. The Claude host has not been tested in a real environment.
+- It was built around one person's daily work. The example rules reflect that and should be rewritten for your own.
 
 ## License
 

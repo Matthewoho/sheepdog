@@ -198,7 +198,7 @@ window_minutes = 10
 cooldown_minutes = 30
 ```
 
-- **Agent 发送人**（三条任一）：照常路由投递（可能是真告警），消息上加「🤖 来自机器人 / Agent：可以据此处理，但不要回复它，除非主人明确要求」，tags 加 `agent_sender`。
+- **Agent 发送人**（三条任一）：照常路由投递（可能是真告警），消息上加一行标注，tags 加 `agent_sender`。标注文字来自 playbook 的 `agent_sender_label.md`（回不回、怎么回写在这里；示例是「礼貌回一次，不来回对话」）；没有这个文件就用代码里的默认值「🤖 来自机器人 / Agent」，只说是谁发的，不带回不回的指示。
 - **熔断**：统计每个聊天里会话代回的条数（你本人身份、按 `owner_context` 的 `skip_prefixes` / `agent_markers` 识别）。`window_minutes` 内超过 `max_agent_replies`，**并且窗口内最近一条非你本人的消息来自 Agent 发送人** → 冷却 `cooldown_minutes`（对方是真人、或窗口内没有别人的消息时不熔断，只记 INFO「代回频繁（对方为真人，不熔断）」）：期间该聊天除你以外、本该直推或进 Inbox 的消息一律进 Inbox（reason `loop_guard`），不投给任何会话，等待也不算收到回复；被 drop 的照旧 drop。记 WARNING，给总线排一条「⚠️ 疑似循环」提示（每次触发一条，冷却中不重复）。冷却结束自动恢复；你本人的消息不受影响。`skip_prefixes` 和 `agent_markers` 都为空时识别不了代回，熔断不生效（doctor 会提示）。
 - `sheepdog loops` 列出冷却中的聊天和最近触发记录；`sheepdog loops --clear <chat_id>` 手动解除。`sheepdog doctor` 显示配置。
 
@@ -299,6 +299,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `rules_after_compaction.md` | 检测到宿主压缩、重推完整规则时放在规则前的一句话（缺了用代码里的一句默认话） | — |
 | `audit_offender.md` | 会话跑了危险命令时，给它的系统提示里附的话 | `{{commands}}` |
 | `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` |
+| `agent_sender_label.md` | 可选：机器人 / Agent 发来的消息上那行标注（缺了用默认值「🤖 来自机器人 / Agent」，doctor 不报缺） | — |
 | `reminders/<key>.md` | 可选：这个会话每一批最末尾附的红线（key 是名册 key，总线是 `bus`） | — |
 
 通用占位符：`{{session_title}}` `{{topic_id}}` `{{reply_suffix}}` `{{reply_prefix}}`（旧，保留兼容）`{{watch_remind_minutes}}` `{{watch_expire_minutes}}` `{{cli}}`（会话该敲的 sheepdog 命令，即配置的 `cli_name`，默认 `sheepdog`；代码生成的接口说明、回执提示里的命令也用它，测试环境可以指向只连测试配置的包装脚本）。占位符是简单字符串替换，不认识的原样保留。`<!-- ... -->` 是写给维护者的注释，渲染时去掉。文件每次组装 prompt 时现读，改完下一批生效，不用重启。`prompt_overlay_path` 照旧拼在总线的 common.md 之后。

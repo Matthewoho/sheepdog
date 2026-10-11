@@ -3,6 +3,8 @@
 
 import io
 import os
+import shutil
+import tempfile
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,10 +14,11 @@ from sheepdog import cli
 from sheepdog.config import LoopGuardConfig
 from sheepdog.engine import BUS_TOPIC_ID, Collector
 from sheepdog.models import Mention
-from sheepdog.prompts import AGENT_SENDER_LABEL
+from sheepdog.playbook import OPTIONAL_PLAYBOOK_FILES, PLAYBOOK_FILES, Playbook
+from sheepdog.prompts import AGENT_SENDER_LABEL, agent_sender_label
 from sheepdog.roster import Roster
 
-from test_roster import ME, Base, FakeSource, msg
+from test_roster import FIXTURES, ME, REPO, Base, FakeSource, msg
 
 PREFIX = "FX-PREFIX "
 LOOP = "oc_test_loop"
@@ -168,3 +171,54 @@ class LoopGuardTest(Base):
         self.cfg.owner_context.skip_prefixes = []
         self.poll([self.reply(f"om_test_x{i}") for i in range(8)])
         self.assertEqual(self.store.open_loop_events(), [])
+
+
+class AgentSenderLabelTest(Base):
+    """机器人 / Agent 消息上的标注从 playbook 的 agent_sender_label.md 读；没有就用中性默认值。"""
+
+    def setUp(self):
+        super().setUp()
+        self.pdir = Path(self.tmp.name) / "playbook"
+        shutil.copytree(FIXTURES, self.pdir)
+        self.cfg.playbook_dir = str(self.pdir)
+        self.d = self.disp(Roster())
+        self.d.init()
+
+    def deliver_agent_msg(self, mid):
+        Collector(self.cfg, self.store, FakeSource([[msg(message_id=mid, chat_type="p2p", chat_id="oc_test_p9",
+                                                          sender_type="app", sender_name="某机器人", content="出故障了")]]),
+                  Roster()).poll_once()
+        self.d.dispatch_once()
+        return self.sink.to("conv_test_bus")[-1]
+
+    def test_label_from_playbook_file(self):
+        (self.pdir / "agent_sender_label.md").write_text(
+            "<!-- 维护者注释 -->\nFX-AGENT-LABEL 礼貌回一次\n", encoding="utf-8")
+        text = self.deliver_agent_msg("om_test_lbl1")
+        self.assertIn("FX-AGENT-LABEL 礼貌回一次", text)
+        self.assertNotIn("维护者注释", text)
+        self.assertNotIn(AGENT_SENDER_LABEL, text.splitlines())  # 有文件就不用默认值
+
+    def test_default_label_without_file(self):
+        self.assertFalse((self.pdir / "agent_sender_label.md").exists())
+        text = self.deliver_agent_msg("om_test_lbl2")
+        self.assertIn(AGENT_SENDER_LABEL, text.splitlines())
+
+    def test_default_label_is_neutral(self):
+        self.assertEqual(AGENT_SENDER_LABEL, "🤖 来自机器人 / Agent")
+        self.assertNotIn("不要回复", AGENT_SENDER_LABEL)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(agent_sender_label(Playbook(Path(d))), AGENT_SENDER_LABEL)
+            (Path(d) / "agent_sender_label.md").write_text("<!-- 只有注释 -->\n", encoding="utf-8")
+            self.assertEqual(agent_sender_label(Playbook(Path(d))), AGENT_SENDER_LABEL)
+
+    def test_optional_not_reported_missing(self):
+        self.assertIn("agent_sender_label.md", OPTIONAL_PLAYBOOK_FILES)
+        self.assertNotIn("agent_sender_label.md", PLAYBOOK_FILES)
+        self.assertEqual(Playbook(self.pdir).missing(), [])  # fixtures 没有这个文件，也不算缺
+
+    def test_example_label(self):
+        text = agent_sender_label(Playbook(REPO / "examples" / "playbook"))
+        self.assertTrue(text.startswith("🤖 来自机器人 / Agent：礼貌回一次"), text)
+        self.assertNotIn("<!--", text)
+        self.assertNotIn("不要回复", text)
