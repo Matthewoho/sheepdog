@@ -44,6 +44,12 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "attention_notice.md": "会话进入 attention 时私聊主人的通知末尾附的话，可用 {{host}} {{reason}} {{since}} {{queued}} "
                            "{{auto_recover}}（yes / no）",
     "attention_recovered.md": "会话自动恢复时私聊主人的通知末尾附的话，可用 {{host}} {{evidence}} {{queued}}",
+    # 在岗表（7.20）：事实由代码拼，这里只放对会话、对人的说明；缺了只发事实（摘要标题缺了用代码里的一句）
+    "duty_collision.md": "撞车提醒（消息里的编号登记在别的会话名下）后面附的话，可用 {{key}} {{owner_title}} {{owner_topic}} "
+                         "{{work_state}} {{run_state}} {{action}} {{ago}}",
+    "duty_mail.md": "会话留言（sheepdog tell）后面附的话，可用 {{from_topic}} {{from_title}} {{key}}",
+    "duty_digest.md": "总线批次里在岗表摘要的标题（在岗表有变化才附），可用 {{count}}",
+    "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。

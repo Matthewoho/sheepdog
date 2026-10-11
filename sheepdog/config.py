@@ -300,6 +300,66 @@ class AuditConfig:
         return [re.compile(x) for x in self.ignore_patterns]
 
 
+# 撞车检查认编号的规则（7.20）：审批单号（12 位数字）、PR #123、Linear 单号 ABC-123。示例配置里写的也是这一份
+DEFAULT_KEY_PATTERNS = [
+    r"(?<!\d)\d{12}(?!\d)",
+    r"(?i)(?<![a-z0-9])PR\s*#\s*\d+",
+    r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}-\d+(?!\d)",
+]
+
+
+def _positive(v, integer: bool = False) -> bool:
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, int) and v > 0 if integer else isinstance(v, (int, float)) and v > 0
+
+
+@dataclass
+class DutyConfig:
+    """[duty]（7.20 在岗表）：会话卡片怎么算、撞车怎么认、留言怎么限流。热加载，下一轮生效。"""
+    # 从消息正文认编号的正则：有命名分组 key 就取它，否则取整段命中。认出的编号登记在别的会话名下、没结束 → 撞车提醒
+    key_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_KEY_PATTERNS))
+    # 批次在跑（或送出后会话没碰过）这么多分钟没有新动作 → 中断
+    stall_minutes: float = 15
+    # 批次送出后会话记录这么多分钟完全不动（文件没写过） → 失联
+    lost_minutes: float = 30
+    # 同一条命令 / 同一个工具调用连续这么多次 → 标「空转」
+    spin_repeat: int = 3
+    # 总线摘要最多几行（每个会话一行）
+    digest_max_lines: int = 15
+    # 同一对会话 mail_window_minutes 内互发超过 mail_pair_limit 条 → 暂停这一对 mail_pause_minutes 分钟，并通知总线
+    mail_pair_limit: int = 6
+    mail_window_minutes: float = 10
+    mail_pause_minutes: float = 30
+    # 多久内的压缩点在卡片上标「刚被压缩」
+    compacted_recent_minutes: float = 60
+    # 履历（回执摘要、做完的活、最近动作）、已结束的活、已读留言保留几天
+    history_days: int = 7
+
+    def validate(self) -> None:
+        v = self.key_patterns
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ConfigError("[duty] key_patterns 必须是非空字符串列表")
+        for x in v:
+            try:
+                re.compile(x)
+            except re.error as e:
+                raise ConfigError(f"[duty] key_patterns 里的 {x!r} 不是有效正则: {e}") from e
+        for k in ("stall_minutes", "lost_minutes", "mail_window_minutes", "mail_pause_minutes",
+                  "compacted_recent_minutes"):
+            if not _positive(getattr(self, k)):
+                raise ConfigError(f"[duty] {k} 必须是正数")
+        for k in ("spin_repeat", "digest_max_lines", "mail_pair_limit", "history_days"):
+            if not _positive(getattr(self, k), integer=True):
+                raise ConfigError(f"[duty] {k} 必须是正整数")
+        if self.lost_minutes < self.stall_minutes:
+            raise ConfigError("[duty] lost_minutes 不能小于 stall_minutes（先中断、后失联）")
+
+    @property
+    def patterns(self) -> list[re.Pattern]:
+        return [re.compile(x) for x in self.key_patterns]
+
+
 # Codex 配置档名：只是一个名字，拼进 ~/.codex/<名字>.config.toml，不许带路径或其他字符；
 # 也不许以「-」开头
 _PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
@@ -409,6 +469,7 @@ class Config:
     owner_context: OwnerContextConfig = field(default_factory=OwnerContextConfig)
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    duty: DutyConfig = field(default_factory=DutyConfig)
     # 会话在自己终端里敲的 sheepdog 命令（提示词里所有「去跑 sheepdog …」的命令文字都用它）。
     # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
     cli_name: str = "sheepdog"
@@ -500,6 +561,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.loop_guard, data.get("loop_guard", {}))
         _apply(cfg.source, data.get("source", {}))
         _apply(cfg.audit, data.get("audit", {}))
+        _apply(cfg.duty, data.get("duty", {}))
         hosts = data.get("hosts", {})
         if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
             raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -519,6 +581,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.owner_context.validate()
     cfg.loop_guard.validate()
     cfg.audit.validate()
+    cfg.duty.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

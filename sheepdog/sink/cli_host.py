@@ -37,6 +37,8 @@ log = logging.getLogger("sheepdog")
 RETRY_MINUTES = (5, 10, 20)
 # 登录失效后多久放一轮试试（主人可能已经重新登录）
 AUTH_RETRY_MINUTES = 30
+# 后台进程没了、既没结果也没报错（在岗表据此判「失联」，7.20）
+NO_RESULT = "进程退出，没有结果"
 _RECEIPT_RE = re.compile(r"```" + RECEIPT_FENCE + r"[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 
 # 错误分类（7.18 第 6 条）：按输出内容认
@@ -324,7 +326,7 @@ class CliHostSink:
             self.store.update_run(run["batch_id"], state="done", error=None, error_kind=None, **fields)
             self.clear_unavailable()
             return self._result(run, "done", answer=parsed.get("answer") or "", denials=denials)
-        errors = "\n".join(parsed.get("errors") or []) or err_text.strip() or "进程退出，没有结果"
+        errors = "\n".join(parsed.get("errors") or []) or err_text.strip() or NO_RESULT
         kind = parsed.get("error_kind") or classify_error(errors + "\n" + err_text)
         attempts = run["attempts"] or 1
         if kind == "capacity" and attempts <= len(RETRY_MINUTES):

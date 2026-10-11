@@ -22,6 +22,12 @@
   （2026-10-12 对着 10-11 晚上卡住的总线记录核过）
 - Codex：`{"type": "event_msg", "payload": {"type": "item_completed"}}`，时间看顶层 timestamp
 - Claude：记录格式没核实过，不认，只认晚到的回执
+
+在岗表（7.20）的「此刻动作」只取工具调用的动作说明，不读模型的思考和回答正文：
+- Antigravity：`PLANNER_RESPONSE` 里 `tool_calls[].args.toolSummary`，没有就 `toolAction`（都是 JSON 编码过的字符串，
+  先解一次），再没有就是工具名；主人亲自说话是 `USER_INPUT`（第 0 步是开场提示词，不算）
+- Codex：跑的命令（同命令审计）
+- Claude：记录格式没核实过，不认
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from .config import ANTIGRAVITY
 COMPACTION = "compaction"
 AUDIT = "audit"
 ACTIVITY = "activity"
+DUTY = "duty"
 
 AG_COMPACTION_PREFIX = "# Resuming from a compaction"
 
@@ -47,6 +54,8 @@ _NEEDLES = {
     COMPACTION: (b"CHECKPOINT", b"compaction", b"compacted", b"compact_boundary"),
     AUDIT: (b"run_command", b"CommandExecution", b"custom_tool_call", b"tool_use"),
     ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
+    DUTY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed", b"custom_tool_call", b"USER_INPUT", b"CHECKPOINT",
+           b"compaction", b"compacted", b"compact_boundary"),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
 LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
@@ -282,3 +291,63 @@ def local_hhmm(ts: str) -> str:
     if dt.tzinfo is None:
         return dt.strftime("%H:%M")
     return dt.astimezone().strftime("%H:%M")
+
+
+# ---------- 在岗表的此刻动作（7.20） ----------
+@dataclass
+class ToolAction:
+    sig: str       # 空转判定用：同一个工具、同一条命令 / 同一句说明算同一个调用
+    summary: str   # 给人看的动作说明（没截断、没脱敏）
+    at: str        # 记录里的时间（ISO）；没有就空
+
+
+def _decoded(raw) -> str:
+    return decode_command_line(raw).strip() if isinstance(raw, str) else ""
+
+
+def tool_actions(host: str, d: dict, line_offset: int) -> list[ToolAction]:
+    """一行记录里的工具调用。只看动作说明和命令，不碰 thinking / content。"""
+    out: list[ToolAction] = []
+    if host == ANTIGRAVITY:
+        if d.get("type") != "PLANNER_RESPONSE":
+            return out
+        at = str(d.get("created_at") or "")
+        for tc in d.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or "")
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            summary = _decoded(args.get("toolSummary")) or _decoded(args.get("toolAction")) or name
+            cmd = normalize(_decoded(args.get("CommandLine"))) if name == "run_command" else ""
+            if summary:
+                out.append(ToolAction(f"{name}:{cmd or summary}", summary, at))
+        return out
+    if host == "codex":
+        cmds = [c for c in commands_in(host, d, line_offset) if not c.step.endswith(":rest")]
+        return [ToolAction(c.text, c.text, c.at) for c in cmds]
+    return out
+
+
+def human_input_at(host: str, d: dict) -> datetime | None:
+    """主人在会话里亲自说话（Antigravity 的 USER_INPUT，第 0 步的开场提示词不算）；其他宿主不认，返回 None。"""
+    if host == ANTIGRAVITY and d.get("type") == "USER_INPUT" and d.get("step_index") not in (0, None):
+        return parse_ts(str(d.get("created_at") or ""))
+    return None
+
+
+def record_time(host: str, d: dict) -> datetime | None:
+    """这一行记录的时间（Antigravity 看 created_at，Codex 看 timestamp）。"""
+    return parse_ts(str(d.get("created_at") or d.get("timestamp") or ""))
+
+
+_SENTENCE_END = re.compile(r"[。！？!?\n]|\.(\s|$)")
+
+
+def one_sentence(text: str, limit: int = 80) -> str:
+    """截成一句：到第一个句号 / 问号 / 换行为止，再截到 limit 字。"""
+    text = (text or "").strip()
+    m = _SENTENCE_END.search(text)
+    if m and m.start() > 0:
+        text = text[:m.start()]
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "…"

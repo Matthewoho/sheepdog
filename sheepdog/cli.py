@@ -28,7 +28,11 @@
   sheepdog inject --text 正文 [--chat oc_x] [--sender ou_x] ...  （只在 [source] enabled = false 时）放一条合成消息进账本
   sheepdog reply-card (--text 正文 | --text-file 文件或 -)  打印代回卡片 JSON（正文 + 右下角标记）
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
-  sheepdog session-reset --topic T                       人工把 attention/failed 复位
+  sheepdog session-reset --topic T                       人工把 attention/failed 复位（同时清掉在岗表的中断 / 失联判定）
+  sheepdog work set --topic T --key K --title ... --state S [--waiting-on 谁] [--until 几点] [--expect ...] [--to 会话]
+  sheepdog work done --topic T --key K --result ...      在岗表：登记 / 收掉会话名下的活（立即写入）
+  sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
+  sheepdog board [--topic T] [--json]                    在岗表：各会话在干什么
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
 
@@ -56,9 +60,11 @@ from . import actions
 from .ack import Acker
 from .card import build_reply_card
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, load_config
-from .engine import (DYNAMIC, HOST_LABEL, RETIRED, Collector, Dispatcher, add_watch, attention_notice_key,
-                     attention_reason_label, auto_recovers, bus_quote_verifier,
-                     close_session, escalation_summary, forward_messages, open_escalations, write_receipt)
+from . import duty
+from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, RETIRED, Collector, Dispatcher, add_watch,
+                     attention_notice_key, attention_reason_label, auto_recovers, bus_quote_verifier,
+                     close_session, display_time, duty_reset_key, escalation_summary, forward_messages,
+                     open_escalations, owner_quote_verifier, write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
 from .prompts import with_cli
@@ -233,7 +239,18 @@ def cmd_doctor(args) -> int:
         print(line)
     for line in attention_report(cfg, store):
         print(line)
+    print(duty_report(cfg, store))
     return 0 if ok else 1
+
+
+def duty_report(cfg, store: Store) -> str:
+    """doctor：在岗表（7.20）的阈值和现在卡住的会话。"""
+    dc = cfg.duty
+    stuck = [c["topic_id"] for c in store.list_cards() if c["run_state"] in duty.STUCK]
+    return (f"在岗表: 中断 {dc.stall_minutes:g} 分钟 / 失联 {dc.lost_minutes:g} 分钟 / 空转 {dc.spin_repeat} 次；"
+            f"编号规则 {len(dc.key_patterns)} 条；留言同一对 {dc.mail_window_minutes:g} 分钟内超过 {dc.mail_pair_limit} 条暂停；"
+            f"履历保留 {dc.history_days} 天"
+            + (f"；⚠ 中断 / 失联：{', '.join(stuck)}" if stuck else ""))
 
 
 def guard_report(cfg, store: Store, pb: Playbook) -> list[str]:
@@ -447,7 +464,7 @@ def cmd_run(args) -> int:
                 logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
-                pruned = store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir)
+                pruned = store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir, cfg.duty.history_days)
                 last_prune = time.time()
                 if any(pruned.values()):
                     logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,
@@ -670,7 +687,7 @@ def cmd_forward(args) -> int:
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
         ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
-                               cfg.self_open_id, cfg.escalation.open_hours)
+                               cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns)
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
@@ -1094,6 +1111,13 @@ def cmd_session_reset(args) -> int:
     if not t:
         print("topic 不存在")
         return 2
+    # 在岗表（7.20）：在这之前送出、会话没碰过的批次不再算中断 / 失联，排队的信号下一轮照常投
+    store.set_meta(duty_reset_key(args.topic), now_iso())
+    card = store.get_card(args.topic)
+    if card is not None and card["run_state"] in duty.STUCK:
+        store.upsert_card(args.topic, run_state=None, detail="session-reset 清掉了中断 / 失联判定，下一轮重算",
+                          stuck_since=None)
+        print("已清掉在岗表的中断 / 失联判定")
     if not sm.can(t["state"], "reset"):
         print(f"当前状态 {t['state']} 无需复位")
         return 0
@@ -1101,6 +1125,79 @@ def cmd_session_reset(args) -> int:
                        attention_at=None, attention_reason=None)
     store.set_meta(attention_notice_key(args.topic), "")
     print("已复位为 active")
+    return 0
+
+
+# ======================= 在岗表（7.20） =======================
+def _duty_target_ok(store: Store):
+    """留言和登记活的会话：总线、名册 managed、总线新开的（没收掉的）。"""
+    def ok(tid: str) -> bool:
+        t = store.get_topic(tid)
+        return t is not None and t["state"] != sm.CLOSED and (tid == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS)
+    return ok
+
+
+def _topic_arg(x: str) -> str:
+    x = (x or "").strip()
+    return x if not x or x.startswith("tp_") else "tp_" + x
+
+
+def cmd_work(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    tid = _topic_arg(args.topic)
+    if not _duty_target_ok(store)(tid):
+        print(f"work 被拒绝: {tid} 不是在投递的会话（总线、名册 managed、总线新开的）", file=sys.stderr)
+        return 2
+    try:
+        if args.work_cmd == "set":
+            wid, others = duty.set_work(store, tid, args.key, title=args.title, state=args.state,
+                                        waiting_on=args.waiting_on, until=args.until, expect=args.expect,
+                                        to=_topic_arg(args.to), result=args.result)
+        else:
+            wid, others = duty.done_work(store, tid, args.key, args.result), []
+    except duty.DutyError as e:
+        print(f"work 被拒绝: {e}", file=sys.stderr)
+        return 2
+    w = store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone()
+    print(f"已登记（立即写入在岗表）：{tid} · {duty.work_line(w)}")
+    for o in others:
+        card = store.get_card(o["topic_id"])
+        run = duty.RUN_LABEL.get(card["run_state"], "") if card is not None and card["run_state"] else ""
+        act = (f"，最近动作「{card['action']}」{duty.ago_text(card['action_at'] or '')}"
+               if card is not None and card["action"] else "")
+        print(f"⚠ 这把钥匙{duty.topic_label(store, o['topic_id'])}也在做：{duty.WORK_LABEL.get(o['state'], o['state'])}"
+              + (f"，会话{run}" if run else "") + act + "。仍已登记；需要它配合就用 tell 跟它说，不要动手做它的活")
+    return 0
+
+
+def cmd_tell(args) -> int:
+    cfg = load_config()
+    security = _security(cfg)
+    store = Store(cfg.db_path)
+    verify = owner_quote_verifier(store, security.quote_max_age_hours, cfg.self_open_id) if args.quote else None
+    try:
+        mail_id = duty.send_mail(store, cfg, _topic_arg(args.topic), _topic_arg(args.to), args.text, args.key,
+                                 args.quote, verify, Playbook.from_config(cfg), _duty_target_ok(store))
+    except duty.DutyError as e:
+        print(f"tell 被拒绝: {e}", file=sys.stderr)
+        return 2
+    print(f"留言 #{mail_id} 已存进信箱，{_topic_arg(args.to)} 下一批收到（对方排队、离线都不丢）")
+    return 0
+
+
+def cmd_board(args) -> int:
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    cards = duty.board_cards(store, cfg, topic=args.topic, history=bool(args.topic))
+    if args.topic and not cards:
+        print(f"topic {_topic_arg(args.topic)} 不存在", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(cards, ensure_ascii=False, indent=2))
+        return 0
+    now = datetime.now().astimezone()
+    print(duty.render_board(cards, display_time(now, cfg.timezone_offset)))
     return 0
 
 
@@ -1255,6 +1352,39 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("session-reset")
     sp.add_argument("--topic", required=True)
     sp.set_defaults(func=cmd_session_reset)
+
+    sp = sub.add_parser("work", help="在岗表：登记 / 收掉会话名下的活")
+    wsub = sp.add_subparsers(dest="work_cmd", required=True)
+    w = wsub.add_parser("set")
+    w.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    w.add_argument("--key", required=True, help="钥匙：外部编号（审批单号、PR、Linear 单号）或短名")
+    w.add_argument("--title", default="", help="一句话：这件活是什么")
+    w.add_argument("--state", default=duty.DOING,
+                   help="doing | waiting_other | waiting_owner | done | handed_off（也认中文：进行中 / 等别人 / 等主人 / 已完成 / 已转交）")
+    w.add_argument("--waiting-on", default="", help="等谁")
+    w.add_argument("--until", default="", help="到几点")
+    w.add_argument("--expect", default="", help="答应交出什么（一句话）")
+    w.add_argument("--to", default="", help="转交给哪个会话（handed_off 必填）")
+    w.add_argument("--result", default="", help="结果（一句话）")
+    w.set_defaults(func=cmd_work)
+    w = wsub.add_parser("done")
+    w.add_argument("--topic", required=True)
+    w.add_argument("--key", required=True)
+    w.add_argument("--result", required=True, help="做成了什么（一句话）")
+    w.set_defaults(func=cmd_work)
+
+    sp = sub.add_parser("tell", help="在岗表：给别的会话留言")
+    sp.add_argument("--topic", "--from", dest="topic", required=True, help="你自己的会话（tp_x）")
+    sp.add_argument("--to", required=True, help="收件会话（tp_x）")
+    sp.add_argument("text", help="留言正文")
+    sp.add_argument("--key", default="", help="说的是哪件活")
+    sp.add_argument("--quote", default="", help="要转达的主人原话（核对同 forward）")
+    sp.set_defaults(func=cmd_tell)
+
+    sp = sub.add_parser("board", help="在岗表：各会话在干什么")
+    sp.add_argument("--topic", default="", help="只看这个会话（附最近回执和动作）")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_board)
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

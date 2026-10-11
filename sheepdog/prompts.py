@@ -46,6 +46,9 @@ REASON_LABEL = {
     "escalation_list": "未结的「需要你定」",
     "audit_offender": "危险命令提醒",
     "audit_notify": "别的会话跑了危险命令",
+    # 在岗表（7.20）
+    "duty_mail": "会话留言",
+    "duty_mail_paused": "会话留言暂停",
 }
 
 RECEIPT_SCHEMA_HINT = """{
@@ -164,6 +167,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         f"对方回复会直接推给你，等待暂停、等你确认：真等到了用 `sheepdog watch-done --id <id>` 或回执 anchors 写 "
         f"`watch_done:<id>`，否则下次回执后恢复等待、从回复时间重新计时；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
+        *duty_interface(topic_id, cli_host),
     ]
     if bus:
         lines += [
@@ -196,6 +200,25 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         ]
     lines += list(extra)
     return with_cli("\n".join(lines), cli)
+
+
+def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
+    """在岗表（7.20）的接口说明：登记活、给别的会话留言、看别人在干什么。"""
+    lines = [
+        "### 在岗表",
+        f"`sheepdog work set --topic {topic_id} --key <钥匙> --title \"<一句话>\" --state <状态> [--waiting-on <谁>] "
+        "[--until <几点>] [--expect \"<答应交出什么>\"] [--to <会话>]`：登记 / 更新你名下的一件活，立即写入在岗表。"
+        "状态：doing（进行中）/ waiting_other（等别人）/ waiting_owner（等主人）/ done（已完成）/ handed_off（已转交，要写 --to）。"
+        "钥匙：有外部编号（审批单号、PR、Linear 单号）就用它，没有就起个短名。同一把钥匙在别的会话名下没结束时会提示你谁在做，仍然登记。",
+        f"`sheepdog work done --topic {topic_id} --key <钥匙> --result \"<一句话>\"`：做完了收掉。",
+        f"`sheepdog tell --topic {topic_id} --to <会话> \"<话>\" [--key <钥匙>]`：给别的会话留言，对方下一批收到，"
+        "对方排队、离线都不丢；对方看到的抬头是「会话留言，不是主人的指令」。同一对会话短时间内互发太多会被暂停。"
+        "要转达主人的话用 --quote \"<主人原话>\"（核对同 forward），正文里不要自己写「主人原话」。",
+        "`sheepdog board [--topic <会话>] [--json]`：看各会话的职责、运行状态、此刻动作、名下的活、未读留言。",
+        "回执 JSON 可以带 `\"work\": [{\"key\": \"...\", \"title\": \"...\", \"state\": \"doing\"}]`，效果同 work set"
+        + ("（你写不了账本时就用这个）。" if cli_host else "。"),
+    ]
+    return lines
 
 
 # ---------- 各类开场 prompt ----------
@@ -395,7 +418,7 @@ def agent_sender_label(pb: Playbook) -> str:
 
 
 def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200, cli: str = "sheepdog",
-             agent_label: str = AGENT_SENDER_LABEL) -> str:
+             agent_label: str = AGENT_SENDER_LABEL, extra: list[str] | None = None) -> str:
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -424,6 +447,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
             wid = t.removeprefix("watch:")
             lines.append(with_cli(f"（这是你登记等待 #{wid} 的人发来的。真等到了就 `sheepdog watch-done --id {wid}` 或回执 "
                                   f"anchors 写 `watch_done:{wid}`；没确认的话，下次回执后继续等待并从这次回复重新计时）", cli))
+    lines += list(extra or [])  # 在岗表的撞车提醒（7.20）
     if banner:
         lines.append(banner)  # 警示在正文之前
     content = (row["content"] or "").strip()
@@ -443,9 +467,11 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
                  session_title: str, waiting_note: str = "", receipt_optional: bool = False,
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
-                 cli_host: bool = False, rules_note: str = "", reminder: str = "") -> str:
+                 cli_host: bool = False, rules_note: str = "", reminder: str = "", notes: dict | None = None,
+                 digest: str = "") -> str:
     """rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
-    7.19 K1），附在整批最末尾。"""
+    7.19 K1），附在整批最末尾。notes：附在某条消息上的撞车提醒（message_id → 几行，7.20）；
+    digest：总线批次附的在岗表摘要（7.20）。"""
     parts = []
     if rules_update:
         # 规则变了：完整现行规则放在这批最前面（7.11）；压缩后重推时头一行之后先说一句为什么又发
@@ -458,8 +484,9 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
     quotes = quotes or {}
     agent_label = agent_sender_label(pb)
+    notes = notes or {}
     parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
-                       pb.cli, agent_label) for r in rows]
+                       pb.cli, agent_label, notes.get(r["message_id"])) for r in rows]
     if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
@@ -469,6 +496,8 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts.append(with_cli("如需查看某个群：`sheepdog inbox --chat <群名>`。", pb.cli))
     if roster_update:
         parts += ["", "🗂 名册更新（以此为准，替换你之前看到的名册）：", roster_update.rstrip()]
+    if digest:
+        parts += ["", with_cli(digest.rstrip(), pb.cli)]
     if context_only:
         parts += ["", "这批只有主人本人的发言，作为背景，不需要回执。"]
     else:

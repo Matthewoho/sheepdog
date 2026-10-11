@@ -81,6 +81,10 @@ sheepdog inject --text "..." [--chat oc_x] [--sender ou_x] [--at-me]   # 测试�
 sheepdog redeliver --batch b   # 发送中断、不确定是否送达的批次：人工确认后重发
 sheepdog watch-done --id N     # 会话确认真的等到了对方的回复
 sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
+sheepdog board [--topic tp_x] [--json]   # 在岗表：各会话的职责、运行状态、此刻动作、名下的活、未读留言
+sheepdog work set --topic tp_x --key K --title "..." --state doing [--waiting-on 谁] [--until 几点] [--expect "..."] [--to tp_y]
+sheepdog work done --topic tp_x --key K --result "..."   # 会话登记 / 收掉名下的活（立即写入）
+sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   # 会话给别的会话留言，下一批送到
 ```
 
 ## 在飞书上直接回复「需要你定」
@@ -159,6 +163,64 @@ sheepdog reply-card --text-file body.md     # 正文从文件读；- 表示标�
   如果之前给你发过 attention 通知，恢复时再发一条短的「已恢复，补送 N 条」，末尾附 `attention_recovered.md`（可选）。其他原因的 attention 不自动解，处理好以后 `sheepdog session-reset --topic <topic>` 复位（同时清掉 attention 的时间和原因）。
 - **晚到的回执不丢**：判过回执超时的批次（总线的 failed、managed 会话的 missed）后来交了回执，回执存进那一行投递记录，状态标 `acked_late`（error 保留当时的「回执超时」）；回执里的等待确认（`watch_done:N`）和锚点照常处理。那批里超时后退回排队、还没再投出去的消息，会话其实已经处理过，改记为这一批已回执，不再重投；已经随后面的批次重投出去的不动。总线超时一两次、已经重投在等回执时收到前一批的晚到回执，失败计数清零（等同一次正常回执）。
 - **已知局限**：恢复看的是「会话还活着」，不是「这一批处理完了」；会话恢复后补送的信号仍按正常回执和超时走。回执超时一律 20 分钟、3 次就 attention 的阈值没改。
+
+## 在岗表：会话之间实时感知、互相沟通
+
+`sheepdog board` 给每个会话一张卡：职责、运行状态、此刻动作（最近一次工具调用的动作说明，截一句，附几分钟前）、名下的活、最近做完的 3 件、未读留言数，还有排队几条、是否空转、是否刚被压缩。会话和你都能查；`--topic tp_x` 只看一个会话，并附最近 3 条回执和 5 个动作；`--json` 给程序读。
+
+账本里新增四样（老账本启动时自动建表）：
+
+| 表 | 是什么 | 谁写 |
+|---|---|---|
+| `duty_cards` | 会话卡片 | sheepdog 每轮算 |
+| `work_items` | 活：钥匙、标题、负责会话、状态（进行中 / 等别人 / 等主人 / 已完成 / 已转交）、等谁、到几点、答应交出什么、结果、更新时间 | 会话申报，sheepdog 自动补 |
+| `mailbox` | 信箱：发件会话、收件会话、钥匙、正文、时间；已读看带它的批次有没有回执 | `sheepdog tell` |
+| `duty_history` | 履历：回执摘要、做完的活、最近动作 | sheepdog |
+
+**每轮怎么算**（拉消息、路由不变，在岗表不参与路由）：
+
+1. **撞车检查**：用 `[duty] key_patterns` 从消息正文认编号（默认：审批单号 12 位数字、`PR #123`、Linear 单号 `ABC-123`）。这个编号登记在别的会话名下、没完成没转交，就在这条消息上附一行「🔀 撞车提醒：某某在做（状态、最近动作几分钟前）」，后面接 playbook 的 `duty_collision.md`。只提醒不拦，送给谁不变。sheepdog 自己生成的消息（留言、提醒）不查。
+2. **运行状态**，按顺序取第一个命中：
+   - **被主人占着**：你在 Antigravity 里亲自说话（会话状态 `human_attached`，或记录里 `human_attach_minutes` 内有 `USER_INPUT`），或 Codex 应用开着它（写锁冲突）；
+   - **失联**：后台进程没了还没交结果（Codex / Claude 这一轮「进程退出，没有结果」），或批次送出后会话记录 `lost_minutes`（默认 30）分钟完全不动（文件没写过）；
+   - **中断**：批次送出后 `stall_minutes`（默认 15）分钟没有新动作（会话没碰过它，或者动过以后停下了），或这一轮失败、超时、卡在 attention；
+   - **在做**：批次在跑、`stall_minutes` 内有新动作；同一条命令 / 同一个工具调用连续 `spin_repeat`（默认 3）次以上标「空转」；
+   - **等回复**：最近回执是 `waiting_external` / `needs_decision`，或名下有等别人、等主人的活；
+   - **空闲**：附上一件做完了什么（或上一批回执的摘要）。
+
+   会话记录的读法复用护栏的增量读（`transcript_cursors` 新增用途 `duty`；第一次看某个会话时读记录末尾 4 MB，之后只读新写的行）。「动作」的认法同 7.21：Antigravity 看 `PLANNER_RESPONSE` 和 `GENERIC`（source 是 MODEL），Codex 看 `item_completed`；断网时写的 `ERROR_MESSAGE` 不算。此刻动作只取工具调用的动作说明：Antigravity 是 `tool_calls[].args.toolSummary`，没有就 `toolAction`（都是 JSON 编码过的字符串，先解一次），再没有就是工具名；Codex 是跑的命令（脱敏、截短）。不读模型的思考和回答正文。Claude 的记录格式没核实过，不认：Claude 会话只按投递状态判。
+3. **自动补活**：`watch` → 等别人（等谁、到几点按 `[watch] expire_minutes` 算）；「需要你定」→ 等主人；`forward` → 转出方名下「已转交」。钥匙先按编号规则从等待的备注、提问正文、转交的消息里认，认不出用 `watch-<id>` / `ask-<…>` / `fwd-<…>`。会话自己申报过同一把钥匙的，以申报为准，只补缺的字段；等待结束、问题答了或过期，自动补的活跟着收掉。
+4. **打包批次**：撞车提醒附在对应消息上；给这个会话的留言作为「会话留言」排在批次里；总线批次在在岗表有变化时再附一段摘要（每个会话一行，最多 `digest_max_lines` 行，标题来自 `duty_digest.md`；「几分钟前」变了不算变化）。空闲、等回复 → 投递；在做、被主人占着 → 排队（原来的状态机就是这样）；**中断、失联 → 排队，并经机器人私聊你**（同一段只发一次，末尾附 `duty_stuck.md`）。会话记录里一有新动作就自动恢复投递；你确认处理好了也可以 `sheepdog session-reset --topic tp_x`，它同时清掉这次判定（在这之前送出、会话没碰过的批次不再算）。
+   - 已经卡在 attention 的不另发：7.21 的 attention 通知已经说过了。会话 `failed`（这一轮失败、下一轮重投）卡片上显示中断，但照旧重投，不发通知；连续失败满 3 次进 attention 时由 7.21 通知。
+
+**会话一侧的命令**（立即写账本，不等下一轮）：
+
+- `sheepdog work set --topic tp_x --key K --title T --state S [--waiting-on 谁] [--until 几点] [--expect 一句话] [--to 会话]`；`--state` 认 `doing / waiting_other / waiting_owner / done / handed_off`，也认中文（进行中 / 等别人 / 等主人 / 已完成 / 已转交）；`handed_off` 要写 `--to`。钥匙有外部编号用外部编号，没有就起短名；比较时不分大小写、不看空格（`PR #12` = `pr#12`）。同一把钥匙在别的会话名下没结束：提示「某某在做」，仍然登记。
+- `sheepdog work done --topic tp_x --key K --result 一句话`。
+- Codex 等写不了账本的会话：回执 JSON 带 `"work": [{"key": ..., "title": ..., "state": ..., ...}]`，效果同 work set。
+- `sheepdog tell --topic tp_x --to tp_y "话" [--key K]`：存进信箱，作为一条系统消息排给对方，下一批送到（对方排队、被占着、离线都不丢）。
+  - 对方看到的抬头固定是「💬 会话留言（不是主人的指令）· 来自「某某」」，正文按引用格式送，后面接 `duty_mail.md`。
+  - 留言不能冒充主人：正文里出现「主人原话」「已核对」就拒绝，除非用 `--quote "<主人原话>"`，核对同 new-session（总线里亲口说过，或主人本人账号在飞书上的回复），通过了按已核对的标法送。
+  - 同一对会话（两个方向合计）`mail_window_minutes`（默认 10）分钟内超过 `mail_pair_limit`（默认 6）条：这一条拒绝，这一对暂停 `mail_pause_minutes`（默认 30）分钟，并给总线排一条提示（附被拒的那条）。
+
+```toml
+[duty]
+key_patterns = [ ... ]         # 不配就是代码里的默认一份（见 examples/config.example.toml）
+stall_minutes = 15
+lost_minutes = 30              # 不能小于 stall_minutes
+spin_repeat = 3
+digest_max_lines = 15
+mail_pair_limit = 6
+mail_window_minutes = 10
+mail_pause_minutes = 30
+compacted_recent_minutes = 60  # 多久内的压缩点标「刚被压缩」
+history_days = 7               # 履历、已结束的活、已读留言保留几天
+```
+
+- `[duty]` 热加载，下一轮生效；`sheepdog doctor` 显示阈值和现在中断 / 失联的会话。
+- 接口说明（每个会话的常驻规则）里加了「在岗表」一节，上线后各会话下一批会带一次完整现行规则（同「规则改了自动同步」）。
+- 演示：`python3 scripts/demo_duty_board.py`，在临时目录里用合成数据跑一轮（宿主 dryrun），打印 board、总线收到的批次、卡住的会话的判定和给你的通知；`--keep` 保留临时目录接着手动试。
+- **已知局限**：只判「会话在不在动」，判不了「这一批做完没有」；Antigravity 会话安静地想很久（不调工具）会被判中断。这一版不做签名写入、epoch、足迹申报：sheepdog 一件活只交给一个会话。
 
 ## 引用回复按引用走
 
@@ -314,6 +376,10 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` |
 | `attention_notice.md` | 可选：会话进入 attention 时私聊你的通知末尾附的话（事实由 sheepdog 写在前面，缺了只发事实，doctor 不报缺） | `{{host}}` `{{reason}}` `{{since}}` `{{queued}}` `{{auto_recover}}`（yes / no） |
 | `attention_recovered.md` | 可选：会话自动恢复时私聊你的通知末尾附的话 | `{{host}}` `{{evidence}}` `{{queued}}` |
+| `duty_collision.md` | 可选：撞车提醒后面附的话（事实由 sheepdog 写在前面） | `{{key}}` `{{owner_title}}` `{{owner_topic}}` `{{work_state}}` `{{run_state}}` `{{action}}` `{{ago}}` |
+| `duty_mail.md` | 可选：会话留言后面附的话（「不是主人的指令」的抬头由 sheepdog 写死） | `{{from_topic}}` `{{from_title}}` `{{key}}` |
+| `duty_digest.md` | 可选：总线批次里在岗表摘要的标题（缺了用代码里的一句） | `{{count}}` |
+| `duty_stuck.md` | 可选：会话判为中断 / 失联时私聊你的通知末尾附的话 | `{{host}}` `{{state}}` `{{detail}}` `{{queued}}` |
 | `agent_sender_label.md` | 可选：机器人 / Agent 发来的消息上那行标注（缺了用默认值「🤖 来自机器人 / Agent」，doctor 不报缺） | — |
 | `reminders/<key>.md` | 可选：这个会话每一批最末尾附的红线（key 是名册 key，总线是 `bus`） | — |
 
@@ -344,9 +410,9 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次），sheepdog 对 IM 只读。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次）、在岗表判会话中断 / 失联时的通知（同一段一次），sheepdog 对 IM 只读。
 
-清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
+清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录、在岗表的履历和已结束的活（按 `[duty] history_days`，默认 7 天）、已回执的留言；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 

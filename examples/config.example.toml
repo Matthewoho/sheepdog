@@ -127,6 +127,25 @@ ignore_patterns = [
 ]
 also_notify = []               # 比如负责发布的会话的 topic_id
 
+[duty]
+# 在岗表：会话之间实时感知、互相沟通（sheepdog board / work / tell）。改了下一轮生效
+# 从消息正文认编号的正则（有命名分组 key 就取它）：编号登记在别的会话名下、没结束 → 给消息附撞车提醒（只提醒不拦）。
+# 不配就是下面这一份：审批单号（12 位数字）、PR #123、Linear 单号 ABC-123
+key_patterns = [
+  '(?<!\d)\d{12}(?!\d)',
+  '(?i)(?<![a-z0-9])PR\s*#\s*\d+',
+  '(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}-\d+(?!\d)',
+]
+stall_minutes = 15             # 批次在跑（或送出后会话没碰过）这么久没有新动作 → 中断：排队，私聊你
+lost_minutes = 30              # 批次送出后会话记录这么久完全不动 → 失联：排队，私聊你
+spin_repeat = 3                # 同一条命令 / 同一个工具调用连续这么多次 → 标「空转」
+digest_max_lines = 15          # 总线批次里在岗表摘要最多几行（在岗表有变化才附）
+mail_pair_limit = 6            # 同一对会话 mail_window_minutes 分钟内互发超过这么多条 → 暂停这一对，并通知总线
+mail_window_minutes = 10
+mail_pause_minutes = 30
+compacted_recent_minutes = 60  # 多久内的压缩点在卡片上标「刚被压缩」
+history_days = 7               # 履历（回执摘要、做完的活、最近动作）保留几天
+
 [ack]
 # 确认表情：消息送达会话后，以你的身份在消息下点这个表情；你回复后撤下。删掉整段 = 关闭
 # 这是 sheepdog 唯一的 IM 写操作（只加 / 撤这个表情）

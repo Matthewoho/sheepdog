@@ -238,6 +238,71 @@ CREATE TABLE IF NOT EXISTS audit_hits (
     notified_at     TEXT,
     UNIQUE (conversation_id, step)
 );
+
+-- 在岗表（7.20）：会话卡片，牧羊犬每轮算出来写入。run_state 见 duty.RUN_LABEL
+CREATE TABLE IF NOT EXISTS duty_cards (
+    topic_id     TEXT PRIMARY KEY,
+    run_state    TEXT,                 -- occupied | lost | stalled | working | waiting | idle
+    spinning     INTEGER DEFAULT 0,    -- 同一条命令 / 工具调用连续 spin_repeat 次以上
+    detail       TEXT,                 -- 判定依据（一句话）
+    action       TEXT,                 -- 此刻动作：最近一次工具调用的动作说明（截一句；不读模型的思考）
+    action_at    TEXT,                 -- 此刻动作的时间
+    last_act_at  TEXT,                 -- 会话记录里最近一次动作（含没有工具调用的回答）
+    last_sig     TEXT,                 -- 空转判定：最近一次工具调用的签名
+    sig_repeat   INTEGER DEFAULT 0,
+    human_at     TEXT,                 -- 主人最近一次在会话里亲自说话（Antigravity 的 USER_INPUT）
+    compacted_at TEXT,                 -- 最近一次压缩点
+    queued       INTEGER DEFAULT 0,    -- 排队的信号数
+    stuck_since  TEXT,                 -- 中断 / 失联从几点算起
+    updated_at   TEXT
+);
+
+-- 活（7.20）：会话申报（work set / 回执的 work 字段），牧羊犬从 watch、「需要你定」、forward 自动补。
+-- 同一把钥匙可以登记在不同会话名下（撞车只提醒不拦）；同一会话同一把钥匙只有一行
+CREATE TABLE IF NOT EXISTS work_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    norm_key    TEXT NOT NULL,         -- 比较用：去空白、转大写
+    title       TEXT,
+    state       TEXT NOT NULL,         -- doing | waiting_other | waiting_owner | done | handed_off
+    waiting_on  TEXT,
+    until       TEXT,
+    expect      TEXT,                  -- 答应交出什么（一句话）
+    handed_to   TEXT,                  -- 转交给哪个会话
+    result      TEXT,
+    source      TEXT,                  -- declared（会话申报）| watch | escalation | forward
+    source_ref  TEXT,                  -- watch:N / escalation:<message_id> / forward:<message_id>
+    declared    INTEGER DEFAULT 0,     -- 会话自己申报过：自动补活只补缺的字段
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    closed_at   TEXT,
+    UNIQUE (topic_id, norm_key)
+);
+CREATE INDEX IF NOT EXISTS idx_work_key ON work_items(norm_key, closed_at);
+
+-- 信箱（7.20）：会话之间的留言。正文作为一条 sheepdog 系统消息排给收件会话（message_id），
+-- 投递、排队、离线不丢都跟着那条消息走；已读 = 带它的批次交了回执
+CREATE TABLE IF NOT EXISTS mailbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_topic  TEXT NOT NULL,
+    to_topic    TEXT NOT NULL,
+    key         TEXT,
+    body        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    message_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mail_pair ON mailbox(from_topic, to_topic, created_at);
+
+-- 履历（7.20）：回执摘要、做完的活、最近动作；保留 [duty] history_days 天
+CREATE TABLE IF NOT EXISTS duty_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id  TEXT NOT NULL,
+    kind      TEXT NOT NULL,           -- receipt | work | action
+    text      TEXT NOT NULL,
+    at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_history_topic ON duty_history(topic_id, at);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -292,6 +357,8 @@ class Store:
                 src.backup(mem.conn)
             finally:
                 src.close()
+            # backup 把内存库整个换成了老账本：新加的表（如在岗表，7.20）要再建一次，新加的列再补一次
+            mem.conn.executescript(SCHEMA)
             mem._migrate()
         return mem
 
@@ -850,6 +917,112 @@ class Store:
         with self.tx() as c:
             c.executemany("UPDATE audit_hits SET notified_at=? WHERE id=?", [(ts, i) for i in ids])
 
+
+    # ---------- 在岗表（7.20） ----------
+    def get_card(self, topic_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (topic_id,)).fetchone()
+
+    def list_cards(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM duty_cards").fetchall()
+
+    def upsert_card(self, topic_id: str, **fields) -> None:
+        fields["updated_at"] = now_iso()
+        cols = ["topic_id", *fields]
+        sets = ", ".join(f"{k}=excluded.{k}" for k in fields)
+        with self.tx() as c:
+            c.execute(f"INSERT INTO duty_cards({','.join(cols)}) VALUES({','.join('?' * len(cols))}) "
+                      f"ON CONFLICT(topic_id) DO UPDATE SET {sets}", (topic_id, *fields.values()))
+
+    def get_work(self, topic_id: str, norm_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM work_items WHERE topic_id=? AND norm_key=?",
+                                 (topic_id, norm_key)).fetchone()
+
+    def work_by_ref(self, source_ref: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM work_items WHERE source_ref=? ORDER BY id DESC LIMIT 1",
+                                 (source_ref,)).fetchone()
+
+    def add_work(self, topic_id: str, key: str, norm_key: str, state: str, source: str, declared: bool,
+                 **fields) -> int:
+        ts = now_iso()
+        cols = ["topic_id", "key", "norm_key", "state", "source", "declared", "created_at", "updated_at", *fields]
+        vals = [topic_id, key, norm_key, state, source, int(declared), ts, ts, *fields.values()]
+        with self.tx() as c:
+            cur = c.execute(f"INSERT INTO work_items({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals)
+            return int(cur.lastrowid)
+
+    def update_work(self, work_id: int, **fields) -> None:
+        fields["updated_at"] = now_iso()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as c:
+            c.execute(f"UPDATE work_items SET {cols} WHERE id=?", (*fields.values(), work_id))
+
+    def open_work(self, topic_id: str | None = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM work_items WHERE closed_at IS NULL", []
+        if topic_id:
+            sql += " AND topic_id=?"
+            args.append(topic_id)
+        return self.conn.execute(sql + " ORDER BY updated_at DESC, id DESC", args).fetchall()
+
+    def open_work_by_key(self, norm_key: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM work_items WHERE norm_key=? AND closed_at IS NULL ORDER BY id",
+                                 (norm_key,)).fetchall()
+
+    def open_auto_work(self, source: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM work_items WHERE source=? AND closed_at IS NULL ORDER BY id",
+                                 (source,)).fetchall()
+
+    def closed_work(self, topic_id: str, limit: int = 3) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM work_items WHERE topic_id=? AND closed_at IS NOT NULL "
+                                 "ORDER BY closed_at DESC, id DESC LIMIT ?", (topic_id, limit)).fetchall()
+
+    def add_mail(self, from_topic: str, to_topic: str, key: str, body: str) -> int:
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO mailbox(from_topic,to_topic,key,body,created_at) VALUES(?,?,?,?,?)",
+                            (from_topic, to_topic, key or None, body, now_iso()))
+            return int(cur.lastrowid)
+
+    def set_mail_message(self, mail_id: int, message_id: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE mailbox SET message_id=? WHERE id=?", (message_id, mail_id))
+
+    def get_mail(self, mail_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT b.*, m.dispatch_state, m.batch_id FROM mailbox b LEFT JOIN messages m ON m.message_id = b.message_id
+               WHERE b.id=?""", (mail_id,)).fetchone()
+
+    def mails_between(self, a: str, b: str, since_iso: str) -> int:
+        """since 之后 a、b 之间（两个方向）的留言条数。"""
+        return self.conn.execute(
+            """SELECT COUNT(*) FROM mailbox WHERE created_at >= ?
+               AND ((from_topic=? AND to_topic=?) OR (from_topic=? AND to_topic=?))""",
+            (since_iso, a, b, b, a)).fetchone()[0]
+
+    def unread_mail(self, to_topic: str) -> list[sqlite3.Row]:
+        """给这个会话、还没被回执确认的留言（没送出去的、送出去还没回执的）。"""
+        return self.conn.execute(
+            """SELECT b.*, m.dispatch_state FROM mailbox b LEFT JOIN messages m ON m.message_id = b.message_id
+               WHERE b.to_topic=? AND (m.dispatch_state IS NULL OR m.dispatch_state != 'acked') ORDER BY b.id""",
+            (to_topic,)).fetchall()
+
+    def add_history(self, topic_id: str, kind: str, text: str, at: str = "") -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO duty_history(topic_id,kind,text,at) VALUES(?,?,?,?)",
+                      (topic_id, kind, text, at or now_iso()))
+
+    def history(self, topic_id: str, kind: str, limit: int = 5) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM duty_history WHERE topic_id=? AND kind=? ORDER BY id DESC LIMIT ?",
+                                 (topic_id, kind, limit)).fetchall()
+
+    def recent_dispatches(self, topic_id: str, limit: int = 30) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC LIMIT ?",
+                                 (topic_id, limit)).fetchall()
+
+    def person_name(self, person_id: str) -> str:
+        """账本里这个人最近一次发言用的名字；没有就是空串。"""
+        r = self.conn.execute("SELECT sender_name FROM messages WHERE sender_id=? AND sender_name != '' "
+                              "ORDER BY create_time DESC LIMIT 1", (person_id,)).fetchone()
+        return r[0] if r else ""
+
     # ---------- 保留期清理 ----------
     # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
     PRUNE_SQL = {
@@ -869,15 +1042,28 @@ class Store:
         "audit_hits": "DELETE FROM audit_hits WHERE notified_at IS NOT NULL AND notified_at < ?",
     }
 
+    # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删
+    PRUNE_DUTY_SQL = {
+        "duty_history": "DELETE FROM duty_history WHERE at < ?",
+        "work_items": "DELETE FROM work_items WHERE closed_at IS NOT NULL AND closed_at < ?",
+        "mailbox": """DELETE FROM mailbox WHERE created_at < ? AND (message_id IS NULL OR message_id NOT IN
+                      (SELECT message_id FROM messages WHERE dispatch_state IN ('pending','sending','delivered','uncertain')))""",
+    }
+
     def prune(self, retention_days: int, receipts_dir: Path | None = None,
-              runs_dir: Path | None = None) -> dict[str, int]:
-        """清理超过 retention_days 的记录与回执文件；返回每类删了多少。"""
+              runs_dir: Path | None = None, history_days: int | None = None) -> dict[str, int]:
+        """清理超过 retention_days 的记录与回执文件、超过 history_days（默认同 retention_days）的在岗表履历；
+        返回每类删了多少。"""
         now = datetime.now().astimezone()
         cutoff = (now - timedelta(days=retention_days)).isoformat(timespec="seconds")
+        hcut = (now - timedelta(days=history_days if history_days is not None else retention_days)
+                ).isoformat(timespec="seconds")
         out: dict[str, int] = {}
         with self.tx() as c:
             for table, sql in self.PRUNE_SQL.items():
                 out[table] = c.execute(sql, (cutoff,)).rowcount
+            for table, sql in self.PRUNE_DUTY_SQL.items():
+                out[table] = c.execute(sql, (hcut,)).rowcount
         if receipts_dir is not None and receipts_dir.exists():
             keep = {r[0] for r in self.conn.execute(
                 "SELECT pending_batch_id FROM topics WHERE pending_batch_id IS NOT NULL")}

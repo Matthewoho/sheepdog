@@ -10,10 +10,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import session as sm
-from .config import ANTIGRAVITY, Config
+from .config import ANTIGRAVITY, Config, DutyConfig
 from .models import Message
-from .guard import (ACTIVITY, AUDIT, COMPACTION, activity_at, commands_in, first_match, is_compaction,
-                    last_activity_at, local_hhmm, redact, scan_jsonl)
+from . import duty
+from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
+                    human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
+                    scan_jsonl, tool_actions)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
                       batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
@@ -25,8 +27,8 @@ from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, me
 from .sink import RunResult, Sink, SinkError
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
-from .sink.cli_host import RECEIPT_FENCE, extract_receipt
-from .store import SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
+from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
+from .store import SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
 
 log = logging.getLogger("sheepdog")
 
@@ -114,6 +116,20 @@ ATTENTION_REASONS = {
 }
 AUTO_RECOVER_REASONS = {ATTN_RECEIPT_TIMEOUT}
 
+# 在岗表（7.20）
+DIGEST_META = "duty_digest_fp"           # 上一次附给总线的摘要指纹：变了才再附
+DEFAULT_DIGEST_TITLE = "📋 在岗表摘要（有变化才附，每个会话一行）："
+
+
+def duty_reset_key(topic_id: str) -> str:
+    """meta 键：session-reset 的时间。在这之前送出、会话没碰过的批次不再算中断 / 失联。"""
+    return f"duty_reset:{topic_id}"
+
+
+def duty_notice_key(topic_id: str) -> str:
+    """meta 键：上一次「中断 / 失联」通知的是哪一段（状态@起点），同一段只通知一次。"""
+    return f"duty_notice:{topic_id}"
+
 
 def attention_reason_label(reason: str | None) -> str:
     return ATTENTION_REASONS.get(reason or "", reason or "原因没记录（老账本）")
@@ -128,18 +144,28 @@ def attention_notice_key(topic_id: str) -> str:
     return f"attention_notice:{topic_id}"
 
 
-def display_time(dt: datetime | None, offset: str = "+08:00") -> str:
-    """给人看的时间：换到配置的时区（timezone_offset），+08:00 标「北京时间」。"""
-    if dt is None:
-        return ""
+def _tz(offset: str) -> tuple[timezone, str]:
+    """配置的时区（timezone_offset）和它的叫法：+08:00 叫「北京时间」。"""
     try:
         sign = -1 if offset.startswith("-") else 1
         hh, _, mm = offset.lstrip("+-").partition(":")
         tz = timezone(sign * timedelta(hours=int(hh), minutes=int(mm or 0)))
     except ValueError:
         tz, offset = timezone(timedelta(hours=8)), "+08:00"
-    label = "北京时间" if offset == "+08:00" else f"UTC{offset}"
+    return tz, ("北京时间" if offset == "+08:00" else f"UTC{offset}")
+
+
+def display_time(dt: datetime | None, offset: str = "+08:00") -> str:
+    """给人看的时间：换到配置的时区（timezone_offset），+08:00 标「北京时间」。"""
+    if dt is None:
+        return ""
+    tz, label = _tz(offset)
     return f"{dt.astimezone(tz).strftime('%m-%d %H:%M')}（{label}）"
+
+
+def clock(dt: datetime | None, offset: str = "+08:00") -> str:
+    """HH:MM（配置的时区），在岗表里一行写得下。"""
+    return dt.astimezone(_tz(offset)[0]).strftime("%H:%M") if dt is not None else "-"
 
 
 def _now() -> datetime:
@@ -151,6 +177,8 @@ def _parse(ts: str) -> datetime | None:
         return datetime.fromisoformat(ts) if ts else None
     except ValueError:
         return None
+
+
 
 
 # ======================= 聊天归属 =======================
@@ -950,6 +978,7 @@ class Dispatcher:
             if anchors := self._receipt_anchors(t, receipt):
                 fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
+            self._receipt_duty(t["topic_id"], batch, receipt)
             log.info("回执 %s/%s: %s -> %s", t["topic_id"], batch, status, new_state)
             if t["kind"] == DYNAMIC and new_state == sm.CLOSED:
                 self._dynamic_closed(t["topic_id"], "回执 done")
@@ -1156,6 +1185,7 @@ class Dispatcher:
             if new := self._receipt_anchors(t, receipt):
                 self.store.update_topic(t["topic_id"], anchors_json=new)
                 t = self.store.get_topic(t["topic_id"])
+            self._receipt_duty(t["topic_id"], d["batch_id"], receipt)
             log.info("回执晚到 %s/%s: %s（判超时以后才到；其中 %d 条消息不再重投）", t["topic_id"], d["batch_id"],
                      receipt.get("status", "-"), n)
             out.append((d["batch_id"], receipt))
@@ -1362,6 +1392,14 @@ class Dispatcher:
             log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
             res["waiting_spawn"] = True
             return res
+        card = self.store.get_card(t["topic_id"])
+        if card is not None and card["run_state"] in duty.STUCK and t["state"] != sm.FAILED:
+            # 在岗表判为中断 / 失联（7.20 第 6 步）：排队，主人那边已经通知；会话记录一有新动作就恢复投递。
+            # failed 照旧重投（重投本身就是在试它还活着没有，连续失败由 7.21 的 attention 接手）
+            why = f"在岗表判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
+            log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))
+            res["queued"] = why
+            return res
         busy = self._busy(t) if t["conversation_id"] else ""
         if busy:
             # 命令行宿主（7.18）：宿主不可用 / 会话还在跑上一轮 / 并发已满 → 排队，下一轮再看
@@ -1392,13 +1430,16 @@ class Dispatcher:
             # 7.15：有引用的消息都附「↪ 回复的是」（从账本取被引用的那条）
             quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"]))
                       for r in rows if "reply_to" in r.keys() and r["reply_to"]}
+            # 在岗表（7.20）：消息里的编号登记在别的会话名下 → 附撞车提醒；总线批次在在岗表变化时附摘要
+            notes = self._collision_notes(t, rows)
+            digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
                                   rules_note=self._compaction_note(t) if rules_update else "",
-                                  reminder=self.reminder(t))
+                                  reminder=self.reminder(t), notes=notes, digest=digest)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -1412,6 +1453,8 @@ class Dispatcher:
         self.store.set_dispatch_state(batch_id, "sent")
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
+        if digest_fp:
+            self.store.set_meta(DIGEST_META, digest_fp)
         if rules_update:
             self.store.update_topic(t["topic_id"], rules_hash=new_hash, compacted_at=None)
             log.info("topic %s: 规则已更新，随批次 %s 送达%s", t["topic_id"], batch_id,
@@ -1677,16 +1720,17 @@ class Dispatcher:
         return path
 
     def _read_from_start(self, topic_id: str, conversation_id: str) -> None:
-        """sheepdog 自己刚建的会话：两种用途都从头读（第一轮跑的命令也要审）。记录文件还没有，路径先空着。"""
+        """sheepdog 自己刚建的会话：各种用途都从头读（第一轮跑的命令也要审）。记录文件还没有，路径先空着。"""
         if not topic_id or not conversation_id:
             return
-        for purpose in (COMPACTION, AUDIT):
+        for purpose in (COMPACTION, AUDIT, DUTY):
             self.store.set_cursor(topic_id, purpose, conversation_id, "", 0)
 
-    def _follow(self, t, purpose: str, handle) -> None:
+    def _follow(self, t, purpose: str, handle, backfill: int = 0) -> None:
         """增量读一个会话的记录：每个会话、每种用途记一个偏移，只读新写的完整行。
 
         - 没有偏移，或者偏移记的是别的会话编号（名册改指了一个已有的会话）：从现在的末尾开始，不翻旧账；
+          backfill > 0 时（在岗表要知道此刻动作）先读末尾 backfill 字节，从其中第一个完整行起；
         - sheepdog 自己建的会话（_read_from_start）、记录文件换了、文件变短了：从头读。
         """
         path = self._record_file(t)
@@ -1699,7 +1743,18 @@ class Dispatcher:
         tid, cid = t["topic_id"], t["conversation_id"]
         cur = self.store.get_cursor(tid, purpose)
         if cur is None or cur["conversation_id"] != cid:
-            self.store.set_cursor(tid, purpose, cid, str(path), size)
+            start = max(0, size - backfill) if backfill else size
+            if 0 < start < size:
+                try:
+                    with path.open("rb") as f:  # 从中间开始读：跳到下一个完整行的行首
+                        f.seek(start)
+                        start += len(f.readline())
+                except OSError:
+                    start = size
+            if start >= size:
+                self.store.set_cursor(tid, purpose, cid, str(path), size)
+                return
+            self.store.set_cursor(tid, purpose, cid, str(path), scan_jsonl(path, start, purpose, handle))
             return
         offset = cur["byte_offset"] or 0
         if cur["path"] != str(path) or size < offset:
@@ -1819,6 +1874,301 @@ class Dispatcher:
         t = self.store.get_topic(topic_id)
         return t is not None and t["state"] != sm.CLOSED and (topic_id == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS)
 
+    # ---------- 在岗表（7.20） ----------
+    def _duty_round(self, tids: list[str], autofill: bool = True) -> None:
+        """第 5 步自动补活、第 4 步算各会话的运行状态并写进卡片；中断、失联的私聊主人。出错不挡投递。"""
+        if autofill:
+            try:
+                self._autofill_work()
+            except Exception as e:
+                log.warning("在岗表自动补活出错: %s", e)
+        for tid in tids:
+            t = self.store.get_topic(tid)
+            if t is None or t["state"] == sm.CLOSED:
+                continue
+            try:
+                self._duty_scan(t)
+                state, detail, since, notify = self._duty_state(t)
+                card = self.store.get_card(tid)
+                spinning = state == duty.WORKING and card is not None and \
+                    (card["sig_repeat"] or 0) >= self.cfg.duty.spin_repeat
+                self.store.upsert_card(tid, run_state=state, detail=detail, stuck_since=since or None,
+                                       spinning=int(spinning), queued=self.store.count_pending_signals(tid))
+                if notify:
+                    self._duty_notice(self.store.get_topic(tid), state, detail, since)
+            except Exception as e:
+                log.warning("算会话 %s 的在岗表卡片出错: %s", tid, e)
+
+    def _duty_scan(self, t) -> None:
+        """增量读会话记录（复用护栏的 _follow，用途 duty）：此刻动作、最近一次动作、空转计数、主人发言、压缩点。
+        此刻动作只取工具调用的动作说明（Antigravity 的 toolSummary / toolAction，Codex 的命令），不读模型的思考。"""
+        host = self.topic_host(t)
+        if host not in (ANTIGRAVITY, "codex") or not t["conversation_id"]:
+            return
+        card = self.store.get_card(t["topic_id"])
+        c = dict(card) if card is not None else {}
+        state = {"sig": c.get("last_sig"), "rep": c.get("sig_repeat") or 0,
+                 "act": _parse(c.get("last_act_at") or ""), "upd": {}}
+
+        def iso(dt: datetime) -> str:
+            return dt.astimezone().isoformat(timespec="seconds")
+
+        def handle(off: int, d: dict) -> None:
+            upd = state["upd"]
+            at = activity_at(host, d)
+            for a in tool_actions(host, d, off):
+                state["rep"] = state["rep"] + 1 if a.sig == state["sig"] else 1
+                state["sig"] = a.sig
+                when = parse_ts(a.at) or at
+                text = one_sentence(a.summary) if host == ANTIGRAVITY else redact(a.summary, 80)
+                upd.update(action=text, action_at=iso(when) if when else now_iso())
+                if when is not None and (at is None or when > at):
+                    at = when
+            if at is not None and (state["act"] is None or at > state["act"]):
+                state["act"] = at
+            if (h := human_input_at(host, d)) is not None:
+                upd["human_at"] = iso(h)
+            if is_compaction(host, d):
+                upd["compacted_at"] = iso(record_time(host, d) or _now())
+
+        self._follow(t, DUTY, handle, backfill=LAST_ACTIVITY_TAIL)
+        upd = state["upd"]
+        if state["act"] is not None:
+            upd["last_act_at"] = iso(state["act"])
+        if state["sig"] != c.get("last_sig") or state["rep"] != (c.get("sig_repeat") or 0):
+            upd.update(last_sig=state["sig"], sig_repeat=state["rep"])
+        if upd:
+            self.store.upsert_card(t["topic_id"], **upd)
+            if upd.get("action") and upd["action"] != c.get("action"):
+                self.store.add_history(t["topic_id"], "action", upd["action"], upd.get("action_at", ""))
+
+    def _unanswered_since(self, t, last_act: datetime | None) -> datetime | None:
+        """会话还没碰过的批次里最早送出的时间：在跑的这一批，以及回执超时、之后会话记录里再没动作的批次。
+        session-reset 之前送出的不算；只看 24 小时内。"""
+        floor = [x for x in (last_act, _parse(self.store.get_meta(duty_reset_key(t["topic_id"])))) if x is not None]
+        floor_dt = max(floor) if floor else None
+        now, out = _now(), None
+        for d in self.store.recent_dispatches(t["topic_id"]):
+            if d["state"] not in ("sent", "missed", "failed"):
+                continue
+            if d["state"] == "failed" and not (d["error"] or "").startswith(RECEIPT_TIMEOUT):
+                continue  # 根本没送到（发送失败）的不算会话没碰
+            sent = _parse(d["sent_at"])
+            if sent is None or sent.tzinfo is None or now - sent > timedelta(hours=24):
+                continue
+            if floor_dt is not None and sent <= floor_dt:
+                continue
+            out = sent if out is None or sent < out else out
+        return out
+
+    def _duty_state(self, t) -> tuple[str, str, str, bool]:
+        """运行状态，按顺序取第一个命中：被主人占着 → 失联 → 中断 → 在做 → 等回复 → 空闲。
+        返回 (状态, 判定依据, 中断 / 失联从几点算起, 要不要通知主人)。阈值在 [duty]。"""
+        tid, host, now = t["topic_id"], self.topic_host(t), _now()
+        dc, tz = self.cfg.duty, self.cfg.timezone_offset
+        label = HOST_LABEL.get(host, host)
+        card = self.store.get_card(tid)
+        c = dict(card) if card is not None else {}
+        last_act = _parse(c.get("last_act_at") or "")
+
+        def hm(dt: datetime | None) -> str:
+            return clock(dt, tz)
+
+        def mins(delta: timedelta) -> int:
+            return int(delta.total_seconds() // 60)
+
+        # 1. 被主人占着：主人在 Antigravity 里亲自说话，或 Codex 应用开着它（写锁冲突）
+        if t["state"] == sm.HUMAN_ATTACHED:
+            return duty.OCCUPIED, "主人在会话里亲自说话，暂停投递", "", False
+        human = _parse(c.get("human_at") or "")
+        if human is not None and now - human < timedelta(minutes=self.cfg.session.human_attach_minutes):
+            return duty.OCCUPIED, f"主人 {hm(human)} 在会话里说过话", "", False
+        sink = self.sinks.get(host)
+        lock = getattr(sink, "lock_streak_since", None)
+        if lock is not None and t["conversation_id"] and (since := lock(t["conversation_id"])) is not None:
+            return duty.OCCUPIED, f"{label} 应用开着它（{hm(since)} 起写锁冲突）", "", False
+        # 2. 失联：后台进程没了还没交结果
+        if host != ANTIGRAVITY and t["state"] in (sm.FAILED, sm.ATTENTION):
+            run = self.store.latest_run_for_topic(tid)
+            if run is not None and run["state"] == "failed" and (run["error"] or "").startswith(NO_RESULT):
+                return duty.LOST, f"后台进程没了，没交结果（{hm(_parse(run['ended_at'] or ''))}）", \
+                    run["ended_at"] or "", False
+        # 2、3. 看会话记录：批次送出后完全不动 → 失联；批次在跑但没有新动作 → 中断
+        path = self._record_file(t) if host in (ANTIGRAVITY, "codex") else None
+        mtime = None
+        if path is not None:
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+            except OSError:
+                path = None
+        if path is not None:
+            # since：会话没碰过的批次里最早送出的；或者批次在跑、会话动过以后停下来的那一刻
+            since, untouched = self._unanswered_since(t, last_act), True
+            if since is None and t["state"] == sm.RUNNING and last_act is not None \
+                    and now - last_act >= timedelta(minutes=dc.stall_minutes):
+                since, untouched = last_act, False
+            if since is not None:
+                head = f"批次 {hm(since)} 送出后" if untouched else f"批次在跑，最近动作 {hm(since)}，之后"
+                quiet = now - max(mtime, since)
+                if quiet >= timedelta(minutes=dc.lost_minutes):
+                    return duty.LOST, f"{head}会话记录 {mins(quiet)} 分钟完全不动", since.isoformat(), True
+                if now - since >= timedelta(minutes=dc.stall_minutes):
+                    return duty.STALLED, f"{head} {mins(now - since)} 分钟没有新动作", since.isoformat(), True
+        # 3. 中断：这一轮跑失败、超时被杀（连续失败由 7.21 的 attention 通知主人，这里不重复发）
+        if t["state"] == sm.ATTENTION:
+            return duty.STALLED, f"卡在 attention：{attention_reason_label(t['attention_reason'])}", \
+                t["attention_at"] or "", False
+        if t["state"] == sm.FAILED:
+            return duty.STALLED, f"这一轮失败（累计 {t['retries'] or 0} 次），下一轮重投", "", False
+        # 4. 在做：批次在跑
+        run_active = getattr(sink, "run_active", None)
+        if t["state"] == sm.RUNNING or (run_active is not None and t["pending_batch_id"]
+                                        and run_active(t["pending_batch_id"])):
+            sent = _parse(t["dispatched_at"] or "")
+            return duty.WORKING, f"批次 {t['pending_batch_id'] or '-'} {hm(sent)} 送出", "", False
+        # 5. 等回复：最近回执说在等，或名下有等待中的活
+        if t["state"] in (sm.BLOCKED, sm.WAITING_HUMAN):
+            what = "等别人" if t["state"] == sm.BLOCKED else "等主人拍板"
+            return duty.WAITING, f"最近回执：{what}" + (f"（{duty.short(t['summary'], 40)}）" if t["summary"] else ""), \
+                "", False
+        waiting = [w for w in self.store.open_work(tid) if w["state"] in duty.WAITING_WORK]
+        if waiting:
+            w = waiting[0]
+            who = w["waiting_on"] or duty.WORK_LABEL[w["state"]]
+            return duty.WAITING, f"{w['key']} 等 {who}" + (f"，到 {w['until']}" if w["until"] else "") \
+                + (f"（另有 {len(waiting) - 1} 件在等）" if len(waiting) > 1 else ""), "", False
+        # 6. 空闲：附上一件做完了什么
+        done = self.store.closed_work(tid, 1)
+        if done:
+            return duty.IDLE, f"上一件：{duty.work_line(done[0])}", "", False
+        r = self.store.last_receipt(tid)
+        if r is not None:
+            try:
+                summary = json.loads(r["receipt"]).get("summary") or ""
+            except (json.JSONDecodeError, AttributeError):
+                summary = ""
+            if summary:
+                return duty.IDLE, f"上一批回执：{duty.short(summary, 60)}", "", False
+        return duty.IDLE, "", "", False
+
+    def _duty_notice(self, t, state: str, detail: str, since: str) -> None:
+        """会话判为中断 / 失联（看会话记录判的）：经机器人私聊主人，同一段只发一次（复用 7.21 的告知通道）。
+        已经卡在 attention 的不发：7.21 已经通知过。事实在这里拼，对人的说明在 playbook 的 duty_stuck.md。"""
+        tid = t["topic_id"]
+        if t["state"] == sm.ATTENTION:
+            return
+        mark = f"{state}@{since}"
+        key = duty_notice_key(tid)
+        if self.store.get_meta(key) == mark:
+            return
+        host = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
+        title = self._session_title(t) or tid
+        label = duty.RUN_LABEL[state]
+        card = self.store.get_card(tid)
+        queued = self.store.count_pending_signals(tid)
+        action = ""
+        if card is not None and card["action"]:
+            action = f"最近一次工具调用「{card['action']}」（{display_time(_parse(card['action_at'] or ''), self.cfg.timezone_offset)}）。"
+        lines = [f"🐕 汇报 · 会话{label}了 [{BUS_TOPIC_ID}]",
+                 f"「{title}」（topic `{tid}`，{host}）判为{label}：{detail}。" + action,
+                 f"排着 {queued} 条信号，暂不投递。会话记录里一有新动作就自动恢复投递；确认处理好了也可以用 "
+                 f"`sheepdog session-reset --topic {tid}` 清掉这次判定。"]
+        why = self.playbook.render("duty_stuck.md", session_title=title, topic_id=tid, host=host, state=label,
+                                   detail=detail, queued=str(queued))
+        if why:
+            lines.append(why)
+        log.warning("会话 %s 判为%s：%s（%d 条信号排队）", tid, label, detail, queued)
+        if self._notify_owner("\n".join(lines), "在岗表通知"):
+            self.store.set_meta(key, mark)
+
+    def _autofill_work(self) -> None:
+        """第 5 步：watch → 等别人；「需要你定」→ 等主人（forward → 已转交在 forward_messages 里当场补）。
+        会话自己申报过同一把钥匙的以申报为准，只补缺的字段；来源结束了，自动补的活跟着收掉。"""
+        pats = self.cfg.duty.patterns
+        expire = self.cfg.watch.expire_minutes
+        for w in self.store.open_watches():
+            who = self.store.person_name(w["person_id"]) or w["person_id"]
+            started = _parse(w["last_reply_at"] or "") or _parse(w["started_at"] or "")
+            until = clock(started + timedelta(minutes=expire), self.cfg.timezone_offset) if started else ""
+            key = duty.key_for(w["note"] or "", pats, f"watch-{w['id']}")
+            duty.auto_work(self.store, w["topic_id"], key, f"watch:{w['id']}", duty.SRC_WATCH, duty.WAITING_OTHER,
+                           title=duty.short(w["note"] or "", 40) or f"等 {who} 回复", waiting_on=who, until=until)
+
+        def watch_closed(ref: str) -> str | None:
+            wid = ref.removeprefix("watch:")
+            w = self.store.get_watch(int(wid)) if wid.isdigit() else None
+            if w is None:
+                return "等待记录已清理"
+            return f"等待结束（{w['close_reason']}）" if w["closed_at"] else None
+
+        duty.close_auto_work(self.store, duty.SRC_WATCH, watch_closed)
+        for e in open_escalations(self.store, self.cfg.escalation.open_hours):
+            key = duty.key_for(e["text"] or "", pats, f"ask-{e['message_id'][-8:]}")
+            duty.auto_work(self.store, e["topic_id"], key, f"escalation:{e['message_id']}", duty.SRC_ESCALATION,
+                           duty.WAITING_OWNER, title=escalation_summary(e, 40), waiting_on=duty.OWNER_NAME_FIELD)
+        live = {e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)}
+
+        def escalation_closed(ref: str) -> str | None:
+            mid = ref.removeprefix("escalation:")
+            if mid in live:
+                return None
+            e = self.store.get_escalation(mid)
+            return "主人已答" if e is not None and e["answered_at"] else "「需要你定」已过期"
+
+        duty.close_auto_work(self.store, duty.SRC_ESCALATION, escalation_closed)
+
+    def _receipt_duty(self, topic_id: str, batch_id: str, receipt: dict) -> None:
+        """回执进在岗表：work 字段同 work set；回执摘要记进履历。"""
+        try:
+            duty.apply_receipt_work(self.store, topic_id, receipt, log)
+            summary = receipt.get("summary") if isinstance(receipt, dict) else ""
+            self.store.add_history(topic_id, "receipt",
+                                   f"{batch_id} {receipt.get('status', 'handled')}：{duty.short(summary or '', 80)}")
+        except Exception as e:
+            log.warning("回执 %s/%s 写进在岗表出错: %s", topic_id, batch_id, e)
+
+    def _collision_notes(self, t, rows) -> dict[str, list[str]]:
+        """第 3 步撞车检查：消息正文里的编号登记在别的会话名下、没完成没转交 → 给这条消息附提醒。只提醒不拦。"""
+        pats = self.cfg.duty.patterns
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            if r["chat_type"] == SYSTEM_CHAT:
+                continue
+            lines: list[str] = []
+            for key in duty.extract_keys(r["content"] or "", pats):
+                for w in duty.holders(self.store, key, t["topic_id"]):
+                    lines.append(self._collision_line(t, w))
+            if lines:
+                out[r["message_id"]] = lines
+        return out
+
+    def _collision_line(self, t, w) -> str:
+        owner = self.store.get_topic(w["topic_id"])
+        title = (self._session_title(owner) if owner is not None else "") or w["topic_id"]
+        card = self.store.get_card(w["topic_id"])
+        run = duty.RUN_LABEL.get(card["run_state"], "") if card is not None and card["run_state"] else ""
+        ago = duty.ago_text(card["action_at"] or "") if card is not None else ""
+        action = f"，最近动作「{card['action']}」{ago}" if card is not None and card["action"] else ""
+        fact = (f"🔀 撞车提醒：{w['key']} 登记在「{title}」（topic `{w['topic_id']}`）名下，"
+                f"{duty.WORK_LABEL.get(w['state'], w['state'])}" + (f"，会话{run}" if run else "") + action + "。")
+        why = self.playbook.render("duty_collision.md", key=w["key"], owner_title=title, owner_topic=w["topic_id"],
+                                   work_state=duty.WORK_LABEL.get(w["state"], w["state"]), run_state=run,
+                                   action=card["action"] if card is not None and card["action"] else "", ago=ago,
+                                   session_title=self._session_title(t), topic_id=t["topic_id"])
+        return fact + (f"\n{why}" if why else "")
+
+    def _duty_digest(self, t) -> tuple[str, str]:
+        """总线摘要：在岗表变了（指纹不同）才附，最多 [duty] digest_max_lines 行。返回 (摘要, 指纹)。"""
+        cards = duty.board_cards(self.store, self.cfg, exclude=(BUS_TOPIC_ID,))
+        if not cards:
+            return "", ""
+        fp = duty.digest_fingerprint(cards)
+        if self.store.get_meta(DIGEST_META) == fp:
+            return "", ""
+        title = self.playbook.render("duty_digest.md", session_title=self._session_title(t), topic_id=t["topic_id"],
+                                     count=str(len(cards))) or DEFAULT_DIGEST_TITLE
+        return "\n".join([title, *duty.digest_lines(cards, self.cfg.duty.digest_max_lines)]), fp
+
     # ---------- 主流程 ----------
     def dispatch_once(self) -> dict:
         # 这一轮里各会话的记录文件（自动恢复和护栏共用）
@@ -1841,6 +2191,8 @@ class Dispatcher:
         self._check_handovers()
         self._tick_watches(set(tids))
         self._expire_escalations()
+        # 在岗表（7.20）：先自动补活（第 5 步），再算各会话的运行状态（第 4 步，等回复要看名下的活）
+        self._duty_round(tids)
         # 护栏（7.19）：增量读会话记录，压缩了就清指纹（这一轮的批次就带上完整规则）；危险命令报警（系统提示这一轮就排上）
         for step in (self._scan_compactions, self._audit_commands):
             try:
@@ -1873,6 +2225,8 @@ class Dispatcher:
                 r = self._dispatch_topic(self.store.get_topic(tid), groups[tid])
                 result["topics"][tid] = r
                 result["sent"] += r["sent"]
+        # 投递以后再算一遍卡片（刚送出批次的会话变成在做）；记录只读新写的行，基本没有成本
+        self._duty_round(tids, autofill=False)
         result["state"] = self.store.get_topic(BUS_TOPIC_ID)["state"]
         return result
 
@@ -1945,7 +2299,8 @@ class Dispatcher:
         self.store.set_meta("roster_notify_bus", "1")
         if ids or note:
             forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
-                             escalation_open_hours=self.cfg.escalation.open_hours)
+                             escalation_open_hours=self.cfg.escalation.open_hours,
+                             key_patterns=self.cfg.duty.patterns)
         log.info("总线新开会话 %s（%s）-> %s（%d 条消息排队）", topic_id, host, cid, len(ids))
         return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids), "host": host}
 
@@ -2252,7 +2607,8 @@ def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
 
 
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
-                     verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24) -> list[str]:
+                     verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24,
+                     key_patterns: list | None = None) -> list[str]:
     """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
     下一轮完成，因此同样受人类接管、onboarding 约束。
 
@@ -2260,6 +2616,7 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     - quote 必须通过 verify_quote 核对（没给核对器一律拒绝），投递时标成已核对的主人原话；note 不核对，标成总线备注。
     - 被安全规则 hold 的消息只能带已核对的 quote 转交。
     - 目标是总线、known、已移除或不存在时抛 ValueError。
+    - 在岗表（7.20）：转出去的消息记成转出方名下「已转交」的活（钥匙按 [duty] key_patterns 从正文认）。
     """
     _check_target(store, topic_id, "转交")
     ids = list(dict.fromkeys(i.strip() for i in message_ids if i.strip()))
@@ -2290,6 +2647,16 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
                 store.answer_escalation(opens[0]["message_id"], i)
                 store.set_note(i, escalation_note(opens[0]))
         store.forward_message(i, topic_id, tags)
+    pats = key_patterns if key_patterns is not None else DutyConfig().patterns
+    by_src: dict[str, list] = {}
+    for i, row in rows.items():
+        by_src.setdefault(row["topic_id"] or BUS_TOPIC_ID, []).append(row)
+    for src, rs in by_src.items():
+        if src != topic_id:
+            try:
+                duty.forward_work(store, src, topic_id, rs, pats)
+            except Exception as e:  # 在岗表出错不挡转交
+                log.warning("转交记进在岗表出错: %s", e)
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
         store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))
