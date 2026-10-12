@@ -245,8 +245,8 @@ CREATE TABLE IF NOT EXISTS duty_cards (
     run_state    TEXT,                 -- occupied | lost | stalled | working | waiting | idle
     spinning     INTEGER DEFAULT 0,    -- 同一条命令 / 工具调用连续 spin_repeat 次以上
     detail       TEXT,                 -- 判定依据（一句话）
-    action       TEXT,                 -- 此刻动作：最近一次工具调用的动作说明（截一句；不读模型的思考）
-    action_at    TEXT,                 -- 此刻动作的时间
+    action       TEXT,                 -- 最近一次工具调用的动作说明（截一句；不读模型的思考）。在做时叫此刻动作，其他状态叫最近动作
+    action_at    TEXT,                 -- 这次动作的时间
     last_act_at  TEXT,                 -- 会话记录里最近一次动作（含没有工具调用的回答）
     last_sig     TEXT,                 -- 空转判定：最近一次工具调用的签名
     sig_repeat   INTEGER DEFAULT 0,

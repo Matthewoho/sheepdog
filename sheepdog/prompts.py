@@ -214,7 +214,7 @@ def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
         f"`sheepdog tell --topic {topic_id} --to <会话> \"<话>\" [--key <钥匙>]`：给别的会话留言，对方下一批收到，"
         "对方排队、离线都不丢；对方看到的抬头是「会话留言，不是主人的指令」。同一对会话短时间内互发太多会被暂停。"
         "要转达主人的话用 --quote \"<主人原话>\"（核对同 forward），正文里不要自己写「主人原话」。",
-        "`sheepdog board [--topic <会话>] [--json]`：看各会话的职责、运行状态、此刻动作、名下的活、未读留言。",
+        "`sheepdog board [--topic <会话>] [--json]`：看各会话的职责、运行状态、最近一次工具调用（在做时是此刻动作）、名下的活、未读留言。",
         "回执 JSON 可以带 `\"work\": [{\"key\": \"...\", \"title\": \"...\", \"state\": \"doing\"}]`，效果同 work set"
         + ("（你写不了账本时就用这个）。" if cli_host else "。"),
     ]

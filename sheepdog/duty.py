@@ -29,6 +29,14 @@ RUN_ORDER = (OCCUPIED, LOST, STALLED, WORKING, WAITING, IDLE)
 RUN_LABEL = {OCCUPIED: "被主人占着", LOST: "失联", STALLED: "中断", WORKING: "在做", WAITING: "等回复", IDLE: "空闲"}
 # 中断、失联：排队并告诉主人
 STUCK = (LOST, STALLED)
+# 总线摘要行数超了先砍谁：卡住的最后砍（显示仍按 RUN_ORDER）
+KEEP_ORDER = (LOST, STALLED, OCCUPIED, WORKING, WAITING, IDLE)
+# 卡片上最近一次工具调用的叫法：只有在做时它才是「此刻」的动作，其他状态下是过去的事
+ACTION_NOW = "此刻动作"
+ACTION_LAST = "最近动作"
+# 总线摘要里空闲会话合成的那一行：每个标题最多几个字、整行最多几个字（超了用「等」收尾）
+IDLE_TITLE_LIMIT = 16
+IDLE_LINE_LIMIT = 120
 
 # ---------- 活的状态 ----------
 DOING = "doing"
@@ -365,8 +373,14 @@ def work_line(w, with_owner: bool = False) -> str:
     return head + ("（" + "；".join(extra) + "）" if extra else "")
 
 
+def action_label(run_state: str) -> str:
+    """最近一次工具调用叫什么：在做时是「此刻动作」，其他状态（空闲、等回复、中断……）都是「最近动作」。"""
+    return ACTION_NOW if run_state == WORKING else ACTION_LAST
+
+
 def card_data(store: Store, t, card, now: datetime | None = None) -> dict:
-    """一张会话卡（board / 摘要共用）：职责、运行状态、此刻动作、名下的活、最近做完的 3 件、未读留言数。"""
+    """一张会话卡（board / 摘要共用）：职责、运行状态、此刻 / 最近动作、名下的活、最近做完的 3 件、未读留言数。
+    action 字段名不分此刻还是最近，action_label 说明是哪一种。"""
     now = now or datetime.now().astimezone()
     tid = t["topic_id"]
     work = store.open_work(tid)
@@ -385,6 +399,7 @@ def card_data(store: Store, t, card, now: datetime | None = None) -> dict:
         "spinning": bool(c.get("spinning")),
         "detail": c.get("detail") or "",
         "action": c.get("action") or "",
+        "action_label": action_label(state),
         "action_at": c.get("action_at") or "",
         "action_ago": ago_text(c.get("action_at") or "", now),
         "action_minutes": minutes_ago(c.get("action_at") or "", now),
@@ -416,7 +431,8 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
         lines.append(f"━ 「{d['title']}」 {d['topic_id']} · {d['host']}")
         lines.append(f"  职责：{short(d['duty'], 80) or '-'}")
         lines.append(f"  运行状态：{state_text(d)}" + (f"；排队 {d['queued']} 条" if d["queued"] else ""))
-        lines.append(f"  此刻动作：{action_text(d)}" + (f"；{d['compacted_label']}" if d.get("compacted_label") else ""))
+        lines.append(f"  {d['action_label']}：{action_text(d)}"
+                     + (f"；{d['compacted_label']}" if d.get("compacted_label") else ""))
         if d["work"]:
             lines.append("  名下的活：")
             lines += [f"    - {work_line(w)}" for w in d["work"]]
@@ -428,7 +444,7 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
         else:
             lines.append("  最近做完：（无）")
         lines.append(f"  未读留言：{d['unread_mail']}")
-        for k, label in (("recent_receipts", "最近回执"), ("recent_actions", "最近动作")):
+        for k, label in (("recent_receipts", "最近 3 条回执"), ("recent_actions", "最近 5 个动作")):
             if d.get(k):
                 lines.append(f"  {label}：")
                 lines += [f"    - {x}" for x in d[k]]
@@ -436,12 +452,12 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
 
 
 def digest_line(d: dict) -> str:
-    """总线摘要里一个会话一行（事实）。"""
+    """总线摘要里一个不空闲的会话一行（事实）。"""
     parts = [f"「{d['title']}」{d['topic_id']}", d["run_label"] + ("（空转）" if d["spinning"] else "")]
     if d["run_state"] in STUCK and d["detail"]:
         parts[-1] += f"（{short(d['detail'], 50)}）"
     if d["action"]:
-        parts.append(f"「{short(d['action'], 40)}」{d['action_ago']}")
+        parts.append(f"{action_label(d['run_state'])}「{short(d['action'], 40)}」{d['action_ago']}")
     if d["work"]:
         ws = [f"{w['key']}（{WORK_LABEL.get(w['state'], w['state'])}）" for w in d["work"][:3]]
         parts.append("活 " + "、".join(ws) + (f" 等 {len(d['work'])} 件" if len(d["work"]) > 3 else ""))
@@ -450,21 +466,59 @@ def digest_line(d: dict) -> str:
     return "- " + " · ".join(parts)
 
 
+def idle_line(cards: list[dict]) -> str:
+    """空闲的会话合成一行：「- 空闲 N 个：标题1、标题2……」。标题太长截短；整行超过 IDLE_LINE_LIMIT 字就用「等」收尾。"""
+    head = f"- 空闲 {len(cards)} 个："
+    names = [short(d["title"] or d["topic_id"], IDLE_TITLE_LIMIT) for d in cards]
+    shown: list[str] = []
+    for i, n in enumerate(names):
+        more = i + 1 < len(names)
+        if shown and len(head + "、".join([*shown, n]) + ("等" if more else "")) > IDLE_LINE_LIMIT:
+            break
+        shown.append(n)
+    return head + "、".join(shown) + ("等" if len(shown) < len(names) else "")
+
+
 def digest_fingerprint(cards: list[dict]) -> str:
-    """摘要只在在岗表变化时附：指纹不含「几分钟前」这类每轮都变的东西。"""
-    data = [(d["topic_id"], d["run_state"], d["spinning"], d["action"],
-             sorted((w["norm_key"], w["state"]) for w in d["work"]), d["unread_mail"]) for d in cards]
+    """摘要只在在岗表变化时附。空闲的会话只看「它空闲」这一件事；不空闲的看运行状态、空转、名下的活、未读留言。
+    动作、几分钟前、判定依据这类每轮都可能变的东西不算：空闲会话的最近动作变了不会再附一次摘要。"""
+    data = []
+    for d in sorted(cards, key=lambda d: d["topic_id"]):
+        if d["run_state"] == IDLE:
+            data.append((d["topic_id"], IDLE))
+        else:
+            data.append((d["topic_id"], d["run_state"], bool(d["spinning"]),
+                         sorted((w["norm_key"], w["state"]) for w in d["work"]), d["unread_mail"]))
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
 def digest_lines(cards: list[dict], max_lines: int) -> list[str]:
-    """按要紧程度排：失联 / 中断 / 被占 / 在做 / 等回复 / 空闲；最多 max_lines 行（超出的合成最后一行）。"""
+    """不空闲的会话每个一行，按 RUN_ORDER 排（被占 / 失联 / 中断 / 在做 / 等回复）；空闲的合成最后一行。
+    最多 max_lines 行：超了按 KEEP_ORDER 留最要紧的（卡住的先留），砍掉的合成最后一行，写明省略了几个、各是什么状态。"""
     order = {s: i for i, s in enumerate(RUN_ORDER)}
-    cards = sorted(cards, key=lambda d: (order.get(d["run_state"], len(order)), d["topic_id"]))
-    lines = [digest_line(d) for d in cards]
-    if len(lines) > max_lines:
-        rest = len(lines) - (max_lines - 1)
-        lines = lines[:max_lines - 1] + [f"- …还有 {rest} 个会话，`sheepdog board` 看全部"]
+    keep_rank = {s: i for i, s in enumerate(KEEP_ORDER)}
+    busy = [d for d in cards if d["run_state"] != IDLE]
+    idle = sorted((d for d in cards if d["run_state"] == IDLE), key=lambda d: d["topic_id"])
+    # 每一项是 (保留优先级, 显示顺序, 这一行, 它代表的会话)；空闲那一行最先被砍
+    entries = [(keep_rank.get(d["run_state"], len(KEEP_ORDER) - 1), order.get(d["run_state"], len(order)),
+                d["topic_id"], digest_line(d), [d]) for d in busy]
+    if idle:
+        entries.append((len(KEEP_ORDER), len(order) + 1, "", idle_line(idle), idle))
+    if len(entries) > max_lines:
+        entries.sort(key=lambda e: (e[0], e[2]))
+        kept, dropped = entries[:max_lines - 1], entries[max_lines - 1:]
+    else:
+        kept, dropped = entries, []
+    kept.sort(key=lambda e: (e[1], e[2]))
+    lines = [e[3] for e in kept]
+    if dropped:
+        gone = [d for e in dropped for d in e[4]]
+        counts: dict[str, int] = {}
+        for d in gone:
+            counts[d["run_state"]] = counts.get(d["run_state"], 0) + 1
+        what = "、".join(f"{RUN_LABEL.get(s, '还没算')} {counts[s]}"
+                        for s in sorted(counts, key=lambda s: order.get(s, len(order))))
+        lines.append(f"- …另有 {len(gone)} 个会话没列出（{what}），`sheepdog board` 看全部")
     return lines
 
 

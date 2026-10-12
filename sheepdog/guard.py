@@ -23,7 +23,7 @@
 - Codex：`{"type": "event_msg", "payload": {"type": "item_completed"}}`，时间看顶层 timestamp
 - Claude：记录格式没核实过，不认，只认晚到的回执
 
-在岗表（7.20）的「此刻动作」只取工具调用的动作说明，不读模型的思考和回答正文：
+在岗表（7.20）卡片上的动作（在做时叫「此刻动作」，其他状态叫「最近动作」）只取工具调用的动作说明，不读模型的思考和回答正文：
 - Antigravity：`PLANNER_RESPONSE` 里 `tool_calls[].args.toolSummary`，没有就 `toolAction`（都是 JSON 编码过的字符串，
   先解一次），再没有就是工具名；主人亲自说话是 `USER_INPUT`（第 0 步是开场提示词，不算）
 - Codex：跑的命令（同命令审计）
@@ -293,7 +293,7 @@ def local_hhmm(ts: str) -> str:
     return dt.astimezone().strftime("%H:%M")
 
 
-# ---------- 在岗表的此刻动作（7.20） ----------
+# ---------- 在岗表卡片上的动作（7.20） ----------
 @dataclass
 class ToolAction:
     sig: str       # 空转判定用：同一个工具、同一条命令 / 同一句说明算同一个调用

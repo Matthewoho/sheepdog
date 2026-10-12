@@ -319,21 +319,88 @@ class DigestTest(DutyBase):
         duty.set_work(self.store, "tp_alpha", KEY, title="发版", state="doing")
         t1 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg1")
         self.assertIn("FX-DIGEST count=1", t1)
-        self.assertIn(f"「Alpha 需求」tp_alpha · 空闲 · 活 {KEY}（进行中）", t1)
+        self.assertIn("- 空闲 1 个：Alpha 需求", t1)  # 空闲的只合成一行，不列它名下的活
         t2 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg2")
         self.assertNotIn("FX-DIGEST", t2)  # 没变化不附
         duty.set_work(self.store, "tp_alpha", KEY, state="waiting_other", waiting_on="ou_test_bob")
         t3 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg3")
         self.assertIn("FX-DIGEST", t3)
-        self.assertIn(f"{KEY}（等别人）", t3)
+        self.assertIn(f"「Alpha 需求」tp_alpha · 等回复 · 活 {KEY}（等别人）", t3)
+        self.assertNotIn("空闲", t3.split("FX-DIGEST")[1].split("处理完成后")[0])
 
-    def test_digest_capped_at_max_lines(self):
-        cards = [{"topic_id": f"tp_x{i:02d}", "title": f"x{i}", "run_state": duty.IDLE, "run_label": "空闲",
-                  "spinning": False, "detail": "", "action": "", "action_ago": "", "work": [], "unread_mail": 0}
-                 for i in range(20)]
-        lines = duty.digest_lines(cards, 15)
-        self.assertEqual(len(lines), 15)
-        self.assertIn("还有 6 个会话", lines[-1])
+    @staticmethod
+    def fake_card(i, state=duty.IDLE, title="", action="", work=(), unread=0, spinning=False):
+        return {"topic_id": f"tp_x{i:02d}", "title": title or f"x{i}", "run_state": state,
+                "run_label": duty.RUN_LABEL.get(state, ""), "spinning": spinning, "detail": "卡了一会儿",
+                "action": action, "action_ago": "3 分钟前" if action else "",
+                "work": [{"key": k, "norm_key": duty.norm_key(k), "state": s} for k, s in work], "unread_mail": unread}
+
+    def test_idle_cards_merge_into_one_line(self):
+        cards = [self.fake_card(i) for i in range(20)]
+        self.assertEqual(duty.digest_lines(cards, 15), ["- 空闲 20 个：" + "、".join(f"x{i}" for i in range(20))])
+        # 标题太长截短；整行超过约 120 字用「等」收尾
+        long = [self.fake_card(i, title=f"第{i}个会话的标题写得特别特别特别长") for i in range(12)]
+        line = duty.idle_line(long)
+        self.assertTrue(line.startswith("- 空闲 12 个：第0个会话的标题写得特别特别特别…、"), line)
+        self.assertTrue(line.endswith("等"), line)
+        self.assertLessEqual(len(line), duty.IDLE_LINE_LIMIT)
+        self.assertNotIn("第11个", line)
+
+    def test_digest_order_and_cap_keeps_stuck_first(self):
+        cards = ([self.fake_card(i, duty.WORKING, action="Run build") for i in range(10)]
+                 + [self.fake_card(10 + i, duty.STALLED) for i in range(3)]
+                 + [self.fake_card(20 + i, duty.OCCUPIED) for i in range(2)]
+                 + [self.fake_card(30 + i) for i in range(6)])
+        full = duty.digest_lines(cards, 100)
+        self.assertEqual(len(full), 16)  # 15 个不空闲的各一行 + 空闲一行
+        self.assertEqual([ln.split("」")[1].split(" · ")[0] for ln in full[:5]],
+                         ["tp_x20", "tp_x21", "tp_x10", "tp_x11", "tp_x12"])  # 显示按 RUN_ORDER：被占、中断……
+        self.assertIn("此刻动作「Run build」3 分钟前", full[5])
+        self.assertEqual(full[-1], "- 空闲 6 个：x30、x31、x32、x33、x34、x35")
+        capped = duty.digest_lines(cards, 8)
+        self.assertEqual(len(capped), 8)
+        kept = " ".join(capped)
+        for i in (10, 11, 12, 20, 21):
+            self.assertIn(f"tp_x{i}", kept)  # 卡住的、被占的都留着
+        self.assertEqual(capped[-1], "- …另有 14 个会话没列出（在做 8、空闲 6），`sheepdog board` 看全部")
+        self.assertEqual(len(duty.digest_lines(cards, 1)), 1)
+
+    def test_fingerprint_ignores_idle_details_and_actions(self):
+        base = [self.fake_card(0, action="Read a file"), self.fake_card(1, duty.WORKING, action="Run build")]
+        fp = duty.digest_fingerprint(base)
+        # 空闲会话的最近动作、活变了：不算变化
+        same = [self.fake_card(0, action="Something else", work=[("PR #1", duty.DOING)], unread=2),
+                self.fake_card(1, duty.WORKING, action="Run tests")]
+        self.assertEqual(duty.digest_fingerprint(same), fp)
+        # 不空闲的：状态、活、空转、未读留言变了才算
+        for changed in ([self.fake_card(0, duty.WAITING), base[1]],
+                        [base[0], self.fake_card(1, duty.STALLED)],
+                        [base[0], self.fake_card(1, duty.WORKING, work=[("PR #1", duty.DOING)])],
+                        [base[0], self.fake_card(1, duty.WORKING, spinning=True)],
+                        [base[0], self.fake_card(1, duty.WORKING, unread=1)],
+                        [base[0], base[1], self.fake_card(2)]):
+            self.assertNotEqual(duty.digest_fingerprint(changed), fp, changed)
+
+    def test_action_label_now_only_when_working(self):
+        self.assertEqual(duty.action_label(duty.WORKING), "此刻动作")
+        for s in (duty.IDLE, duty.WAITING, duty.STALLED, duty.LOST, duty.OCCUPIED, ""):
+            self.assertEqual(duty.action_label(s), "最近动作")
+        self.append("conv_test_alpha", tool(ago(40), "Check dashboards"))
+        self.round()
+        rc, out = self.cli("board", "--topic", "tp_alpha")
+        self.assertIn("  最近动作：「Check dashboards」（40 分钟前）", out)
+        self.assertNotIn("此刻动作", out)
+        rc, out = self.cli("board", "--json")
+        card = {c["topic_id"]: c for c in json.loads(out)}["tp_alpha"]
+        self.assertEqual((card["action"], card["action_label"]), ("Check dashboards", "最近动作"))
+        self.sent_batch("tp_alpha", 2)
+        self.append("conv_test_alpha", tool(ago(1), "Trigger build"))
+        self.round()
+        rc, out = self.cli("board")
+        self.assertIn("  此刻动作：「Trigger build」（1 分钟前）", out)
+        rc, out = self.cli("board", "--json")
+        card = {c["topic_id"]: c for c in json.loads(out)}["tp_alpha"]
+        self.assertEqual((card["action"], card["action_label"]), ("Trigger build", "此刻动作"))
 
     def test_digest_title_default_without_playbook(self):
         (self.pdir / "duty_digest.md").unlink()

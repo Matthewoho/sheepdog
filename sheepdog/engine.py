@@ -118,7 +118,7 @@ AUTO_RECOVER_REASONS = {ATTN_RECEIPT_TIMEOUT}
 
 # 在岗表（7.20）
 DIGEST_META = "duty_digest_fp"           # 上一次附给总线的摘要指纹：变了才再附
-DEFAULT_DIGEST_TITLE = "📋 在岗表摘要（有变化才附，每个会话一行）："
+DEFAULT_DIGEST_TITLE = "📋 在岗表摘要（有变化才附；不空闲的会话每个一行，空闲的合成一行）："
 
 
 def duty_reset_key(topic_id: str) -> str:
@@ -775,7 +775,8 @@ class Dispatcher:
         self.store = store
         # 按宿主取 sink（7.18）：{antigravity: ..., codex: ..., claude: ...}；只给一个时就是 antigravity 的
         self.sinks: dict[str, Sink] = dict(sink) if isinstance(sink, dict) else {ANTIGRAVITY: sink}
-        # 经机器人给主人发一条私聊（登录失效提醒）；notifier(text)，没有就只记日志
+        # 经机器人给主人发一条私聊（登录失效提醒等）；notifier(text)，或 [notify] file 时的 FileNotifier（notify(text, 类型)）；
+        # 没有就只记日志
         self.notifier = notifier
         self._host_warned: set[str] = set()
         # 确认表情（7.9）：投递成功后以主人身份点表情
@@ -1633,11 +1634,19 @@ class Dispatcher:
                                       f"（{r.error_kind}）：{r.error[-300:]}", about=r.topic_id)
 
     def _notify_owner(self, text: str, what: str) -> bool:
-        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟、会话卡住）；没有发送渠道时只记日志。返回发出去没有。"""
+        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟、会话卡住）；没有发送渠道时只记日志。返回发出去没有。
+
+        notifier 有 notify(text, what) 方法的（[notify] file 写文件的那种）连同通知类型一起交给它；
+        否则只交正文（经机器人私聊、dry-run 打印、测试里的 list.append）。"""
         if self.notifier is None:
             return False
+        text = with_cli(text, self.cfg.cli_command)
         try:
-            self.notifier(with_cli(text, self.cfg.cli_command))
+            notify = getattr(self.notifier, "notify", None)
+            if callable(notify):
+                notify(text, what)
+            else:
+                self.notifier(text)
         except Exception as e:
             log.warning("给主人发%s失败: %s", what, e)
             return False
@@ -1730,7 +1739,7 @@ class Dispatcher:
         """增量读一个会话的记录：每个会话、每种用途记一个偏移，只读新写的完整行。
 
         - 没有偏移，或者偏移记的是别的会话编号（名册改指了一个已有的会话）：从现在的末尾开始，不翻旧账；
-          backfill > 0 时（在岗表要知道此刻动作）先读末尾 backfill 字节，从其中第一个完整行起；
+          backfill > 0 时（在岗表要知道最近一次动作）先读末尾 backfill 字节，从其中第一个完整行起；
         - sheepdog 自己建的会话（_read_from_start）、记录文件换了、文件变短了：从头读。
         """
         path = self._record_file(t)
@@ -1900,8 +1909,9 @@ class Dispatcher:
                 log.warning("算会话 %s 的在岗表卡片出错: %s", tid, e)
 
     def _duty_scan(self, t) -> None:
-        """增量读会话记录（复用护栏的 _follow，用途 duty）：此刻动作、最近一次动作、空转计数、主人发言、压缩点。
-        此刻动作只取工具调用的动作说明（Antigravity 的 toolSummary / toolAction，Codex 的命令），不读模型的思考。"""
+        """增量读会话记录（复用护栏的 _follow，用途 duty）：最近一次工具调用、最近一次动作、空转计数、主人发言、压缩点。
+        卡片上的动作（在做时叫此刻动作，其他状态叫最近动作）只取工具调用的动作说明（Antigravity 的 toolSummary /
+        toolAction，Codex 的命令），不读模型的思考。"""
         host = self.topic_host(t)
         if host not in (ANTIGRAVITY, "codex") or not t["conversation_id"]:
             return

@@ -165,6 +165,13 @@ expire_minutes = 60
 # false = 不拉 IM（测试环境用）：这时可以用 sheepdog inject 往账本里放一条合成消息；改了要重启
 enabled = true
 
+[notify]
+# 给你的通知（在岗表判会话中断 / 失联、会话卡在 attention 和自动恢复、危险命令报警、写锁提醒、登录失效）发到哪。
+# 留空 = 经机器人私聊你（正式环境就这样，不要设）。
+# 设了路径 = 一律追加写进这个文件（每条带北京时间和通知类型），不发飞书：测试环境（[source] enabled = false）
+# 用它检查通知。拉着飞书又设了它，sheepdog doctor 会提示。相对路径相对本文件所在目录；改了下一轮生效
+file = ""
+
 # 会话宿主（每个会话一个，默认 antigravity = 上面的 sink）。codex / claude 走各自的命令行，一轮在后台跑完。
 # 权限不归 sheepdog 管：这里没有沙箱、审批、权限项，全部来自宿主自己的配置
 # （Codex 看 ~/.codex/config.toml；Claude 看它自己的用户设置、workdir 下的设置，或下面 settings 指的文件）。

@@ -325,7 +325,7 @@ class DutyConfig:
     lost_minutes: float = 30
     # 同一条命令 / 同一个工具调用连续这么多次 → 标「空转」
     spin_repeat: int = 3
-    # 总线摘要最多几行（每个会话一行）
+    # 总线摘要最多几行（不空闲的会话每个一行，空闲的合成一行；超了先留卡住的）
     digest_max_lines: int = 15
     # 同一对会话 mail_window_minutes 内互发超过 mail_pair_limit 条 → 暂停这一对 mail_pause_minutes 分钟，并通知总线
     mail_pair_limit: int = 6
@@ -428,6 +428,20 @@ class HostConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """[notify]：给主人的通知（在岗表中断 / 失联、attention 和恢复、危险命令报警、写锁提醒、登录失效）发到哪。
+
+    file 留空（默认）= 经机器人私聊主人（要拉飞书、配了 self_open_id），行为不变。
+    file 设了 = 一律追加写进这个文件（带时间和通知类型），不发飞书；测试环境（[source] enabled = false）用。
+    相对路径相对本配置文件所在目录。下一轮生效。"""
+    file: str = ""
+
+    def validate(self) -> None:
+        if not isinstance(self.file, str):
+            raise ConfigError("[notify] file 必须是字符串（文件路径）；留空 = 经机器人私聊主人")
+
+
+@dataclass
 class SourceConfig:
     # false = 不拉飞书（测试环境用，7.18）：这时可以用 sheepdog inject 往账本里放合成消息
     enabled: bool = True
@@ -474,6 +488,7 @@ class Config:
     # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
     cli_name: str = "sheepdog"
     source: SourceConfig = field(default_factory=SourceConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -514,6 +529,14 @@ class Config:
     @property
     def playbook_path(self) -> Path:
         p = Path(self.playbook_dir or "playbook").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
+    def notify_path(self) -> Path | None:
+        """[notify] file：给主人的通知写到哪个文件；没设是 None（照旧经机器人私聊）。"""
+        if not self.notify.file.strip():
+            return None
+        p = Path(self.notify.file.strip()).expanduser()
         return p if p.is_absolute() else self.config_path.parent / p
 
     @property
@@ -560,6 +583,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.owner_context, data.get("owner_context", {}))
         _apply(cfg.loop_guard, data.get("loop_guard", {}))
         _apply(cfg.source, data.get("source", {}))
+        _apply(cfg.notify, data.get("notify", {}))
         _apply(cfg.audit, data.get("audit", {}))
         _apply(cfg.duty, data.get("duty", {}))
         hosts = data.get("hosts", {})
@@ -586,6 +610,7 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()
     cfg.source.validate()
+    cfg.notify.validate()
     for h in cfg.hosts.values():
         h.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)

@@ -75,6 +75,7 @@ from .sink.agentapi import AgentApiSink, DryRunSink
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
+from .notify import FileNotifier
 from .source import NullSource
 from .source.lark import LarkCliSource
 from .store import Store, now_iso
@@ -150,12 +151,37 @@ def _sinks(cfg, store: Store, dry: bool) -> dict:
 
 
 def _notifier(cfg, source, args):
-    """经机器人给主人发私聊（登录失效提醒）。不拉 IM、没有 self_open_id 时没有；dry-run 只打印。"""
+    """给主人的通知（在岗表中断 / 失联、attention 和恢复、危险命令报警、写锁提醒、登录失效）怎么送：
+
+    - 配了 [notify] file：一律追加写进那个文件（带时间和通知类型），不发飞书（测试环境用；拉不拉 IM 都一样）；
+    - 否则经机器人私聊主人；不拉 IM、没有 self_open_id 时没有渠道（只记日志）。
+    dry-run 一律只打印，不写文件、不发飞书。"""
+    path = cfg.notify_path
+    dry = getattr(args, "dry_run", False)
+    if path is not None:
+        if dry:
+            return lambda text: print(f"[dryrun] 给主人的通知（正式运行写进 {path}，不发飞书）：\n{text}\n")
+        return FileNotifier(path, cfg.timezone_offset)
     if not cfg.self_open_id or not hasattr(source, "send_text"):
         return None
-    if getattr(args, "dry_run", False):
+    if dry:
         return lambda text: print(f"[dryrun] 给主人发私聊：\n{text}\n")
     return lambda text: source.send_text(cfg.self_open_id, text, "bot")
+
+
+def notify_report(cfg) -> str:
+    """doctor：给主人的通知送到哪。设了 [notify] file 又在拉飞书，多半是正式配置误设了，提示一句。"""
+    path = cfg.notify_path
+    if path is not None:
+        line = f"主人通知: 写到文件 {path}（[notify] file），不发飞书"
+        if cfg.source.enabled:
+            line += "\n  ⚠ 主人通知写到文件，不发飞书：现在在拉飞书（[source] enabled = true），正式配置不要设 [notify] file"
+        return line
+    if not cfg.source.enabled:
+        return "主人通知: ⚠ 不拉飞书又没设 [notify] file，给主人的通知只记日志（测试环境可设 [notify] file 写到文件）"
+    if not cfg.self_open_id:
+        return "主人通知: ⚠ 没配 self_open_id，给主人的通知只记日志"
+    return "主人通知: 经机器人私聊"
 
 
 def _acker(cfg, store, source, args) -> Acker | None:
@@ -181,6 +207,7 @@ def cmd_doctor(args) -> int:
     print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
     print(f"状态目录: {cfg.state_dir}")
     print(cli_name_report(cfg))
+    print(notify_report(cfg))
     print(f"self_open_id: {'✓ 已配置' if cfg.self_open_id else '✗ 未配置（@我/回复我 判定会失效）'}")
     ok &= bool(cfg.self_open_id)
     if cfg.source.enabled:
@@ -432,6 +459,8 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
     if hasattr(source, "tz"):
         source.tz = new.timezone_offset
     collector.acker = dispatcher.acker = _acker(new, store, source, args)
+    # 主人通知的去向跟着配置走（[notify] file 改了下一轮生效）
+    dispatcher.notifier = _notifier(new, source, args)
     return new
 
 
