@@ -31,6 +31,7 @@ from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
 from .store import SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
+from .source.lark import parse_message as parse_thread_reply
 
 log = logging.getLogger("sheepdog")
 
@@ -127,19 +128,20 @@ def is_agent_reply(content: str, oc) -> bool:
     return any(mk in b for b in [content or "", *bodies] for mk in oc.agent_markers)
 
 
+# 话题里开头那条的序号（thread_message_position，7.22，10-12 22:5x 真实飞书核实）：普通聊天（p2p、group）开头那条
+# 是 "-1"、回复从 "0" 起；话题群（chat_type = topic）开头那条是 "0"
+THREAD_ROOT_POSITION = {"topic": "0"}
+DEFAULT_THREAD_ROOT_POSITION = "-1"
+
+
+def root_position(chat_type: str) -> str:
+    return THREAD_ROOT_POSITION.get(chat_type or "", DEFAULT_THREAD_ROOT_POSITION)
+
+
 def is_thread_root(m: Message) -> bool:
-    """话题开头那条（thread_message_position 是 "0"，7.22）：它自己不是「在话题里回复」。"""
-    return str((m.raw or {}).get("thread_message_position", "")).strip() == "0"
-
-
-def thread_root_of(msgs: list[Message]) -> Message | None:
-    """话题列表（按时间正序）里开头那条：thread_message_position 是 "0" 的那条；列表里完全没有这个字段时取第一条。"""
-    for x in msgs:
-        if is_thread_root(x):
-            return x
-    if msgs and not any("thread_message_position" in (x.raw or {}) for x in msgs):
-        return msgs[0]
-    return None
+    """话题开头那条（序号是这个聊天类型的开头序号）：它自己不是「在话题里回复」。没有序号的不算开头。"""
+    pos = (m.thread_position or "").strip()
+    return bool(pos) and pos == root_position(m.chat_type)
 
 
 def first_line(content: str) -> str:
@@ -798,10 +800,15 @@ class Collector:
         return d
 
     # ---------- 一事一串（7.22）：主人在话题里回复，按话题送回 ----------
+    # 用 mget 找话题开头那条时，最多看多少条候选（每次 50 条）
+    ROOT_CANDIDATES_MAX = 200
+
     def _learn_thread(self, m: Message) -> None:
-        """「找主人」聊天里带话题编号的消息：它是已记话题的开头那条、或 ask / report 发进话题里的，就把话题编号补上。"""
+        """「找主人」聊天里带话题编号的消息：账本里这条原来没有话题的补上；它是已记话题的开头那条、或 ask / report
+        发进话题里的，就把话题编号补进话题表。"""
         if not m.thread_id:
             return
+        self.store.fill_thread_fields(m.message_id, m.thread_id, m.thread_position)
         if self.store.thread_by_root(m.message_id) is not None:
             self.store.set_thread_id(m.message_id, m.thread_id)
             return
@@ -809,15 +816,15 @@ class Collector:
         if s is not None and s["root_message_id"]:
             self.store.set_thread_id(s["root_message_id"], m.thread_id)
 
-    def _list_thread(self, thread_id: str) -> tuple[list[Message] | None, str]:
-        """查话题列表（只读）。失败返回 (None, 原因)，不抛。"""
-        fn = getattr(self.source, "thread_messages", None)
+    def _mget(self, ids: list[str]) -> tuple[list[Message] | None, str]:
+        """只读按消息号取（mget）。失败返回 (None, 原因)，不抛。"""
+        fn = getattr(self.source, "messages_by_id", None)
         if fn is None:
-            return None, "消息源不支持查话题"
+            return None, "消息源不支持按消息号取"
         try:
-            return list(fn(thread_id, "asc")), ""
+            return list(fn(ids)), ""
         except Exception as e:
-            log.warning("查话题 %s 失败: %s", thread_id, e)
+            log.warning("mget %d 条失败: %s", len(ids), e)
             return None, str(e)
 
     def _recognize_root(self, root: Message) -> str | None:
@@ -839,41 +846,59 @@ class Collector:
                 return topic
         return None
 
-    def _find_thread(self, m: Message) -> tuple[object, list[Message] | None, str]:
-        """主人这条话题回复属于哪个已记的话题：先按话题编号，再看账本里同一话题的消息，最后查话题列表找开头那条
-        （认出来就补记进表）。返回 (话题行或 None, 查到的话题列表或 None, 查话题失败的原因)。"""
-        thr = self.store.thread_by_thread_id(m.thread_id)
-        if thr is not None:
-            return thr, None, ""
-        for r in self.store.thread_messages_in_ledger(m.thread_id):
-            thr = self.store.thread_by_root(r["message_id"])
-            if thr is None and (s := self.store.send_by_message(r["message_id"])) is not None and s["root_message_id"]:
-                thr = self.store.thread_by_root(s["root_message_id"])
-            if thr is not None:
-                self.store.set_thread_id(thr["root_message_id"], m.thread_id)
-                return self.store.thread_by_root(thr["root_message_id"]), None, ""
-        listing, err = self._list_thread(m.thread_id)
-        root = thread_root_of(listing or [])
-        if root is None:
-            return None, listing, err or ("话题列表里找不到开头那条" if listing is not None else "")
+    def _adopt_root(self, root: Message, thread_id: str):
+        """找到了开头那条：话题表里有就补上话题编号；没有就按开头那条认会话，认出来补记（source = recognized）。
+        返回话题行，认不出返回 None。"""
         thr = self.store.thread_by_root(root.message_id)
         if thr is None:
             topic = self._recognize_root(root)
             if topic is None:
-                return None, listing, ""
-            title = duty.short(first_line(root.content), 40)
-            self.store.add_thread(root.message_id, topic, "", "", title, "recognized", m.thread_id)
-            log.info("主人在话题 %s 里回复，靠开头那条 %s 认出是 %s，补记进话题表", m.thread_id, root.message_id, topic)
+                return None
+            self.store.add_thread(root.message_id, topic, "", "", duty.short(first_line(root.content), 40),
+                                  "recognized", thread_id)
+            log.info("话题 %s 靠开头那条 %s 认出是 %s，补记进话题表", thread_id, root.message_id, topic)
         else:
-            self.store.set_thread_id(root.message_id, m.thread_id)
-        return self.store.thread_by_root(root.message_id), listing, ""
+            self.store.set_thread_id(root.message_id, thread_id)
+        return self.store.thread_by_root(root.message_id)
+
+    def _find_thread(self, m: Message):
+        """主人这条话题回复属于哪个话题。依次：
+        1. 话题表里有这个话题编号；
+        2. 账本里同一话题的消息：序号是开头序号的那条就是开头；ask / report 发进话题里的，按发出时记的开头；
+        3. mget 候选（sheepdog 在这个聊天里发过、还没记话题编号的开头那条、「需要你定」、发给主人的消息），每次 50 条，
+           看谁的 thread_id 对得上（话题列表不含开头那条，不用它找开头）；
+        都不行返回 None。返回 (话题行或 None, 开头那条 Message 或 None, mget 带回来的话题回复, 失败原因)。"""
+        thr = self.store.thread_by_thread_id(m.thread_id)
+        if thr is not None:
+            return thr, None, [], ""
+        for r in self.store.thread_messages_in_ledger(m.thread_id):
+            if (r["thread_position"] or "") == root_position(r["chat_type"]):
+                root = row_to_message(r)
+                return self._adopt_root(root, m.thread_id), root, [], ""
+            s = self.store.send_by_message(r["message_id"])
+            if s is not None and s["root_message_id"] and (t := self.store.thread_by_root(s["root_message_id"])):
+                self.store.set_thread_id(t["root_message_id"], m.thread_id)
+                return self.store.thread_by_root(t["root_message_id"]), None, [], ""
+        cands = self.store.root_candidates(m.chat_id)
+        if len(cands) > self.ROOT_CANDIDATES_MAX:
+            log.warning("话题 %s：开头那条的候选 %d 条，只看最近 %d 条", m.thread_id, len(cands), self.ROOT_CANDIDATES_MAX)
+            cands = cands[:self.ROOT_CANDIDATES_MAX]
+        for i in range(0, len(cands), 50):
+            got, err = self._mget(cands[i:i + 50])
+            if got is None:
+                return None, None, [], err
+            for x in got:
+                if x.thread_id and x.thread_id == m.thread_id:
+                    replies = [parse_thread_reply(r, self.cfg.timezone_offset)
+                               for r in (x.raw or {}).get("thread_replies") or []]
+                    return self._adopt_root(x, m.thread_id), x, replies, ""
+        return None, None, [], ""
 
     def _thread_reply(self, m: Message, tags: list[str], d: RouteDecision) -> RouteDecision:
-        thr, listing, err = self._find_thread(m)
+        thr, root, extra, err = self._find_thread(m)
         if thr is None:
             # 都认不出：同 7.15「认不出来源」，交给总线
             self.store.upsert_message(m, d.route, d.reason, [*tags, f"thread:{m.thread_id}"], BUS_TOPIC_ID)
-            root = thread_root_of(listing or [])
             if root is not None:
                 where = f"开头那条（message_id `{root.message_id}`）：{duty.short(root.content, 200)}"
             else:
@@ -886,7 +911,7 @@ class Collector:
                            self.cfg.cli_command))
             log.info("主人在认不出来源的话题 %s 里回复 %s，投总线", m.thread_id, m.message_id)
             return d
-        members = self._thread_members(thr, m, listing)
+        members = self._thread_members(thr, m, [*([root] if root is not None else []), *extra])
         member_ids = {x["message_id"] for x in members} | {thr["root_message_id"]}
         live = [e for e in open_escalations(self.store, self.cfg.escalation.open_hours, thr["topic_id"])
                 if e["message_id"] in member_ids]
@@ -897,8 +922,8 @@ class Collector:
         log.info("主人在话题 %s 里回复 %s -> %s（钥匙 %s）", m.thread_id, m.message_id, thr["topic_id"], thr["key"] or "-")
         return d
 
-    def _thread_members(self, thr, m: Message, listing: list[Message] | None) -> list[dict]:
-        """这个话题里的消息（含开头那条和主人这一条），合并账本、ask / report 发出的记录、话题列表，按时间排。只读。"""
+    def _thread_members(self, thr, m: Message, extra: list[Message]) -> list[dict]:
+        """这个话题里的消息（含开头那条和主人这一条），合并账本、ask / report 发出的记录、mget 带回来的，按时间排。只读。"""
         root = thr["root_message_id"]
         me = self.cfg.self_open_id
         out: dict[str, dict] = {}
@@ -912,7 +937,7 @@ class Collector:
 
         for r in self.store.thread_messages_in_ledger(thr["thread_id"] or m.thread_id, root):
             add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), r["content"])
-        for x in listing or []:
+        for x in extra:
             add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), x.content)
         for s in self.store.sends_in_thread(root):
             add(s["message_id"], s["sent_at"], "机器人", s["text"])

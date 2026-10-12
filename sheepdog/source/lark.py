@@ -68,6 +68,8 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
         updated=bool(raw.get("updated")),
         update_time=_norm_time(raw.get("update_time", ""), tz),
         sender_tenant_key=sender.get("tenant_key") or "",
+        message_position=str(raw.get("message_position") or ""),
+        thread_position="" if raw.get("thread_message_position") is None else str(raw.get("thread_message_position")),
         raw=raw,
     )
 
@@ -241,7 +243,8 @@ class LarkCliSource:
 
     # ---------- 读：话题、发前检查（7.22），user 身份，只读 ----------
     def thread_messages(self, thread: str, order: str = "asc", max_pages: int = 10) -> list[Message]:
-        """一个话题里的消息（thread 可以是 omt_ 话题编号，也可以是开头那条的 om_ 消息号）。"""
+        """一个话题里的回复（thread 可以是 omt_ 话题编号，也可以是开头那条的 om_ 消息号）。
+        实测（10-12 22:5x）：返回只有话题里的回复，不含开头那条。"""
         args = ["im", "+threads-messages-list", "--thread", thread, "--order", order, "--page-size", "50",
                 "--format", "json", "--no-reactions"]
         out: list[Message] = []
@@ -252,6 +255,16 @@ class LarkCliSource:
             token = data.get("page_token") or ""
             if not data.get("has_more") or not token:
                 break
+        return out
+
+    def messages_by_id(self, message_ids: list[str]) -> list[Message]:
+        """按消息号批量取（+messages-mget，一次最多 50 条）。有话题的开头那条会带 thread_id 和 thread_replies。"""
+        out: list[Message] = []
+        for i in range(0, len(message_ids), 50):
+            chunk = message_ids[i: i + 50]
+            data = self._run(["im", "+messages-mget", "--message-ids", ",".join(chunk), "--format", "json",
+                              "--no-reactions"])
+            out += [parse_message(m, self.tz) for m in data.get("messages") or data.get("items") or []]
         return out
 
     def chat_messages_since(self, chat_id: str, sender_id: str, start_iso: str, max_pages: int = 5) -> list[Message]:

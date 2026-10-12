@@ -34,16 +34,16 @@
   sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
   sheepdog board [--topic T] [--json]                    羊群看板：各会话在干什么
   sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
-  sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B]
+  sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B（默认当前 / 最近一批）]
                                                          经机器人找主人「需要你定」（sheepdog 加开头一行）；带 --key：
                                                          同一把钥匙第一次在主聊天里起一条，之后回到它的话题里（一事一串）
   sheepdog report ...（参数同 ask）                       经机器人向主人汇报
-  sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied] [--followup]
+  sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied]
                                                          代回：发前只读检查主人有没有新发言；说过就不发（退出码 3）
   sheepdog thread --topic T (--key K | --thread omt_x)    只读：列出一个话题的全部消息
 
 ask / report / reply 的退出码：0 发出（或同样的内容已经发过）/ 1 发送失败或超时（原样重试，防重编号保证只发一条）/
-2 参数不对 / 3 主人已经回过、没发 / 4 发前检查失败、没发 / 5 这一批已经回过这条（内容不同）、没发
+2 参数不对 / 3 主人已经回过、没发 / 4 发前检查失败、没发。代回内容一样才算重复：同一条先回「稍等」再回结论两条都发
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
 
@@ -1425,7 +1425,7 @@ def cmd_reply(args) -> int:
         return _test_env_write(cfg, "代回", f"回复 {args.to}：\n{shown}")
     try:
         r = outbound.reply(cfg, store, _source(cfg), tid, args.to, text=args.text or "", card_text=card_text,
-                           even_if_owner_replied=args.even_if_owner_replied, followup=args.followup)
+                           even_if_owner_replied=args.even_if_owner_replied)
     except outbound.OutboundError as e:
         print(f"代回没发: {e}", file=sys.stderr)
         return e.code
@@ -1440,7 +1440,7 @@ def cmd_reply(args) -> int:
 
 
 def cmd_thread(args) -> int:
-    """sheepdog thread：只读列出一个话题的全部消息（账本里有的优先，缺的查话题列表）。"""
+    """sheepdog thread：只读列出一个话题的全部消息（开头那条从账本 / sends / mget 取，回复从账本和话题列表取）。"""
     cfg = load_config()
     store = Store(cfg.db_path)
     source = _source(cfg)
@@ -1655,7 +1655,8 @@ def main(argv: list[str] | None = None) -> int:
         g.add_argument("--text", help="正文")
         g.add_argument("--file", help="正文文件；- 表示标准输入")
         sp.add_argument("--key", default="", help="钥匙（和在岗表的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
-        sp.add_argument("--batch", default="", help="批次号（可选）：参与防重编号，区分不同批次里同样的正文")
+        sp.add_argument("--batch", default="",
+                        help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
         sp.set_defaults(func=cmd_ask)
 
     sp = sub.add_parser("reply", help="代回：以主人身份回复一条消息（卡片带代回标记）；发前先查主人有没有新发言")
@@ -1667,8 +1668,6 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--text", help="纯文本代回（末尾自动附代回标记）")
     sp.add_argument("--even-if-owner-replied", action="store_true",
                     help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
-    sp.add_argument("--followup", action="store_true",
-                    help="同一批里对同一条消息再回一条（比如先回了「稍等」、现在回结论）；重试时正文不要改")
     sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("thread", help="只读：列出一个话题的全部消息")

@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS messages (
     note           TEXT,               -- 未用（早期转交说明，转达改为 sheepdog 消息）
     security_tags  TEXT,               -- 安全规则命中的 rule name 列表（JSON）
     security_action TEXT,              -- none | tag | hold（取最严）
+    message_position TEXT,             -- 消息在这个聊天里的序号（lark message_position，7.22 发前检查比先后用）；空 = 不知道
+    thread_position TEXT,              -- 话题里的序号（lark thread_message_position，7.22）：普通聊天开头 "-1"、回复从 "0" 起；
+                                       -- 话题群开头 "0"
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
@@ -360,7 +363,8 @@ CREATE TABLE IF NOT EXISTS duty_route_seen (
 -- 一行 = 一个话题：开头那条是机器人在主聊天里发的第一条，之后同一把钥匙的消息都回复到它的话题里
 CREATE TABLE IF NOT EXISTS owner_threads (
     root_message_id TEXT PRIMARY KEY,  -- 话题开头那条
-    thread_id       TEXT,              -- omt_…；发出时不一定知道，拉到话题里的消息、或查话题列表以后补上
+    thread_id       TEXT,              -- omt_…；发出时不知道（--reply-in-thread 的返回里没有），发完 mget 开头那条、
+                                       -- 或拉到话题里的消息以后补上
     topic_id        TEXT NOT NULL,
     key             TEXT,              -- 钥匙原样；主人在老消息下开的话题（靠开头那条认出来的）为空
     norm_key        TEXT,              -- duty.norm_key(key)；为空 = 没有钥匙
@@ -408,7 +412,7 @@ SYSTEM_ID_PREFIX = "sd_"
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
-                 ("security_action", "TEXT")],
+                 ("security_action", "TEXT"), ("message_position", "TEXT"), ("thread_position", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
                ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
@@ -497,13 +501,15 @@ class Store:
             c.execute(
                 """INSERT INTO messages(message_id,chat_id,chat_name,chat_type,sender_id,sender_name,sender_type,
                        sender_tenant_key,content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,
-                       updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen,
+                       message_position,thread_position)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
                  m.sender_tenant_key,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,
                  int(m.deleted), int(m.updated), m.update_time, route, reason,
-                 json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts),
+                 json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts, m.message_position or None,
+                 m.thread_position or None),
             )
 
     def update_content(self, message_id: str, m: Message, route: str | None = None,
@@ -899,6 +905,45 @@ class Store:
                ORDER BY create_time, first_seen, message_id""",
             (thread_id or "", thread_id or "", root_message_id or "", root_message_id or "")).fetchall()
 
+    def fill_thread_fields(self, message_id: str, thread_id: str, thread_position: str) -> bool:
+        """账本里这条消息后来有了话题（开头那条被再次拉到时带上 thread_id）：只补空的，已有的不改。"""
+        if not thread_id:
+            return False
+        with self.tx() as c:
+            return c.execute("UPDATE messages SET thread_id=?, thread_position=? WHERE message_id=? "
+                             "AND (thread_id IS NULL OR thread_id='')",
+                             (thread_id, thread_position or None, message_id)).rowcount > 0
+
+    def root_candidates(self, chat_id: str) -> list[str]:
+        """话题开头那条的候选（7.22）：sheepdog 在这个聊天里发过、还没记 thread_id 的消息——话题表里没有 thread_id 的
+        开头那条，加上这个聊天里（保留期内）的「需要你定」和机器人发给主人的消息（ask / report 当场记的也算）。
+        排除：账本里已经知道属于别的话题的、发进话题里的那些（不是开头）。新的在前。"""
+        rows = self.conn.execute(
+            """SELECT mid, MAX(at) AS at FROM (
+                   SELECT root_message_id AS mid, created_at AS at FROM owner_threads WHERE thread_id IS NULL
+                   UNION ALL
+                   SELECT message_id, asked_at FROM escalations WHERE chat_id=?
+                   UNION ALL
+                   SELECT b.message_id, b.sent_at FROM bot_outbox b
+                     LEFT JOIN messages m ON m.message_id = b.message_id
+                     LEFT JOIN sends s ON s.message_id = b.message_id
+                    WHERE m.chat_id=? OR s.kind IN ('ask','report'))
+               GROUP BY mid ORDER BY at DESC""", (chat_id, chat_id)).fetchall()
+        out = []
+        for r in rows:
+            mid = r["mid"]
+            known = self.conn.execute("SELECT thread_id FROM messages WHERE message_id=?", (mid,)).fetchone()
+            if known is not None and known["thread_id"]:
+                continue
+            thr = self.thread_by_root(mid)
+            if thr is not None and thr["thread_id"]:
+                continue
+            s = self.send_by_message(mid)
+            if s is not None and s["root_message_id"] and s["root_message_id"] != mid:
+                continue
+            out.append(mid)
+        return out
+
     def add_seen_before_send(self, topic_id: str, message_id: str, target_message_id: str) -> bool:
         """记「发送前已看到」；同一会话同一条已经记过就不动（返回 False）。"""
         with self.tx() as c:
@@ -1288,6 +1333,12 @@ class Store:
             args.append(norm_key)
         return self.conn.execute(sql + " ORDER BY last_at DESC, topic_id", args).fetchall()
 
+    def latest_batch_id(self, topic_id: str) -> str:
+        """这个会话最近一批的批次号（按送出时间，同一秒按记录先后）；没有就是空串。"""
+        r = self.conn.execute("SELECT batch_id FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                              (topic_id,)).fetchone()
+        return r[0] if r is not None else ""
+
     def recent_dispatches(self, topic_id: str, limit: int = 30) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC LIMIT ?",
                                  (topic_id, limit)).fetchall()
@@ -1384,4 +1435,6 @@ def row_to_message(row: sqlite3.Row) -> Message:
         create_time=row["create_time"] or "", mentions=mentions, reply_to=row["reply_to"] or "",
         thread_id=row["thread_id"] or "", link=row["link"] or "", deleted=bool(row["deleted"]),
         updated=bool(row["updated"]), update_time=row["update_time"] or "",
+        message_position=row["message_position"] or "",
+        thread_position=row["thread_position"] or "",
     )

@@ -1,8 +1,12 @@
 """7.22 一事一串与发前再看一眼。
 
-假的飞书（FakeLark）替换 lark-cli 的子进程调用：按架构侧核实过的字段造数据（搜索 / mget / 话题列表里的话题消息
-没有 parent_id、root_id，开头那条 thread_message_position 是 "0"），记录每次调用的参数，按防重编号去重
-（同一个编号只建一条消息，返回第一次的结果），可以模拟失败、超时、「发出去了但响应超时」。
+假的飞书（FakeLark）替换 lark-cli 的子进程调用，按架构侧 10-12 22:5x 在真实飞书上核实的格式造数据：
+- 搜索 / mget / 话题列表里的消息没有 parent_id、root_id；
+- 普通聊天（p2p、group）话题开头那条 thread_message_position 是 "-1"、回复从 "0" 起；话题群（topic）开头那条是 "0"；
+- 话题列表只有回复、不含开头那条；mget 有话题的开头那条带 thread_id 和 thread_replies；
+- --reply-in-thread 的返回只有 chat_id、create_time、message_id，没有 thread_id；
+- 同一个防重编号再发：ok，返回第一次那条的 message_id，不多发。
+它还记录每次调用的参数，可以模拟失败、超时、「发出去了但响应超时」。
 
 A ask / report：同一把钥匙第一次起新消息、之后进话题；不带钥匙每次新消息；重试只发一条；失败返回非零。
 B 主人在话题里回复：按话题送回、带开头那条；话题长了附最近几条和 sheepdog thread 提示；老消息下开的话题靠话题列表认；
@@ -61,15 +65,15 @@ def _card_text(content: str) -> str:
 class FakeLark:
     """假的飞书 + lark-cli。只在内存里，绝不起真实进程。"""
 
-    def __init__(self, list_includes_root: bool = True, reply_returns_thread_id: bool = False):
+    def __init__(self, positions: bool = True):
         self.calls: list[list[str]] = []
         self.msgs: dict[str, dict] = {}
         self.idem: dict[str, str] = {}
         # 子命令 → 依次使用的模式：error（报错，什么都没发）/ timeout（超时，什么都没发）/ lost（发出去了但响应超时）
         self.plan: dict[str, list[str]] = {}
         self.n = 0
-        self.list_includes_root = list_includes_root
-        self.reply_returns_thread_id = reply_returns_thread_id
+        # 搜索结果带不带 message_position（消息在这个聊天里的序号，按发送先后，同一分钟里也分先后）
+        self.positions = positions
 
     # ---------- 造数据 ----------
     def add(self, *, chat_id: str, sender_id: str, content: str, at: datetime | None = None, sender_type: str = "user",
@@ -80,7 +84,8 @@ class FakeLark:
              "at": (at or now8()).astimezone(TZ8).replace(second=0, microsecond=0),
              "sender": {"id": sender_id, "sender_type": sender_type,
                         "name": "主人" if sender_id == ME else "机器人" if sender_type == "app" else "Alice"},
-             "thread_root": "", "thread_id": "", "pos": None, "deleted": False}
+             "thread_root": "", "thread_id": "", "pos": None, "deleted": False, "seq": self.n}
+        base = 0 if chat_type == "topic" else -1   # 开头那条的序号：话题群 "0"，普通聊天 "-1"
         if thread_root:
             root = self.msgs[thread_root]
             if root["thread_root"]:
@@ -88,10 +93,15 @@ class FakeLark:
                 root = self.msgs[thread_root]
             if not root["thread_id"]:
                 root["thread_id"] = "omt_test_" + thread_root.removeprefix("om_test_")
-                root["pos"] = 0
+                root["pos"] = 0 if root["chat_type"] == "topic" else -1
+            m["chat_type"] = root["chat_type"]
             m["thread_root"] = thread_root
             m["thread_id"] = root["thread_id"]
-            m["pos"] = 1 + sum(1 for x in self.msgs.values() if x["thread_root"] == thread_root)
+            m["pos"] = root["pos"] + 1 + sum(1 for x in self.msgs.values() if x["thread_root"] == thread_root)
+        elif chat_type == "topic":
+            # 话题群里每条顶层消息本身就是一个话题的开头
+            m["thread_id"] = "omt_test_" + mid.removeprefix("om_test_")
+            m["pos"] = base
         self.msgs[mid] = m
         return mid
 
@@ -101,8 +111,11 @@ class FakeLark:
         out = {"chat_id": m["chat_id"], "chat_name": "测试私聊", "chat_type": m["chat_type"], "content": m["content"],
                "create_time": m["at"].strftime("%Y-%m-%d %H:%M"), "deleted": m["deleted"],
                "message_app_link": f"https://example.invalid/{mid}", "message_id": mid,
-               "message_position": str(list(self.msgs).index(mid) + 1), "msg_type": "text", "sender": m["sender"],
-               "updated": False}
+               "msg_type": "text", "sender": m["sender"], "updated": False}
+        if self.positions:
+            # 聊天里的序号：同一聊天按（时间、发送先后）排，所以同一分钟里谁先谁后也分得清
+            out["message_position"] = str(1 + sum(1 for x in self.msgs.values() if x["chat_id"] == m["chat_id"]
+                                                  and (x["at"], x["seq"]) < (m["at"], m["seq"])))
         if m["thread_id"]:
             out["thread_id"] = m["thread_id"]
             out["thread_message_position"] = str(m["pos"])
@@ -151,8 +164,6 @@ class FakeLark:
     def _created(self, mid: str) -> dict:
         m = self.msgs[mid]
         out = {"message_id": mid, "chat_id": m["chat_id"], "create_time": str(int(m["at"].timestamp()))}
-        if self.reply_returns_thread_id and m["thread_id"]:
-            out["thread_id"] = m["thread_id"]
         return out
 
     def _send(self, args: list[str]) -> dict:
@@ -198,13 +209,23 @@ class FakeLark:
     def _thread_list(self, args: list[str]) -> dict:
         t = _opt(args, "--thread")
         root = next((k for k, v in self.msgs.items() if v["thread_id"] == t and not v["thread_root"]), t)
-        ids = ([root] if self.list_includes_root and root in self.msgs else []) + self.in_thread(root)
+        ids = self.in_thread(root)   # 只有回复，不含开头那条
         if _opt(args, "--order") == "desc":
             ids.reverse()
-        return {"messages": [self.raw(i) for i in ids], "has_more": False}
+        tid = self.msgs[root]["thread_id"] if root in self.msgs else t
+        return {"has_more": False, "messages": [self.raw(i) for i in ids], "page_token": "", "thread_id": tid,
+                "total": len(ids)}
 
     def _mget(self, args: list[str]) -> dict:
-        return {"messages": [self.raw(i) for i in _opt(args, "--message-ids").split(",") if i in self.msgs]}
+        out = []
+        for i in _opt(args, "--message-ids").split(","):
+            if i not in self.msgs:
+                continue
+            r = self.raw(i)
+            if self.in_thread(i):   # 有话题的开头那条带上回复
+                r["thread_replies"] = [self.raw(x) for x in self.in_thread(i)]
+            out.append(r)
+        return {"messages": out, "total": len(out)}
 
 
 def snapshot(path: Path) -> dict:
@@ -356,6 +377,44 @@ class AskTest(ThreadsBase):
         self.assertEqual(rc, outbound.EXIT_SEND_FAILED)
         self.assertIn("假的失败", err)
 
+    def test_batch_defaults_to_current_then_latest_batch(self):
+        # 不带 --batch：用这个会话当前在跑的批次；没有在跑的用最近一批；隔批说同样的话照常发
+        self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="第一批的消息")
+        self.poll()
+        self.d.dispatch_once()
+        b1 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        self.assertTrue(b1)
+        self.ask(text="同样的话")
+        first = _opt(self.lark.sent()[0], "--idempotency-key")
+        self.assertEqual(first, outbound.idem_key("ask", "tp_alpha", "", b1, outbound.compose(
+            self.cfg, "ask", "tp_alpha", "发版时间", "同样的话")))
+        self.ack("tp_alpha")
+        self.d.dispatch_once()                                    # 回执以后没有在跑的批次：用最近一批，还是 b1
+        self.assertIsNone(self.store.get_topic("tp_alpha")["pending_batch_id"])
+        self.assertEqual(outbound.current_batch(self.store, "tp_alpha"), b1)
+        self.assertEqual(self.ask(text="同样的话")[0], 0)
+        self.assertEqual(len(self.lark.sent()), 1)                # 同一批里重跑只发一条
+        self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="第二批的消息")
+        self.poll()
+        self.d.dispatch_once()
+        b2 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        self.assertNotEqual(b2, b1)
+        self.ask(text="同样的话")                                 # 隔一批：同样的话照常发
+        self.assertEqual(len(self.lark.sent()), 2)
+        self.assertNotEqual(_opt(self.lark.sent()[1], "--idempotency-key"), first)
+
+    def test_batch_empty_without_any_batch_and_explicit_batch_wins(self):
+        self.store.conn.execute("DELETE FROM dispatches WHERE topic_id='tp_alpha'")
+        self.store.conn.execute("UPDATE topics SET pending_batch_id=NULL WHERE topic_id='tp_alpha'")
+        self.store.conn.commit()
+        self.assertEqual(outbound.current_batch(self.store, "tp_alpha"), "")
+        self.ask(text="没有批次")
+        text = outbound.compose(self.cfg, "ask", "tp_alpha", "发版时间", "没有批次")
+        self.assertEqual(_opt(self.lark.sent()[0], "--idempotency-key"), outbound.idem_key("ask", "tp_alpha", "", "", text))
+        self.ask("--batch", "b_test_given", text="没有批次")
+        self.assertEqual(_opt(self.lark.sent()[1], "--idempotency-key"),
+                         outbound.idem_key("ask", "tp_alpha", "", "b_test_given", text))
+
     def test_invalid_arguments(self):
         rc, _, err = self.ask(topic="tp_nobody")
         self.assertEqual(rc, outbound.EXIT_INVALID)
@@ -388,6 +447,8 @@ class ThreadReplyTest(ThreadsBase):
         self.poll()
         root = self.store.thread_by_key("tp_alpha", "PR#9")["root_message_id"]
         mid = self.owner_in_thread(root, "下周一")
+        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "0")   # 普通聊天：话题里第一条回复是 "0"
+        self.assertEqual(self.lark.raw(root)["thread_message_position"], "-1")  # 开头那条是 "-1"
         self.poll()
         r = self.row(mid)
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", "tp_alpha"))
@@ -439,69 +500,130 @@ class ThreadReplyTest(ThreadsBase):
         self.poll()
         self.assertIn("最近 0 条", self.deliver())
 
-    def test_old_message_thread_recognized_by_thread_list(self):
-        # 老办法发的「需要你定」（没走 ask）：先被拉进账本、登记成未结问题
+    def age(self, mid: str, days: int = 3) -> None:
+        """让这条变老：之后的拉取窗口里不再有它（账本里已有的那行不变）。"""
+        self.lark.msgs[mid]["at"] -= timedelta(days=days)
+
+    def bus_notes(self) -> list[str]:
+        return [n[0] for n in self.store.conn.execute("SELECT content FROM messages WHERE reason='escalation_list'")]
+
+    def test_old_message_thread_recognized_by_mget_candidates(self):
+        # 老办法发的「需要你定」（没走 ask）：拉进账本时还没有话题；之后主人在它下面开了话题，开头那条不再被拉到
         old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app",
                             content="🐕 需要你定 · 老问题 [tp_alpha]\n怎么办？")
         self.poll()
         self.assertIsNotNone(self.store.get_escalation(old))
+        self.assertFalse(self.row(old)["thread_id"])
+        self.age(old)
         mid = self.owner_in_thread(old, "按 A 办")
+        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "0")   # 普通聊天的第一条回复是 "0"
         self.poll()
         r = self.row(mid)
         self.assertEqual((r["topic_id"], r["reason"]), ("tp_alpha", "owner_reply"))
         thr = self.store.thread_by_root(old)
         self.assertEqual((thr["topic_id"], thr["source"], thr["key"]), ("tp_alpha", "recognized", None))
-        self.assertTrue(thr["thread_id"].startswith("omt_"))
-        lists = [c for c in self.lark.calls if c[1] == "+threads-messages-list"]
-        self.assertEqual(len(lists), 1)
-        self.assertEqual((_opt(lists[0], "--order"), _opt(lists[0], "--as")), ("asc", "user"))
+        self.assertEqual(thr["thread_id"], self.lark.msgs[old]["thread_id"])
+        mgets = [c for c in self.lark.calls if c[1] == "+messages-mget"]
+        self.assertEqual(len(mgets), 1)
+        self.assertIn(old, _opt(mgets[0], "--message-ids").split(","))
+        self.assertLessEqual(len(_opt(mgets[0], "--message-ids").split(",")), 50)
+        self.assertNotIn("+threads-messages-list", self.lark.subcommands())   # 话题列表不用来找开头
         text = self.deliver()
         self.assertIn("怎么办？", text)
         self.assertEqual(self.store.get_escalation(old)["close_reason"], "answered")
-        # 同一话题再回：按表直接认出，不再查话题列表
+        # 同一话题再回：按表直接认出，不再 mget
         self.owner_in_thread(old, "补充一句")
         self.poll()
-        self.assertEqual(sum(1 for c in self.lark.calls if c[1] == "+threads-messages-list"), 1)
+        self.assertEqual(sum(1 for c in self.lark.calls if c[1] == "+messages-mget"), 1)
 
-    def test_old_report_thread_recognized_by_first_line(self):
-        # 开头那条不在 bot_outbox / escalations 里（比如过了保留期），按第一行认
+    def test_root_in_ledger_found_by_position_and_first_line(self):
+        # 开头那条在账本里，拉取时带上了话题编号和开头序号 "-1"；它不在 escalations / bot_outbox 里（比如登记时会话不可投），
+        # 按第一行认
         old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", content="🐕 汇报 · 早先的 [tp_alpha]\n…")
-        mid = self.owner_in_thread(old, "收到")
-        self.lark.msgs[old]["at"] -= timedelta(days=3)  # 不在拉取窗口里
         self.poll()
+        self.store.conn.execute("DELETE FROM bot_outbox WHERE message_id=?", (old,))
+        self.store.conn.commit()
+        mid = self.owner_in_thread(old, "收到")
+        self.poll()                         # 开头那条还在拉取窗口里：再拉到时补上话题编号和序号
+        self.assertEqual((self.row(old)["thread_id"], self.row(old)["thread_position"]),
+                         (self.lark.msgs[old]["thread_id"], "-1"))
         self.assertEqual(self.row(mid)["topic_id"], "tp_alpha")
         self.assertEqual(self.store.thread_by_root(old)["source"], "recognized")
+        self.assertNotIn("+messages-mget", self.lark.subcommands())
+
+    def test_topic_group_root_is_zero(self):
+        # 话题群（chat_type = topic）：开头那条序号是 "0"，回复从 "1" 起
+        topic_chat = "oc_test_esc_topic"
+        self.cfg.escalation.chat_ids = [ESC_CHAT, topic_chat]
+        old = self.lark.add(chat_id=topic_chat, chat_type="topic", sender_id=BOT, sender_type="app",
+                            content="🐕 需要你定 · 话题群里问的 [tp_alpha]\n选哪个？")
+        self.poll()
+        self.assertEqual(self.row(old)["thread_position"], "0")
+        mid = self.owner_in_thread(old, "选 B")
+        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "1")
+        self.poll()
+        r = self.row(mid)
+        self.assertEqual(r["topic_id"], "tp_alpha")
+        self.assertIn("🧵", r["note"])
+        self.assertIn("选哪个？", r["note"])
+        # 主人在话题群里新发一条（它自己就是开头，序号 "0"）：不当成话题回复
+        own = self.lark.add(chat_id=topic_chat, chat_type="topic", sender_id=ME, content="另起一件事")
+        self.poll()
+        self.assertNotIn("🧵", self.row(own)["note"] or "")
+        self.assertFalse(any(t.startswith("thread:") for t in json.loads(self.row(own)["tags_json"])))
 
     def test_unrecognized_thread_goes_to_bus(self):
-        # 主人自己发的一条下面开了话题：开头那条认不出来源
+        # 主人自己发的一条下面开了话题：它不在候选里，认不出来源
         own = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="我自己记一笔")
-        self.lark.msgs[own]["at"] -= timedelta(days=3)
+        self.age(own)
         mid = self.owner_in_thread(own, "这条给谁？")
         self.poll()
         r = self.row(mid)
         self.assertEqual((r["topic_id"], r["reason"]), (BUS_TOPIC_ID, "owner_reply"))
-        notes = self.store.conn.execute("SELECT content FROM messages WHERE reason='escalation_list'").fetchall()
-        self.assertTrue(any("认不出来源的话题" in n[0] and mid in n[0] and "我自己记一笔" in n[0] for n in notes))
+        self.assertTrue(any("认不出来源的话题" in n and mid in n and "开头那条查不到" in n for n in self.bus_notes()))
         self.assertIsNone(self.store.thread_by_root(own))
 
-    def test_thread_list_failure_goes_to_bus_with_reason(self):
+    def test_candidates_without_match_go_to_bus(self):
+        self.ask(text="不带钥匙问的")                               # 候选里有它，但话题对不上
+        own = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="我自己记一笔")
+        self.age(own)
+        mid = self.owner_in_thread(own, "这条给谁？")
+        self.poll()
+        self.assertEqual(self.row(mid)["topic_id"], BUS_TOPIC_ID)
+        self.assertEqual(sum(1 for c in self.lark.calls if c[1] == "+messages-mget"), 1)
+
+    def test_mget_failure_goes_to_bus_with_reason(self):
         old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", content="🐕 需要你定 · x [tp_alpha]\ny")
-        self.lark.msgs[old]["at"] -= timedelta(days=3)
+        self.poll()
+        self.age(old)
         mid = self.owner_in_thread(old, "回复")
-        self.lark.plan["+threads-messages-list"] = ["error"]
+        self.lark.plan["+messages-mget"] = ["error"]
         with self.assertLogs("sheepdog", "WARNING"):
             self.poll()
         self.assertEqual(self.row(mid)["topic_id"], BUS_TOPIC_ID)
-        notes = [n[0] for n in self.store.conn.execute("SELECT content FROM messages WHERE reason='escalation_list'")]
-        self.assertTrue(any("开头那条查不到" in n and "假的失败" in n for n in notes))
+        self.assertTrue(any("开头那条查不到" in n and "假的失败" in n for n in self.bus_notes()))
 
-    def test_list_without_root_is_unrecognized(self):
-        self.lark.list_includes_root = False
-        old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", content="🐕 需要你定 · x [tp_alpha]\ny")
-        self.lark.msgs[old]["at"] -= timedelta(days=3)
-        mid = self.owner_in_thread(old, "回复")
-        self.poll()
-        self.assertEqual(self.row(mid)["topic_id"], BUS_TOPIC_ID)
+    def test_thread_id_backfilled_by_mget_after_posting(self):
+        # --reply-in-thread 的返回里没有 thread_id：发完以后只读 mget 一次开头那条，补进话题表（不等拉取）
+        self.ask("--key", "K13")
+        root = self.store.thread_by_key("tp_alpha", "K13")["root_message_id"]
+        self.assertEqual(self.lark.subcommands(), ["+messages-send"])
+        self.ask("--key", "K13", text="第二条")
+        self.assertEqual(self.lark.subcommands(), ["+messages-send", "+messages-reply", "+messages-mget"])
+        self.assertEqual(_opt(self.lark.calls[-1], "--message-ids"), root)
+        self.assertEqual(self.store.thread_by_key("tp_alpha", "K13")["thread_id"], self.lark.msgs[root]["thread_id"])
+        self.ask("--key", "K13", text="第三条")                    # 已经知道了，不再 mget
+        self.assertEqual(self.lark.subcommands().count("+messages-mget"), 1)
+
+    def test_thread_id_backfill_failure_does_not_fail_the_send(self):
+        self.ask("--key", "K14")
+        self.lark.plan["+messages-mget"] = ["error"]
+        rc, out, _ = self.ask("--key", "K14", text="第二条")
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.store.thread_by_key("tp_alpha", "K14")["thread_id"])
+        self.poll()                                                 # 之后从拉取里补
+        root = self.store.thread_by_key("tp_alpha", "K14")["root_message_id"]
+        self.assertEqual(self.store.thread_by_key("tp_alpha", "K14")["thread_id"], self.lark.msgs[root]["thread_id"])
 
     def test_quote_reply_path_unchanged(self):
         # 有 reply_to（引用回复）时照旧按引用走，哪怕消息也带着话题编号
@@ -520,6 +642,7 @@ class ThreadReplyTest(ThreadsBase):
         self.assertEqual(r["topic_id"], BUS_TOPIC_ID)
         self.assertNotIn("🧵", r["note"] or "")
         self.assertNotIn("+threads-messages-list", self.lark.subcommands())
+        self.assertNotIn("+messages-mget", self.lark.subcommands()[-6:])
 
     def test_root_itself_is_not_a_thread_reply(self):
         # 主人自己发的一条，后来成了话题开头：它本身照旧按「没引用」处理（这里唯一未结在 tp_alpha）
@@ -551,6 +674,20 @@ class ThreadCommandTest(ThreadsBase):
         self.assertEqual(out.count("message_id"), 3)
         self.assertEqual(diff_tables(before, snapshot(self.cfg.db_path)), set())
         self.assertEqual(self.lark.subcommands(), ["+threads-messages-list"])
+
+    def test_thread_lists_root_via_mget_when_not_in_ledger(self):
+        # 话题列表不含开头那条；开头那条不在账本、也不是 sheepdog 发的：从 mget 取
+        old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", content="很早以前的一条")
+        self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="主人的回复一", thread_root=old)
+        self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="主人的回复二", thread_root=old)
+        rc, out, _ = self.cli("thread", "--topic", BUS_TOPIC_ID, "--thread", old)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("【开头】", out)
+        self.assertIn("很早以前的一条", out)
+        self.assertIn("主人的回复一", out)
+        self.assertIn("主人的回复二", out)
+        self.assertLess(out.index("很早以前的一条"), out.index("主人的回复一"))
+        self.assertEqual(self.lark.subcommands(), ["+messages-mget", "+threads-messages-list"])
 
     def test_thread_refuses_other_sessions_thread(self):
         self.ask("--key", "K21")
@@ -643,7 +780,8 @@ class ReplyCheckTest(ThreadsBase):
         self.assertEqual((c[1], _opt(c, "--message-id"), _opt(c, "--as"), _opt(c, "--msg-type")),
                          ("+messages-reply", self.q, "user", "interactive"))
         self.assertNotIn("--reply-in-thread", c)
-        self.assertEqual(_opt(c, "--idempotency-key"), outbound.idem_key("reply", self.batch, self.q))
+        self.assertEqual(_opt(c, "--idempotency-key"),
+                         outbound.idem_key("reply", self.batch, self.q, outbound.text_fingerprint("收到，下班前给结论")))
         card = json.loads(_opt(c, "--content"))
         self.assertIn(MARK, json.dumps(card, ensure_ascii=False))
         mid = self.store.conn.execute("SELECT message_id FROM sends WHERE kind='reply'").fetchone()[0]
@@ -694,7 +832,7 @@ class ReplyCheckTest(ThreadsBase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(datetime.fromisoformat(_opt(self.lark.calls[0], "--start")), self.t0 + timedelta(minutes=4))
         self.owner_says("这句在最后", minutes_after=6)
-        rc, out, _ = self.cli("reply", "--topic", "tp_alpha", "--to", self.q, "--card-text", "第二条", "--followup")
+        rc, out, _ = self.cli("reply", "--topic", "tp_alpha", "--to", self.q, "--card-text", "第二条")
         self.assertEqual(rc, outbound.EXIT_OWNER_REPLIED)
         self.assertIn("这句在最后", out)
         self.assertNotIn("在这两条之间说的", out)
@@ -713,17 +851,55 @@ class ReplyCheckTest(ThreadsBase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.lark.subcommands(), ["+messages-reply"])
 
-    def test_duplicate_with_different_text_and_followup(self):
+    def test_ack_then_conclusion_both_sent_and_same_text_retried_once(self):
+        # 处理要久的先回「ok，稍等」，处理完对同一条再回结论：两条都发；同样内容重试只发一条
         self.assertEqual(self.reply(text="ok，稍等")[0], 0)
-        rc, _, err = self.reply(text="结论：可以")
-        self.assertEqual(rc, outbound.EXIT_DUPLICATE)
-        self.assertIn("--followup", err)
+        self.assertEqual(self.reply(text="结论：可以")[0], 0)
+        for _ in range(3):
+            self.assertEqual(self.reply(text="ok，稍等")[0], 0)
+            self.assertEqual(self.reply(text="结论：可以")[0], 0)
+        sent = self.lark.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertEqual({_opt(c, "--message-id") for c in sent}, {self.q})
+        self.assertEqual(len({_opt(c, "--idempotency-key") for c in sent}), 2)
+        mine = [m for m in self.lark.msgs.values() if m["chat_id"] == ALPHA_P2P and m["sender"]["id"] == ME]
+        self.assertEqual(len(mine), 2)
+
+    def test_same_minute_owner_before_target_is_not_after(self):
+        # 同一分钟里：主人先说、Alice 后问。按聊天里的序号比，主人那句在要回复的那条之前，不算「之后」
+        m0 = now8()   # 两条用同一个分钟，免得跨分钟时测试悄悄变成按分钟就能分开
+        self.lark.add(chat_id=ALPHA_P2P, sender_id=ME, content="我先说一句", at=m0)
+        q2 = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="同一分钟里问的", at=m0)
+        self.pull(q2)
+        self.deliver()
+        self.assertTrue(self.row(q2)["message_position"])
+        rc, out, _ = self.cli("reply", "--topic", "tp_alpha", "--to", q2, "--card-text", "好的")
+        self.assertEqual(rc, 0, out)
         self.assertEqual(len(self.lark.sent()), 1)
-        rc, _, _ = self.reply("--followup", text="结论：可以")
-        self.assertEqual(rc, 0)
-        rc, _, _ = self.reply("--followup", text="结论：可以")   # 重试只发一次
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(self.lark.sent()), 2)
+
+    def test_same_minute_owner_after_target_counts(self):
+        m0 = now8()
+        q2 = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="同一分钟里问的", at=m0)
+        said = self.lark.add(chat_id=ALPHA_P2P, sender_id=ME, content="我已经回了", at=m0)
+        self.pull(q2)
+        self.deliver()
+        rc, out, _ = self.cli("reply", "--topic", "tp_alpha", "--to", q2, "--card-text", "好的")
+        self.assertEqual(rc, outbound.EXIT_OWNER_REPLIED)
+        self.assertIn(said, out)
+        self.assertEqual(self.lark.sent(), [])
+
+    def test_without_positions_falls_back_to_minutes(self):
+        # 没有序号时退回按分钟比：同一分钟里主人在前也算「之后」（偏保守，宁可不发）
+        self.lark.positions = False
+        m0 = now8()   # 两条用同一个分钟，免得跨分钟时测试悄悄变成按分钟就能分开
+        self.lark.add(chat_id=ALPHA_P2P, sender_id=ME, content="我先说一句", at=m0)
+        q2 = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="同一分钟里问的", at=m0)
+        self.pull(q2)
+        self.deliver()
+        self.assertIsNone(self.row(q2)["message_position"])
+        rc, out, _ = self.cli("reply", "--topic", "tp_alpha", "--to", q2, "--card-text", "好的")
+        self.assertEqual(rc, outbound.EXIT_OWNER_REPLIED)
+        self.assertIn("我先说一句", out)
 
     def test_plain_text_gets_marker_and_target_must_be_in_ledger(self):
         rc, _, _ = self.cli("reply", "--topic", "tp_alpha", "--to", self.q, "--text", "纯文本")
@@ -738,7 +914,8 @@ class ReplyCheckTest(ThreadsBase):
         self.store.conn.execute("UPDATE messages SET batch_id=NULL WHERE message_id=?", (self.q,))
         self.store.conn.commit()
         self.reply()
-        self.assertEqual(_opt(self.lark.sent()[0], "--idempotency-key"), outbound.idem_key("reply", "tp_alpha", self.q))
+        self.assertEqual(_opt(self.lark.sent()[0], "--idempotency-key"),
+                         outbound.idem_key("reply", "tp_alpha", self.q, outbound.text_fingerprint("收到，下班前给结论")))
 
 
 # ======================= D：规则、文档、测试环境 =======================
