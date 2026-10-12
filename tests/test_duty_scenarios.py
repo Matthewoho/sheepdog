@@ -141,11 +141,12 @@ class S2LongCommand(Scenario):
         n = w.notices()[0]["text"]
         self.assertIn("「会话alpha」（topic `tp_alpha`，Antigravity）判为中断", n)
         self.assertIn("最近一次工具调用「Run release script」", n)
-        # 会话有了新动作：回到在做，不重复通知
+        # 会话有了新动作：回到在做，不重复通知中断，补一句「已恢复」
         a.act("Check release status", cmd="./release.sh --status")
         self.to(18)
         self.assert_card("tp_alpha", duty.WORKING)
-        self.assertEqual(len(self.notes()), 1)
+        self.assertEqual(self.notes()[1:], [("09:18", "恢复通知", "🐕 汇报 · 会话已恢复 [tp_bus]")])
+        self.assertIn("「会话alpha」（topic `tp_alpha`）10-12 09:17（北京时间）又有动作了", w.notices()[1]["text"])
         # 回执超时（09:01 送出，超过 20 分钟 → 09:22）：adopted 会话这一批按「没交回执」收掉，回到可投递
         # （会话动过这一批，算它处理过）
         self.to(21)
@@ -162,7 +163,8 @@ class S2LongCommand(Scenario):
         self.assert_card("tp_alpha", duty.WORKING)
         self.to(39)
         self.assert_card("tp_alpha", duty.STALLED, "最近动作 09:23")
-        self.assertEqual([x[:2] for x in self.notes()], [("09:16", "在岗表通知"), ("09:38", "在岗表通知")])
+        self.assertEqual([x[:2] for x in self.notes()],
+                         [("09:16", "在岗表通知"), ("09:18", "恢复通知"), ("09:38", "在岗表通知")])
         self.assertEqual(len(self.got("tp_alpha")), 2)
         self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")
 
@@ -189,7 +191,10 @@ class S2LongCommand(Scenario):
         self.assert_card(BUS_TOPIC_ID, duty.WORKING)
         self.to(57)
         self.assert_card(BUS_TOPIC_ID, duty.STALLED, "最近动作 09:40")
-        self.assertEqual([x[:2] for x in self.notes()], [("09:16", "在岗表通知"), ("09:55", "在岗表通知")])
+        self.assertEqual([x[:2] for x in self.notes()],
+                         [("09:16", "在岗表通知"), ("09:41", "恢复通知"), ("09:55", "在岗表通知")])
+        self.assertIn("排着 0 条信号。", w.notices()[0]["text"])  # 总线的中断通知不写「暂不投递」（会照常重投）
+        self.assertNotIn("暂不投递", w.notices()[0]["text"])
 
     def test_adopted_silent_across_receipt_timeout_notifies_stall_and_lost_once_each(self):
         """会话 09:01 碰了一下就再也不动（App 也死了，记录不再写）。20 分钟回执超时以后排队的消息会照现在的规则
@@ -251,7 +256,9 @@ class S3UntouchedBatch(Scenario):
         a.receipt()
         self.to(90)
         self.assertEqual(self.got("tp_alpha"), [[m1], [m2, m3, m4]])
-        self.assertEqual(len(self.notes()), 2)
+        self.assertEqual([x[:2] for x in self.notes()],
+                         [("09:16", "在岗表通知"), ("09:31", "在岗表通知"), ("09:46", "恢复通知")])
+        self.assertIn("排着的 3 条信号接着补送", w.notices()[2]["text"])
         self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")
 
 
@@ -288,9 +295,13 @@ class S4NetworkDown(Scenario):
         self.assertEqual(w.store.count_pending_signals(BUS_TOPIC_ID), 5)
         self.assertEqual(w.card(BUS_TOPIC_ID)["last_act_at"], last_act)  # ERROR / SYSTEM 不算动作
         self.assertEqual(self.notes(), [("09:18", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
-                                        ("10:06", "attention 通知", "🐕 汇报 · 会话卡住了 [tp_bus]")])
-        self.assertIn("排着 3 条信号", w.notices()[1]["text"])
-        self.assertIn("会自动恢复", w.notices()[1]["text"])
+                                        ("10:06", "attention 通知", "🐕 汇报 · 会话仍卡着 [tp_bus]")])
+        first, second = w.notices()[0]["text"], w.notices()[1]["text"]
+        self.assertNotIn("暂不投递", first)  # 总线回执超时照常重投
+        # 在岗表已经说过中断：attention 只补一句「仍卡着，已停止重投」
+        self.assertEqual(len(second.splitlines()), 2)
+        self.assertIn("仍卡着，已停止重投：回执超时（累计失败 3 次），排着 3 条信号；它一交回执或会话记录又有动作，"
+                      "就自动恢复、补送。", second)
         return ids
 
     def test_outage_then_late_receipt(self):
@@ -314,7 +325,8 @@ class S4NetworkDown(Scenario):
         bus.act("Handle m4 m5")
         bus.receipt()
         self.to(140)
-        self.assertEqual(len(self.notes()), 3)  # 整个过程：中断、attention、恢复，各一条
+        self.assertEqual(len(self.notes()), 3)  # 整个过程：中断、仍卡着、已恢复，各一条，最后一条是「已恢复」
+        self.assertEqual(self.notes()[-1][1], "恢复通知")
         delivered = [m for batch in self.got(BUS_TOPIC_ID) for m in batch]
         self.assertEqual(delivered.count(ids["m4"]), 1)
         self.assertEqual(delivered.count(ids["m5"]), 1)
@@ -355,7 +367,7 @@ class S4NetworkDown(Scenario):
         self.to(120)
         self.assertEqual(self.notes(), [("09:18", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
                                         ("09:33", "在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]"),
-                                        ("10:06", "attention 通知", "🐕 汇报 · 会话卡住了 [tp_bus]")])
+                                        ("10:06", "attention 通知", "🐕 汇报 · 会话仍卡着 [tp_bus]")])
         bus.app_alive = True
         bus.act("Back online")
         self.to(121)
@@ -365,6 +377,7 @@ class S4NetworkDown(Scenario):
         bus.receipt()
         self.to(240)
         self.assertEqual(len(self.notes()), 4)
+        self.assertEqual(self.notes()[-1][1], "恢复通知")
 
 
 # ======================= S5 被主人占着 =======================
@@ -458,8 +471,9 @@ class S6FailedRedelivered(Scenario):
         self.to(23)  # 第 3 次：attention
         t = w.topic(BUS_TOPIC_ID)
         self.assertEqual((t["state"], t["attention_reason"]), (sm.ATTENTION, "send_failed"))
-        self.assertEqual(self.notes()[-1], ("09:23", "attention 通知", "🐕 汇报 · 会话卡住了 [tp_bus]"))
-        self.assertIn("不会自动恢复", w.notices()[-1]["text"])
+        # 09:16 在岗表已经说过中断（同一段）：attention 只补一句「仍卡着」，写明要手动复位
+        self.assertEqual(self.notes()[-1], ("09:23", "attention 通知", "🐕 汇报 · 会话仍卡着 [tp_bus]"))
+        self.assertIn("session-reset --topic tp_bus", w.notices()[-1]["text"])
         n = len(self.notes())
         w.sink.fail.clear()
         w[BUS_TOPIC_ID].act("Something")
@@ -471,26 +485,43 @@ class S6FailedRedelivered(Scenario):
         self.assertEqual(self.got(BUS_TOPIC_ID), [[mid], [mid]])
         self.assertEqual(len(self.notes()), n)
 
-    def test_send_failure_on_idle_session_retries_every_round_silently(self):
-        """现状记录（报告里列为待定）：会话空闲时 agentapi 发不出去，状态机不允许 active → failed，
-        retries 一直涨、不进 attention、不通知主人；每轮重发，发得出去就恢复。卡片显示空闲。"""
+    def test_send_failure_on_idle_session_notifies_once_then_recovered(self):
+        """会话空闲时 agentapi 发不出去（状态机不允许 active → failed，不进 attention）：消息照常排队、每轮重试；
+        连续 3 次失败私聊主人一次「投递不出去」，之后发出去了再说一句「投递已恢复」。同一段失败只说一次。"""
         w = self.w
         w.sink.fail.add("conv_test_alpha")
         mid = w.message("alpha", "发不出去的一条")
+        self.to(2)
+        self.assertEqual(self.notes(), [])
+        self.to(3)  # 第 3 次失败
+        self.assertEqual(self.notes(), [("09:03", "投递失败通知", "🐕 汇报 · 投递不出去 [tp_bus]")])
+        text = w.notices()[0]["text"]
+        self.assertIn("「会话alpha」（topic `tp_alpha`，Antigravity）从 10-12 09:01（北京时间）起连续 3 次投递失败", text)
+        self.assertIn("agentapi send-message 失败（模拟）", text)
+        self.assertIn("消息照常排队、一条不丢", text)
         self.to(10)
         t = w.topic("alpha")
-        self.assertEqual((t["state"], t["retries"]), (sm.ACTIVE, 10))
+        self.assertEqual((t["state"], t["retries"]), (sm.ACTIVE, 10))  # 不扣消息、不改状态
         self.assertEqual(w.sink.sends, 10)
-        self.assert_card("tp_alpha", duty.IDLE)
-        self.assertEqual(self.notes(), [])
+        self.assertEqual(w.state(mid), "pending")
+        self.assertEqual(len(self.notes()), 1)
         w.sink.fail.clear()
         self.to(11)
         self.assertEqual(self.got("tp_alpha"), [[mid]])
+        self.assertEqual(self.notes()[1], ("09:11", "投递恢复通知", "🐕 汇报 · 投递已恢复 [tp_bus]"))
+        self.assertIn("之前连续失败 10 次），这一批送出 1 条", w.notices()[1]["text"])
+        # 新的一段失败：再说一次
+        w["alpha"].act("Handle")
+        w["alpha"].receipt()
+        w.sink.fail.add("conv_test_alpha")
+        w.message("alpha", "又发不出去")
+        self.to(15)
+        self.assertEqual([x[1] for x in self.notes()], ["投递失败通知", "投递恢复通知", "投递失败通知"])
 
 
 # ======================= S7 撞车提醒 =======================
 class S7Collision(Scenario):
-    def test_collision_notes_follow_open_work(self):
+    def test_collision_notes_from_routes_and_declared_work(self):
         w = self.w
         for key, title in ((KEY1, "审批单发版"), (KEY2, "合 PR"), (KEY3, "Linear 单")):
             rc, out = self.cli("work", "set", "--topic", "tp_alpha", "--key", key, "--title", title)
@@ -503,15 +534,20 @@ class S7Collision(Scenario):
         self.assertEqual((self.got(BUS_TOPIC_ID, 1), self.got("tp_beta", 1), self.got("tp_alpha", 1)),
                          ([[m1]], [[m2]], [[m3]]))
         bus_text = self.texts(BUS_TOPIC_ID)[-1]
-        for key in (KEY1, KEY2, KEY3):
-            self.assertIn(f"🔀 撞车提醒：{key} 登记在「会话alpha」（topic `tp_alpha`）名下", bus_text)
-            self.assertIn(f"FX-COLLISION key={key} owner=tp_alpha", bus_text)
-        self.assertIn(f"FX-COLLISION key={KEY3} owner=tp_alpha state=进行中 run=空闲 to=tp_beta", self.texts("tp_beta")[-1])
-        self.assertNotIn("撞车提醒", self.texts("tp_alpha")[-1])  # 自己名下的不提醒
+        for key in (KEY1, "pr#123", KEY3):  # 这一轮还没有路由事实：只有 alpha 自报的活，措辞写明「会话自报」
+            self.assertIn(f"🔀 撞车提醒：{key} 在「会话alpha」（topic `tp_alpha`）手上；会话自报：进行中", bus_text)
+        self.assertIn(f"FX-COLLISION key={KEY3} owner=tp_alpha state=进行中 run=空闲 to=tp_beta basis=会话自报",
+                      self.texts("tp_beta")[-1])
+        # alpha 自己手上的（自报的 KEY1）不提醒；但同一轮总线刚收到过提到 KEY1 的消息——这是事实，照样提醒
+        alpha_text = self.texts("tp_alpha")[-1]
+        self.assertEqual(alpha_text.count("撞车提醒"), 1)
+        self.assertIn(f"🔀 撞车提醒：{KEY1} 的消息最近送到了「Lark 信号·总线」（topic `tp_bus`）：最近一次 刚刚，共 1 条",
+                      alpha_text)
+        self.assertIn("basis=路由", alpha_text)
         for tid in (BUS_TOPIC_ID, "tp_alpha", "tp_beta"):
             w[tid].act("Handle")
             w[tid].receipt()
-        # 完成 / 转交以后不再提醒；没结束的照旧提醒
+        # 自报完成 / 转交以后不再提醒（同一编号送到 alpha 的路由事实也跟着收掉）；没结束的照旧提醒
         self.assertEqual(self.cli("work", "done", "--topic", "tp_alpha", "--key", KEY1, "--result", "发了")[0], 0)
         self.assertEqual(self.cli("work", "set", "--topic", "tp_alpha", "--key", KEY2, "--state", "handed_off",
                                   "--to", "beta")[0], 0)
@@ -521,7 +557,10 @@ class S7Collision(Scenario):
         text = self.texts(BUS_TOPIC_ID)[-1]
         self.assertNotIn(f"撞车提醒：{KEY1}", text)
         self.assertNotIn(f"撞车提醒：{KEY2}", text)
-        self.assertIn(f"撞车提醒：{KEY3}", text)
+        # KEY3：alpha 自报在做，beta 那边是事实（上一轮送到它的消息提到了 KEY3）
+        self.assertIn(f"🔀 撞车提醒：{KEY3} 在「会话alpha」（topic `tp_alpha`）手上；会话自报：进行中", text)
+        self.assertIn(f"🔀 撞车提醒：{KEY3} 的消息最近送到了「会话beta」（topic `tp_beta`）：最近一次 1 分钟前，共 1 条；"
+                      "它现在空闲", text)
         self.assertEqual(self.notes(), [])
 
 
@@ -662,7 +701,7 @@ class S9Digest(Scenario):
         # 不空闲的会话名下的活变了：算
         self.assertEqual(self.cli("work", "set", "--topic", "tp_rel", "--key", KEY1, "--title", "发版")[0], 0)
         lines = self.digest(self.bus_batch())
-        self.assertTrue(any(f"活 {KEY1}（进行中）" in ln for ln in lines), lines)
+        self.assertTrue(any(f"手上 {KEY1}（进行中·自报）" in ln for ln in lines), lines)
         self.assertEqual(self.notes()[0][1], "在岗表通知")  # patrol 中断的那一条
         self.assertEqual(len(self.notes()), 1)
 
@@ -695,7 +734,8 @@ class S10AutoWork(Scenario):
         self.assertEqual((b["XYZ-3"]["state"], b["XYZ-3"]["source"]), (duty.WAITING_OTHER, "watch"))
         self.assertEqual((b["PR #77"]["state"], b["PR #77"]["waiting_on"]), (duty.WAITING_OWNER, "主人"))
         self.assert_card("tp_beta", duty.WAITING)
-        self.assert_card("tp_alpha", duty.IDLE)  # 申报的是进行中、不是等待
+        # 运行状态只看事实：alpha 登记了等 bob 回复（watch），就是等回复——不管它自报的是「进行中」
+        self.assert_card("tp_alpha", duty.WAITING, "等 ou_test_bob 回复（watch #1")
         # forward → 转出方名下「已转交」
         mid = w.message("bus", "XYZ-9 这单给 alpha")
         self.to(2)
@@ -750,7 +790,8 @@ class S11Restart(Scenario):
         w.restart()
         self.to(50)
         self.assertEqual(self.got("tp_alpha"), [[m1], [m2]])
-        self.assertEqual(len(self.notes()), 2)
+        self.assertEqual([x[2] for x in self.notes()], ["🐕 汇报 · 会话中断了 [tp_bus]", "🐕 汇报 · 会话失联了 [tp_bus]",
+                                                       "🐕 汇报 · 会话已恢复 [tp_bus]"])
 
     def test_restart_in_attention_still_auto_recovers(self):
         w, bus = self.w, self.w[BUS_TOPIC_ID]
@@ -875,16 +916,21 @@ class S14OtherPaths(Scenario):
         self.assert_card("tp_alpha", duty.IDLE)
 
     def test_failed_bus_with_owner_talking(self):
-        """总线 failed（回执超时）时主人正在总线里说话：human_attach 不允许从 failed 进，在岗表也不扣 failed。
-        现状：照样重投进主人正在说话的会话。报告里列为待定。"""
+        """总线 failed（回执超时）时主人正在总线里说话：human_attach 不允许从 failed 进，以前照样重投进他正说话的会话。
+        现在：failed 加上卡片是「被主人占着」就排队，主人走了（15 分钟）再重投。"""
         w, bus = self.w, self.w[BUS_TOPIC_ID]
         mid = w.message("bus", "总线的一条")
         self.to(1)
         self.to(19)
         bus.owner_says("我来看看总线怎么了")
         bus.answer_only()
-        self.to(22)
+        self.to(22)  # 09:22 回执超时 → failed；主人还在 → 不重投
+        self.assertEqual(w.topic(BUS_TOPIC_ID)["state"], sm.FAILED)
         self.assert_card(BUS_TOPIC_ID, duty.OCCUPIED)
+        self.assertIn("主人在会话里", w.last_result["topics"][BUS_TOPIC_ID]["queued"])
+        self.to(33)
+        self.assertEqual(self.got(BUS_TOPIC_ID), [[mid]])
+        self.to(34)  # 09:19 + 15 分钟：主人走了，重投
         self.assertEqual(self.got(BUS_TOPIC_ID), [[mid], [mid]])
 
     def test_crash_mid_send_is_not_redelivered(self):

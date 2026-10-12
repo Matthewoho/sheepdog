@@ -49,11 +49,15 @@ CLOSED_WORK = (DONE, HANDED_OFF)
 WAITING_WORK = (WAITING_OTHER, WAITING_OWNER)
 _WORK_ALIASES = {**{v: k for k, v in WORK_LABEL.items()}, **{k: k for k in WORK_LABEL}}
 
-# 活的来源
+# 活的来源。会话自报（declared）以外都是牧羊犬看事实补的（自动）；路由事实另有一张表（duty_routes），不进 work_items
 DECLARED = "declared"
 SRC_WATCH = "watch"
 SRC_ESCALATION = "escalation"
 SRC_FORWARD = "forward"
+SRC_ROUTED = "routed"
+SOURCE_LABEL = {DECLARED: "会话自报", SRC_WATCH: "自动·等人回复", SRC_ESCALATION: "自动·需要你定",
+                SRC_FORWARD: "自动·转交", SRC_ROUTED: "自动·路由"}
+STALE_MARK = "可能过期"
 
 # 留言：sheepdog 系统消息的 reason
 MAIL_REASON = "duty_mail"
@@ -130,24 +134,35 @@ def set_work(store: Store, topic_id: str, key: str, *, title: str = "", state: s
     given = {k: v for k, v in dict(title=title, waiting_on=waiting_on, until=until, expect=expect, handed_to=to,
                                    result=result).items() if v}
     w = store.get_work(topic_id, nk)
+    ts = now_iso()
     if w is None:
-        wid = store.add_work(topic_id, key, nk, state, DECLARED, True, **given, **_close_fields(state))
+        wid = store.add_work(topic_id, key, nk, state, DECLARED, True, declared_at=ts, **given, **_close_fields(state))
     else:
         wid = w["id"]
-        store.update_work(wid, key=key, state=state, declared=1, **given, **_close_fields(state))
-    if state in CLOSED_WORK and (w is None or w["closed_at"] is None):
-        record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone())
+        store.update_work(wid, key=key, state=state, declared=1, declared_at=ts, **given, **_close_fields(state))
+    if state in CLOSED_WORK:
+        # 会话自报做完 / 转交：这之前送到它的同一编号的消息不再算它手上的事（之后又送到就重新算）
+        store.close_route(topic_id, nk, "会话自报已转交" if state == HANDED_OFF else "会话自报已完成", ts)
+        if w is None or w["closed_at"] is None:
+            record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone())
     return wid, others
 
 
 def done_work(store: Store, topic_id: str, key: str, result: str) -> int:
-    """sheepdog work done：收掉名下的一件活。"""
+    """sheepdog work done：收掉名下的一件活。只有路由事实、没登记过的编号也可以 done（等于登记一件已完成的活）。"""
     w = store.get_work(topic_id, norm_key(key))
+    if w is None and store.active_routes("", topic_id, norm_key(key)):
+        if not (result or "").strip():
+            raise DutyError("--result 不能为空：一句话写做成了什么")
+        return set_work(store, topic_id, key, state=DONE, result=result.strip())[0]
     if w is None:
         raise DutyError(f"{topic_id} 名下没有钥匙 {key!r} 的活：先 work set，或者直接 work set --state done")
     if not (result or "").strip():
         raise DutyError("--result 不能为空：一句话写做成了什么")
-    store.update_work(w["id"], state=DONE, result=result.strip(), declared=1, closed_at=w["closed_at"] or now_iso())
+    ts = now_iso()
+    store.update_work(w["id"], state=DONE, result=result.strip(), declared=1, declared_at=ts,
+                      closed_at=w["closed_at"] or ts)
+    store.close_route(topic_id, norm_key(key), "会话自报已完成", ts)
     if w["closed_at"] is None:
         record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
     return w["id"]
@@ -226,11 +241,63 @@ def key_for(text: str, patterns: Iterable[re.Pattern], fallback: str) -> str:
 def forward_work(store: Store, src_topic: str, dst_topic: str, rows: list, patterns: Iterable[re.Pattern]) -> None:
     """forward → 已转交（7.20 第 5 步）：转交出去的消息记成转出方名下「已转交」的活。"""
     patterns = list(patterns)
+    ts = now_iso()
     for r in rows:
         mid = r["message_id"]
         key = key_for(r["content"] or "", patterns, f"fwd-{mid[-8:]}")
         auto_work(store, src_topic, key, f"forward:{mid}", SRC_FORWARD, HANDED_OFF,
                   title=short(r["content"] or "", 40), handed_to=dst_topic)
+        # 转出方手上的这件事（路由事实）收掉：之后撞车提醒指向接手的会话
+        for k in extract_keys(r["content"] or "", patterns):
+            store.close_route(src_topic, norm_key(k), f"已转交给 {dst_topic}", ts)
+
+
+# ======================= 路由事实 =======================
+def record_routes(store: Store, topic_id: str, rows: list, patterns: Iterable[re.Pattern], at: str = "") -> int:
+    """消息投给了这个会话：正文里认出的编号，按 (会话, 编号) 记一条路由事实（几点、第几条）。
+    sheepdog 自己生成的消息（留言、提醒）不算。返回记了几条。"""
+    from .store import SYSTEM_CHAT
+    patterns = list(patterns)
+    at = at or now_iso()
+    n = 0
+    for r in rows:
+        if r["chat_type"] == SYSTEM_CHAT:
+            continue
+        for k in extract_keys(r["content"] or "", patterns):
+            n += store.add_route(topic_id, k, norm_key(k), short(r["content"] or "", 40), r["message_id"], at)
+    return n
+
+
+def routes_since(now: datetime, hours: float) -> str:
+    return (now - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def route_holders(store: Store, key: str, exclude_topic: str, now: datetime, hours: float) -> list:
+    """这把钥匙的消息最近（hours 小时内）送到过的别的会话（路由事实，还没转交、没自报做完）。"""
+    return [r for r in store.active_routes(routes_since(now, hours), norm_key=norm_key(key))
+            if r["topic_id"] != exclude_topic]
+
+
+def is_stale(w, card, now: datetime, hours: float) -> bool:
+    """会话自报、还开着的活「可能过期」：hours 小时没更新，并且这段时间会话一直空闲。只是标出来，不替它关。"""
+    if not w["declared"] or w["closed_at"]:
+        return False
+    keys = w.keys() if hasattr(w, "keys") else w
+    upd = _dt(w["declared_at"] if "declared_at" in keys and w["declared_at"] else w["updated_at"])
+    if upd is None or now - upd < timedelta(hours=hours):
+        return False
+    if card is None or card["run_state"] != IDLE:
+        return False
+    idle = _dt(card["idle_since"] if "idle_since" in (card.keys() if hasattr(card, "keys") else card) else "")
+    return idle is not None and now - idle >= timedelta(hours=hours)
+
+
+def _dt(ts) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(ts) if ts else None
+    except ValueError:
+        return None
+    return dt if dt is not None and dt.tzinfo is not None else None
 
 
 # ======================= 信箱 =======================
@@ -348,12 +415,30 @@ def ago_text(ts: str, now: datetime | None = None) -> str:
     return f"{m // 60} 小时前"
 
 
-def work_line(w, with_owner: bool = False) -> str:
+def source_text(w) -> str:
+    """这件活从哪来：会话自报，或者牧羊犬看事实自动补的（等人回复、需要你定、转交）。自报过、又有自动来源的两个都写。"""
+    src = w["source"] or DECLARED
+    if w["declared"]:
+        return SOURCE_LABEL[DECLARED] + (f" + {SOURCE_LABEL.get(src, src)}" if src != DECLARED else "")
+    return SOURCE_LABEL.get(src, src)
+
+
+def stale_label(hours: float) -> str:
+    return f"{STALE_MARK}（{hours:g} 小时没更新）"
+
+
+def work_line(w, with_owner: bool = False, route=None, now: datetime | None = None) -> str:
+    """一件活一行：钥匙、标题、状态，括号里是细节和来源。w 里有 stale（可能过期的说明）就放在最前面。
+    route：同一把钥匙的路由事实（消息最近送到这里），有就一起写。"""
     parts = [w["key"]]
     if w["title"]:
         parts.append(short(w["title"], 40))
     head = " ".join(parts) + f" · {WORK_LABEL.get(w['state'], w['state'])}"
     extra = []
+    stale = w.get("stale") if isinstance(w, dict) else ""
+    if stale:
+        extra.append(f"⚠ {stale}")
+    extra.append(source_text(w))
     if w["waiting_on"]:
         extra.append(f"等 {w['waiting_on']}")
     if w["until"]:
@@ -364,13 +449,57 @@ def work_line(w, with_owner: bool = False) -> str:
         extra.append(f"转给 {w['handed_to']}")
     if w["result"]:
         extra.append(f"结果：{short(w['result'], 40)}")
-    if w["source"] and w["source"] != DECLARED and not w["declared"]:
-        extra.append(f"牧羊犬按 {w['source']} 自动补")
     if with_owner:
         extra.append(f"会话 {w['topic_id']}")
-    if not w["closed_at"] and (ago := ago_text(w["updated_at"] or "")):
+    keys = w.keys() if hasattr(w, "keys") else w
+    upd = (w["declared_at"] if "declared_at" in keys and w["declared_at"] and w["declared"] else "") or w["updated_at"]
+    if not w["closed_at"] and (ago := ago_text(upd or "", now)):
         extra.append(f"更新于 {ago}")
-    return head + ("（" + "；".join(extra) + "）" if extra else "")
+    if route is not None:
+        extra.append(f"{SOURCE_LABEL[SRC_ROUTED]}：消息最近一次 {ago_text(route['last_at'], now) or route['last_at']}"
+                     f"送到这里，共 {route['count']} 条")
+    return head + "（" + "；".join(extra) + "）"
+
+
+def route_line(r, now: datetime | None = None) -> str:
+    """只有路由事实、会话没登记过的编号：「这个编号的消息最近送到了这里」。"""
+    return (f"{r['key']} · 消息最近送到这里（{SOURCE_LABEL[SRC_ROUTED]}：最近一次 "
+            f"{ago_text(r['last_at'], now) or r['last_at']}，共 {r['count']} 条；最近一条：{short(r['title'] or '', 30)}）")
+
+
+def on_hand(work: list[dict], routes: list[dict]) -> list[dict]:
+    """「手上的事」：还开着的活（自报 + 自动）和还算数的路由事实，按钥匙合并。"""
+    items: list[dict] = []
+    by_key: dict[str, dict] = {}
+    for w in work:
+        item = {"key": w["key"], "norm_key": w["norm_key"], "state": w["state"], "declared": bool(w["declared"]),
+                "stale": bool(w.get("stale")), "work": w, "route": None}
+        items.append(item)
+        by_key[w["norm_key"]] = item
+    for r in routes:
+        if r["norm_key"] in by_key:
+            by_key[r["norm_key"]]["route"] = r
+        else:
+            items.append({"key": r["key"], "norm_key": r["norm_key"], "state": "", "declared": False, "stale": False,
+                          "work": None, "route": r})
+    return items
+
+
+def item_line(item: dict, now: datetime | None = None) -> str:
+    return work_line(item["work"], route=item["route"], now=now) if item["work"] is not None \
+        else route_line(item["route"], now)
+
+
+def item_tag(item: dict) -> str:
+    """摘要里一件事的简写：状态·来源（自报 / 自动 / 路由），可能过期的加一句。"""
+    if item["work"] is None:
+        return "路由"
+    tags = [WORK_LABEL.get(item["state"], item["state"]), "自报" if item["declared"] else "自动"]
+    if item["route"] is not None:
+        tags.append("路由")
+    if item["stale"]:
+        tags.append(STALE_MARK)
+    return "·".join(tags)
 
 
 def action_label(run_state: str) -> str:
@@ -378,16 +507,35 @@ def action_label(run_state: str) -> str:
     return ACTION_NOW if run_state == WORKING else ACTION_LAST
 
 
-def card_data(store: Store, t, card, now: datetime | None = None) -> dict:
-    """一张会话卡（board / 摘要共用）：职责、运行状态、此刻 / 最近动作、名下的活、最近做完的 3 件、未读留言数。
-    action 字段名不分此刻还是最近，action_label 说明是哪一种。"""
+def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: float = 4,
+              routed_hours: float = 24) -> dict:
+    """一张会话卡（board / 摘要共用）：职责、运行状态、此刻 / 最近动作、手上的事、最近做完的 3 件、未读留言数。
+    action 字段名不分此刻还是最近，action_label 说明是哪一种。
+
+    手上的事 = 还开着的活（work：会话自报的、牧羊犬自动补的，各自标来源）+ 还算数的路由事实（routes：带这个编号的
+    消息最近 routed_hours 小时内送到了这里）。会话自报、stale_hours 小时没更新、这段时间一直空闲的，标「可能过期」。"""
     now = now or datetime.now().astimezone()
     tid = t["topic_id"]
-    work = store.open_work(tid)
-    closed = store.closed_work(tid, 3)
     unread = store.unread_mail(tid)
     c = dict(card) if card is not None else {}
     state = c.get("run_state") or ""
+    work = []
+    for w in store.open_work(tid):
+        d = dict(w)
+        d["source_label"] = source_text(w)
+        d["stale"] = stale_label(stale_hours) if is_stale(w, card, now, stale_hours) else ""
+        work.append(d)
+    closed = []
+    for w in store.closed_work(tid, 3):
+        d = dict(w)
+        d["source_label"] = source_text(w)
+        closed.append(d)
+    routes = []
+    for r in store.active_routes(routes_since(now, routed_hours), topic_id=tid):
+        d = dict(r)
+        d["source_label"] = SOURCE_LABEL[SRC_ROUTED]
+        d["ago"] = ago_text(r["last_at"], now)
+        routes.append(d)
     return {
         "topic_id": tid,
         "title": t["title"],
@@ -406,8 +554,10 @@ def card_data(store: Store, t, card, now: datetime | None = None) -> dict:
         "compacted_at": c.get("compacted_at") or "",
         "queued": c.get("queued") or 0,
         "updated_at": c.get("updated_at") or "",
-        "work": [dict(w) for w in work],
-        "recent_done": [dict(w) for w in closed],
+        "work": work,
+        "routes": routes,
+        "on_hand": on_hand(work, routes),
+        "recent_done": closed,
         "unread_mail": len(unread),
     }
 
@@ -433,11 +583,11 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
         lines.append(f"  运行状态：{state_text(d)}" + (f"；排队 {d['queued']} 条" if d["queued"] else ""))
         lines.append(f"  {d['action_label']}：{action_text(d)}"
                      + (f"；{d['compacted_label']}" if d.get("compacted_label") else ""))
-        if d["work"]:
-            lines.append("  名下的活：")
-            lines += [f"    - {work_line(w)}" for w in d["work"]]
+        if d["on_hand"]:
+            lines.append("  手上的事：")
+            lines += [f"    - {item_line(it)}" for it in d["on_hand"]]
         else:
-            lines.append("  名下的活：（无）")
+            lines.append("  手上的事：（无）")
         if d["recent_done"]:
             lines.append("  最近做完：")
             lines += [f"    - {work_line(w)}" for w in d["recent_done"]]
@@ -458,9 +608,10 @@ def digest_line(d: dict) -> str:
         parts[-1] += f"（{short(d['detail'], 50)}）"
     if d["action"]:
         parts.append(f"{action_label(d['run_state'])}「{short(d['action'], 40)}」{d['action_ago']}")
-    if d["work"]:
-        ws = [f"{w['key']}（{WORK_LABEL.get(w['state'], w['state'])}）" for w in d["work"][:3]]
-        parts.append("活 " + "、".join(ws) + (f" 等 {len(d['work'])} 件" if len(d["work"]) > 3 else ""))
+    items = d.get("on_hand") or []
+    if items:
+        ws = [f"{it['key']}（{item_tag(it)}）" for it in items[:3]]
+        parts.append("手上 " + "、".join(ws) + (f" 等 {len(items)} 件" if len(items) > 3 else ""))
     if d["unread_mail"]:
         parts.append(f"未读留言 {d['unread_mail']}")
     return "- " + " · ".join(parts)
@@ -480,15 +631,16 @@ def idle_line(cards: list[dict]) -> str:
 
 
 def digest_fingerprint(cards: list[dict]) -> str:
-    """摘要只在在岗表变化时附。空闲的会话只看「它空闲」这一件事；不空闲的看运行状态、空转、名下的活、未读留言。
-    动作、几分钟前、判定依据这类每轮都可能变的东西不算：空闲会话的最近动作变了不会再附一次摘要。"""
+    """摘要只在在岗表变化时附。空闲的会话只看「它空闲」这一件事；不空闲的看运行状态、空转、手上的事（钥匙、状态、
+    自报还是自动、有没有路由事实、可能过期）、未读留言。动作、几分钟前、判定依据、路由的次数这类每轮都可能变的不算。"""
     data = []
     for d in sorted(cards, key=lambda d: d["topic_id"]):
         if d["run_state"] == IDLE:
             data.append((d["topic_id"], IDLE))
         else:
             data.append((d["topic_id"], d["run_state"], bool(d["spinning"]),
-                         sorted((w["norm_key"], w["state"]) for w in d["work"]), d["unread_mail"]))
+                         sorted([it["norm_key"], it["state"], it["declared"], it["stale"], it["route"] is not None]
+                                for it in (d.get("on_hand") or [])), d["unread_mail"]))
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
@@ -543,7 +695,7 @@ def board_cards(store: Store, cfg, topic: str = "", exclude: Iterable[str] = (),
     for t in topics:
         if t["topic_id"] in exclude:
             continue
-        d = card_data(store, t, store.get_card(t["topic_id"]), now)
+        d = card_data(store, t, store.get_card(t["topic_id"]), now, cfg.duty.stale_hours, cfg.duty.routed_active_hours)
         m = minutes_ago(d["compacted_at"], now)
         if m is not None and m <= cfg.duty.compacted_recent_minutes:
             d["compacted_label"] = f"刚被压缩（{ago_text(d['compacted_at'], now)}）"

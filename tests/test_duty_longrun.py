@@ -45,14 +45,20 @@ DELIVERED = ("delivered", "acked", "missed")
 
 
 def my_fingerprint(cards: list[dict]) -> str:
-    """按规格独立算的在岗表指纹：空闲的只看「空闲」，不空闲的看运行状态、空转、名下的活、未读留言。"""
+    """按规格独立算的在岗表指纹：空闲的只看「空闲」，不空闲的看运行状态、空转、手上的事、未读留言。
+    手上的事 = 还开着的活（钥匙、状态、自报还是自动、可能过期）+ 还算数的路由事实（钥匙）。"""
     data = {}
     for d in cards:
         if d["run_state"] == duty.IDLE:
             data[d["topic_id"]] = "idle"
-        else:
-            data[d["topic_id"]] = [d["run_state"], bool(d["spinning"]),
-                                   sorted([duty.norm_key(w["key"]), w["state"]] for w in d["work"]), d["unread_mail"]]
+            continue
+        items = {}
+        for w in d["work"]:
+            items[w["norm_key"]] = [w["state"], bool(w["declared"]), bool(w["stale"]), False]
+        for r in d["routes"]:
+            items.setdefault(r["norm_key"], ["", False, False, False])[3] = True
+        data[d["topic_id"]] = [d["run_state"], bool(d["spinning"]), sorted([k, *v] for k, v in items.items()),
+                               d["unread_mail"]]
     return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
 
@@ -71,9 +77,16 @@ class Behaviour:
 
 
 class LongRun:
-    def __init__(self, seed: int, rounds: int):
-        self.seed, self.rounds = seed, rounds
+    def __init__(self, seed: int, rounds: int, mode: str = "chaos"):
+        """mode：chaos = 会话随机登记、还乱登记（登错编号、该收不收、重复登记、自报和实际相反、回执里带坏的 work）；
+        none = 完全不登记。两种模式用同一个种子，除了登记以外的随机事件一模一样（登记用另一个随机数发生器）。"""
+        self.seed, self.rounds, self.mode = seed, rounds, mode
         self.rng = random.Random(seed)
+        self.reg_rng = random.Random(seed * 7919 + 17)
+        self.trace: list[tuple] = []     # 每一轮：投了什么、给主人发了什么通知、每张卡片的运行状态
+        self.owed: dict[str, int] = {}   # 说过中断 / 失联 / attention、还没说「已恢复」的：会话 → 这一段说了几条
+        self.owed_at: dict[str, object] = {}  # 最后一条「卡住」类通知的时间
+        self.fail_told: dict[str, bool] = {}
         self.w = World(KEYS, real_human_reader=False, fast_db=True)
         self.tids = [BUS_TOPIC_ID] + [f"tp_{k}" for k in KEYS]
         self.beh = {tid: Behaviour() for tid in self.tids}
@@ -135,7 +148,8 @@ class LongRun:
         now = w.now
         # 安静的一段：只有总线有消息（在岗表不怎么变，用来检查「没变就不附摘要」）
         if self.quiet_until is None and self.chance(0.01):
-            self.quiet_until = now + self.mins(30, 90)
+            # 多数是半小时到一个半小时；偶尔一整晚（5–8 小时，自报的活会「可能过期」）
+            self.quiet_until = now + (self.mins(300, 480) if self.chance(0.2) else self.mins(30, 90))
             self.stats["安静时段"] += 1
         quiet = self.quiet_until is not None and now < self.quiet_until
         if self.quiet_until is not None and not quiet:
@@ -196,21 +210,9 @@ class LongRun:
                 text = "主人原话：直接发" if self.chance(0.05) else f"SIM 留言 {i}"
                 rc, _ = self.cli("tell", "--topic", a, "--to", bb, text)
                 self.stats["tell 成功" if rc == 0 else "tell 被拒"] += 1
-        # 登记 / 收掉活
-        if not quiet and self.chance(0.05):
-            tid = rng.choice(self.tids)
-            open_keys = [x["key"] for x in w.store.open_work(tid) if x["declared"]]
-            if open_keys and self.chance(0.4):
-                rc, out = self.cli("work", "done", "--topic", tid, "--key", rng.choice(open_keys), "--result", "SIM 做完")
-            else:
-                state = rng.choice(("doing", "doing", "waiting_other", "waiting_owner", "done", "handed_off"))
-                argv = ["work", "set", "--topic", tid, "--key", rng.choice(KEY_POOL), "--title", "SIM 活", "--state", state]
-                if state == "handed_off":
-                    argv += ["--to", rng.choice([x for x in self.tids if x != tid])]
-                rc, out = self.cli(*argv)
-            if rc != 0:
-                self.fail(f"work 命令失败：{out}")
-            self.stats["work"] += 1
+        # 登记 / 收掉活：只在 chaos 模式，用另一个随机数发生器（不影响别的随机事件）
+        if self.mode == "chaos":
+            self.register()
         # 等待：登记、结束（自动补活）
         if self.chance(0.01):
             tid = rng.choice(self.tids)
@@ -231,11 +233,61 @@ class LongRun:
                 if rc != 0:
                     self.fail(f"session-reset 失败：{out}")
                 self.reset_at[tid] = now
+                self.owed[tid] = 0  # 主人自己复位：这一段到此为止，不再欠「已恢复」
                 self.stats["session-reset"] += 1
         if self.chance(0.001):
             w.restart()
             self.wrap()
             self.stats["重启"] += 1
+
+    def register(self) -> None:
+        """会话随手登记 / 乱登记：登错编号、自报和实际相反、重复登记、该收不收（自报了就再也不管）、
+        done 一件没登记过的、状态写错、回执里带坏的 work（在 work_on_batch 里）。都只能让「手上的事」不准，
+        不能改变任何投递和通知的决定。"""
+        rr, w = self.reg_rng, self.w
+        if rr.random() >= 0.12:
+            return
+        tid = rr.choice(self.tids)
+        t = w.store.get_topic(tid)
+        wrong_key = f"2026{rr.randint(10000000, 99999999)}"  # 登错的编号：消息里从没出现过
+        key = rr.choice(KEY_POOL + [wrong_key])
+        kind = rr.random()
+        if kind < 0.35:      # 随手登记一件（状态随机）
+            state = rr.choice(("doing", "waiting_other", "waiting_owner", "done", "handed_off"))
+        elif kind < 0.55:    # 和实际相反：在跑批次的说在等、空闲的说在做、卡住的说做完了
+            state = "waiting_other" if t["state"] == sm.RUNNING else "doing"
+            if w.store.get_card(tid) is not None and w.store.get_card(tid)["run_state"] in duty.STUCK:
+                state = "done"
+        elif kind < 0.65:    # 重复登记同一件
+            state = "doing"
+            self.cli("work", "set", "--topic", tid, "--key", key, "--title", "SIM 重复登记", "--state", state)
+        elif kind < 0.75:    # 状态写错 / 转交不写 --to：被拒，什么都不该变
+            rc, _ = self.cli("work", "set", "--topic", tid, "--key", key, "--state", rr.choice(("busy", "handed_off")))
+            self.stats["登记被拒"] += rc != 0
+            return
+        elif kind < 0.9:     # 收掉一件（有的是自报的、有的只有路由事实、有的根本没有）
+            rc, _ = self.cli("work", "done", "--topic", tid, "--key", key, "--result", "SIM 做完")
+            self.stats["登记 done"] += 1
+            return
+        else:                # 自报「进行中」以后再也不管（4 小时后应标「可能过期」）
+            state = "doing"
+        argv = ["work", "set", "--topic", tid, "--key", key, "--title", "SIM 自报", "--state", state]
+        if state == "handed_off":
+            argv += ["--to", rr.choice([x for x in self.tids if x != tid])]
+        rc, out = self.cli(*argv)
+        if rc != 0:
+            self.fail(f"work set 失败：{out}")
+        self.stats["登记"] += 1
+
+    def receipt_work(self) -> dict:
+        """chaos 模式下回执里带的 work 字段：有好有坏（缺 key、状态写错、登错编号）。"""
+        if self.mode != "chaos" or self.reg_rng.random() >= 0.2:
+            return {}
+        rr = self.reg_rng
+        item = rr.choice(({"key": rr.choice(KEY_POOL), "title": "SIM 回执里的活", "state": "doing"},
+                          {"key": "", "state": "doing"}, {"key": rr.choice(KEY_POOL), "state": "飞起来"},
+                          {"key": f"2026{rr.randint(10000000, 99999999)}", "state": "done", "result": "登错的"}))
+        return {"work": item}
 
     def work_on_batch(self, tid: str) -> None:
         """健康的会话处理它收到的批次：先动起来，中间可能有一段长命令、可能空转，做完交回执（adopted 有时不交）。
@@ -256,8 +308,7 @@ class LongRun:
                 b.task_until = None
                 if tid == BUS_TOPIC_ID or not self.chance(0.15):  # adopted 回执可选
                     status = rng.choice(("handled",) * 6 + ("needs_decision", "waiting_external"))
-                    extra = {"work": {"key": rng.choice(KEY_POOL), "title": "SIM 回执里的活", "state": "doing"}} \
-                        if self.chance(0.1) else {}
+                    extra = self.receipt_work()
                     s.receipt(bid, status=status, **extra)
                     self.stats["回执"] += 1
                 else:
@@ -290,7 +341,8 @@ class LongRun:
         stall = timedelta(minutes=cfg.duty.stall_minutes)
         lost = timedelta(minutes=cfg.duty.lost_minutes)
         # ---- 1. 同一条消息不会投两次（除了回执超时退回的重投） ----
-        for dlv in w.sink.deliveries[self.seen_deliveries:]:
+        self.round_deliveries = w.sink.deliveries[self.seen_deliveries:]
+        for dlv in self.round_deliveries:
             bid = dlv["batch"]
             if not bid:
                 continue
@@ -337,11 +389,13 @@ class LongRun:
             elif why == "queued" and "在岗表" in res["queued"] and info["card"] not in duty.STUCK:
                 self.fail(f"不变量 2：按在岗表排队，但决定时卡片是 {info['card']}")
             self.stats[f"排队原因 {why}"] += 1
-        # ---- 3. 通知：每一段卡住中断、失联各最多一条 ----
+        # ---- 3. 通知：每一段卡住中断、失联各最多一条；说过卡住的最后一定说「已恢复」，一次最多 4 条 ----
         notices = w.notices()
-        for n in notices[self.seen_notices:]:
+        new_notices = notices[self.seen_notices:]
+        for n in new_notices:
             what, text = n["what"], n["text"]
             tid = text.split("topic `", 1)[1].split("`", 1)[0]
+            cid = w.sessions[tid].cid
             if what == "在岗表通知":
                 kind = "中断" if "会话中断了" in text.splitlines()[0] else "失联"
                 s = w.sessions[tid]
@@ -352,13 +406,36 @@ class LongRun:
                 self.segments[(tid, kind, start)] += 1
                 if self.segments[(tid, kind, start)] > 1:
                     self.fail(f"不变量 3：{tid} 同一段卡住（从 {start} 起）第 {self.segments[(tid, kind, start)]} 条{kind}通知")
+                if tid == BUS_TOPIC_ID and "暂不投递" in text:
+                    self.fail("不变量 3：总线的中断通知不该写「暂不投递」")
+                self.owed[tid] = self.owed.get(tid, 0) + 1
+                self.owed_at[tid] = now
                 self.stats[f"通知 {kind}"] += 1
             elif what == "attention 通知":
                 self.attn_notices[tid] += 1
+                if self.owed.get(tid) and "仍卡着" not in text.splitlines()[0]:
+                    self.fail(f"不变量 3：{tid} 这一段已经说过卡住，attention 通知应该只说「仍卡着」")
+                self.owed[tid] = self.owed.get(tid, 0) + 1
+                self.owed_at[tid] = now
                 self.stats["通知 attention"] += 1
             elif what == "恢复通知":
-                self.recover_notices[tid] += 1
+                if not self.owed.get(tid):
+                    self.fail(f"不变量 3：{tid} 没说过卡住，却说「已恢复」")
+                elif self.owed[tid] > 3:
+                    self.fail(f"不变量 3：{tid} 一次卡住发了 {self.owed[tid] + 1} 条通知（上限 4 条）")
+                self.stats[f"一次卡住共 {self.owed.get(tid, 0) + 1} 条通知"] += 1
+                self.owed[tid] = 0
                 self.stats["通知 恢复"] += 1
+            elif what == "投递失败通知":
+                if w.sink.streak.get(cid, 0) < 3 or self.fail_told.get(tid):
+                    self.fail(f"不变量 3：{tid} 连续失败 {w.sink.streak.get(cid, 0)} 次就说投递不出去（或同一段说了两次）")
+                self.fail_told[tid] = True
+                self.stats["通知 投递失败"] += 1
+            elif what == "投递恢复通知":
+                if not self.fail_told.get(tid) or w.sink.streak.get(cid, 0) != 0:
+                    self.fail(f"不变量 3：{tid} 没说过投递不出去，或者还没发出去，就说投递已恢复")
+                self.fail_told[tid] = False
+                self.stats["通知 投递恢复"] += 1
             else:
                 self.fail(f"不变量 3：没见过的通知类型 {what}")
             self.stats["inv3 检查"] += 1
@@ -370,8 +447,6 @@ class LongRun:
             self.attn_seen[tid] = t["attention_at"] if t["state"] == sm.ATTENTION else None
             if self.attn_notices[tid] > self.attn_entries[tid]:
                 self.fail(f"不变量 3：{tid} attention 通知 {self.attn_notices[tid]} 条，进 attention 只有 {self.attn_entries[tid]} 次")
-            if self.recover_notices[tid] > self.attn_notices[tid]:
-                self.fail(f"不变量 3：{tid} 恢复通知比 attention 通知多")
         # ---- 4. 卡片和账本、会话记录对得上 ----
         for tid in self.tids:
             self.stats["inv4 检查"] += 1
@@ -382,11 +457,8 @@ class LongRun:
             if info is not None and info["sent"]:
                 if info["state"] == sm.HUMAN_ATTACHED:
                     self.fail(f"不变量 4：{tid} 状态是被主人占着，这一轮却投了")
-                if owner_recent:  # 按真相：主人 15 分钟内在会话里说过话
-                    if info["state"] == sm.FAILED:
-                        self.stats["已知例外：failed 时主人在说话照样重投"] += 1
-                    else:
-                        self.fail(f"不变量 4：主人 {s.owner_spoke} 在 {tid} 里说过话（{info['state']}），这一轮却投了")
+                if owner_recent:  # 按真相：主人 15 分钟内在会话里说过话（failed 也一样，等主人走了再重投）
+                    self.fail(f"不变量 4：主人 {s.owner_spoke} 在 {tid} 里说过话（{info['state']}），这一轮却投了")
                 if info["card"] in duty.STUCK and info["state"] != sm.FAILED:
                     self.fail(f"不变量 4：{tid} 卡片判{info['card']}，这一轮却投了")
                 gt = self.untouched_since(tid)
@@ -418,6 +490,13 @@ class LongRun:
             cards = duty.board_cards(store, cfg)
             duty.render_board(cards, "SIM")
             json.dumps(cards, ensure_ascii=False)
+            self.stats["自报的活标了可能过期（卡片×轮）"] += sum(1 for d in cards for x in d["work"] if x["stale"])
+            self.stats["手上的事里的路由事实（卡片×轮）"] += sum(len(d["routes"]) for d in cards)
+            for dlv in self.round_deliveries:
+                for ln in dlv["content"].splitlines():
+                    if ln.startswith("🔀 撞车提醒"):
+                        self.stats["撞车提醒（按路由事实）" if "的消息最近送到了" in ln else "撞车提醒（按自动补的 / 自报的活）"] += 1
+                        self.stats["撞车提醒里带「可能过期」"] += duty.STALE_MARK in ln
             one = duty.board_cards(store, cfg, topic=self.rng.choice(self.tids), history=True)
             duty.render_board(one, "SIM")
             lines = duty.digest_lines([d for d in cards if d["topic_id"] != BUS_TOPIC_ID], cfg.duty.digest_max_lines)
@@ -449,6 +528,14 @@ class LongRun:
             else:
                 self.stats["摘要没变不附"] += 1
             self.stats["inv6 检查"] += 1
+        # ---- 差分用：这一轮的决定（投了什么、给主人说了什么、每张卡片的运行状态） ----
+        self.trace.append((
+            self.w.round_no, now.isoformat(),
+            tuple((d["cid"], d["batch"], tuple(self.canon(m) for m in json.loads(
+                store.get_dispatch(d["batch"])["message_ids"] or "[]"))) for d in self.round_deliveries if d["batch"]),
+            tuple((n["at"], n["what"], n["text"]) for n in new_notices),
+            tuple((tid, (store.get_card(tid) or {"run_state": None})["run_state"], store.get_topic(tid)["state"])
+                  for tid in self.tids)))
         # 主人在会话里说话：拿真读法（AgentApiSink 整份读合成的记录）和真相对一遍；前 2000 轮每 50 轮一次，之后每 1000 轮
         if self.w.round_no % (50 if self.w.round_no <= 2000 else 1000) == 0:
             from sheepdog.sink.agentapi import AgentApiSink
@@ -457,6 +544,14 @@ class LongRun:
                 real = AgentApiSink().last_human_activity(s.cid)
                 if (real is None) != (s.owner_spoke is None) or (real is not None and real != s.owner_spoke):
                     self.fail(f"主人说话的真读法和真相不一致：{tid} {real} vs {s.owner_spoke}")
+
+    def canon(self, mid: str) -> str:
+        """消息编号在两次跑里要能对上：sheepdog 自己生成的系统消息编号带随机串，换成「原因 + 正文」的摘要。"""
+        if not mid.startswith("sd_"):
+            return mid
+        r = self.w.store.get_message(mid)
+        import hashlib
+        return f"sd:{r['reason']}:{hashlib.sha1((r['content'] or '').encode()).hexdigest()[:12]}" if r is not None else mid
 
     def untouched_since(self, tid: str):
         """按真相算：投给这个会话、它一直没碰过（之后没有动作）、也没交回执的批次里最早送出的时间（这一轮刚送的不算）。"""
@@ -525,12 +620,15 @@ class LongRun:
             b.mode, b.owner_until = "healthy", None
             s.app_alive, s.net_down = True, False
         w.clock.advance(minutes=20)  # 主人占着的都过期
+        for tid in self.tids:
+            w.sessions[tid].act("Wake up")  # 每个会话都醒一下：说过卡住的，接着要说「已恢复」
         for i in range(400):
             for tid in self.tids:
                 t = w.store.get_topic(tid)
                 if t["state"] == sm.ATTENTION and t["attention_reason"] != "receipt_timeout":
                     self.cli("session-reset", "--topic", tid)
                     self.reset_at[tid] = w.now
+                    self.owed[tid] = 0
                 self.work_on_batch(tid)
                 c = w.store.get_card(tid)
                 if c is not None and c["run_state"] in duty.STUCK and (i % 20 == 19):
@@ -541,8 +639,15 @@ class LongRun:
             pending = w.store.conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE route='dispatch' AND dispatch_state='pending'").fetchone()[0]
             busy = any(w.store.get_topic(tid)["state"] == sm.RUNNING for tid in self.tids)
-            if pending == 0 and not busy:
+            if pending == 0 and not busy and i >= 2:
                 break
+        for tid, n in self.owed.items():
+            s = w.sessions[tid]
+            # 说过卡住、之后会话真的又动了（不是回执超时把 adopted 的批次收掉那种），就一定要说过「已恢复」
+            if n and s.last_action is not None and s.last_action > self.owed_at[tid]:
+                self.fail(f"不变量 3（最终）：{tid} 说过卡住（{n} 条），会话 {s.last_action} 又动了，也没说「已恢复」")
+            elif n:
+                self.stats["说过中断、之后会话没再动（adopted 回执超时收掉），不说已恢复"] += 1
         # 治好以后，每条消息都要有着落：会话交了回执（acked），或者 adopted 会话超时不交（missed）
         left = w.store.conn.execute(
             "SELECT message_id, topic_id, dispatch_state FROM messages WHERE route='dispatch' AND dispatch_state NOT IN "
@@ -565,33 +670,70 @@ def seeds_from_env() -> list[int]:
     return [int(x) for x in v.split(",") if x.strip()] if v else list(DEFAULT_SEEDS)
 
 
+def run_one(seed: int, rounds: int, mode: str) -> LongRun:
+    sim = LongRun(seed, rounds, mode)
+    try:
+        sim.run()
+    finally:
+        sim.close()
+    return sim
+
+
+def compare(a: LongRun, b: LongRun) -> tuple[list[str], Counter]:
+    """差分：同一个种子、一遍乱登记（a）、一遍不登记（b），每一轮的决定要完全一样。返回 (不一样的地方, 比了多少)。"""
+    diffs: list[str] = []
+    n: Counter = Counter()
+    if len(a.trace) != len(b.trace):
+        diffs.append(f"轮数不一样：{len(a.trace)} vs {len(b.trace)}")
+    names = ("投递", "通知", "卡片")
+    for ta, tb in zip(a.trace, b.trace):
+        n["轮"] += 1
+        n["投递批次"] += len(ta[2])
+        n["投出的消息"] += sum(len(x[2]) for x in ta[2])
+        n["通知"] += len(ta[3])
+        n["卡片"] += len(ta[4])
+        if ta[:2] != tb[:2]:
+            diffs.append(f"第 {ta[0]} 轮时间不一样：{ta[1]} vs {tb[1]}")
+        for i, name in enumerate(names, start=2):
+            if ta[i] != tb[i]:
+                diffs.append(f"第 {ta[0]} 轮（{ta[1]}）{name}不一样：\n  乱登记：{ta[i]}\n  不登记：{tb[i]}")
+        if len(diffs) > 5:
+            break
+    return diffs, n
+
+
 class LongRunTest(unittest.TestCase):
-    def test_random_long_run(self):
+    def test_random_long_run_and_registration_does_not_change_decisions(self):
+        """每个种子跑两遍：一遍会话随机登记、还乱登记，一遍完全不登记。两遍都查 6 条不变量；
+        两遍每一轮投给每个会话的消息、给主人的每条通知（时间、类型、正文）、每张卡片的运行状态，必须一模一样。"""
         rounds = rounds_from_env()
         for seed in seeds_from_env():
             with self.subTest(seed=seed):
-                sim = LongRun(seed, rounds)
-                try:
-                    stats = sim.run()
-                finally:
-                    sim.close()
-                self.assertEqual(sim.failures, [], "\n".join(sim.failures[:20]))
-                # 长跑真的覆盖到了：卡住、通知、重投、摘要、留言暂停都出现过
-                for k in ("通知 中断", "合法重投", "摘要附上", "摘要没变不附", "进入 stuck", "tell 被拒"):
-                    self.assertGreater(stats[k], 0, f"seed {seed} 没跑到「{k}」：{dict(stats)}")
+                a = run_one(seed, rounds, "chaos")
+                b = run_one(seed, rounds, "none")
+                self.assertEqual(a.failures, [], "\n".join(a.failures[:20]))
+                self.assertEqual(b.failures, [], "\n".join(b.failures[:20]))
+                diffs, n = compare(a, b)
+                self.assertEqual(diffs, [], "\n".join(diffs))
+                self.assertGreater(n["通知"], 0)
+                # 长跑真的覆盖到了：卡住、通知、重投、摘要、留言暂停、乱登记都出现过
+                for k in ("通知 中断", "通知 恢复", "合法重投", "摘要附上", "摘要没变不附", "进入 stuck", "tell 被拒", "登记",
+                          "登记被拒", "登记 done"):
+                    self.assertGreater(a.stats[k], 0, f"seed {seed} 没跑到「{k}」：{dict(a.stats)}")
+                self.assertEqual(b.stats["登记"], 0)
 
 
 if __name__ == "__main__":
     import logging
     logging.disable(logging.CRITICAL)
     for seed in seeds_from_env():
-        sim = LongRun(seed, rounds_from_env())
-        try:
-            st = sim.run()
-        finally:
-            sim.close()
-        print(f"seed {seed}: 失败 {len(sim.failures)}")
-        for f in sim.failures[:20]:
+        a = run_one(seed, rounds_from_env(), "chaos")
+        b = run_one(seed, rounds_from_env(), "none")
+        diffs, n = compare(a, b)
+        print(f"seed {seed}: 乱登记失败 {len(a.failures)}，不登记失败 {len(b.failures)}，两遍不一样的地方 {len(diffs)}")
+        for f in (a.failures + b.failures)[:20] + diffs[:5]:
             print("  ", f)
-        print("  ", json.dumps(dict(sorted(st.items())), ensure_ascii=False))
+        print("   比了：", json.dumps(dict(n), ensure_ascii=False))
+        print("   乱登记：", json.dumps(dict(sorted(a.stats.items())), ensure_ascii=False))
+        print("   不登记：", json.dumps(dict(sorted(b.stats.items())), ensure_ascii=False))
     sys.exit(0)

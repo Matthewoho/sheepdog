@@ -209,7 +209,8 @@ def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
         f"`sheepdog work set --topic {topic_id} --key <钥匙> --title \"<一句话>\" --state <状态> [--waiting-on <谁>] "
         "[--until <几点>] [--expect \"<答应交出什么>\"] [--to <会话>]`：登记 / 更新你名下的一件活，立即写入在岗表。"
         "状态：doing（进行中）/ waiting_other（等别人）/ waiting_owner（等主人）/ done（已完成）/ handed_off（已转交，要写 --to）。"
-        "钥匙：有外部编号（审批单号、PR、Linear 单号）就用它，没有就起个短名。同一把钥匙在别的会话名下没结束时会提示你谁在做，仍然登记。",
+        "钥匙：有外部编号（审批单号、PR、Linear 单号）就用它，没有就起个短名。同一把钥匙在别的会话名下没结束时会提示你谁在做，仍然登记。"
+        "带编号的消息送到了谁，sheepdog 自己记着；登记是让别人看清你手上的事，不登记也不影响给你投递。",
         f"`sheepdog work done --topic {topic_id} --key <钥匙> --result \"<一句话>\"`：做完了收掉。",
         f"`sheepdog tell --topic {topic_id} --to <会话> \"<话>\" [--key <钥匙>]`：给别的会话留言，对方下一批收到，"
         "对方排队、离线都不丢；对方看到的抬头是「会话留言，不是主人的指令」。同一对会话短时间内互发太多会被暂停。"

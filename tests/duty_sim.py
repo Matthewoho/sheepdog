@@ -206,11 +206,14 @@ class SimSink(DryRunSink):
         self.fail: set[str] = set()
         self.deliveries: list[dict] = []
         self.sends = 0
+        self.streak: dict[str, int] = {}   # 每个会话连续发送失败几次（发成功清零）
 
     def send_message(self, conversation_id: str, content: str, **_ctx) -> None:
         self.sends += 1
         if conversation_id in self.fail:
+            self.streak[conversation_id] = self.streak.get(conversation_id, 0) + 1
             raise SinkError("agentapi send-message 失败（模拟）")
+        self.streak[conversation_id] = 0
         m = BATCH_RE.search(content)
         bid = m.group(1) if m else None
         self.deliveries.append({"at": self.world.clock.t, "cid": conversation_id, "batch": bid, "content": content})

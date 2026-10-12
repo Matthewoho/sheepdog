@@ -11,10 +11,11 @@
 数据全是合成的（*_test_* 编号，没有真实的人名和 ID）。
 
 场景：
-- 总线 tp_bus；「发版」tp_release 正在做审批单 202610100035（申报了 work，最近一次工具调用「Trigger agent-worker build」
-  在 5 分钟前）；「授权」tp_auth 在等同事回复（登记了 watch，牧羊犬自动补活 → 等别人）；
+- 总线 tp_bus；「发版」tp_release 正在做审批单 202610100035：8 分钟前牧羊犬把提到这个单号的消息投给了它（路由事实，
+  不靠它登记），它自己也申报了 work（会话自报），最近一次工具调用「Trigger agent-worker build」在 5 分钟前；
+  「授权」tp_auth 在等同事回复（登记了 watch，牧羊犬自动补活 → 自动·等人回复）；
   「巡检」tp_patrol 卡住了：批次送出 20 分钟，会话记录里再没有新动作 → 应判为「中断」，信号排队、私聊主人。
-- 一条飞书私聊提到 202610100035，路由给总线 → 带撞车提醒；
+- 一条飞书私聊提到 202610100035，路由给总线 → 带撞车提醒（以路由事实为主，自报的活注明「会话自报」）；
 - release 用 `sheepdog tell --to tp_bus` 给总线留一句话。
 """
 
@@ -191,6 +192,19 @@ def main() -> int:
     store.conn.execute("UPDATE dispatches SET sent_at=? WHERE batch_id='b_test_release'", (iso(ago(8)),))
     store.conn.commit()
     store.update_topic("tp_release", state=sm.RUNNING, pending_batch_id="b_test_release", dispatched_at=iso(ago(8)))
+    # 那一批里有发版群的一条消息提到审批单号：投递时牧羊犬记下路由事实（同 _complete_delivery 的做法）
+    release_ask = Message(message_id="om_test_demo_release", chat_id="oc_test_release_grp", chat_name="发版群",
+                          chat_type="group", sender_id=REQUESTER, sender_name="需求方乙", sender_type="user",
+                          content=f"@发版 审批单 {APPROVAL} 已经批了，麻烦发一下 agent-worker", msg_type="text",
+                          create_time=iso(ago(9)))
+    store.upsert_message(release_ask, "dispatch", "at_me", [], "tp_release")
+    store.mark_batch([release_ask.message_id], "b_test_release", "tp_release", "delivered")
+    store.conn.execute("UPDATE dispatches SET message_ids=? WHERE batch_id='b_test_release'",
+                       (json.dumps([release_ask.message_id]),))
+    store.conn.commit()
+    from sheepdog import duty as duty_mod
+    duty_mod.record_routes(store, "tp_release", [store.get_message(release_ask.message_id)], cfg.duty.patterns,
+                           iso(ago(8)))
     write_record(app, "conv_test_release", [
         system_msg(ago(8), 101, "[sheepdog] 新信号批次 `b_test_release`（演示）"),
         tool_call(ago(7), 102, "Read the release skill", "Reading release skill"),
@@ -271,9 +285,11 @@ def main() -> int:
         print(n)
     if not notices:
         print("（没有）")
-    ok = (patrol["run_state"] == "stalled" and notices and "撞车提醒" in bus_batch and "会话留言" in bus_batch
-          and "在岗表" in bus_batch and queued >= 1)
-    print("\n检查：" + ("✓ 中断判定、排队、通知、撞车提醒、留言、摘要都在" if ok else "✗ 有东西没出来，看上面"))
+    ok = (patrol["run_state"] == "stalled" and notices and "的消息最近送到了「发版」" in bus_batch
+          and "会话自报" in bus_batch and "会话留言" in bus_batch and "在岗表" in bus_batch and queued >= 1
+          and "自动·路由" in board and "自动·等人回复" in board)
+    print("\n检查：" + ("✓ 中断判定、排队、通知、撞车提醒（路由事实 + 会话自报）、留言、摘要、手上的事的来源都在" if ok
+                       else "✗ 有东西没出来，看上面"))
     if args.keep:
         print(f"\n临时目录保留在 {root}；接着手动试：\n  export SHEEPDOG_CONFIG={conf_dir / 'config.toml'} "
               f"SHEEPDOG_STATE_DIR={state} ANTIGRAVITY_APP_DATA_DIR={app}\n  sheepdog board --topic tp_release")

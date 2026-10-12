@@ -276,6 +276,7 @@ def duty_report(cfg, store: Store) -> str:
     stuck = [c["topic_id"] for c in store.list_cards() if c["run_state"] in duty.STUCK]
     return (f"在岗表: 中断 {dc.stall_minutes:g} 分钟 / 失联 {dc.lost_minutes:g} 分钟 / 空转 {dc.spin_repeat} 次；"
             f"编号规则 {len(dc.key_patterns)} 条；留言同一对 {dc.mail_window_minutes:g} 分钟内超过 {dc.mail_pair_limit} 条暂停；"
+            f"路由事实算 {dc.routed_active_hours:g} 小时；自报的活 {dc.stale_hours:g} 小时没更新标可能过期；"
             f"履历保留 {dc.history_days} 天"
             + (f"；⚠ 中断 / 失联：{', '.join(stuck)}" if stuck else ""))
 

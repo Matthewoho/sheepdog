@@ -144,6 +144,8 @@ mail_pair_limit = 6            # 同一对会话 mail_window_minutes 分钟内�
 mail_window_minutes = 10
 mail_pause_minutes = 30
 compacted_recent_minutes = 60  # 多久内的压缩点在卡片上标「刚被压缩」
+routed_active_hours = 24       # 带编号的消息送到某个会话以后，这么多小时内算它「手上的事」（撞车提醒以它为主）
+stale_hours = 4                # 会话自报的活这么多小时没更新、期间会话一直空闲 → 标「可能过期」（不替它关掉）
 history_days = 7               # 履历（回执摘要、做完的活、最近动作）保留几天
 
 [ack]

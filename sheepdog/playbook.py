@@ -45,8 +45,8 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
                            "{{auto_recover}}（yes / no）",
     "attention_recovered.md": "会话自动恢复时私聊主人的通知末尾附的话，可用 {{host}} {{evidence}} {{queued}}",
     # 在岗表（7.20）：事实由代码拼，这里只放对会话、对人的说明；缺了只发事实（摘要标题缺了用代码里的一句）
-    "duty_collision.md": "撞车提醒（消息里的编号登记在别的会话名下）后面附的话，可用 {{key}} {{owner_title}} {{owner_topic}} "
-                         "{{work_state}} {{run_state}} {{action}} {{ago}}",
+    "duty_collision.md": "撞车提醒（消息里的编号最近送到过别的会话，或在别的会话手上）后面附的话，可用 {{key}} {{owner_title}} "
+                         "{{owner_topic}} {{work_state}} {{run_state}} {{action}} {{ago}} {{basis}}（路由 / 会话自报 / 自动）",
     "duty_mail.md": "会话留言（sheepdog tell）后面附的话，可用 {{from_topic}} {{from_title}} {{key}}",
     "duty_digest.md": "总线批次里在岗表摘要的标题（在岗表有变化才附），可用 {{count}}",
     "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",

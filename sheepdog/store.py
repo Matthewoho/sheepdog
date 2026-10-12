@@ -254,6 +254,7 @@ CREATE TABLE IF NOT EXISTS duty_cards (
     compacted_at TEXT,                 -- 最近一次压缩点
     queued       INTEGER DEFAULT 0,    -- 排队的信号数
     stuck_since  TEXT,                 -- 中断 / 失联从几点算起
+    idle_since   TEXT,                 -- 这一段空闲从几点算起（不空闲时为空）：自报的活「可能过期」要看它
     updated_at   TEXT
 );
 
@@ -274,6 +275,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     source      TEXT,                  -- declared（会话申报）| watch | escalation | forward
     source_ref  TEXT,                  -- watch:N / escalation:<message_id> / forward:<message_id>
     declared    INTEGER DEFAULT 0,     -- 会话自己申报过：自动补活只补缺的字段
+    declared_at TEXT,                  -- 会话最后一次自己申报 / 更新它的时间（自动补字段不算）
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     closed_at   TEXT,
@@ -303,6 +305,30 @@ CREATE TABLE IF NOT EXISTS duty_history (
     at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_topic ON duty_history(topic_id, at);
+
+-- 路由事实（7.20 第二轮）：牧羊犬把带编号的消息投给了哪个会话。不靠会话登记，撞车提醒和「手上的事」以它为主。
+-- 同一会话同一把钥匙一行；转交出去或会话自报做完时记 closed_at，这之前的路由不再算，之后又送到就重新算
+CREATE TABLE IF NOT EXISTS duty_routes (
+    topic_id        TEXT NOT NULL,
+    norm_key        TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    title           TEXT,              -- 最近一条带这个编号的消息（截一句）
+    first_at        TEXT NOT NULL,
+    last_at         TEXT NOT NULL,     -- 最近一次送到
+    count           INTEGER DEFAULT 0, -- 送到过几条（同一条重投不重复算）
+    last_message_id TEXT,
+    closed_at       TEXT,
+    closed_reason   TEXT,
+    PRIMARY KEY (topic_id, norm_key)
+);
+CREATE INDEX IF NOT EXISTS idx_routes_key ON duty_routes(norm_key, last_at);
+CREATE TABLE IF NOT EXISTS duty_route_seen (
+    topic_id   TEXT NOT NULL,
+    norm_key   TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    PRIMARY KEY (topic_id, norm_key, message_id)
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -320,6 +346,8 @@ MIGRATIONS = {
                ("attention_reason", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
+    "duty_cards": [("idle_since", "TEXT")],
+    "work_items": [("declared_at", "TEXT")],
 }
 
 
@@ -1013,6 +1041,39 @@ class Store:
         return self.conn.execute("SELECT * FROM duty_history WHERE topic_id=? AND kind=? ORDER BY id DESC LIMIT ?",
                                  (topic_id, kind, limit)).fetchall()
 
+    # ---------- 路由事实（7.20 第二轮） ----------
+    def add_route(self, topic_id: str, key: str, norm_key: str, title: str, message_id: str, at: str) -> bool:
+        """记一条路由事实：带这把钥匙的消息送到了这个会话。同一条消息（重投）不重复计数。返回是不是新的一条。"""
+        with self.tx() as c:
+            fresh = c.execute("INSERT OR IGNORE INTO duty_route_seen(topic_id,norm_key,message_id,at) VALUES(?,?,?,?)",
+                              (topic_id, norm_key, message_id, at)).rowcount > 0
+            if not fresh:
+                return False
+            c.execute(
+                """INSERT INTO duty_routes(topic_id,norm_key,key,title,first_at,last_at,count,last_message_id)
+                   VALUES(?,?,?,?,?,?,1,?)
+                   ON CONFLICT(topic_id,norm_key) DO UPDATE SET key=excluded.key, title=excluded.title,
+                       last_at=excluded.last_at, count=count+1, last_message_id=excluded.last_message_id""",
+                (topic_id, norm_key, key, title, at, at, message_id))
+            return True
+
+    def close_route(self, topic_id: str, norm_key: str, reason: str, at: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE duty_routes SET closed_at=?, closed_reason=? WHERE topic_id=? AND norm_key=?",
+                      (at, reason, topic_id, norm_key))
+
+    def active_routes(self, since_iso: str, topic_id: str | None = None, norm_key: str | None = None) -> list[sqlite3.Row]:
+        """还算数的路由事实：since 之后有消息送到，且送到在转交 / 自报做完之后。新的在前。"""
+        sql = ("SELECT * FROM duty_routes WHERE last_at >= ? AND (closed_at IS NULL OR last_at > closed_at)")
+        args: list = [since_iso]
+        if topic_id is not None:
+            sql += " AND topic_id=?"
+            args.append(topic_id)
+        if norm_key is not None:
+            sql += " AND norm_key=?"
+            args.append(norm_key)
+        return self.conn.execute(sql + " ORDER BY last_at DESC, topic_id", args).fetchall()
+
     def recent_dispatches(self, topic_id: str, limit: int = 30) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC LIMIT ?",
                                  (topic_id, limit)).fetchall()
@@ -1045,6 +1106,8 @@ class Store:
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删
     PRUNE_DUTY_SQL = {
         "duty_history": "DELETE FROM duty_history WHERE at < ?",
+        "duty_routes": "DELETE FROM duty_routes WHERE last_at < ?",
+        "duty_route_seen": "DELETE FROM duty_route_seen WHERE at < ?",
         "work_items": "DELETE FROM work_items WHERE closed_at IS NOT NULL AND closed_at < ?",
         "mailbox": """DELETE FROM mailbox WHERE created_at < ? AND (message_id IS NULL OR message_id NOT IN
                       (SELECT message_id FROM messages WHERE dispatch_state IN ('pending','sending','delivered','uncertain')))""",

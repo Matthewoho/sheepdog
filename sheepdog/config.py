@@ -333,6 +333,10 @@ class DutyConfig:
     mail_pause_minutes: float = 30
     # 多久内的压缩点在卡片上标「刚被压缩」
     compacted_recent_minutes: float = 60
+    # 路由事实（带编号的消息送到了哪个会话）多久内算数：撞车提醒、「手上的事」只看这么久以内送到过的
+    routed_active_hours: float = 24
+    # 会话自报、还开着的活，这么多小时没更新、而且这段时间会话一直空闲 → 标「可能过期」（不替它关掉）
+    stale_hours: float = 4
     # 履历（回执摘要、做完的活、最近动作）、已结束的活、已读留言保留几天
     history_days: int = 7
 
@@ -346,7 +350,7 @@ class DutyConfig:
             except re.error as e:
                 raise ConfigError(f"[duty] key_patterns 里的 {x!r} 不是有效正则: {e}") from e
         for k in ("stall_minutes", "lost_minutes", "mail_window_minutes", "mail_pause_minutes",
-                  "compacted_recent_minutes"):
+                  "compacted_recent_minutes", "routed_active_hours", "stale_hours"):
             if not _positive(getattr(self, k)):
                 raise ConfigError(f"[duty] {k} 必须是正数")
         for k in ("spin_repeat", "digest_max_lines", "mail_pair_limit", "history_days"):

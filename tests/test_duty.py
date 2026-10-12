@@ -154,12 +154,16 @@ class RunStateTest(DutyBase):
         self.assertIn("最近一次工具调用「Check dashboards」", n)
         self.assertIn("排着 1 条信号", n)
         self.assertIn("FX-STUCK state=中断 queued=1 host=Antigravity topic=tp_alpha", n)
-        # 会话动起来：恢复投递
+        # 会话动起来：恢复投递，补一句「已恢复」（同一段只说一次）
         self.append("conv_test_alpha", tool(datetime.now().astimezone() + timedelta(seconds=2), "Back online"))
         self.d.dispatch_once()
         self.assertEqual(len(self.sink.to("conv_test_alpha")), before + 1)
         self.assertIn("om_test_st1", self.sink.to("conv_test_alpha")[-1])
-        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(len(self.notices), 2)
+        self.assertIn("会话已恢复 [tp_bus]", self.notices[1])
+        self.assertIn("排着的 1 条信号接着补送", self.notices[1])
+        self.d.dispatch_once()
+        self.assertEqual(len(self.notices), 2)
 
     def test_lost_when_record_does_not_move_for_30_minutes(self):
         self.append("conv_test_alpha", tool(ago(50), "Check dashboards"))
@@ -292,7 +296,7 @@ class CollisionTest(DutyBase):
                        content=f"审批单{KEY}到哪了")])
         self.d.dispatch_once()
         text = self.sink.to("conv_test_bus")[-1]
-        self.assertIn(f"🔀 撞车提醒：{KEY} 登记在「Alpha 需求」（topic `tp_alpha`）名下，进行中", text)
+        self.assertIn(f"🔀 撞车提醒：{KEY} 在「Alpha 需求」（topic `tp_alpha`）手上；会话自报：进行中", text)
         self.assertIn("最近动作「Trigger agent-worker build」", text)
         self.assertIn(f"FX-COLLISION key={KEY} owner=tp_alpha state=进行中", text)
         self.assertLess(text.index("撞车提醒"), text.index(f"> 审批单{KEY}到哪了"))  # 提醒在正文之前
@@ -322,21 +326,26 @@ class DigestTest(DutyBase):
         duty.set_work(self.store, "tp_alpha", KEY, title="发版", state="doing")
         t1 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg1")
         self.assertIn("FX-DIGEST count=1", t1)
-        self.assertIn("- 空闲 1 个：Alpha 需求", t1)  # 空闲的只合成一行，不列它名下的活
+        self.assertIn("- 空闲 1 个：Alpha 需求", t1)  # 空闲的只合成一行，不列它手上的事
         t2 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg2")
         self.assertNotIn("FX-DIGEST", t2)  # 没变化不附
+        # 会话自报「等别人」不改运行状态（只看事实）：空闲会话的自报变了，摘要不变
         duty.set_work(self.store, "tp_alpha", KEY, state="waiting_other", waiting_on="ou_test_bob")
-        t3 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg3")
-        self.assertIn("FX-DIGEST", t3)
-        self.assertIn(f"「Alpha 需求」tp_alpha · 等回复 · 活 {KEY}（等别人）", t3)
-        self.assertNotIn("空闲", t3.split("FX-DIGEST")[1].split("处理完成后")[0])
+        self.assertNotIn("FX-DIGEST", self.deliver_to(BUS_TOPIC_ID, "om_test_dg3"))
+        # 登记了 watch（事实）：等回复，摘要附上，自报的那件活标来源
+        self.store.add_watch("tp_alpha", "ou_test_bob", "", f"等 bob 确认 {KEY}")
+        t4 = self.deliver_to(BUS_TOPIC_ID, "om_test_dg4")
+        self.assertIn("FX-DIGEST", t4)
+        self.assertIn("「Alpha 需求」tp_alpha · 等回复", t4)
+        self.assertIn(f"手上 {KEY}（等别人·自报）", t4)
 
     @staticmethod
     def fake_card(i, state=duty.IDLE, title="", action="", work=(), unread=0, spinning=False):
+        items = [{"key": k, "norm_key": duty.norm_key(k), "state": s, "declared": True, "stale": False,
+                  "work": {"key": k}, "route": None} for k, s in work]
         return {"topic_id": f"tp_x{i:02d}", "title": title or f"x{i}", "run_state": state,
                 "run_label": duty.RUN_LABEL.get(state, ""), "spinning": spinning, "detail": "卡了一会儿",
-                "action": action, "action_ago": "3 分钟前" if action else "",
-                "work": [{"key": k, "norm_key": duty.norm_key(k), "state": s} for k, s in work], "unread_mail": unread}
+                "action": action, "action_ago": "3 分钟前" if action else "", "on_hand": items, "unread_mail": unread}
 
     def test_idle_cards_merge_into_one_line(self):
         cards = [self.fake_card(i) for i in range(20)]
