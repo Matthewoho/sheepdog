@@ -34,6 +34,16 @@
   sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
   sheepdog board [--topic T] [--json]                    羊群看板：各会话在干什么
   sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
+  sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B]
+                                                         经机器人找主人「需要你定」（sheepdog 加开头一行）；带 --key：
+                                                         同一把钥匙第一次在主聊天里起一条，之后回到它的话题里（一事一串）
+  sheepdog report ...（参数同 ask）                       经机器人向主人汇报
+  sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied] [--followup]
+                                                         代回：发前只读检查主人有没有新发言；说过就不发（退出码 3）
+  sheepdog thread --topic T (--key K | --thread omt_x)    只读：列出一个话题的全部消息
+
+ask / report / reply 的退出码：0 发出（或同样的内容已经发过）/ 1 发送失败或超时（原样重试，防重编号保证只发一条）/
+2 参数不对 / 3 主人已经回过、没发 / 4 发前检查失败、没发 / 5 这一批已经回过这条（内容不同）、没发
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
 
@@ -77,6 +87,7 @@ from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
 from .notify import FileNotifier, OwnerDM
+from . import outbound
 from .source import NullSource
 from .source.lark import LarkCliSource
 from .store import Store, now_iso
@@ -260,6 +271,8 @@ def cmd_doctor(args) -> int:
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
+    for line in threads_report(cfg):
+        print(line)
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
     pb = Playbook.from_config(cfg)
     missing = pb.missing()
@@ -273,6 +286,30 @@ def cmd_doctor(args) -> int:
         print(line)
     print(duty_report(cfg, store))
     return 0 if ok else 1
+
+
+def threads_report(cfg) -> list[str]:
+    """doctor：一事一串（7.22）。ask / report 加的开头一行要能被 [escalation] 的正则认出来，否则「需要你定」登记不上、
+    主人的回复送不回去。"""
+    tc, esc = cfg.threads, cfg.escalation
+    out = [f"一事一串: 话题里除了开头那条满 {tc.complex_min_replies} 条算复杂，附最近 {tc.recent_replies} 条"]
+    sample = "tp_doctor_check"
+    ask = tc.header("ask", "示例", sample)
+    report = tc.header("report", "示例", sample)
+    if esc.chat_ids:
+        rx = esc.pattern
+        hit = rx.search(ask) if rx is not None else None
+        out.append(f"  ask 开头一行「{ask}」" + ("✓ 能被 header_regex 认出来" if hit and hit.group("topic") == sample
+                                                 else "✗ 认不出来：ask 发的「需要你定」登记不上，改 [threads] ask_header 或 header_regex"))
+        if rx is not None and rx.search(report):
+            out.append(f"  ⚠ report 开头一行「{report}」也被 header_regex 认成「需要你定」了")
+        ax = esc.attribution
+        if ax is not None:
+            for name, line in (("ask", ask), ("report", report)):
+                m = ax.search(line)
+                if not (m and m.group("topic") == sample):
+                    out.append(f"  ⚠ {name} 开头一行认不出 topic（attribution_regex），主人引用回复它时靠发送时记的来源")
+    return out
 
 
 def duty_report(cfg, store: Store) -> str:
@@ -1315,6 +1352,106 @@ def cmd_notices(args) -> int:
         print(_notice_line(cfg, r))
     return 0
 
+# ======================= 一事一串、发前再看一眼（7.22） =======================
+def _body_arg(text: str | None, path: str | None) -> str:
+    if path:
+        return sys.stdin.read() if path == "-" else Path(path).expanduser().read_text(encoding="utf-8")
+    return text or ""
+
+
+def _test_env_write(cfg, what: str, text: str) -> int:
+    """测试环境（[source] enabled = false）不发飞书：设了 [notify] file 就写进去，否则拒绝。不写账本。"""
+    path = cfg.notify_path
+    if path is None:
+        print(f"{what}没发: 测试环境（[source] enabled = false）不发飞书，也没设 [notify] file", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    FileNotifier(path, cfg.timezone_offset).notify(text, what)
+    print(f"测试环境（[source] enabled = false）：没发飞书，写进了 {path}")
+    return outbound.EXIT_OK
+
+
+def cmd_ask(args) -> int:
+    """sheepdog ask / report：经机器人找主人。带 --key：同一把钥匙第一次起新话题，之后回到这个话题里。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    kind = args.cmd
+    tid = _topic_arg(args.topic)
+    try:
+        body = _body_arg(args.text, args.file)
+    except OSError as e:
+        print(f"{kind} 没发: 读不了正文文件: {e}", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    if not cfg.source.enabled:
+        if not outbound.target_ok(store, tid):
+            print(f"{kind} 没发: {tid} 不是在投递的会话", file=sys.stderr)
+            return outbound.EXIT_INVALID
+        return _test_env_write(cfg, "需要你定" if kind == outbound.ASK else "汇报",
+                               outbound.compose(cfg, kind, tid, args.title, body))
+    try:
+        r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch)
+    except outbound.OutboundError as e:
+        print(f"{kind} 没发: {e}", file=sys.stderr)
+        return e.code
+    if r.already:
+        print(f"之前已经发过同样的内容（防重编号相同，这次没再发）：message_id {r.message_id}")
+    elif r.new_thread:
+        print(f"已发给主人，新起了一个话题（钥匙 {args.key}）：message_id {r.message_id}。之后同一把钥匙的消息都回到这个话题里")
+    elif r.root_message_id:
+        print(f"已发到钥匙 {args.key} 的话题里：message_id {r.message_id}（话题开头 {r.root_message_id}）")
+    else:
+        print(f"已发给主人：message_id {r.message_id}")
+    return outbound.EXIT_OK
+
+
+def cmd_reply(args) -> int:
+    """sheepdog reply：代回。发前只读检查主人有没有新发言；说过就不发（退出码 3），把他的话打印出来。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    tid = _topic_arg(args.topic)
+    try:
+        card_text = _body_arg(args.card_text, args.card_file) if args.card_text is not None or args.card_file else ""
+    except OSError as e:
+        print(f"代回没发: 读不了正文文件: {e}", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    if not cfg.source.enabled:
+        if not outbound.target_ok(store, tid):
+            print(f"代回没发: {tid} 不是在投递的会话", file=sys.stderr)
+            return outbound.EXIT_INVALID
+        try:
+            shown, _ = outbound.reply_body(cfg, args.text or "", card_text)
+        except ValueError as e:
+            print(f"代回没发: {e}", file=sys.stderr)
+            return outbound.EXIT_INVALID
+        return _test_env_write(cfg, "代回", f"回复 {args.to}：\n{shown}")
+    try:
+        r = outbound.reply(cfg, store, _source(cfg), tid, args.to, text=args.text or "", card_text=card_text,
+                           even_if_owner_replied=args.even_if_owner_replied, followup=args.followup)
+    except outbound.OutboundError as e:
+        print(f"代回没发: {e}", file=sys.stderr)
+        return e.code
+    if r.spoke is not None:
+        print(outbound.spoke_text(cfg, r.spoke))
+        return outbound.EXIT_OWNER_REPLIED
+    if r.already:
+        print(f"之前已经发过同样的代回（防重编号相同，这次没再发）：message_id {r.message_id}")
+    else:
+        print(f"已代回：message_id {r.message_id}")
+    return outbound.EXIT_OK
+
+
+def cmd_thread(args) -> int:
+    """sheepdog thread：只读列出一个话题的全部消息（账本里有的优先，缺的查话题列表）。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    source = _source(cfg)
+    try:
+        v = outbound.view_thread(cfg, store, source, _topic_arg(args.topic), args.key or "", args.thread or "")
+    except outbound.OutboundError as e:
+        print(f"thread: {e}", file=sys.stderr)
+        return e.code
+    print(outbound.render_thread(cfg, v))
+    return outbound.EXIT_OK
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
@@ -1509,6 +1646,37 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--topic", default="", help="只看这个会话（附最近回执和动作）")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_board)
+
+    for name, what in (("ask", "需要主人定的事"), ("report", "向主人汇报")):
+        sp = sub.add_parser(name, help=f"经机器人私聊主人：{what}（sheepdog 加开头一行；带 --key 的同一件事归到一个话题里）")
+        sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+        sp.add_argument("--title", required=True, help="短标题（一行）")
+        g = sp.add_mutually_exclusive_group(required=True)
+        g.add_argument("--text", help="正文")
+        g.add_argument("--file", help="正文文件；- 表示标准输入")
+        sp.add_argument("--key", default="", help="钥匙（和在岗表的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
+        sp.add_argument("--batch", default="", help="批次号（可选）：参与防重编号，区分不同批次里同样的正文")
+        sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("reply", help="代回：以主人身份回复一条消息（卡片带代回标记）；发前先查主人有没有新发言")
+    sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    sp.add_argument("--to", required=True, help="要回复的那条消息（om_）")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--card-text", help="卡片正文（同 reply-card --text）")
+    g.add_argument("--card-file", help="卡片正文文件，- 表示标准输入（同 reply-card --text-file）")
+    g.add_argument("--text", help="纯文本代回（末尾自动附代回标记）")
+    sp.add_argument("--even-if-owner-replied", action="store_true",
+                    help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
+    sp.add_argument("--followup", action="store_true",
+                    help="同一批里对同一条消息再回一条（比如先回了「稍等」、现在回结论）；重试时正文不要改")
+    sp.set_defaults(func=cmd_reply)
+
+    sp = sub.add_parser("thread", help="只读：列出一个话题的全部消息")
+    sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--key", help="钥匙（ask / report 带这把 --key 发过）")
+    g.add_argument("--thread", help="话题编号 omt_…（或开头那条的 om_）")
+    sp.set_defaults(func=cmd_thread)
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

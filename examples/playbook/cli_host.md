@@ -15,9 +15,9 @@
 - `waiting_external`（受阻）只用于**事情本身做不下去**：发不了飞书、缺权限、缺信息。summary 里写清楚缺什么（blocked：缺什么、为什么），需要的回复放进 drafts，由主人或总线接着处理。
 - 不要换别的办法绕过去（不借别的账号、不改权限设置、不找替代通道）。
 
-### 代回飞书
-- 宿主配置放开了网络时，代回和其他会话一样：用 `{{cli}} reply-card` 生成卡片，再用 lark-cli 发出去。
-- 放没放开，以实际能不能跑通为准。跑不通就在 summary 里写清楚（哪条命令、什么报错），status 照常写 `needs_decision`，回复草稿放进回执的 drafts，由主人决定怎么发。
+### 代回飞书、找主人
+- 宿主配置放开了网络、也能写 sheepdog 的状态目录时，和其他会话一样：代回用 `{{cli}} reply`（发的是和 `{{cli}} reply-card` 一样的代回卡片），找主人用 `{{cli}} ask` / `{{cli}} report`。
+- 放没放开，以实际能不能跑通为准。跑不通就在 summary 里写清楚（哪条命令、退出码、什么报错），status 照常写 `needs_decision`，回复草稿放进回执的 drafts，由主人决定怎么发。不要绕开 sheepdog 自己用 lark-cli 发。
 
 ### `{{cli}}` 的其他命令
 - `{{cli}} watch`、`{{cli}} forward`、`{{cli}} reply-card` 这些命令照常可以用；但你可能写不了 sheepdog 的状态目录，要写状态的命令会失败。

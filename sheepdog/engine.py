@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +59,8 @@ OWNER_CONTEXT = "owner_context"
 ESCALATION_TAG_PREFIX = "escalation:"
 # 命令审计（7.19 K3）：同一个会话 10 分钟内已经报过的同一条命令不再单独报（并进那次报警）；没报过的命令马上报
 AUDIT_MERGE_MINUTES = 10
+# 发前再看一眼（7.22）：会话 sheepdog reply 发前检查时已经看到过的主人发言，作为背景送到时附这一句
+SEEN_BEFORE_SEND_NOTE = "👀 你发送前已经看到过这条（sheepdog reply 发前检查时打印给你了），不是新的提醒。"
 
 # 给主人的通知账本（owner_notices）：第 n 次发送失败后隔几分钟再试，之后每次隔 NOTICE_BACKOFF_CAP 分钟
 NOTICE_BACKOFF_MINUTES = (1, 2, 4, 8)
@@ -122,6 +125,27 @@ def is_agent_reply(content: str, oc) -> bool:
     if any(b.startswith(p) for b in bodies for p in oc.skip_prefixes):
         return True
     return any(mk in b for b in [content or "", *bodies] for mk in oc.agent_markers)
+
+
+def is_thread_root(m: Message) -> bool:
+    """话题开头那条（thread_message_position 是 "0"，7.22）：它自己不是「在话题里回复」。"""
+    return str((m.raw or {}).get("thread_message_position", "")).strip() == "0"
+
+
+def thread_root_of(msgs: list[Message]) -> Message | None:
+    """话题列表（按时间正序）里开头那条：thread_message_position 是 "0" 的那条；列表里完全没有这个字段时取第一条。"""
+    for x in msgs:
+        if is_thread_root(x):
+            return x
+    if msgs and not any("thread_message_position" in (x.raw or {}) for x in msgs):
+        return msgs[0]
+    return None
+
+
+def first_line(content: str) -> str:
+    bodies = message_bodies(content)
+    text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
+    return text.splitlines()[0] if text else ""
 
 
 def predecessor_topic_id(topic_id: str) -> str:
@@ -475,6 +499,8 @@ class Collector:
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
             else:
+                if m.chat_id in esc_chats:
+                    self._learn_thread(m)  # 7.22：老消息后来有了话题（开头那条再被拉到时带上 thread_id）
                 if self._handle_change(existing, m, ctx):
                     stats["changed"] += 1
                 else:
@@ -651,6 +677,7 @@ class Collector:
         if me and m.sender_id == me:
             return self._owner_reply(m)
         if m.sender_type in ("app", "bot"):
+            self._learn_thread(m)
             question = ""
             if esc.pattern is not None:
                 question = next((mt.group("topic") for b in message_bodies(m.content)
@@ -725,6 +752,9 @@ class Collector:
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
         tags = [OWNER_VERIFIED_TAG]
         d = RouteDecision(DISPATCH, "owner_reply", tags)
+        if not m.reply_to and m.thread_id and not is_thread_root(m):
+            # 7.22：在话题里回复（话题里的消息没有 parent_id）：按话题找会话，不当成没引用去猜
+            return self._thread_reply(m, tags, d)
         if m.reply_to:
             # 7.15：有引用就按引用走，绝不当成没引用去匹配未结问题
             target = self.store.get_escalation(m.reply_to)
@@ -766,6 +796,163 @@ class Collector:
         self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "\n".join(lines))
         log.info("主人的回复 %s 无法确定回答哪条（未结 %d 条），投总线", m.message_id, len(opens))
         return d
+
+    # ---------- 一事一串（7.22）：主人在话题里回复，按话题送回 ----------
+    def _learn_thread(self, m: Message) -> None:
+        """「找主人」聊天里带话题编号的消息：它是已记话题的开头那条、或 ask / report 发进话题里的，就把话题编号补上。"""
+        if not m.thread_id:
+            return
+        if self.store.thread_by_root(m.message_id) is not None:
+            self.store.set_thread_id(m.message_id, m.thread_id)
+            return
+        s = self.store.send_by_message(m.message_id)
+        if s is not None and s["root_message_id"]:
+            self.store.set_thread_id(s["root_message_id"], m.thread_id)
+
+    def _list_thread(self, thread_id: str) -> tuple[list[Message] | None, str]:
+        """查话题列表（只读）。失败返回 (None, 原因)，不抛。"""
+        fn = getattr(self.source, "thread_messages", None)
+        if fn is None:
+            return None, "消息源不支持查话题"
+        try:
+            return list(fn(thread_id, "asc")), ""
+        except Exception as e:
+            log.warning("查话题 %s 失败: %s", thread_id, e)
+            return None, str(e)
+
+    def _recognize_root(self, root: Message) -> str | None:
+        """话题开头那条来自哪个会话：先查「需要你定」和 bot_outbox；都没有、但它是机器人发的，再按第一行认（同 7.15）。"""
+        e = self.store.get_escalation(root.message_id)
+        if e is not None:
+            return e["topic_id"]
+        out = self.store.get_bot_outbox(root.message_id)
+        if out is not None:
+            return out["topic_id"]
+        if root.sender_type in ("app", "bot"):
+            esc = self.cfg.escalation
+            topic = ""
+            if esc.pattern is not None:
+                topic = next((mt.group("topic") for b in message_bodies(root.content)
+                              if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
+            topic = topic or self._attribute(root) or ""
+            if topic and self._escalation_target_ok(topic):
+                return topic
+        return None
+
+    def _find_thread(self, m: Message) -> tuple[object, list[Message] | None, str]:
+        """主人这条话题回复属于哪个已记的话题：先按话题编号，再看账本里同一话题的消息，最后查话题列表找开头那条
+        （认出来就补记进表）。返回 (话题行或 None, 查到的话题列表或 None, 查话题失败的原因)。"""
+        thr = self.store.thread_by_thread_id(m.thread_id)
+        if thr is not None:
+            return thr, None, ""
+        for r in self.store.thread_messages_in_ledger(m.thread_id):
+            thr = self.store.thread_by_root(r["message_id"])
+            if thr is None and (s := self.store.send_by_message(r["message_id"])) is not None and s["root_message_id"]:
+                thr = self.store.thread_by_root(s["root_message_id"])
+            if thr is not None:
+                self.store.set_thread_id(thr["root_message_id"], m.thread_id)
+                return self.store.thread_by_root(thr["root_message_id"]), None, ""
+        listing, err = self._list_thread(m.thread_id)
+        root = thread_root_of(listing or [])
+        if root is None:
+            return None, listing, err or ("话题列表里找不到开头那条" if listing is not None else "")
+        thr = self.store.thread_by_root(root.message_id)
+        if thr is None:
+            topic = self._recognize_root(root)
+            if topic is None:
+                return None, listing, ""
+            title = duty.short(first_line(root.content), 40)
+            self.store.add_thread(root.message_id, topic, "", "", title, "recognized", m.thread_id)
+            log.info("主人在话题 %s 里回复，靠开头那条 %s 认出是 %s，补记进话题表", m.thread_id, root.message_id, topic)
+        else:
+            self.store.set_thread_id(root.message_id, m.thread_id)
+        return self.store.thread_by_root(root.message_id), listing, ""
+
+    def _thread_reply(self, m: Message, tags: list[str], d: RouteDecision) -> RouteDecision:
+        thr, listing, err = self._find_thread(m)
+        if thr is None:
+            # 都认不出：同 7.15「认不出来源」，交给总线
+            self.store.upsert_message(m, d.route, d.reason, [*tags, f"thread:{m.thread_id}"], BUS_TOPIC_ID)
+            root = thread_root_of(listing or [])
+            if root is not None:
+                where = f"开头那条（message_id `{root.message_id}`）：{duty.short(root.content, 200)}"
+            else:
+                where = f"开头那条查不到（{err}）" if err else "开头那条查不到"
+            self.store.add_system_message(
+                BUS_TOPIC_ID, "escalation_list",
+                f"主人在一个认不出来源的话题里回复了（话题 `{m.thread_id}`）。{where}\n"
+                f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
+                + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。",
+                           self.cfg.cli_command))
+            log.info("主人在认不出来源的话题 %s 里回复 %s，投总线", m.thread_id, m.message_id)
+            return d
+        members = self._thread_members(thr, m, listing)
+        member_ids = {x["message_id"] for x in members} | {thr["root_message_id"]}
+        live = [e for e in open_escalations(self.store, self.cfg.escalation.open_hours, thr["topic_id"])
+                if e["message_id"] in member_ids]
+        # 话题就是一件事：主人在话题里回复，这件事里没结的「需要你定」都算答了（投递以后才标）
+        tags = [*tags, f"thread:{m.thread_id}", *(ESCALATION_TAG_PREFIX + e["message_id"] for e in live)]
+        self.store.upsert_message(m, d.route, d.reason, tags, thr["topic_id"])
+        self.store.set_note(m.message_id, self._thread_note(thr, m, members, live))
+        log.info("主人在话题 %s 里回复 %s -> %s（钥匙 %s）", m.thread_id, m.message_id, thr["topic_id"], thr["key"] or "-")
+        return d
+
+    def _thread_members(self, thr, m: Message, listing: list[Message] | None) -> list[dict]:
+        """这个话题里的消息（含开头那条和主人这一条），合并账本、ask / report 发出的记录、话题列表，按时间排。只读。"""
+        root = thr["root_message_id"]
+        me = self.cfg.self_open_id
+        out: dict[str, dict] = {}
+
+        def add(mid: str, at: str, who: str, text: str) -> None:
+            if mid and mid not in out:
+                out[mid] = {"message_id": mid, "at": at or "", "who": who, "text": text or "", "root": mid == root}
+
+        def who_of(sender_id: str, sender_type: str) -> str:
+            return "主人" if me and sender_id == me else "机器人" if sender_type in ("app", "bot") else "-"
+
+        for r in self.store.thread_messages_in_ledger(thr["thread_id"] or m.thread_id, root):
+            add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), r["content"])
+        for x in listing or []:
+            add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), x.content)
+        for s in self.store.sends_in_thread(root):
+            add(s["message_id"], s["sent_at"], "机器人", s["text"])
+        add(m.message_id, m.create_time, "主人", m.content)
+        if root not in out:
+            o = self.store.get_bot_outbox(root)
+            add(root, o["sent_at"] if o is not None else "", "机器人", o["text"] if o is not None else "")
+        rows = list(out.values())
+        rows.sort(key=lambda x: (not x["root"], _parse(x["at"]) or datetime.min.replace(tzinfo=timezone.utc),
+                                 x["message_id"] == m.message_id))
+        return rows
+
+    def _thread_note(self, thr, m: Message, members: list[dict], live: list) -> str:
+        """渐进式披露（参照 cc-connect 的 Linear 评论回复）：一般情况只附这件事开头那条；话题里除了开头那条已有
+        complex_min_replies 条以上（含主人这一条），再附最近几条（每条截短），并说明要全貌去哪里取。条数判断，不让模型判断。"""
+        tc = self.cfg.threads
+        root = next((x for x in members if x["root"]), None)
+        replies = [x for x in members if not x["root"]]
+        tid, key = thr["topic_id"], thr["key"] or ""
+        what = f"钥匙 `{key}`" if key else "没有钥匙（话题开在一条没带 --key 的消息下面）"
+        lines = [f"🧵 主人在话题里回复（话题 `{m.thread_id}`，{what}）。"]
+        if root is not None and root["text"]:
+            root_text = duty.short(root["text"], tc.root_chars)
+        else:
+            root_text = "（原文不在账本里）" + (f"标题：{thr['title']}" if thr["title"] else "")
+        lines.append(f"这件事开头那条（message_id `{thr['root_message_id']}`）：「{root_text}」")
+        latest = live[0] if live else None  # 按提问时间倒序
+        if latest is not None and latest["message_id"] != thr["root_message_id"]:
+            lines.append(f"话题里最近一条「需要你定」（message_id `{latest['message_id']}`）：{escalation_summary(latest)}")
+        if len(replies) >= tc.complex_min_replies:
+            earlier = [x for x in replies if x["message_id"] != m.message_id][-tc.recent_replies:]
+            lines.append(f"话题里除了开头那条已有 {len(replies)} 条（含主人这一条），最近 {len(earlier)} 条：")
+            for x in earlier:
+                at = _parse(x["at"])
+                lines.append(f"- {clock(at, self.cfg.timezone_offset) if at else '-'} {x['who']}："
+                             f"{duty.short(x['text'], tc.reply_chars)}")
+            which = f"--key {shlex.quote(key)}" if key else f"--thread {m.thread_id}"
+            lines.append(with_cli(f"要全貌用 `sheepdog thread --topic {tid} {which}` 取整个话题；还不够就看羊群看板里这件活"
+                                  f"（`sheepdog board --topic {tid}`）和最初的来源消息。", self.cfg.cli_command))
+        return "\n".join(lines)
 
     def _handle_change(self, old, m: Message, ctx: RouteContext) -> bool:
         """编辑 / 撤回：按原消息的路由级别处理（设计稿 2.2.1）。返回是否有变化。"""
@@ -1519,6 +1706,9 @@ class Dispatcher:
                       for r in rows if "reply_to" in r.keys() and r["reply_to"]}
             # 在岗表（7.20）：消息里的编号登记在别的会话名下 → 附撞车提醒；总线批次在在岗表变化时附摘要
             notes = self._collision_notes(t, rows)
+            # 发前再看一眼（7.22）：会话 sheepdog reply 时已经看到过的主人发言，送到时注明，不当新提醒
+            for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in rows]):
+                notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, receipt_optional=adopted, roster_update=roster_update,
@@ -2596,7 +2786,10 @@ class Dispatcher:
 
         duty.close_auto_work(self.store, duty.SRC_WATCH, watch_closed)
         for e in open_escalations(self.store, self.cfg.escalation.open_hours):
-            key = duty.key_for(e["text"] or "", pats, f"ask-{e['message_id'][-8:]}")
+            # sheepdog ask --key 发的（7.22）：钥匙就是会话给的那把，和在岗表的活同一套
+            sent = self.store.send_by_message(e["message_id"])
+            key = (sent["key"] if sent is not None and sent["key"] else
+                   duty.key_for(e["text"] or "", pats, f"ask-{e['message_id'][-8:]}"))
             duty.auto_work(self.store, e["topic_id"], key, f"escalation:{e['message_id']}", duty.SRC_ESCALATION,
                            duty.WAITING_OWNER, title=escalation_summary(e, 40), waiting_on=duty.OWNER_NAME_FIELD)
         live = {e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)}

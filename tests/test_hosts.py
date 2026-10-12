@@ -1257,7 +1257,7 @@ class CliNameTest(HostBase):
         self.assertIn(f"`{self.quoted} watch-done --id 7`", texts["batch"])
         self.assertIn(f"`{self.quoted} show om_test_long`", texts["batch"])
         self.assertIn(f"`{self.quoted} inbox --chat", texts["batch"])
-        self.assertIn(f"`{self.quoted} reply-card`", texts["batch"])  # batch_footer.md 的 {{cli}}
+        self.assertIn(f"`{self.quoted} reply`", texts["batch"])  # batch_footer.md 的 {{cli}}（7.22 起代回改用 reply）
         self.assertIn("回执一律写成回执块", texts["retire"])  # 命令行宿主的回执提示
         self.assertIn(f"`{self.quoted} forward`", texts["bus"])  # bus.md 的 {{cli}}
         self.assertIn("`sheepdog-receipt`", texts["rules"])  # 围栏标记不是命令，不换

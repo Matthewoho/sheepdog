@@ -42,7 +42,7 @@ Lark (lark-cli, as the owner)
 ## Sessions
 
 - Every batch has an ID. The session answers with a receipt (`handled`, `needs_decision`, `waiting_external`, `done`), and the receipt sets the session state: idle, waiting on the owner, waiting on someone else, or closed.
-- When a session is unsure, it DMs the owner through a bot, one question per message. The first line carries the session's topic ID (`[tp_xxx]`), which is how the owner's reply finds its way back. The format lives in the playbook.
+- When a session is unsure, it asks the owner with `sheepdog ask` (reports go through `sheepdog report`), one question per message. sheepdog adds the first line with the session's topic ID (`[tp_xxx]`), which is how the owner's reply finds its way back. Messages about the same thing carry the same `--key`: the first one starts a message in the main chat, later ones go into its thread, and the owner's replies in that thread go back to the session by thread.
 - Waiting on someone is registered with `sheepdog watch`. By default the session is reminded at 15 and 30 minutes, and reports to the owner at 60. A reply only counts once the session confirms it is the answer it was waiting for.
 - Handover: a retiring session writes a handover note. Its successor reads the full predecessor transcript first and lists what it read in its receipt.
 - When the rules change, running sessions get the full new rules with their next batch.
@@ -87,7 +87,7 @@ When a host compacts a session's context, the rules from the session's opening p
 
 ## Speaking for the owner
 
-- Every message a session sends as the owner goes out as a card with a small grey `[🐕Sheepdog Reply]` in the bottom-right corner, so people can tell it came from an agent. Cards are built with `sheepdog reply-card`.
+- Every message a session sends as the owner goes out as a card with a small grey `[🐕Sheepdog Reply]` in the bottom-right corner, so people can tell it came from an agent. Replies go out through `sheepdog reply`, which first checks (read-only) whether the owner has already spoken in that chat; if so it does not send and hands the owner's words back to the session.
 - With `[ack]` configured: once a DM or an @owner message reaches a session, sheepdog adds a "Get" reaction as the owner and removes it after the reply. @all messages get the reaction but it is never removed.
 - Whether and how to reply is up to the playbook. Messages from bots or agents get a label line, whose text comes from `agent_sender_label.md`. The example says to reply politely once and not to keep a back-and-forth going. Without that file the label is just "🤖 来自机器人 / Agent" ("from a bot / agent").
 - Loop breaker: if a session replies in one chat more than 4 times in 10 minutes and the other side is a bot, the chat is paused for 30 minutes. During the pause its messages go to the inbox and the bus is told. `sheepdog loops --clear` lifts it by hand.
@@ -188,7 +188,7 @@ python3 -m unittest discover -s tests -v
 
 ## Limits
 
-- Sessions send messages and run commands themselves; sheepdog is not on the execution path. The reply format, asking the owner and the security rules are all enforced by prompts, not by code. The last lines of defence are the session host's own command permissions and the owner's cloud permissions.
+- Apart from asking the owner and replying on the owner's behalf, which go through sheepdog, sessions send messages and run commands themselves; sheepdog is not on those execution paths. The reply format, asking the owner and the security rules are all enforced by prompts, not by code. The last lines of defence are the session host's own command permissions and the owner's cloud permissions.
 - Security checks are regex rules and can miss a rewording. The command audit alerts after the command has run.
 - When the Antigravity app is closed, sheepdog stops too. It picks up where it left off when the app is back.
 - Edits and recalls are only noticed within a few minutes of the original message.

@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS escalations (
     close_reason      TEXT               -- answered | expired
 );
 
--- 机器人发给主人的消息来自哪个 topic（7.15）：主人引用回复它时按这里送回
+-- 机器人发给主人的消息来自哪个 topic（7.15）：主人引用回复它时按这里送回。
+-- 7.22 起 sheepdog ask / report / reply 替会话发出的消息也当场记进来（reply 是以主人身份代回的，is_question = 0）
 CREATE TABLE IF NOT EXISTS bot_outbox (
     message_id  TEXT PRIMARY KEY,
     topic_id    TEXT NOT NULL,
@@ -353,6 +354,49 @@ CREATE TABLE IF NOT EXISTS duty_route_seen (
     message_id TEXT NOT NULL,
     at         TEXT NOT NULL,
     PRIMARY KEY (topic_id, norm_key, message_id)
+);
+
+-- 一事一串（7.22）：会话经 sheepdog ask / report 找主人，同一会话同一把钥匙的消息归在一个话题里。
+-- 一行 = 一个话题：开头那条是机器人在主聊天里发的第一条，之后同一把钥匙的消息都回复到它的话题里
+CREATE TABLE IF NOT EXISTS owner_threads (
+    root_message_id TEXT PRIMARY KEY,  -- 话题开头那条
+    thread_id       TEXT,              -- omt_…；发出时不一定知道，拉到话题里的消息、或查话题列表以后补上
+    topic_id        TEXT NOT NULL,
+    key             TEXT,              -- 钥匙原样；主人在老消息下开的话题（靠开头那条认出来的）为空
+    norm_key        TEXT,              -- duty.norm_key(key)；为空 = 没有钥匙
+    title           TEXT,              -- 开头那条的短标题
+    source          TEXT NOT NULL,     -- ask（ask / report 带 --key 发出的）| recognized（主人在老消息下开话题，靠开头那条认出来补记的）
+    created_at      TEXT NOT NULL,
+    last_post_at    TEXT               -- 最近一次往这个话题里发（保留期清理按它）
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_threads_key ON owner_threads(topic_id, norm_key) WHERE norm_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_owner_threads_tid ON owner_threads(thread_id);
+
+-- sheepdog ask / report / reply 替会话发出去的每一条（7.22）。按防重编号（发给飞书的 --idempotency-key）一行：
+-- 重试时先查这里，发过的不再调飞书；只记发成功的
+CREATE TABLE IF NOT EXISTS sends (
+    idem_key          TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL,   -- ask | report | reply
+    topic_id          TEXT NOT NULL,
+    message_id        TEXT NOT NULL,   -- 飞书返回的消息号
+    root_message_id   TEXT,            -- ask / report 带钥匙时：在哪个话题里（开头那条的消息号；新起的就是它自己）
+    key               TEXT,
+    norm_key          TEXT,
+    target_message_id TEXT,            -- reply：回复的是哪条
+    text              TEXT,            -- 发出去的正文（卡片记卡片正文）
+    sent_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sends_message ON sends(message_id);
+CREATE INDEX IF NOT EXISTS idx_sends_root ON sends(root_message_id);
+
+-- 发前再看一眼（7.22）：sheepdog reply 发送前查到主人已经在这个聊天里说过话、没发，记下「这个会话发送前已经看到过
+-- 这条主人发言」。同一会话同一条只记一次；这条发言之后作为背景送到这个会话时注明，不重复提醒
+CREATE TABLE IF NOT EXISTS seen_before_send (
+    topic_id          TEXT NOT NULL,
+    message_id        TEXT NOT NULL,   -- 主人的那条发言
+    target_message_id TEXT,            -- 当时会话要回复的那条
+    seen_at           TEXT NOT NULL,
+    PRIMARY KEY (topic_id, message_id)
 );
 """
 
@@ -791,6 +835,84 @@ class Store:
             c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
                       (now_iso(), message_id))
 
+    # ---------- 一事一串（7.22） ----------
+    def thread_by_key(self, topic_id: str, norm_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM owner_threads WHERE topic_id=? AND norm_key=?",
+                                 (topic_id, norm_key)).fetchone()
+
+    def thread_by_root(self, root_message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM owner_threads WHERE root_message_id=?", (root_message_id,)).fetchone()
+
+    def thread_by_thread_id(self, thread_id: str) -> sqlite3.Row | None:
+        if not thread_id:
+            return None
+        return self.conn.execute("SELECT * FROM owner_threads WHERE thread_id=? ORDER BY created_at LIMIT 1",
+                                 (thread_id,)).fetchone()
+
+    def add_thread(self, root_message_id: str, topic_id: str, key: str, norm_key: str, title: str, source: str,
+                   thread_id: str = "") -> bool:
+        """记一个话题；开头那条已经记过、或同一会话同一把钥匙已经有话题时不动，返回 False。"""
+        ts = now_iso()
+        with self.tx() as c:
+            return c.execute(
+                """INSERT OR IGNORE INTO owner_threads(root_message_id,thread_id,topic_id,key,norm_key,title,source,
+                       created_at,last_post_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (root_message_id, thread_id or None, topic_id, key or None, norm_key or None, title, source, ts, ts),
+            ).rowcount > 0
+
+    def set_thread_id(self, root_message_id: str, thread_id: str) -> bool:
+        """补上话题编号（只补空的，已有的不改）。返回是否补了。"""
+        if not thread_id:
+            return False
+        with self.tx() as c:
+            return c.execute("UPDATE owner_threads SET thread_id=? WHERE root_message_id=? AND thread_id IS NULL",
+                             (thread_id, root_message_id)).rowcount > 0
+
+    def touch_thread(self, root_message_id: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE owner_threads SET last_post_at=? WHERE root_message_id=?", (now_iso(), root_message_id))
+
+    def get_send(self, idem_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM sends WHERE idem_key=?", (idem_key,)).fetchone()
+
+    def send_by_message(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM sends WHERE message_id=? ORDER BY sent_at LIMIT 1",
+                                 (message_id,)).fetchone()
+
+    def sends_in_thread(self, root_message_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM sends WHERE root_message_id=? ORDER BY sent_at, rowid",
+                                 (root_message_id,)).fetchall()
+
+    def add_send(self, idem_key: str, kind: str, topic_id: str, message_id: str, text: str, *,
+                 root_message_id: str = "", key: str = "", norm_key: str = "", target_message_id: str = "") -> None:
+        with self.tx() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO sends(idem_key,kind,topic_id,message_id,root_message_id,key,norm_key,
+                       target_message_id,text,sent_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (idem_key, kind, topic_id, message_id, root_message_id or None, key or None, norm_key or None,
+                 target_message_id or None, text, now_iso()))
+
+    def thread_messages_in_ledger(self, thread_id: str, root_message_id: str = "") -> list[sqlite3.Row]:
+        """账本里这个话题的消息（含开头那条），按发送时间排。只读。"""
+        return self.conn.execute(
+            """SELECT * FROM messages WHERE (? != '' AND thread_id=?) OR (? != '' AND message_id=?)
+               ORDER BY create_time, first_seen, message_id""",
+            (thread_id or "", thread_id or "", root_message_id or "", root_message_id or "")).fetchall()
+
+    def add_seen_before_send(self, topic_id: str, message_id: str, target_message_id: str) -> bool:
+        """记「发送前已看到」；同一会话同一条已经记过就不动（返回 False）。"""
+        with self.tx() as c:
+            return c.execute("INSERT OR IGNORE INTO seen_before_send(topic_id,message_id,target_message_id,seen_at) "
+                             "VALUES(?,?,?,?)", (topic_id, message_id, target_message_id, now_iso())).rowcount > 0
+
+    def seen_before_send_ids(self, topic_id: str, message_ids: list[str]) -> set[str]:
+        if not message_ids:
+            return set()
+        marks = ",".join("?" * len(message_ids))
+        return {r[0] for r in self.conn.execute(
+            f"SELECT message_id FROM seen_before_send WHERE topic_id=? AND message_id IN ({marks})",
+            (topic_id, *message_ids))}
+
     # ---------- actions ----------
     def add_action(self, kind: str, args: dict, requested_by: str) -> int:
         with self.tx() as c:
@@ -1196,6 +1318,10 @@ class Store:
         # 给主人的通知：已发的、人工确认过的才删；还在待发、放弃了没人处理的留着
         "owner_notices": """DELETE FROM owner_notices WHERE COALESCE(acked_at, sent_at) < ?
                             AND (state = 'sent' OR acked_at IS NOT NULL)""",
+        # 一事一串（7.22）：话题按最近一次往里发的时间；清掉以后同一把钥匙再发就新起一个话题
+        "owner_threads": "DELETE FROM owner_threads WHERE COALESCE(last_post_at, created_at) < ?",
+        "sends": "DELETE FROM sends WHERE sent_at < ?",
+        "seen_before_send": "DELETE FROM seen_before_send WHERE seen_at < ?",
     }
 
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删

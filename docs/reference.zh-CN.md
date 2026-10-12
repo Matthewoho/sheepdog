@@ -88,11 +88,15 @@ sheepdog notices --ack N|all             # 确认已处理：不再提示、不�
 sheepdog work set --topic tp_x --key K --title "..." --state doing [--waiting-on 谁] [--until 几点] [--expect "..."] [--to tp_y]
 sheepdog work done --topic tp_x --key K --result "..."   # 会话登记 / 收掉名下的活（立即写入）
 sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   # 会话给别的会话留言，下一批送到
+sheepdog ask --topic tp_x --title "短标题" --text "..." [--key K]   # 会话找你「需要你定」（sheepdog 加开头一行；同一把钥匙归到一个话题里）
+sheepdog report --topic tp_x --title "短标题" --text "..." [--key K]   # 会话向你汇报（参数同 ask）
+sheepdog reply --topic tp_x --to om_x --card-text "..."   # 会话代回：发前先查你有没有在这个聊天里说过话，说过就不发（退出码 3）
+sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一个话题的全部消息
 ```
 
 ## 在飞书上直接回复「需要你定」
 
-会话拿不准时以 bot 身份私聊你（开头约定写在 playbook/common.md，带 topic_id）。把这个私聊配进 `[escalation] chat_ids`（不要放 `ignore_chat_ids`），sheepdog 会先于普通路由处理它：
+会话拿不准时用 `sheepdog ask` 经机器人私聊你（开头一行由 sheepdog 加，带 topic_id，见下文「一事一串」）。把这个私聊配进 `[escalation] chat_ids`（不要放 `ignore_chat_ids`），sheepdog 会先于普通路由处理它：
 
 - 机器人发的、正文匹配 `header_regex` 的提问：登记为一条「需要你定」，消息本身不投递；
 - 你的回复：引用了哪条就送回哪条的会话（引用认不出来源的送总线，见下文「引用回复按引用走」）；没引用时，未结的全部属于同一个会话（含只有一条）就送给它、算回答其中最近一条；未结分属不同会话或没有未结时送总线并附未结列表，由总线 `sheepdog forward --message-ids` 转交。送达时标「✅ 主人在飞书的回复（已核对：发送人是主人本人账号）」并附问题摘要，不走安全闸；
@@ -136,11 +140,12 @@ sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   
 
 ## 代回用卡片
 
-会话以你的身份对外回复时发一张卡片：正文 + 右下角灰色小字标记（`session.reply_suffix`，默认 `[🐕Sheepdog Reply]`），别人一眼能看出是 Agent 代回。
+会话以你的身份对外回复时发一张卡片：正文 + 右下角灰色小字标记（`session.reply_suffix`，默认 `[🐕Sheepdog Reply]`），别人一眼能看出是 Agent 代回。回复某条消息一律用 `sheepdog reply`（见上文「发前再看一眼」），它内部就用这里的卡片；只有先发起一段新的聊天时，才用 `reply-card` 加 lark-cli：
 
 ```bash
+sheepdog reply --topic tp_x --to om_x --card-text '收到，周五前给你 <at id=ou_xxx></at>'
 lark-cli im +messages-send --as user --chat-id oc_xxx --msg-type interactive \
-  --content "$(sheepdog reply-card --text '收到，周五前给你 <at id=ou_xxx></at>')"
+  --content "$(sheepdog reply-card --text '你好，想问一下……')"
 sheepdog reply-card --text-file body.md     # 正文从文件读；- 表示标准输入
 ```
 
@@ -255,6 +260,62 @@ attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'   # 第一行里 [
 - 「找你」聊天里机器人发的每条消息（问题、汇报、回复）都记来源到账本 `bot_outbox`：第一行先用 `attribution_regex` 找 topic；找不到时把第一行 `[..]` 标签按「·」拆开，逐段先查 `[escalation.aliases]`，再和各会话标题比（去掉 title_prefix 后相等或互相包含），唯一命中才算。同时匹配 `header_regex` 的还照旧登记为「需要你定」。
 - 你的回复：引用了问题或登记过来源的消息 → 送回那个会话（引用的是问题就关闭它）；引用了认不出来源的消息 → 送总线，附「你引用回复了一条认不出来源的消息」和原文摘要，**绝不**按「没引用」去匹配未结问题；没有引用 → 规则不变。
 - 投递时，任何有引用的消息（你的、别人的）都在标题下附一行「↪ 回复的是：<发送人和摘要>」（账本里没有就写「原文不在账本里」）。
+
+## 一事一串：找你的消息按事归到话题里
+
+会话找你一律用 `sheepdog ask`（需要你定）/ `sheepdog report`（汇报），不再自己调 lark-cli。sheepdog 在正文前加开头一行（`[threads] ask_header` / `report_header`，默认 `🐕 需要你定 · <标题> [tp_xxx]` / `🐕 汇报 · <标题> [tp_xxx]`），以机器人身份私聊你；这一行照旧被 `[escalation] header_regex`、`attribution_regex` 认出来（`sheepdog doctor` 会核对 ask 的开头一行能不能被 header_regex 认出来）。
+
+```bash
+sheepdog ask --topic tp_x --key "PR #12" --title "发版时间" --text "周五还是下周一？建议周一"
+sheepdog report --topic tp_x --key "PR #12" --title "进度" --file body.md     # - 表示标准输入
+```
+
+- **带 `--key`**（和在岗表的活同一把钥匙，按 `norm_key` 比较：去空白、转大写）：同一会话同一把钥匙第一次发，在主聊天里新起一条（话题开头）；之后再发（问题、汇报都算），用 `+messages-reply --reply-in-thread` 回到开头那条的话题里，主聊天里不再并排。账本 `owner_threads` 表记「话题 ↔ 会话、钥匙、开头那条、话题编号」（话题编号发出时不一定知道，拉到话题里的消息或查话题列表后补上）。不同会话用同一把钥匙是各自的话题。ask 照旧登记「需要你定」，在岗表自动补的「等主人」的活用的就是这把钥匙。
+- **不带 `--key`**：和以前一样，每次主聊天里一条新消息。
+- **防重**：每次发送带 `--idempotency-key`（由种类、会话、钥匙、`--batch`（可选）、正文算出来，固定 44 个字符）。发成功的记进账本 `sends` 表，重试时先查它，发过的不再调飞书；超时、不确定发没发的，原样重试，带同一个编号，飞书只发一条（飞书文档说同一个编号 1 小时内只发一条）。发出去的同时记进 `bot_outbox`，你引用回复它照旧能送回。
+- **失败**：发送失败或超时返回退出码 1 和原因，不假装成功，也不记账。
+
+### 你在话题里回复：按话题送回
+
+话题里的消息拉回来只有 `thread_id`，没有 `parent_id`。sheepdog 拉到你在「找你」聊天里发的、带 `thread_id` 的消息时（你自己那条就是话题开头的除外）：
+
+1. 先按话题表找会话和钥匙（话题编号没记上的，再看账本里同一话题的消息是不是 sheepdog 发的）；
+2. 找不到（比如你在一条老的、没走 ask 的消息下面开了话题），用 `+threads-messages-list --order asc` 找到开头那条（`thread_message_position` 是 `"0"`），按它走现有的识别：「需要你定」、`bot_outbox`、第一行；认出来就补记进话题表（`source = recognized`，没有钥匙）；
+3. 都认不出（或话题列表查不到），照「认不出来源」交给总线，附开头那条（或查不到的原因）。
+
+有引用（`reply_to`）的照旧按引用走，不变。话题就是一件事：你在话题里回复，这件事里没结的「需要你定」投递后都标已答。
+
+送回会话的批次按条数渐进披露（参照 cc-connect 回复 Linear 评论的做法，「复杂」按条数判断，不让模型判断）：
+
+- **一般情况**：你的回复，加「这件事开头那条」（截到 `[threads] root_chars`，默认 300 字）；话题里最近一条「需要你定」不是开头那条时，再附一行它的摘要。
+- **复杂情况**：话题里除了开头那条已经有 `complex_min_replies`（默认 3）条以上（含你这一条，也就是话题里第 4 条起），再附最近 `recent_replies`（默认 5）条（每条截到 `reply_chars`，默认 120 字），并写一句：要全貌用 `sheepdog thread --topic tp_x --key K` 取整个话题；还不够就看在岗表里这件活（`sheepdog board --topic tp_x`）和最初的来源消息。
+
+`sheepdog thread --topic tp_x (--key K | --thread omt_x)` 只读：账本里有的优先，缺的用话题列表补，标明每条来自账本、sheepdog 发出还是飞书；不写账本里的消息、不动拉取进度、不点表情。话题记在别的会话名下的不给看；话题表里没有的只有总线能看。
+
+## 发前再看一眼：代回改由 sheepdog 发
+
+会话代回别人一律用 `sheepdog reply`，不再自己调 `lark-cli im +messages-reply --as user`：
+
+```bash
+sheepdog reply --topic tp_x --to om_x --card-text "收到，今天下班前给结论"   # 卡片，同 reply-card
+sheepdog reply --topic tp_x --to om_x --card-file body.md                    # - 表示标准输入
+sheepdog reply --topic tp_x --to om_x --text "收到"                           # 纯文本，末尾也附代回标记
+```
+
+发之前**只读检查**：这个聊天里、从要回复的那条之后（以账本里这条消息的时间为准；它所在批次里同一聊天还有更晚的消息时，以最晚那条为准），你本人有没有新发言（带代回标记的会话代回、同一批里已经送到的不算）。检查只用搜索接口（`+messages-search --chat-id --sender --start`，不会把消息标成已读）：不写账本里的消息、不动拉取进度、不点不撤表情、不改已读。账本仍然是唯一的入口，消息照样由每轮拉取进账本、照常路由。
+
+| 退出码 | 意思 | 会话怎么做 |
+|---|---|---|
+| 0 | 发出去了；或同样的内容已经发过，这次没再发 | — |
+| 1 | 发送失败或超时 | 原样重试，防重编号保证只发一条 |
+| 2 | 参数不对、会话不能发、账本里没有要回复的那条 | 改参数 |
+| 3 | 你已经回过，没发；你的话（时间和内容）原样打印在输出里 | 先读你的话再决定；确实还要照样发，加 `--even-if-owner-replied`（跳过检查） |
+| 4 | 检查本身失败（接口报错、超时），没发 | 过一会儿再试，不当成「你没说话」 |
+| 5 | 这一批里已经回过这条消息（内容不同），防重编号相同，没发 | 确实要再回一条（先回「稍等」、做完回结论），加 `--followup` |
+
+- 退出码 3 时，sheepdog 同时在账本 `seen_before_send` 记「这个会话发送前已经看到过这条」（会话 + 消息号，重复记不变）。这条发言之后作为背景送到这个会话时注明「你发送前已经看到过这条」，只送一次，不重复提醒。
+- 防重编号用「批次号 + 被回复的消息号」（账本里拿不到批次号时用会话 + 消息号），重试只发一条；`--followup` 再加正文指纹。发出的记进 `sends` 和 `bot_outbox`。
+- 测试环境（`[source] enabled = false`）：ask、report、reply 不发飞书，设了 `[notify] file` 就写进那个文件（不写账本），没设就拒绝。
 
 ## 主人本人的发言作为背景
 
@@ -420,7 +481,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 **已知局限**：
 
 - 规则匹配挡不住所有变形话术；最后一道防线仍是会话自己遵守 `security.md`，以及会话宿主（Antigravity / Codex / Claude）自己的命令权限和云权限本身。
-- 消息是会话自己用 lark-cli 发的、命令是会话自己执行的，sheepdog 不在执行路径上，只能在投递前标记和拦截。
+- 找你和代回经 `sheepdog ask / report / reply` 发（7.22），其他消息仍是会话自己用 lark-cli 发的、命令是会话自己执行的，sheepdog 不在这些执行路径上，只能在投递前标记和拦截。
 
 ## 数据与隐私
 
@@ -431,9 +492,9 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（10 分钟内报过的同一条命令不重复报，新命令马上报）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次）、羊群看板判会话中断 / 失联时的通知（同一段一次）和恢复时的「已恢复」、同一会话连续 3 次投递失败时的「投递不出去」和之后的「投递已恢复」，sheepdog 对 IM 只读。设了 `[notify] file`（测试环境）时，这些通知改写进文件，不发飞书。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（10 分钟内报过的同一条命令不重复报，新命令马上报）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次）、羊群看板判会话中断 / 失联时的通知（同一段一次）和恢复时的「已恢复」、同一会话连续 3 次投递失败时的「投递不出去」和之后的「投递已恢复」，sheepdog 自己对 IM 只读；会话调 `sheepdog ask / report / reply` 时，由 sheepdog 替它发这一条（找你经机器人，代回以你的身份），发之前的检查只读。设了 `[notify] file`（测试环境）时，这些通知改写进文件，不发飞书。
 
-清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录、羊群看板的履历和已结束的活（按 `[duty] history_days`，默认 7 天）、已回执的留言；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
+清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录、羊群看板的履历和已结束的活（按 `[duty] history_days`，默认 7 天）、已回执的留言、一事一串的话题表（按最近一次往话题里发的时间；清掉以后同一把钥匙再发就新起一个话题）、替会话发出的记录、「发送前已看到」；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
 提交前运行 `python3 scripts/check_private_data.py`（或启用 `.pre-commit-config.yaml`）拦截真实 IM ID、家目录路径与凭据。测试只使用 `*_test_*` 合成数据。
 

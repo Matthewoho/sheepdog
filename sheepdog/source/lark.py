@@ -19,6 +19,10 @@ from . import SourceError
 
 log = logging.getLogger("sheepdog")
 
+
+class LarkTimeout(SourceError):
+    """lark-cli 超时：写操作（发消息）超时 = 不确定发出去没有，只能带同一个防重编号重试。"""
+
 # 飞书 @所有人 在 mentions 里的标识
 _AT_ALL_IDS = {"all", "@_all"}
 
@@ -90,7 +94,10 @@ class LarkCliSource:
         delay = self.backoff
         last_err = ""
         for attempt in range(self.retries):
-            proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=120)
+            try:
+                proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired as e:
+                raise LarkTimeout(f"lark-cli 超时 {args[:2]}（{e.timeout:g} 秒）") from e
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
                 data = json.loads(out)
@@ -153,10 +160,13 @@ class LarkCliSource:
         return result
 
     # ---------- 写：确认表情（7.9），默认 user 身份，只试一次不重试 ----------
-    def _run_once(self, args: list[str], identity: str = "user") -> dict:
+    def _run_once(self, args: list[str], identity: str = "user", timeout: float = 60) -> dict:
         if identity not in ("user", "bot"):
             raise SourceError(f"未知身份 {identity!r}")
-        proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=60)
+        try:
+            proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            raise LarkTimeout(f"lark-cli 超时 {args[:3]}（{e.timeout:g} 秒）") from e
         out = proc.stdout.strip() or proc.stderr.strip()
         try:
             data = json.loads(out)
@@ -202,6 +212,67 @@ class LarkCliSource:
                 raise SourceError(f"防重编号超过 {self.IDEMPOTENCY_KEY_MAX} 个字符: {idempotency_key!r}")
             args += ["--idempotency-key", idempotency_key]
         self._run_once(args, identity)
+
+    # ---------- 写：替会话发消息（7.22）。只试一次：重试由调用方带同一个防重编号重来，飞书只发一条 ----------
+    def send_to_user(self, user_id: str, text: str, idem_key: str, identity: str = "bot") -> dict:
+        """私聊一个人（ask / report 经机器人找主人）。返回 {message_id, chat_id, thread_id}。"""
+        return self._sent(self._run_once(["im", "+messages-send", "--user-id", user_id, "--text", text,
+                                          "--idempotency-key", idem_key], identity))
+
+    def reply_to(self, message_id: str, *, identity: str, idem_key: str, text: str = "", card: dict | None = None,
+                 in_thread: bool = False) -> dict:
+        """回复一条消息：in_thread = 回到它的话题里（不出现在主聊天）；card = 卡片（interactive），否则纯文本。"""
+        args = ["im", "+messages-reply", "--message-id", message_id]
+        if card is not None:
+            args += ["--msg-type", "interactive", "--content", json.dumps(card, ensure_ascii=False)]
+        else:
+            args += ["--text", text]
+        if in_thread:
+            args.append("--reply-in-thread")
+        args += ["--idempotency-key", idem_key]
+        return self._sent(self._run_once(args, identity))
+
+    def _sent(self, data: dict) -> dict:
+        mid = self._find(data, "message_id")
+        if not mid:
+            raise SourceError(f"发送没返回 message_id: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return {"message_id": str(mid), "chat_id": str(self._find(data, "chat_id") or ""),
+                "thread_id": str(self._find(data, "thread_id") or "")}
+
+    # ---------- 读：话题、发前检查（7.22），user 身份，只读 ----------
+    def thread_messages(self, thread: str, order: str = "asc", max_pages: int = 10) -> list[Message]:
+        """一个话题里的消息（thread 可以是 omt_ 话题编号，也可以是开头那条的 om_ 消息号）。"""
+        args = ["im", "+threads-messages-list", "--thread", thread, "--order", order, "--page-size", "50",
+                "--format", "json", "--no-reactions"]
+        out: list[Message] = []
+        token = ""
+        for _ in range(max_pages):
+            data = self._run(args + (["--page-token", token] if token else []))
+            out += [parse_message(m, self.tz) for m in data.get("messages") or data.get("items") or []]
+            token = data.get("page_token") or ""
+            if not data.get("has_more") or not token:
+                break
+        return out
+
+    def chat_messages_since(self, chat_id: str, sender_id: str, start_iso: str, max_pages: int = 5) -> list[Message]:
+        """这个聊天里、这个人从 start 起发的消息（搜索接口，不会把消息标成已读）。没查完（翻页到上限仍有）就报错，
+        不当成「没有」。"""
+        args = ["im", "+messages-search", "--chat-id", chat_id, "--sender", sender_id, "--start", start_iso,
+                "--page-size", "50", "--format", "json", "--no-reactions"]
+        out: list[Message] = []
+        token = ""
+        for _ in range(max_pages):
+            data = self._run(args + (["--page-token", token] if token else []))
+            out += [parse_message(m, self.tz) for m in data.get("messages") or []]
+            token = data.get("page_token") or ""
+            more = bool(data.get("has_more"))
+            if not more:
+                return out
+            if not token:
+                break
+        if out:
+            return out  # 查到了就够判断；没查完的部分只会更多
+        raise SourceError(f"发前检查没查完（{chat_id} 从 {start_iso} 起翻页到上限仍有更多）")
 
     def remove_reaction(self, message_id: str, reaction_id: str) -> None:
         self._run_once(["im", "reactions", "delete",

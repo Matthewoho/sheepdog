@@ -179,6 +179,41 @@ class OwnerContextConfig:
 
 
 @dataclass
+class ThreadsConfig:
+    """[threads]（7.22 一事一串）：会话经 sheepdog ask / report 找主人，同一把钥匙的消息回到同一个话题里；
+    主人在话题里回复，按话题送回会话。热加载，下一轮生效。"""
+    # ask / report 加在正文前的第一行：{title} = 短标题，{topic} = topic_id。
+    # ask 的那一行要能被 [escalation] header_regex 认出来（登记「需要你定」），两者都要能被 attribution_regex 认出来
+    ask_header: str = "🐕 需要你定 · {title} [{topic}]"
+    report_header: str = "🐕 汇报 · {title} [{topic}]"
+    # 渐进式披露：话题里除了开头那条，已经有这么多条（含主人刚回的这一条）就算「复杂」，送回时再附最近几条
+    complex_min_replies: int = 3
+    recent_replies: int = 5
+    # 开头那条、最近几条各截到多少个字
+    root_chars: int = 300
+    reply_chars: int = 120
+
+    def validate(self) -> None:
+        for k in ("ask_header", "report_header"):
+            v = getattr(self, k)
+            if not isinstance(v, str) or "{title}" not in v or "{topic}" not in v:
+                raise ConfigError(f"[threads] {k} 必须是字符串，并且含 {{title}} 和 {{topic}}")
+            if "\n" in v:
+                raise ConfigError(f"[threads] {k} 只能是一行")
+            try:
+                v.format(title="x", topic="tp_x")
+            except (KeyError, IndexError, ValueError) as e:
+                raise ConfigError(f"[threads] {k} 格式不对（只认 {{title}} 和 {{topic}}）: {e}") from e
+        for k in ("complex_min_replies", "recent_replies", "root_chars", "reply_chars"):
+            if not _positive(getattr(self, k), integer=True):
+                raise ConfigError(f"[threads] {k} 必须是正整数")
+
+    def header(self, kind: str, title: str, topic_id: str) -> str:
+        fmt = self.ask_header if kind == "ask" else self.report_header
+        return fmt.format(title=title, topic=topic_id)
+
+
+@dataclass
 class LoopGuardConfig:
     # 防止和 Agent 机器人来回循环（7.14）。名字 / id 的具体值只写在个人配置里
     agent_sender_names: list[str] = field(default_factory=list)   # 发送人名字包含其一（不分大小写）即视为 Agent
@@ -488,6 +523,7 @@ class Config:
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     duty: DutyConfig = field(default_factory=DutyConfig)
+    threads: ThreadsConfig = field(default_factory=ThreadsConfig)
     # 会话在自己终端里敲的 sheepdog 命令（提示词里所有「去跑 sheepdog …」的命令文字都用它）。
     # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
     cli_name: str = "sheepdog"
@@ -590,6 +626,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.notify, data.get("notify", {}))
         _apply(cfg.audit, data.get("audit", {}))
         _apply(cfg.duty, data.get("duty", {}))
+        _apply(cfg.threads, data.get("threads", {}))
         hosts = data.get("hosts", {})
         if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
             raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -610,6 +647,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.loop_guard.validate()
     cfg.audit.validate()
     cfg.duty.validate()
+    cfg.threads.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

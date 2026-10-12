@@ -168,6 +168,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         f"`watch_done:<id>`，否则下次回执后恢复等待、从回复时间重新计时；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
         *duty_interface(topic_id, cli_host),
+        *owner_interface(topic_id),
     ]
     if bus:
         lines += [
@@ -200,6 +201,28 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         ]
     lines += list(extra)
     return with_cli("\n".join(lines), cli)
+
+
+def owner_interface(topic_id: str) -> list[str]:
+    """一事一串、发前再看一眼（7.22）的接口说明：找主人、代回、看话题。"""
+    return [
+        "### 找主人、代回",
+        f"`sheepdog ask --topic {topic_id} --title \"<短标题>\" (--text \"<正文>\" | --file <文件或 ->) [--key <钥匙>]`："
+        "经机器人私聊主人「需要你定」；`sheepdog report`（参数同 ask）是汇报。开头一行由 sheepdog 加，正文里不要再写。"
+        "带 --key（和在岗表的活同一把钥匙）：同一把钥匙第一次在主聊天里起一条，之后都回到它的话题里；"
+        "ask 会自动在在岗表里补一件「等主人」的活。不带 --key 每次都是主聊天里的一条新消息。"
+        "参数不变地重跑只发一条（重试安全）；同样的话隔一批要再发一次，带上 `--batch <批次号>`。",
+        f"`sheepdog reply --topic {topic_id} --to <消息号> (--card-text \"<正文>\" | --card-file <文件或 ->)`："
+        "以主人身份代回（卡片，右下角带代回标记；`--text` 是纯文本，末尾同样带标记）。"
+        "发之前 sheepdog 会只读查一次：这个聊天里、从这条消息（和同一批里这个聊天更晚的消息）之后，主人本人有没有新发言。",
+        "退出码：0 发出去了（或同样的内容已经发过，没再发）；1 发送失败或超时，原样重试，防重编号保证只发一条；2 参数不对；"
+        "3 主人已经回过，没发，他的话打印在输出里；4 发前检查失败，没发；5 这一批已经回过这条消息（内容不同），没发。"
+        "退出码 3 时先读主人的话再决定：不用回了就不回，要改就改了再发，确实还要照样发加 `--even-if-owner-replied`；"
+        "这些发言之后作为背景送到时会注明「你发送前已经看到过」。同一批里对同一条消息要再回一条（先回「稍等」、"
+        "做完回结论）加 `--followup`。",
+        f"`sheepdog thread --topic {topic_id} (--key <钥匙> | --thread <omt_话题编号>)`：只读，列出一个话题的全部消息。"
+        "主人在话题里回复时，sheepdog 送给你的是他的回复加这件事开头那条；话题长了会再附最近几条，要全貌用这个命令。",
+    ]
 
 
 def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:

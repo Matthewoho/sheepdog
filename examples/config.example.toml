@@ -73,6 +73,18 @@ open_hours = 24
 # 第一行没有 topic_id、只有 [..·名字] 时，按名字认会话；认不出再和各会话标题比（唯一命中才算）
 "总线" = "tp_bus"
 
+[threads]
+# 一事一串（7.22）：会话用 sheepdog ask / report 找你，sheepdog 在正文前加的开头一行。{title} = 短标题，{topic} = topic_id。
+# ask 的这一行要能被上面的 header_regex 认出来（sheepdog doctor 会核对）
+ask_header = "🐕 需要你定 · {title} [{topic}]"
+report_header = "🐕 汇报 · {title} [{topic}]"
+# 你在话题里回复时送回会话的内容：话题里除了开头那条已经有 complex_min_replies 条（含你这一条）就算复杂，
+# 再附最近 recent_replies 条；开头那条、最近几条各截到多少字
+complex_min_replies = 3
+recent_replies = 5
+root_chars = 300
+reply_chars = 120
+
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
 enabled = true
