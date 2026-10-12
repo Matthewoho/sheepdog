@@ -492,6 +492,64 @@ class F5RulesAfterCompaction(OwnerAlertBase):
         self.assertEqual((t["state"], t["pending_batch_id"]), (sm.ATTENTION, None))  # 状态不变
 
 
+    # adopted 会话（发版 bot 这类）：回执可选，批次 20 分钟回执超时记 missed、不重投，但它多半还在干那件长活
+    def alpha_rules(self) -> list[dict]:
+        return [d for d in self.w.sink.to(self.w["alpha"].cid)
+                if d["content"].startswith(f"[sheepdog] {RULES_UPDATE_HEADER}")]
+
+    def miss_alpha_batch(self) -> str:
+        self.w.message("alpha", "帮忙盯一下这次发布")
+        self.w.round()
+        bid = self.w.topic("alpha")["pending_batch_id"]
+        self.assertTrue(bid)
+        for _ in range(40):
+            self.w.round()
+            if self.w.store.get_dispatch(bid)["state"] == "missed":
+                break
+        t = self.w.topic("alpha")
+        self.assertEqual(self.w.store.get_dispatch(bid)["state"], "missed")
+        self.assertIsNone(t["pending_batch_id"])
+        self.assertNotEqual(t["state"], sm.RUNNING)
+        return bid
+
+    def test_adopted_missed_batch_without_receipt_gets_rules_at_once(self):
+        bid = self.miss_alpha_batch()
+        a = self.w["alpha"]
+        a.act("Still watching the rollout")              # 回执超时了，它其实还在干
+        self.w.round()
+        self.assertEqual(self.w.d._batch_in_hand(self.w.topic("alpha")), bid)
+        a.compact()
+        at = self.w.now + timedelta(minutes=1)
+        self.w.round()                                    # 认出压缩的同一轮就补发
+        [msg] = self.alpha_rules()
+        self.assertEqual(msg["at"], at)
+        self.assertIsNone(msg["batch"])
+        self.assertIn(f"手上的批次 `{bid}` 照常做完", msg["content"])
+        t = self.w.topic("alpha")
+        self.assertEqual((t["rules_hash"], t["compacted_at"]), (self.w.d.rules_hash(t), None))
+        self.assertEqual(self.w.store.get_dispatch(bid)["state"], "missed")  # 批次记账不变
+        self.assertIsNone(t["pending_batch_id"])
+
+    def test_adopted_after_late_receipt_waits_for_next_batch(self):
+        bid = self.miss_alpha_batch()
+        a = self.w["alpha"]
+        a.act("Finish the rollout")
+        a.receipt(batch=bid)                              # 回执晚到：交差了
+        self.w.round()
+        self.assertEqual(self.w.store.get_dispatch(bid)["state"], "acked_late")
+        self.assertEqual(self.w.d._batch_in_hand(self.w.topic("alpha")), "")
+        a.compact()
+        self.w.round()
+        self.assertEqual(self.alpha_rules(), [])          # 手上没有没交差的批次：不单独发
+        self.assertTrue(self.w.topic("alpha")["compacted_at"])
+        a.act("Idle check")
+        self.w.message("alpha", "下一件事")
+        self.w.run(2)
+        batches = [d for d in self.w.sink.to(a.cid) if d["batch"]]
+        self.assertEqual(len(batches), 2)
+        self.assertTrue(batches[-1]["content"].startswith(RULES_UPDATE_HEADER))  # 照旧随下一批带上
+
+
 class F5CodexKeepsNextBatch(GuardBase):
     def test_codex_session_mid_run_is_not_sent_rules(self):
         rollout = Path(self.tmp.name) / "codex" / "rollout-2026-10-12T00-00-00-thr_test_f5.jsonl"

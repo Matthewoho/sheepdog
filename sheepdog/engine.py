@@ -2026,15 +2026,18 @@ class Dispatcher:
                     log.warning("topic %s: 压缩后立即补发规则出错（下一批照样带上完整规则）: %s", t["topic_id"], e)
 
     def _batch_in_hand(self, t) -> str:
-        """手上有批次在跑（送出了、在等回执），或者有没交差的批次（判过回执超时、退回重投的）：返回批次号，否则空串。
-        口径同在岗表的 _quiet_since：adopted / 总线新开的会话回执可选，回执超时记 missed，当作处理过；只有背景、
-        发送失败、不确定送没送到的批次不算。"""
+        """手上有批次在跑（送出了、在等回执），或者有没交差的批次：返回批次号，否则空串。
+
+        没交差 = 判过回执超时、之后还没交过回执：总线退回重投的（failed），以及 adopted / 总线新开的会话回执超时记的
+        missed——发版这类会话常干超过 20 分钟的长活，回执超时以后多半还在做（架构侧 10-12 定：这里和羊群看板
+        _quiet_since 的口径不同，missed 也算没交差；多补发一次规则只多花点 token）。之后交过回执（acked / acked_late）
+        的不算；只有背景、发送失败、不确定送没送到的批次不算；一个批次都没有的不算。"""
         if t["pending_batch_id"] and t["state"] == sm.RUNNING:
             return t["pending_batch_id"]
         for d in self.store.recent_dispatches(t["topic_id"]):  # 新的在前
-            if d["state"] in ("acked", ACKED_LATE, "missed"):
+            if d["state"] in ("acked", ACKED_LATE):
                 return ""
-            if d["state"] == "failed" and (d["error"] or "").startswith(RECEIPT_TIMEOUT):
+            if d["state"] in ("failed", "missed") and (d["error"] or "").startswith(RECEIPT_TIMEOUT):
                 return d["batch_id"]
         return ""
 
