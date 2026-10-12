@@ -127,7 +127,8 @@ def duty_reset_key(topic_id: str) -> str:
 
 
 def duty_notice_key(topic_id: str) -> str:
-    """meta 键：上一次「中断 / 失联」通知的是哪一段（状态@起点），同一段只通知一次。"""
+    """meta 键：这一段卡住（从会话最后一次动作或 session-reset 起）已经通知过什么：{"seg": 起点, "sent": [中断 / 失联]}，
+    同一段中断、失联各只通知一次。"""
     return f"duty_notice:{topic_id}"
 
 
@@ -1971,6 +1972,48 @@ class Dispatcher:
             out = sent if out is None or sent < out else out
         return out
 
+    def _quiet_since(self, t, last_act: datetime | None) -> datetime | None:
+        """批次在跑、会话动过以后停下来：会话最后一次动作时手上那一批还没交差，之后送的批次也都没交差（总线回执超时会
+        重投同一批），就从最后一次动作算起。不然返回 None。
+
+        没交差：还挂在 topics 上等回执的那一批，或者判过回执超时、退回重投的（failed）。adopted / 总线新开的会话回执
+        可选，回执超时记 missed，当作处理过（同 _unanswered_since）；只有背景、发送失败、不确定送没送到的批次不算。
+        session-reset 在最后一次动作之后的，不从动作算（reset 清掉的是这次判定）。"""
+        if last_act is None:
+            return None
+        reset = _parse(self.store.get_meta(duty_reset_key(t["topic_id"])))
+        if reset is not None and reset >= last_act:
+            return None
+        before = None
+        later_done = False
+        for d in self.store.recent_dispatches(t["topic_id"]):  # 新的在前
+            sent = _parse(d["sent_at"])
+            if sent is None or sent.tzinfo is None:
+                continue
+            if d["state"] in ("acked", ACKED_LATE, "missed"):
+                done = True
+            elif d["state"] == "sent" and d["batch_id"] == t["pending_batch_id"]:
+                done = False
+            elif d["state"] == "failed" and (d["error"] or "").startswith(RECEIPT_TIMEOUT):
+                done = False
+            else:
+                continue
+            if sent > last_act:
+                later_done = later_done or done
+                continue
+            before = d
+            if done or later_done:
+                return None
+            break
+        return last_act if before is not None else None
+
+    def _silence_start(self, t) -> str:
+        """这一段卡住从哪算起：会话最后一次动作和 session-reset 里晚的那个（同一段只通知一次，7.20）。都没有就是空串。"""
+        card = self.store.get_card(t["topic_id"])
+        at = [x for x in (_parse(card["last_act_at"] or "") if card is not None else None,
+                          _parse(self.store.get_meta(duty_reset_key(t["topic_id"])))) if x is not None]
+        return max(at).isoformat() if at else ""
+
     def _duty_state(self, t) -> tuple[str, str, str, bool]:
         """运行状态，按顺序取第一个命中：被主人占着 → 失联 → 中断 → 在做 → 等回复 → 空闲。
         返回 (状态, 判定依据, 中断 / 失联从几点算起, 要不要通知主人)。阈值在 [duty]。"""
@@ -2012,11 +2055,13 @@ class Dispatcher:
             except OSError:
                 path = None
         if path is not None:
-            # since：会话没碰过的批次里最早送出的；或者批次在跑、会话动过以后停下来的那一刻
+            # since：会话没碰过的批次里最早送出的；或者批次在跑、会话动过以后停下来的那一刻（从那以后手上一直有没交差的
+            # 批次——总线回执超时重投同一批，不算重新开始）
             since, untouched = self._unanswered_since(t, last_act), True
-            if since is None and t["state"] == sm.RUNNING and last_act is not None \
-                    and now - last_act >= timedelta(minutes=dc.stall_minutes):
-                since, untouched = last_act, False
+            quiet_since = self._quiet_since(t, last_act)
+            if quiet_since is not None and now - quiet_since >= timedelta(minutes=dc.stall_minutes) \
+                    and (since is None or quiet_since < since):
+                since, untouched = quiet_since, False
             if since is not None:
                 head = f"批次 {hm(since)} 送出后" if untouched else f"批次在跑，最近动作 {hm(since)}，之后"
                 quiet = now - max(mtime, since)
@@ -2067,9 +2112,18 @@ class Dispatcher:
         tid = t["topic_id"]
         if t["state"] == sm.ATTENTION:
             return
-        mark = f"{state}@{since}"
+        # 「同一段」按会话的沉默算：从最后一次动作（或 session-reset）起，中断、失联各通知一次。重投、回执超时以后
+        # 再送的批次让 since 变了、卡片在中断和失联之间来回（投递写进记录、文件又动了），都还是同一段，不重复通知；
+        # 会话一动（或 reset）才是新的一段
+        seg = self._silence_start(t) or since
         key = duty_notice_key(tid)
-        if self.store.get_meta(key) == mark:
+        try:
+            rec = json.loads(self.store.get_meta(key) or "{}")
+        except json.JSONDecodeError:
+            rec = {}
+        if not isinstance(rec, dict) or rec.get("seg") != seg or not isinstance(rec.get("sent"), list):
+            rec = {"seg": seg, "sent": []}
+        if state in rec["sent"]:
             return
         host = HOST_LABEL.get(self.topic_host(t), self.topic_host(t))
         title = self._session_title(t) or tid
@@ -2089,7 +2143,8 @@ class Dispatcher:
             lines.append(why)
         log.warning("会话 %s 判为%s：%s（%d 条信号排队）", tid, label, detail, queued)
         if self._notify_owner("\n".join(lines), "在岗表通知"):
-            self.store.set_meta(key, mark)
+            rec["sent"].append(state)
+            self.store.set_meta(key, json.dumps(rec, ensure_ascii=False))
 
     def _autofill_work(self) -> None:
         """第 5 步：watch → 等别人；「需要你定」→ 等主人（forward → 已转交在 forward_messages 里当场补）。
@@ -2231,6 +2286,10 @@ class Dispatcher:
             # 读 transcript 有成本：adopted 会话只在有待推消息或处于接管中时检查
             if tid == BUS_TOPIC_ID or tid in groups or t["state"] == sm.HUMAN_ATTACHED:
                 self._check_human(t)
+                if self.store.get_topic(tid)["state"] != t["state"]:
+                    # 主人刚来 / 刚走：卡片按新的会话状态重算一遍再决定投不投。不然拿的是这一轮开头算的卡片——
+                    # 主人刚走的那一轮卡片还是「被主人占着」，会把本该判中断的会话放过去投递
+                    self._duty_round([tid], autofill=False)
             if tid in groups:
                 r = self._dispatch_topic(self.store.get_topic(tid), groups[tid])
                 result["topics"][tid] = r

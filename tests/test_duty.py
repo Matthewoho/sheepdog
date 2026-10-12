@@ -66,6 +66,9 @@ class DutyBase(GuardBase):
         bid = bid or f"b_test_{tid}_{int(minutes_ago)}"
         self.store.record_dispatch(bid, tid, [])
         sent = ago(minutes_ago).isoformat(timespec="seconds")
+        # 时间线要自洽：这个会话之前的批次（setUp 里的 onboarding）都在这一批之前送出
+        self.store.conn.execute("UPDATE dispatches SET sent_at=? WHERE topic_id=? AND batch_id != ? AND sent_at > ?",
+                                (ago(minutes_ago + 5).isoformat(timespec="seconds"), tid, bid, sent))
         self.store.conn.execute("UPDATE dispatches SET sent_at=? WHERE batch_id=?", (sent, bid))
         self.store.conn.commit()
         if running:
