@@ -157,7 +157,7 @@ AUTO_RECOVER_REASONS = {ATTN_RECEIPT_TIMEOUT}
 # 在岗表（7.20）
 DIGEST_META = "duty_digest_fp"           # 上一次附给总线的摘要指纹：变了才再附
 SEND_FAIL_NOTICE = 3                     # 同一会话连续这么多次投递失败（agentapi 发不出去等），私聊主人一次
-DEFAULT_DIGEST_TITLE = "📋 在岗表摘要（有变化才附；不空闲的会话每个一行，空闲的合成一行）："
+DEFAULT_DIGEST_TITLE = "📋 羊群看板摘要（有变化才附；不空闲的会话每个一行，空闲的合成一行）："
 
 
 def duty_reset_key(topic_id: str) -> str:
@@ -1175,7 +1175,7 @@ class Dispatcher:
                     else f"处理好以后用 `sheepdog session-reset --topic {tid}` 复位，排队的随后补送。")
             text = (f"🐕 汇报 · 会话仍卡着 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）仍卡着，已停止重投：{reason}"
                     + (f"（累计失败 {t['retries']} 次）" if t["retries"] else "") + f"，排着 {queued} 条信号；{tail}")
-            log.warning("会话 %s 进入 attention（%s），%d 条信号排队（在岗表已通知过，发短的）", tid,
+            log.warning("会话 %s 进入 attention（%s），%d 条信号排队（羊群看板已通知过，发短的）", tid,
                         t["attention_reason"], queued)
             self._notify_owner(text, "attention 通知", tid,
                                before_send=lambda: self.store.set_meta(key, t["attention_at"] or ""))
@@ -1476,7 +1476,7 @@ class Dispatcher:
         if card is not None and card["run_state"] in duty.STUCK and t["state"] != sm.FAILED:
             # 在岗表判为中断 / 失联（7.20 第 6 步）：排队，主人那边已经通知；会话记录一有新动作就恢复投递。
             # failed 照旧重投（重投本身就是在试它还活着没有，连续失败由 7.21 的 attention 接手）
-            why = f"在岗表判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
+            why = f"羊群看板判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))
             res["queued"] = why
             return res
@@ -2229,7 +2229,7 @@ class Dispatcher:
             try:
                 self._autofill_work()
             except Exception as e:
-                log.warning("在岗表自动补活出错: %s", e)
+                log.warning("羊群看板自动补活出错: %s", e)
         for tid in tids:
             t = self.store.get_topic(tid)
             if t is None or t["state"] == sm.CLOSED:
@@ -2253,7 +2253,7 @@ class Dispatcher:
                 else:
                     self._duty_recovered(self.store.get_topic(tid), state)
             except Exception as e:
-                log.warning("算会话 %s 的在岗表卡片出错: %s", tid, e)
+                log.warning("算会话 %s 的羊群看板卡片出错: %s", tid, e)
 
     def _duty_scan(self, t) -> None:
         """增量读会话记录（复用护栏的 _follow，用途 duty）：最近一次工具调用、最近一次动作、空转计数、主人发言、压缩点。
@@ -2522,7 +2522,7 @@ class Dispatcher:
             rec["sent"].append(state)
             self.store.set_meta(key, json.dumps(rec, ensure_ascii=False))
 
-        self._notify_owner("\n".join(lines), "在岗表通知", tid, before_send=mark)
+        self._notify_owner("\n".join(lines), "羊群看板通知", tid, before_send=mark)
 
     def _duty_record(self, tid: str) -> dict:
         try:
@@ -2566,7 +2566,7 @@ class Dispatcher:
         self._duty_mark_recovered(tid)
         title = self._session_title(t) or tid
         queued = self.store.count_pending_signals(tid)
-        log.warning("会话 %s 又动起来了（%s），在岗表判定解除", tid, last_act.isoformat())
+        log.warning("会话 %s 又动起来了（%s），羊群看板判定解除", tid, last_act.isoformat())
         self._notify_owner(f"🐕 汇报 · 会话已恢复 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）"
                            f"{display_time(last_act, self.cfg.timezone_offset)}又有动作了"
                            + (f"，排着的 {queued} 条信号接着补送。" if queued else "。"), "恢复通知", tid)
@@ -2615,7 +2615,7 @@ class Dispatcher:
             self.store.add_history(topic_id, "receipt",
                                    f"{batch_id} {receipt.get('status', 'handled')}：{duty.short(summary or '', 80)}")
         except Exception as e:
-            log.warning("回执 %s/%s 写进在岗表出错: %s", topic_id, batch_id, e)
+            log.warning("回执 %s/%s 写进羊群看板出错: %s", topic_id, batch_id, e)
 
     def _collision_notes(self, t, rows) -> dict[str, list[str]]:
         """第 3 步撞车检查（只提醒不拦，送给谁不变）。以路由事实为主：消息里的编号，最近 routed_active_hours 小时内
@@ -3191,7 +3191,7 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
             try:
                 duty.forward_work(store, src, topic_id, rs, pats)
             except Exception as e:  # 在岗表出错不挡转交
-                log.warning("转交记进在岗表出错: %s", e)
+                log.warning("转交记进羊群看板出错: %s", e)
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
         store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))

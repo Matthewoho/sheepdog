@@ -49,7 +49,7 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "duty_collision.md": "撞车提醒（消息里的编号最近送到过别的会话，或在别的会话手上）后面附的话，可用 {{key}} {{owner_title}} "
                          "{{owner_topic}} {{work_state}} {{run_state}} {{action}} {{ago}} {{basis}}（路由 / 会话自报 / 自动）",
     "duty_mail.md": "会话留言（sheepdog tell）后面附的话，可用 {{from_topic}} {{from_title}} {{key}}",
-    "duty_digest.md": "总线批次里在岗表摘要的标题（在岗表有变化才附），可用 {{count}}",
+    "duty_digest.md": "总线批次里羊群看板摘要的标题（羊群看板有变化才附），可用 {{count}}",
     "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
 }
 

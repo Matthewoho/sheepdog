@@ -28,11 +28,11 @@
   sheepdog inject --text 正文 [--chat oc_x] [--sender ou_x] ...  （只在 [source] enabled = false 时）放一条合成消息进账本
   sheepdog reply-card (--text 正文 | --text-file 文件或 -)  打印代回卡片 JSON（正文 + 右下角标记）
   sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
-  sheepdog session-reset --topic T                       人工把 attention/failed 复位（同时清掉在岗表的中断 / 失联判定）
+  sheepdog session-reset --topic T                       人工把 attention/failed 复位（同时清掉羊群看板的中断 / 失联判定）
   sheepdog work set --topic T --key K --title ... --state S [--waiting-on 谁] [--until 几点] [--expect ...] [--to 会话]
-  sheepdog work done --topic T --key K --result ...      在岗表：登记 / 收掉会话名下的活（立即写入）
+  sheepdog work done --topic T --key K --result ...      羊群看板：登记 / 收掉会话名下的活（立即写入）
   sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
-  sheepdog board [--topic T] [--json]                    在岗表：各会话在干什么
+  sheepdog board [--topic T] [--json]                    羊群看板：各会话在干什么
   sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
@@ -279,7 +279,7 @@ def duty_report(cfg, store: Store) -> str:
     """doctor：在岗表（7.20）的阈值和现在卡住的会话。"""
     dc = cfg.duty
     stuck = [c["topic_id"] for c in store.list_cards() if c["run_state"] in duty.STUCK]
-    return (f"在岗表: 中断 {dc.stall_minutes:g} 分钟 / 失联 {dc.lost_minutes:g} 分钟 / 空转 {dc.spin_repeat} 次；"
+    return (f"羊群看板: 中断 {dc.stall_minutes:g} 分钟 / 失联 {dc.lost_minutes:g} 分钟 / 空转 {dc.spin_repeat} 次；"
             f"编号规则 {len(dc.key_patterns)} 条；留言同一对 {dc.mail_window_minutes:g} 分钟内超过 {dc.mail_pair_limit} 条暂停；"
             f"路由事实算 {dc.routed_active_hours:g} 小时；自报的活 {dc.stale_hours:g} 小时没更新标可能过期；"
             f"履历保留 {dc.history_days} 天"
@@ -1152,7 +1152,7 @@ def cmd_session_reset(args) -> int:
     if card is not None and card["run_state"] in duty.STUCK:
         store.upsert_card(args.topic, run_state=None, detail="session-reset 清掉了中断 / 失联判定，下一轮重算",
                           stuck_since=None)
-        print("已清掉在岗表的中断 / 失联判定")
+        print("已清掉羊群看板的中断 / 失联判定")
     if not sm.can(t["state"], "reset"):
         print(f"当前状态 {t['state']} 无需复位")
         return 0
@@ -1195,7 +1195,7 @@ def cmd_work(args) -> int:
         print(f"work 被拒绝: {e}", file=sys.stderr)
         return 2
     w = store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone()
-    print(f"已登记（立即写入在岗表）：{tid} · {duty.work_line(w)}")
+    print(f"已登记（立即写入羊群看板）：{tid} · {duty.work_line(w)}")
     for o in others:
         card = store.get_card(o["topic_id"])
         run = duty.RUN_LABEL.get(card["run_state"], "") if card is not None and card["run_state"] else ""
@@ -1468,7 +1468,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--topic", required=True)
     sp.set_defaults(func=cmd_session_reset)
 
-    sp = sub.add_parser("work", help="在岗表：登记 / 收掉会话名下的活")
+    sp = sub.add_parser("work", help="羊群看板：登记 / 收掉会话名下的活")
     wsub = sp.add_subparsers(dest="work_cmd", required=True)
     w = wsub.add_parser("set")
     w.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
@@ -1488,7 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--result", required=True, help="做成了什么（一句话）")
     w.set_defaults(func=cmd_work)
 
-    sp = sub.add_parser("tell", help="在岗表：给别的会话留言")
+    sp = sub.add_parser("tell", help="羊群看板：给别的会话留言")
     sp.add_argument("--topic", "--from", dest="topic", required=True, help="你自己的会话（tp_x）")
     sp.add_argument("--to", required=True, help="收件会话（tp_x）")
     sp.add_argument("text", help="留言正文")
@@ -1505,7 +1505,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--ack", metavar="N|all", help="确认已处理：不再提示、不再重发")
     sp.set_defaults(func=cmd_notices)
 
-    sp = sub.add_parser("board", help="在岗表：各会话在干什么")
+    sp = sub.add_parser("board", help="羊群看板：各会话在干什么")
     sp.add_argument("--topic", default="", help="只看这个会话（附最近回执和动作）")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_board)

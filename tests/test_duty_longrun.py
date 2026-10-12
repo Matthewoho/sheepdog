@@ -389,7 +389,7 @@ class LongRun:
                    "state" if not (info["state"] in sm.DISPATCHABLE or info["state"] == sm.FAILED) else "")
             if not why or res.get("sent"):
                 self.fail(f"不变量 2：{r['message_id']} 在排队却说不出原因：{info['state']} {info['card']} {res}")
-            elif why == "queued" and "在岗表" in res["queued"] and info["card"] not in duty.STUCK:
+            elif why == "queued" and "羊群看板" in res["queued"] and info["card"] not in duty.STUCK:
                 self.fail(f"不变量 2：按在岗表排队，但决定时卡片是 {info['card']}")
             self.stats[f"排队原因 {why}"] += 1
         # ---- 3. 通知：每一段卡住中断、失联各最多一条；说过卡住的最后一定说「已恢复」，一次最多 4 条 ----
@@ -399,7 +399,7 @@ class LongRun:
             what, text = n["what"], n["text"]
             tid = text.split("topic `", 1)[1].split("`", 1)[0]
             cid = w.sessions[tid].cid
-            if what == "在岗表通知":
+            if what == "羊群看板通知":
                 kind = "中断" if "会话中断了" in text.splitlines()[0] else "失联"
                 s = w.sessions[tid]
                 pend = store.get_topic(tid)["pending_batch_id"]

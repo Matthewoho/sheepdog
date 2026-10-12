@@ -137,7 +137,7 @@ class S2LongCommand(Scenario):
         self.assertEqual(self.notes(), [])
         self.to(17)  # 16 分钟：中断，通知 1 次
         self.assert_card("tp_alpha", duty.STALLED, "批次在跑，最近动作 09:01")
-        self.assertEqual(self.notes(), [("09:16", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
+        self.assertEqual(self.notes(), [("09:16", "羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
         n = w.notices()[0]["text"]
         self.assertIn("「会话alpha」（topic `tp_alpha`，Antigravity）判为中断", n)
         self.assertIn("最近一次工具调用「Run release script」", n)
@@ -164,7 +164,7 @@ class S2LongCommand(Scenario):
         self.to(39)
         self.assert_card("tp_alpha", duty.STALLED, "最近动作 09:23")
         self.assertEqual([x[:2] for x in self.notes()],
-                         [("09:16", "在岗表通知"), ("09:18", "恢复通知"), ("09:38", "在岗表通知")])
+                         [("09:16", "羊群看板通知"), ("09:18", "恢复通知"), ("09:38", "羊群看板通知")])
         self.assertEqual(len(self.got("tp_alpha")), 2)
         self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")
 
@@ -192,7 +192,7 @@ class S2LongCommand(Scenario):
         self.to(57)
         self.assert_card(BUS_TOPIC_ID, duty.STALLED, "最近动作 09:40")
         self.assertEqual([x[:2] for x in self.notes()],
-                         [("09:16", "在岗表通知"), ("09:41", "恢复通知"), ("09:55", "在岗表通知")])
+                         [("09:16", "羊群看板通知"), ("09:41", "恢复通知"), ("09:55", "羊群看板通知")])
         self.assertIn("排着 0 条信号。", w.notices()[0]["text"])  # 总线的中断通知不写「暂不投递」（会照常重投）
         self.assertNotIn("暂不投递", w.notices()[0]["text"])
 
@@ -206,13 +206,13 @@ class S2LongCommand(Scenario):
         a.app_alive = False
         m2 = w.message("alpha", "第二件")
         self.to(17)
-        self.assertEqual(self.notes(), [("09:16", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
+        self.assertEqual(self.notes(), [("09:16", "羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
         self.to(22)  # 回执超时：adopted 收掉这一批，第二件送出去
         self.assertEqual(self.got("tp_alpha", 22), [[m2]])
         self.to(60)
         self.assert_card("tp_alpha", duty.LOST)
         self.assertEqual([x[1:] for x in self.notes()],
-                         [("在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"), ("在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]")])
+                         [("羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]"), ("羊群看板通知", "🐕 汇报 · 会话失联了 [tp_bus]")])
 
 
 # ======================= S3 没碰批次 =======================
@@ -228,12 +228,12 @@ class S3UntouchedBatch(Scenario):
         self.assert_card("tp_alpha", duty.WORKING)
         self.to(16)  # 15 分钟：中断
         self.assert_card("tp_alpha", duty.STALLED, "批次 09:01 送出后 15 分钟没有新动作")
-        self.assertEqual(self.notes(), [("09:16", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
+        self.assertEqual(self.notes(), [("09:16", "羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]")])
         self.assertIn("排着 1 条信号", w.notices()[0]["text"])
         m3 = w.message("alpha", "第三件")
         self.to(25)  # 回执超时以后会话状态回到 active，但在岗表判中断：排队
         self.assertEqual(w.topic("alpha")["state"], sm.ACTIVE)
-        self.assertIn("在岗表判为中断", w.last_result["topics"]["tp_alpha"]["queued"])
+        self.assertIn("羊群看板判为中断", w.last_result["topics"]["tp_alpha"]["queued"])
         m4 = w.message("alpha", "第四件")
         self.to(30)
         self.assert_card("tp_alpha", duty.STALLED)
@@ -241,7 +241,7 @@ class S3UntouchedBatch(Scenario):
         self.assertEqual(w.store.count_pending_signals("tp_alpha"), 3)
         self.to(31)  # 30 分钟：失联
         self.assert_card("tp_alpha", duty.LOST, "会话记录 30 分钟完全不动")
-        self.assertEqual([x[:2] for x in self.notes()], [("09:16", "在岗表通知"), ("09:31", "在岗表通知")])
+        self.assertEqual([x[:2] for x in self.notes()], [("09:16", "羊群看板通知"), ("09:31", "羊群看板通知")])
         self.assertIn("会话失联了", self.notes()[1][2])
         self.assertIn("排着 3 条信号", w.notices()[1]["text"])
         self.to(45)
@@ -257,7 +257,7 @@ class S3UntouchedBatch(Scenario):
         self.to(90)
         self.assertEqual(self.got("tp_alpha"), [[m1], [m2, m3, m4]])
         self.assertEqual([x[:2] for x in self.notes()],
-                         [("09:16", "在岗表通知"), ("09:31", "在岗表通知"), ("09:46", "恢复通知")])
+                         [("09:16", "羊群看板通知"), ("09:31", "羊群看板通知"), ("09:46", "恢复通知")])
         self.assertIn("排着的 3 条信号接着补送", w.notices()[2]["text"])
         self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")
 
@@ -294,7 +294,7 @@ class S4NetworkDown(Scenario):
         self.assertEqual(len(self.got(BUS_TOPIC_ID)), 4)  # 09:01、09:03、09:24、09:45，之后没再投
         self.assertEqual(w.store.count_pending_signals(BUS_TOPIC_ID), 5)
         self.assertEqual(w.card(BUS_TOPIC_ID)["last_act_at"], last_act)  # ERROR / SYSTEM 不算动作
-        self.assertEqual(self.notes(), [("09:18", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
+        self.assertEqual(self.notes(), [("09:18", "羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
                                         ("10:06", "attention 通知", "🐕 汇报 · 会话仍卡着 [tp_bus]")])
         first, second = w.notices()[0]["text"], w.notices()[1]["text"]
         self.assertNotIn("暂不投递", first)  # 总线回执超时照常重投
@@ -365,8 +365,8 @@ class S4NetworkDown(Scenario):
             self.to(m)
             mids.append(w.message("bus", f"断网中 {m}"))
         self.to(120)
-        self.assertEqual(self.notes(), [("09:18", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
-                                        ("09:33", "在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]"),
+        self.assertEqual(self.notes(), [("09:18", "羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
+                                        ("09:33", "羊群看板通知", "🐕 汇报 · 会话失联了 [tp_bus]"),
                                         ("10:06", "attention 通知", "🐕 汇报 · 会话仍卡着 [tp_bus]")])
         bus.app_alive = True
         bus.act("Back online")
@@ -734,7 +734,7 @@ class S9Digest(Scenario):
         self.assertEqual(self.cli("work", "set", "--topic", "tp_rel", "--key", KEY1, "--title", "发版")[0], 0)
         lines = self.digest(self.bus_batch())
         self.assertTrue(any(f"手上 {KEY1}（进行中·自报）" in ln for ln in lines), lines)
-        self.assertEqual(self.notes()[0][1], "在岗表通知")  # patrol 中断的那一条
+        self.assertEqual(self.notes()[0][1], "羊群看板通知")  # patrol 中断的那一条
         self.assertEqual(len(self.notes()), 1)
 
     def test_digest_cap_keeps_stuck_and_says_how_many_omitted(self):
@@ -1009,13 +1009,13 @@ class S15NoRecord(Scenario):
         self.assertEqual(self.notes(), [])
         self.to(31)  # 09:01 送出起满 30 分钟
         self.assert_card("tp_alpha", duty.LOST, "找不到会话记录（conv_test_alpha），批次 09:01 送出后无从判断")
-        self.assertEqual(self.notes(), [("09:31", "在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]")])
+        self.assertEqual(self.notes(), [("09:31", "羊群看板通知", "🐕 汇报 · 会话失联了 [tp_bus]")])
         rc, out = self.cli("board", "--topic", "tp_alpha")
         self.assertIn("最近动作：（找不到会话记录）", out)
         m2 = w.message("alpha", "第二件")
         self.to(40)
         self.assertEqual(self.got("tp_alpha"), [[m1]])  # 扣着
-        self.assertIn("在岗表判为失联", w.last_result["topics"]["tp_alpha"]["queued"])
+        self.assertIn("羊群看板判为失联", w.last_result["topics"]["tp_alpha"]["queued"])
         self.assertEqual(w.card("alpha")["queued"], 1)
         self.assertEqual(len(self.notes()), 1)  # 同一段只说一次
         # 目录挪回来，会话有了动作：恢复，补送，说「已恢复」
@@ -1025,7 +1025,7 @@ class S15NoRecord(Scenario):
         self.to(41)
         self.assertEqual(self.got("tp_alpha"), [[m1], [m2]])
         self.assert_card("tp_alpha", duty.WORKING)
-        self.assertEqual([x[:2] for x in self.notes()], [("09:31", "在岗表通知"), ("09:41", "恢复通知")])
+        self.assertEqual([x[:2] for x in self.notes()], [("09:31", "羊群看板通知"), ("09:41", "恢复通知")])
         c = duty.board_cards(w.store, w.cfg, topic="tp_alpha")[0]
         self.assertEqual((c["action"], c["no_record"]), ("Reopen the session", False))
         self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")

@@ -1,4 +1,5 @@
-"""在岗表（7.20）：会话之间实时感知、互相沟通。
+"""在岗表（7.20）：会话之间实时感知、互相沟通。给人和会话看的名字是「羊群看板」（2026-10-12 改名）；代码里的模块名、
+函数名、配置段 [duty]、账本表名列名、--json 字段名沿用 duty / 在岗表，不改。
 
 这里只放机制：活（work）的登记与自动补、信箱（tell）的校验与限流、编号认取、卡片和摘要的数据拼装。
 会话卡片的运行状态由 engine 每轮算（要读会话记录、看投递状态）；对人和对会话的说明一律在 playbook
@@ -591,7 +592,7 @@ def action_text(d: dict) -> str:
 
 
 def render_board(cards: list[dict], now_label: str, compact: bool = False) -> str:
-    lines = [f"在岗表 · {now_label}"]
+    lines = [f"羊群看板 · {now_label}"]
     if not cards:
         return lines[0] + "\n（没有在投递的会话）"
     for d in cards:

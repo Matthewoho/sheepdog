@@ -205,9 +205,9 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
 def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
     """在岗表（7.20）的接口说明：登记活、给别的会话留言、看别人在干什么。"""
     lines = [
-        "### 在岗表",
+        "### 羊群看板",
         f"`sheepdog work set --topic {topic_id} --key <钥匙> --title \"<一句话>\" --state <状态> [--waiting-on <谁>] "
-        "[--until <几点>] [--expect \"<答应交出什么>\"] [--to <会话>]`：登记 / 更新你名下的一件活，立即写入在岗表。"
+        "[--until <几点>] [--expect \"<答应交出什么>\"] [--to <会话>]`：登记 / 更新你名下的一件活，立即写入羊群看板。"
         "状态：doing（进行中）/ waiting_other（等别人）/ waiting_owner（等主人）/ done（已完成）/ handed_off（已转交，要写 --to）。"
         "钥匙：有外部编号（审批单号、PR、Linear 单号）就用它，没有就起个短名。同一把钥匙在别的会话名下没结束时会提示你谁在做，仍然登记。"
         "带编号的消息送到了谁，sheepdog 自己记着；登记是让别人看清你手上的事，不登记也不影响给你投递。",

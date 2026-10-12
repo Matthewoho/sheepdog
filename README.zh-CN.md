@@ -83,7 +83,7 @@
   2. 给跑命令的会话发一条提示（`audit_offender.md`）；
   3. 提醒 `also_notify` 里的会话先核对现场，别重复操作（`audit_notify.md`）。
 
-  同时命中 `ignore_patterns` 的不报，比如查帮助、`--dry-run`、发消息时正文里提到命令名。10 分钟内报过的同一条命令再跑不重复报；没报过的命令马上再报，每次都再提示一次停手。给主人的私聊发不出去（比如飞书限流）会按退避重试，2 小时还没发出去就在 `sheepdog doctor` 和 `sheepdog board` 开头提示，`sheepdog notices` 查看。这是事后报警，命令已经跑了。
+  同时命中 `ignore_patterns` 的不报，比如查帮助、`--dry-run`、发消息时正文里提到命令名。10 分钟内报过的同一条命令再跑不重复报；没报过的命令马上再报，每次都再提示一次停手。给主人的私聊发不出去（比如飞书限流）会按退避重试，2 小时还没发出去就在 `sheepdog doctor` 和羊群看板（`sheepdog board`）开头提示，`sheepdog notices` 查看。这是事后报警，命令已经跑了。
 
 ## 对外发言
 

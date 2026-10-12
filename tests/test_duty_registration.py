@@ -155,7 +155,7 @@ class TwinRunTest(unittest.TestCase):
             self.assertEqual(ra[3], rb[3], f"{ra[0]} 运行状态不一样")
         # 剧本真的走到了这些情况
         whats = [n["what"] for n in self.a_seen["notices"]]
-        self.assertIn("在岗表通知", whats)
+        self.assertIn("羊群看板通知", whats)
         self.assertIn("attention 通知", whats)
         self.assertIn("恢复通知", whats)
         states = {s for r in self.a for (_, s, _) in r[3]}
@@ -273,7 +273,7 @@ class WrongRegistrationTest(unittest.TestCase):
             to(w, w.round_no + 4)
         to(w, 17)
         self.assertEqual(w.run_state("rel"), duty.STALLED)
-        self.assertEqual([n["what"] for n in w.notices()], ["在岗表通知"])
+        self.assertEqual([n["what"] for n in w.notices()], ["羊群看板通知"])
         m2 = w.message("rel", "第二件")
         to(w, 25)
         self.assertEqual(w.state(m2), "pending")  # 照样排队

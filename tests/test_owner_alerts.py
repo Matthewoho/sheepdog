@@ -97,7 +97,7 @@ class OwnerAlertBase(unittest.TestCase):
         self.t0 = self.w.now
 
     def tick(self, minutes: int = 1) -> None:
-        """一分钟一轮。会话收到批次（比如停手提示）就动一下、交回执：场景里只看报警本身，不让在岗表判它中断、
+        """一分钟一轮。会话收到批次（比如停手提示）就动一下、交回执：场景里只看报警本身，不让羊群看板判它中断、
         再冒出别的通知。"""
         for _ in range(minutes):
             self.w.round()
@@ -199,7 +199,7 @@ class F3OwnerNoticeLedger(OwnerAlertBase):
         self.assertEqual({k for _, k, _ in self.ch.alert_calls()}, {row["idem_key"]})  # 防重编号不变
         _, doctor = self.cli("doctor")
         self.assertNotIn("给主人的通知没发出去", doctor)
-        self.assertFalse(self.cli("board")[1].startswith("⚠"))
+        self.assertTrue(self.cli("board")[1].startswith("羊群看板 · "))  # 提示消失；标题是改名后的「羊群看板」
 
     def test_ack_clears_the_warning_without_sending(self):
         self.ch.down = True
@@ -279,12 +279,12 @@ class F3OwnerNoticeLedger(OwnerAlertBase):
         self.assertEqual(self.w.store.pending_audit_hits(), [])
 
     def test_duty_notice_goes_through_the_ledger_too(self):
-        """在岗表的中断通知：第一次 429，下一轮补发；在岗表这一段不会因为没发出去再拼一条新的。"""
+        """羊群看板的中断通知：第一次 429，下一轮补发；羊群看板这一段不会因为没发出去再拼一条新的。"""
         self.ch.fail = [rate_limited()]
         self.w.message("alpha", "帮忙看下这个需求")
         self.w.run(17)                                    # 批次送出后 15 分钟没动：判中断（这里会话故意不动）
         self.w.run(10)
-        rows = self.notices("在岗表通知")
+        rows = self.notices("羊群看板通知")
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["state"], rows[0]["attempts"]), ("sent", 2))
         self.assertEqual(len([t for _, _, t in self.ch.delivered if "会话中断了" in t]), 1)
@@ -419,8 +419,9 @@ class F5RulesAfterCompaction(OwnerAlertBase):
         self.assertIn(f"手上的批次 `{bid}` 照常做完", text)
         self.assertIn("FX-COMPACTED", text)               # playbook 的 rules_after_compaction.md
         self.assertIn("FX-BUS", text)                     # 完整现行规则
+        self.assertIn("### 羊群看板", text)                # 接口说明也在（改名后的标题）
         self.assertNotIn("新信号批次", text)
-        # 批次记账不变：还在等 bid 的回执，送出时间不变，没有新的 dispatches 行；在岗表照旧是「在做 bid」
+        # 批次记账不变：还在等 bid 的回执，送出时间不变，没有新的 dispatches 行；羊群看板照旧是「在做 bid」
         t = self.w.topic(BUS_TOPIC_ID)
         self.assertEqual((t["state"], t["pending_batch_id"], t["dispatched_at"]),
                          (sm.RUNNING, bid, before["dispatched_at"]))

@@ -272,7 +272,7 @@ class RunStateTest(DutyBase):
         self.assertEqual(self.state("tp_alpha"), duty.STALLED)
         rc, out = self.cli("session-reset", "--topic", "tp_alpha")
         self.assertEqual(rc, 0)
-        self.assertIn("清掉在岗表的中断", out)
+        self.assertIn("清掉羊群看板的中断", out)
         self.round()
         self.assertEqual(self.state("tp_alpha"), duty.IDLE)
 
@@ -647,7 +647,7 @@ class DigestTest(DutyBase):
     def test_digest_title_default_without_playbook(self):
         (self.pdir / "duty_digest.md").unlink()
         duty.set_work(self.store, "tp_alpha", KEY, state="doing")
-        self.assertIn("📋 在岗表摘要", self.deliver_to(BUS_TOPIC_ID, "om_test_dg4"))
+        self.assertIn("📋 羊群看板摘要", self.deliver_to(BUS_TOPIC_ID, "om_test_dg4"))
 
 
 # ======================= 信箱 =======================

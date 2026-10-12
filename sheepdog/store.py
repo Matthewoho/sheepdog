@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS audit_hits (
 -- 2 小时还没发出去标放弃，doctor / board 开头提示，直到人工 sheepdog notices --retry / --ack。[notify] file 模式不走这里
 CREATE TABLE IF NOT EXISTS owner_notices (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL,         -- 通知类型：危险命令报警 / 在岗表通知 / attention 通知 / 恢复通知 / 投递失败通知 …
+    kind        TEXT NOT NULL,         -- 通知类型：危险命令报警 / 羊群看板通知 / attention 通知 / 恢复通知 / 投递失败通知 …
     topic_id    TEXT,                  -- 说的是哪个会话（登录提醒说的是宿主，为空）
     body        BLOB NOT NULL,         -- 正文原样字节（UTF-8，命令名已换好）：每次重试发同一份，不重拼
     idem_key    TEXT NOT NULL UNIQUE,  -- 防重编号（lark-cli --idempotency-key，≤ 50 字符）：落账本时定好，每次重试都用它

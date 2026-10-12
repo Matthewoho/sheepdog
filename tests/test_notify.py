@@ -82,10 +82,10 @@ class NotifyConfigTest(unittest.TestCase):
         lark = FakeLark()
         n = cli._notifier(cfg, lark, mock.Mock(dry_run=False))
         self.assertIsInstance(n, FileNotifier)
-        n.notify("🐕 汇报 · 会话中断了 [tp_bus]\n第二行", "在岗表通知")
+        n.notify("🐕 汇报 · 会话中断了 [tp_bus]\n第二行", "羊群看板通知")
         self.assertEqual(lark.sent, [])  # 写文件优先，不发飞书
         got = read_notices(cfg.notify_path)
-        self.assertEqual([(g["what"], g["text"]) for g in got], [("在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]\n第二行")])
+        self.assertEqual([(g["what"], g["text"]) for g in got], [("羊群看板通知", "🐕 汇报 · 会话中断了 [tp_bus]\n第二行")])
         self.assertEqual(got[0]["tz"], "北京时间")
         # dry-run：只打印，不写文件
         out = io.StringIO()
@@ -131,9 +131,9 @@ class NotifyFileEngineTest(GuardBase):
         self.store.update_topic("tp_alpha", state=sm.ATTENTION, attention_at="2026-10-12T01:00:00+08:00",
                                 attention_reason="send_failed")
         self.d._attention_entered(self.store.get_topic("tp_alpha"), "fx")
-        self.assertTrue(self.d._notify_owner("🐕 汇报 · 测试", "在岗表通知"))
+        self.assertTrue(self.d._notify_owner("🐕 汇报 · 测试", "羊群看板通知"))
         got = read_notices(path)
-        self.assertEqual([g["what"] for g in got], ["attention 通知", "在岗表通知"])
+        self.assertEqual([g["what"] for g in got], ["attention 通知", "羊群看板通知"])
         self.assertIn("「Alpha 需求」（topic `tp_alpha`", got[0]["text"])
         for g in got:
             at = datetime.strptime(g["at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone(timedelta(hours=8)))
@@ -146,11 +146,11 @@ class NotifyFileEngineTest(GuardBase):
         bad.write_text("x", encoding="utf-8")
         self.d.notifier = FileNotifier(bad / "under_a_file.log")  # 父目录是个文件：写不进去
         with self.assertLogs("sheepdog", "WARNING") as logs:
-            self.assertFalse(self.d._notify_owner("x", "在岗表通知"))
-        self.assertTrue(any("给主人发在岗表通知失败" in m for m in logs.output))
+            self.assertFalse(self.d._notify_owner("x", "羊群看板通知"))
+        self.assertTrue(any("给主人发羊群看板通知失败" in m for m in logs.output))
 
     def test_plain_notifier_still_gets_text_only(self):
-        self.assertTrue(self.d._notify_owner("🐕 汇报 · 测试 `sheepdog board`", "在岗表通知"))
+        self.assertTrue(self.d._notify_owner("🐕 汇报 · 测试 `sheepdog board`", "羊群看板通知"))
         self.assertEqual(self.notices, ["🐕 汇报 · 测试 `sheepdog board`"])
 
     def test_reload_config_switches_notifier(self):

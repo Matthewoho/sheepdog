@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在岗表（7.20）演示：在临时目录里搭一套隔离的配置和账本，用合成数据跑一轮投递（宿主一律 dryrun），
+"""羊群看板（7.20 在岗表，10-12 改名）演示：在临时目录里搭一套隔离的配置和账本，用合成数据跑一轮投递（宿主一律 dryrun），
 打印三样东西：`sheepdog board` 的输出、总线收到的那一批、卡住的会话被判成什么和给主人的通知。
 
 用法：python3 scripts/demo_duty_board.py [--keep]
@@ -272,7 +272,7 @@ def main() -> int:
     patrol_topic = store.get_topic("tp_patrol")
     queued = store.count_pending_signals("tp_patrol")
 
-    print("在岗表演示（临时目录：" + str(root) + "）")
+    print("羊群看板演示（临时目录：" + str(root) + "）")
     print(f"\n准备：{tell_out.strip()}")
     print("\n" + "=" * 20 + " 1. sheepdog board " + "=" * 20)
     print(board.rstrip())
@@ -288,7 +288,7 @@ def main() -> int:
     if not notices:
         print("（没有）")
     ok = (patrol["run_state"] == "stalled" and notices and "的消息最近送到了「发版」" in bus_batch
-          and "会话自报" in bus_batch and "会话留言" in bus_batch and "在岗表" in bus_batch and queued >= 1
+          and "会话自报" in bus_batch and "会话留言" in bus_batch and "羊群看板" in bus_batch and queued >= 1
           and "自动·路由" in board and "自动·等人回复" in board)
     print("\n检查：" + ("✓ 中断判定、排队、通知、撞车提醒（路由事实 + 会话自报）、留言、摘要、手上的事的来源都在" if ok
                        else "✗ 有东西没出来，看上面"))
