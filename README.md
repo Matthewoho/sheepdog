@@ -6,6 +6,17 @@ sheepdog is a work assistant that runs on the owner's own machine. Every minute 
 
 The name: the owner is the shepherd, the AI sessions are the flock, and sheepdog keeps the flock together.
 
+## Flock board
+
+`sheepdog board` shows what each session is doing right now: its run state, the work on its hands, and its last action. When something changes, the bus session gets a digest.
+
+- Run states: working, waiting, stalled, lost, owner-busy, idle. sheepdog recomputes them every round from the delivery ledger, the session transcript and the owner's own typing. "Waiting" also reads the session's latest receipt.
+- Work on hand comes mostly from facts sheepdog records itself: registered waits, unanswered questions to the owner, hand-overs, and which session a message with an approval number, PR or Linear issue was last delivered to. Sessions can add entries with `sheepdog work set`; these are shown but never change delivery or state, and are marked possibly stale after 4 hours without an update while the session is idle. A differential test runs the same random scenarios twice, once with wrong registrations and once with none, and checks that deliveries, notices and states are identical.
+- Stalled and lost: a session with work in flight and no new tool call for 15 minutes is stalled; no transcript change for 30 minutes is lost. New messages for it are held and the owner gets a DM. When the session moves again, held messages are delivered once and the owner is told it has recovered.
+- Owner-busy: for 15 minutes after the owner types in a session, sheepdog doesn't deliver to it and doesn't call it stalled.
+- Collisions: when a message carries a number that recently went to another session, sheepdog attaches a note saying which session has it and what that session is doing. It only informs; delivery doesn't change.
+- Notes between sessions: `sheepdog tell`. The header is set by code and says the note is not the owner's instruction. A pair of sessions that sends more than 6 notes in 10 minutes is paused.
+
 ## Workflow
 
 1. Collect: once a minute, pull new messages with lark-cli as the owner and record them in a local ledger (SQLite).
@@ -145,6 +156,7 @@ Then enable **sheepdog** in Antigravity's **Automations** panel. On start it run
 
 ```bash
 sheepdog sessions            # every session: host, duty, chats, state, linked projects
+sheepdog board [--topic tp_x] # flock board: what each session is doing, work on hand, last action
 sheepdog inbox [--chat X]    # parked group messages
 sheepdog escalations         # questions waiting for the owner
 sheepdog watches             # sessions waiting on someone's reply
