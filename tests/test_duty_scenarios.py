@@ -338,6 +338,35 @@ class S4NetworkDown(Scenario):
         self.assert_card(BUS_TOPIC_ID, duty.IDLE)
 
 
+    def test_outage_with_app_frozen_upper_bound_is_four(self):
+        """断网时 App 连投递进来的那一行都不写（记录完全不动）：多一条「失联」。整个过程的上限是 4 条：
+        中断、失联（在岗表，同一段各一次）、attention、恢复（7.21，各一次）；重投、回执超时都不再多发。"""
+        w, bus = self.w, self.w[BUS_TOPIC_ID]
+        w.message("bus", "断网前")
+        self.to(1)
+        bus.act("Handle message")
+        bus.receipt()
+        self.to(2)
+        bus.app_alive = False
+        mids = [w.message("bus", "断网后第 1 条")]
+        for m in (10, 30, 50, 70, 90):
+            self.to(m)
+            mids.append(w.message("bus", f"断网中 {m}"))
+        self.to(120)
+        self.assertEqual(self.notes(), [("09:18", "在岗表通知", "🐕 汇报 · 会话中断了 [tp_bus]"),
+                                        ("09:33", "在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]"),
+                                        ("10:06", "attention 通知", "🐕 汇报 · 会话卡住了 [tp_bus]")])
+        bus.app_alive = True
+        bus.act("Back online")
+        self.to(121)
+        self.assertEqual(self.notes()[3], ("11:01", "恢复通知", "🐕 汇报 · 会话已恢复 [tp_bus]"))
+        self.assertEqual(self.got(BUS_TOPIC_ID, 121), [mids])
+        bus.act("Handle backlog")
+        bus.receipt()
+        self.to(240)
+        self.assertEqual(len(self.notes()), 4)
+
+
 # ======================= S5 被主人占着 =======================
 class S5OwnerOccupied(Scenario):
     def test_owner_talking_holds_delivery_without_stall_then_resumes(self):
@@ -518,7 +547,7 @@ class S8Mail(Scenario):
         self.cli("tell", "--topic", "tp_beta", "--to", "tp_alpha", "主人占着时的留言")
         self.to(10)
         self.assertEqual(len(self.got("tp_alpha")), 1)
-        self.assertEqual(w.card("alpha")["unread_mail"] if "unread_mail" in w.card("alpha").keys() else 1, 1)
+        self.assertEqual(duty.board_cards(w.store, w.cfg, topic="tp_alpha")[0]["unread_mail"], 1)  # 排着，没丢
         self.to(18)
         self.assertEqual(len(self.got("tp_alpha")), 2)
         self.assertIn("主人占着时的留言", self.texts("tp_alpha")[-1])
@@ -802,7 +831,7 @@ class S13Compaction(Scenario):
 
 # ======================= 其他关键路径 =======================
 class S14OtherPaths(Scenario):
-    def test_spinning_marked_and_digest_reacts(self):
+    def test_spinning_marked_and_cleared(self):
         w, a = self.w, self.w["alpha"]
         w.message("alpha", "盯一下 CI")
         self.to(1)
