@@ -2,10 +2,11 @@
 
 规则优先级（自上而下，先命中先返回）：
  1. 自己发的            → self（仅入账，供「回复我」判定）
+ 1a. 机器人自己发的（7.26，[identity] 开着）→ self（self_bot）：不分派、不算主人发言
  1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环）
  2. 强制忽略的会话       → drop
  3. 私聊：人 → dispatch；bot → inbox(bot_p2p)，关键词命中则 dispatch
- 4. 群 @我、回复我的消息 → dispatch（同级，都在免打扰之前，7.16）
+ 4. 群 @我、@机器人、回复我（或机器人）的消息 → dispatch（同级，都在免打扰之前，7.16 / 7.26）
  5. 群 @所有人          → dispatch（可配置）
  6. 免打扰群            → drop（@我/回复我/@所有人 已在上面处理；关键人发言仍受免打扰约束）
  8. 关键人发言           → dispatch
@@ -37,6 +38,9 @@ class RouteContext:
     muted_chat_ids: set[str] = field(default_factory=set)
     # 判断某条消息是否为「我」发的（用于回复我判定）；由调用方注入以便测试
     is_my_message: Callable[[str], bool] = lambda _mid: False
+    # 机器人自己的 id（7.26，[identity] 开着才有）：open_id（事件、@ 里用）和 app_id（搜索结果里机器人发的消息的发送人）。
+    # 空 = 关着，行为和以前一样
+    bot_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -70,6 +74,9 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 1. 自己发的
     if ctx.self_open_id and msg.sender_id == ctx.self_open_id:
         return RouteDecision(SELF, "self")
+    # 1a. 机器人自己发的（7.26）：认作自己，不分派，也不当成主人的发言（防止自己回自己）
+    if ctx.bot_ids and msg.sender_id in ctx.bot_ids:
+        return RouteDecision(SELF, "self_bot")
 
     # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响
     prefixes = [p for p in cfg.drop_bot_message_prefixes if p]
@@ -92,11 +99,14 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
         return RouteDecision(DISPATCH, "p2p")
 
     mentioned_me = any(m.id == ctx.self_open_id for m in msg.mentions if ctx.self_open_id)
+    mentioned_bot = bool(ctx.bot_ids) and any(m.id in ctx.bot_ids for m in msg.mentions if m.id)
     mentioned_all = any(m.is_all for m in msg.mentions)
 
     # 4. @我、回复我：同级，排在免打扰之前——免打扰群里有人回复主人也要送到（7.16）
     if mentioned_me:
         return RouteDecision(DISPATCH, "at_me")
+    if mentioned_bot:
+        return RouteDecision(DISPATCH, "at_bot")  # 7.26：@机器人 和 @主人 同等对待
     if msg.reply_to and ctx.is_my_message(msg.reply_to):
         return RouteDecision(DISPATCH, "reply_to_me")
     # 5. @所有人

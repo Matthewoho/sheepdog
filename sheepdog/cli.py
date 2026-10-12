@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -90,6 +91,8 @@ from .notify import FileNotifier, OwnerDM
 from . import outbound
 from .source import NullSource
 from .source.lark import LarkCliSource
+from .source.bot_events import BotEventConsumer
+from . import identity as ident
 from .store import Store, now_iso
 from . import session as sm
 
@@ -274,6 +277,8 @@ def cmd_doctor(args) -> int:
         print(line)
     for line in threads_report(cfg):
         print(line)
+    for line in identity_report(cfg, store):
+        print(line)
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
     pb = Playbook.from_config(cfg)
     missing = pb.missing()
@@ -305,6 +310,55 @@ def switches_report(cfg) -> list[str]:
         out.append(f"⚠ 只拉这些聊天：{', '.join(cfg.source.only_chat_ids)}（测试用，[source] only_chat_ids；正式环境不要设）")
     if cfg.threads.owner_chat_id:
         out.append(f"⚠ 找主人改发到群 {cfg.threads.owner_chat_id}（测试用，[threads] owner_chat_id；正式环境不要设）")
+    return out
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def identity_report(cfg, store: Store) -> list[str]:
+    """doctor：区分智能体身份和本人身份（7.26）。机器人接收在不在、最近一次收到事件的时间、机器人不在而代回退回本人的群。"""
+    ic = cfg.identity
+    if not ic.enabled:
+        return ["身份区分: 关（[identity] enabled = false）：代回一律用主人本人身份、带代回标记"]
+    oid = ic.bot_open_id or store.get_meta(ident.META_OPEN_ID)
+    app = ic.bot_app_id or store.get_meta(ident.META_APP_ID)
+    out = [f"身份区分: 开；机器人 open_id {oid or '✗ 不知道（sheepdog run 启动时查，或 [identity] bot_open_id 手填）'}"
+           f"，app_id {app or '✗ 不知道'}"]
+    st = ident.consumer_state(store)
+    if not st:
+        out.append("  机器人接收: ✗ 没记录（sheepdog run 还没起过）")
+    else:
+        owner = st.get("owner_pid")
+        running = st.get("state") in ("running", "starting") and st.get("pid") and _pid_alive(st.get("pid")) \
+            and owner and _pid_alive(owner)
+        label = {"running": "✓ 在收", "starting": "起来了、还没连上", "down": "✗ 退出了，等重启",
+                 "stopped": "✗ 停了"}.get(st.get("state", ""), st.get("state", ""))
+        if st.get("state") in ("running", "starting") and not running:
+            label = "✗ 不在（记录里的进程已经不在了：sheepdog run 没在跑？）"
+        out.append(f"  机器人接收: {label}；pid {st.get('pid') or '-'}，最近一次收到事件 {st.get('last_event_at') or '（还没有）'}"
+                   f"，共 {st.get('events', 0)} 个，重启 {st.get('restarts', 0)} 次；状态记于 {st.get('updated_at') or '-'}")
+        if st.get("last_exit"):
+            out.append(f"  最近一次退出: {st['last_exit']}")
+        if st.get("last_error"):
+            out.append(f"  最近一次报错: {st['last_error']}")
+    chats, at = ident.cached_bot_chats(store)
+    out.append(f"  机器人在的群: {len(chats)} 个（{at.isoformat(timespec='minutes') if at else '缓存已作废'}查的，"
+               f"缓存 {ic.bot_chats_cache_minutes:g} 分钟）" if chats is not None else "  机器人在的群: 还没查过（第一次代回时查）")
+    absent = store.bot_absent_chats()
+    if absent:
+        out.append(f"  ⚠ 机器人不在、代回退回本人的群 {len(absent)} 个（建议把机器人拉进去）：")
+        out += [f"    - {r['chat_name'] or '-'}（{r['chat_id']}）退回 {r['fallbacks']} 次，最近 {r['last_at']}" for r in absent[:20]]
+    since = (datetime.now().astimezone() - timedelta(hours=ic.bot_dm_reply_hours)).isoformat(timespec="seconds")
+    n = len(store.list_bot_dm_replies(since))
+    pb = Playbook.from_config(cfg)
+    out.append(f"  别人私聊机器人: 不分派，自动回一句（{'playbook/bot_dm.md' if pb.read('bot_dm.md').strip() else '⚠ 没有 bot_dm.md，用代码里的默认话'}），"
+               f"同一个人 {ic.bot_dm_reply_hours:g} 小时内只回一次；这段时间回了 {n} 次")
     return out
 
 
@@ -502,6 +556,10 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
     if new.sink != old.sink:
         logging.warning("sink 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s", new.sink, old.sink)
         new.sink = old.sink
+    if new.identity.enabled != old.identity.enabled:
+        logging.warning("[identity] enabled 改成了 %s，需要重启 sheepdog run 才生效；本次沿用 %s",
+                        new.identity.enabled, old.identity.enabled)
+        new.identity.enabled = old.identity.enabled
     if new.source.enabled != old.source.enabled:
         logging.warning("[source] enabled 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s",
                         new.source.enabled, old.source.enabled)
@@ -536,6 +594,29 @@ def cmd_run(args) -> int:
     dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args))
     logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
                  "、".join(f"{h}={s.name}" for h, s in sink.items()))
+    consumer = _start_bot_events(cfg, store, source, args)
+    collector.bot_events = consumer
+    try:
+        return _run_loop(args, cfg, store, source, collector, dispatcher)
+    finally:
+        if consumer is not None:
+            consumer.stop()
+
+
+def _start_bot_events(cfg, store: Store, source, args):
+    """[identity] 开着（7.26）：查一次机器人自己的 id，起机器人身份的实时接收。不拉飞书、--dry-run 不起。"""
+    if not cfg.identity.enabled or not cfg.source.enabled or getattr(args, "dry_run", False):
+        return None
+    ident.resolve_bot_ids(cfg, store, source)
+    ic = cfg.identity
+    consumer = BotEventConsumer(getattr(source, "binary", "lark-cli"), ic.restart_backoff_seconds,
+                                ic.restart_backoff_max_seconds,
+                                state_writer=lambda st: store.set_meta(ident.META_CONSUMER, json.dumps(st, ensure_ascii=False)))
+    consumer.start()
+    return consumer
+
+
+def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher: Dispatcher) -> int:
     last_prune = 0.0
     while True:
         try:
@@ -1459,10 +1540,14 @@ def cmd_reply(args) -> int:
     if r.spoke is not None:
         print(outbound.spoke_text(cfg, r.spoke))
         return outbound.EXIT_OWNER_REPLIED
+    who = ""
+    if cfg.identity.enabled:
+        who = ("（机器人身份，不加代回标记）" if r.identity == ident.BOT
+               else f"（主人本人身份，带代回标记：{ident.WHY_LABEL.get(r.why, r.why)}）" if r.why else "")
     if r.already:
         print(f"之前已经发过同样的代回（防重编号相同，这次没再发）：message_id {r.message_id}")
     else:
-        print(f"已代回：message_id {r.message_id}")
+        print(f"已代回{who}：message_id {r.message_id}")
     return outbound.EXIT_OK
 
 

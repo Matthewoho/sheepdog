@@ -13,6 +13,7 @@ import logging
 import shutil
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
 from ..models import Mention, Message
 from . import SourceError
@@ -74,6 +75,52 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
     )
 
 
+def _event_time(ms: str, tz: str) -> str:
+    """事件里的毫秒时间戳 → 本地时区 ISO，只到分钟（和搜索结果一样：发前检查、确认表情按分钟比先后）。"""
+    try:
+        sec = int(str(ms).strip()) / 1000
+    except (TypeError, ValueError):
+        return ""
+    sign = -1 if tz.startswith("-") else 1
+    hh, _, mm = tz.lstrip("+-").partition(":")
+    try:
+        offset = timezone(sign * timedelta(hours=int(hh), minutes=int(mm or 0)))
+    except ValueError:
+        offset = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(sec, offset).replace(second=0, microsecond=0).isoformat(timespec="seconds")
+
+
+def parse_event(raw: dict, tz: str = "+08:00") -> Message:
+    """机器人身份实时接收的一条消息（lark-cli event consume im.message.receive_v1，7.26）。
+    事件是拍平的：没有群名、发送人名字、租户、序号；正文是渲染好的文字（卡片是原始 JSON）；
+    机器人发的 sender_type 是 bot（搜索结果里是 app）。"""
+    mentions = []
+    for m in raw.get("mentions") or []:
+        mid = m.get("id") or ""
+        key = m.get("key") or ""
+        mentions.append(Mention(id=mid, name=m.get("name") or "", is_all=(mid in _AT_ALL_IDS or key in _AT_ALL_IDS)))
+    content = raw.get("content")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    sender_type = raw.get("sender_type") or ""
+    return Message(
+        message_id=raw.get("message_id") or raw.get("id") or "",
+        chat_id=raw.get("chat_id") or "",
+        chat_name="",
+        chat_type=raw.get("chat_type") or "",
+        sender_id=raw.get("sender_id") or "",
+        sender_name="",
+        sender_type="app" if sender_type == "bot" else sender_type,
+        content=content or "",
+        msg_type=raw.get("message_type") or "",
+        create_time=_event_time(raw.get("create_time", ""), tz),
+        mentions=mentions,
+        reply_to=raw.get("reply_to") or "",
+        thread_id=raw.get("thread_id") or "",
+        raw=raw,
+    )
+
+
 class LarkCliSource:
     def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3):
         self.tz = tz
@@ -92,12 +139,12 @@ class LarkCliSource:
         subtype = str(err.get("subtype") or "").lower()
         return bool(err.get("retryable")) or subtype == "rate_limit" or err.get("type") == "network" or "timeout" in subtype
 
-    def _run(self, args: list[str]) -> dict:
+    def _run(self, args: list[str], identity: str = "user") -> dict:
         delay = self.backoff
         last_err = ""
         for attempt in range(self.retries):
             try:
-                proc = subprocess.run([self.binary, *args, "--as", "user"], capture_output=True, text=True, timeout=120)
+                proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=120)
             except subprocess.TimeoutExpired as e:
                 raise LarkTimeout(f"lark-cli 超时 {args[:2]}（{e.timeout:g} 秒）") from e
             out = proc.stdout.strip() or proc.stderr.strip()
@@ -135,12 +182,12 @@ class LarkCliSource:
         self.last_fetch_partial = more
         return out
 
-    def _chat_ids(self, extra: list[str]) -> set[str]:
+    def _chat_ids(self, extra: list[str], identity: str = "user") -> set[str]:
         ids: set[str] = set()
         token = ""
         for _ in range(self.max_pages):
             args = ["im", "+chat-list", "--page-size", "100", *extra]
-            data = self._run(args + (["--page-token", token] if token else []))
+            data = self._run(args + (["--page-token", token] if token else []), identity)
             ids |= {c.get("chat_id") for c in data.get("chats") or [] if c.get("chat_id")}
             token = data.get("page_token") or ""
             if not data.get("has_more") or not token:
@@ -151,6 +198,36 @@ class LarkCliSource:
         all_ids = self._chat_ids([])
         unmuted = self._chat_ids(["--exclude-muted"])
         return all_ids - unmuted
+
+    # ---------- 机器人身份（7.26），只读 ----------
+    def bot_chat_ids(self) -> set[str]:
+        """机器人在哪些群（+chat-list --as bot，翻完所有页）。"""
+        return self._chat_ids([], "bot")
+
+    def bot_open_id(self) -> str:
+        """机器人自己的 open_id（bot/v3/info）。"""
+        data = self._run(["api", "GET", "/open-apis/bot/v3/info"], "bot")
+        oid = self._find(data, "open_id") or (data.get("bot") or {}).get("open_id")
+        if not oid:
+            raise SourceError(f"bot/v3/info 没返回 open_id: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return str(oid)
+
+    def bot_app_id(self) -> str:
+        """lark-cli 绑定的应用 app_id（lark-cli config show）：搜索结果里机器人发的消息，发送人是它。"""
+        try:
+            proc = subprocess.run([self.binary, "config", "show"], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as e:
+            raise LarkTimeout(f"lark-cli config show 超时（{e.timeout:g} 秒）") from e
+        out = proc.stdout or ""
+        end = out.rfind("}")
+        try:
+            data = json.loads(out[out.find("{"): end + 1]) if end >= 0 else {}
+        except json.JSONDecodeError:
+            data = {}
+        app = (data or {}).get("appId") or ""
+        if not app:
+            raise SourceError(f"lark-cli config show 没有 appId: {out[:200]}")
+        return str(app)
 
     def read_status(self, message_ids: list[str]) -> dict[str, bool]:
         result: dict[str, bool] = {}

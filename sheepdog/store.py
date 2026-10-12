@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS messages (
     message_position TEXT,             -- 消息在这个聊天里的序号（lark message_position，7.22 发前检查比先后用）；空 = 不知道
     thread_position TEXT,              -- 话题里的序号（lark thread_message_position，7.22）：普通聊天开头 "-1"、回复从 "0" 起；
                                        -- 话题群开头 "0"
+    received_by    TEXT,               -- 哪个身份收到的（7.26，[identity] 开着才写）：user（主人身份的搜索）| bot（机器人身份的
+                                       -- 实时接收）| both；关着时为空
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
@@ -388,7 +390,8 @@ CREATE TABLE IF NOT EXISTS sends (
     norm_key          TEXT,
     target_message_id TEXT,            -- reply：回复的是哪条
     text              TEXT,            -- 发出去的正文（卡片记卡片正文）
-    sent_at           TEXT NOT NULL
+    sent_at           TEXT NOT NULL,
+    identity          TEXT             -- 用哪个身份发的（7.26，[identity] 开着才写）：user（主人本人）| bot（机器人）
 );
 CREATE INDEX IF NOT EXISTS idx_sends_message ON sends(message_id);
 CREATE INDEX IF NOT EXISTS idx_sends_root ON sends(root_message_id);
@@ -402,6 +405,28 @@ CREATE TABLE IF NOT EXISTS seen_before_send (
     seen_at           TEXT NOT NULL,
     PRIMARY KEY (topic_id, message_id)
 );
+
+-- 别人私聊机器人（7.26）：不分派，机器人回一句请对方直接找主人本人。同一个人 [identity] bot_dm_reply_hours 内只回一次；
+-- 一行 = 回过的一次（只记发成功的）
+CREATE TABLE IF NOT EXISTS bot_dm_replies (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id        TEXT NOT NULL,     -- 私聊机器人的那个人（open_id）
+    chat_id          TEXT,
+    message_id       TEXT,              -- 他发给机器人的那条
+    reply_message_id TEXT,              -- 机器人回的那条
+    replied_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_dm_sender ON bot_dm_replies(sender_id, replied_at);
+
+-- 机器人不在、代回退回主人本人的群（7.26）：sheepdog doctor 列出来，建议把机器人拉进来
+CREATE TABLE IF NOT EXISTS bot_absent_chats (
+    chat_id     TEXT PRIMARY KEY,
+    chat_name   TEXT,
+    fallbacks   INTEGER DEFAULT 0,      -- 退回了几次
+    last_reason TEXT,                   -- not_in_chat（群列表里没有）| 230002（发送时飞书报不在群里）| list_failed（群列表查不到）
+    first_at    TEXT NOT NULL,
+    last_at     TEXT NOT NULL
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -412,7 +437,8 @@ SYSTEM_ID_PREFIX = "sd_"
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
-                 ("security_action", "TEXT"), ("message_position", "TEXT"), ("thread_position", "TEXT")],
+                 ("security_action", "TEXT"), ("message_position", "TEXT"), ("thread_position", "TEXT"),
+                 ("received_by", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
                ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
@@ -422,6 +448,7 @@ MIGRATIONS = {
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
+    "sends": [("identity", "TEXT")],
 }
 
 
@@ -493,7 +520,8 @@ class Store:
         row = self.conn.execute("SELECT sender_id FROM messages WHERE message_id=?", (message_id,)).fetchone()
         return bool(row and self_open_id and row["sender_id"] == self_open_id)
 
-    def upsert_message(self, m: Message, route: str, reason: str, tags: list[str], topic_id: str | None = None) -> None:
+    def upsert_message(self, m: Message, route: str, reason: str, tags: list[str], topic_id: str | None = None,
+                       received_by: str | None = None) -> None:
         ts = now_iso()
         mentions = json.dumps([asdict(x) for x in m.mentions], ensure_ascii=False)
         dispatch_state = "pending" if route == "dispatch" else None
@@ -502,15 +530,84 @@ class Store:
                 """INSERT INTO messages(message_id,chat_id,chat_name,chat_type,sender_id,sender_name,sender_type,
                        sender_tenant_key,content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,
                        updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen,
-                       message_position,thread_position)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       message_position,thread_position,received_by)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
                  m.sender_tenant_key,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,
                  int(m.deleted), int(m.updated), m.update_time, route, reason,
                  json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts, m.message_position or None,
-                 m.thread_position or None),
+                 m.thread_position or None, received_by),
             )
+
+    def merge_identity_copy(self, message_id: str, m: Message, received_by: str, fill_content: bool) -> None:
+        """另一个身份又收到了同一条（7.26）：账本仍只有一条。received_by 记成 both；账本里空着的字段（群名、发送人名、
+        租户、序号、话题）用这一份补上。fill_content：账本里那份是机器人实时接收的原样（正文渲染和搜索不一样），换成这一份的
+        正文，不当成编辑。"""
+        row = self.get_message(message_id)
+        if row is None:
+            return
+        sets, vals = ["last_seen=?"], [now_iso()]
+        prev = row["received_by"] or "user"   # 开关打开以前入账的（为空）都是主人身份搜到的
+        if prev != received_by and prev != "both":
+            sets.append("received_by='both'")
+        for col, val in (("chat_name", m.chat_name), ("sender_name", m.sender_name),
+                         ("sender_tenant_key", m.sender_tenant_key), ("message_position", m.message_position),
+                         ("thread_position", m.thread_position), ("thread_id", m.thread_id), ("link", m.link),
+                         ("reply_to", m.reply_to)):
+            if val and not row[col]:
+                sets.append(f"{col}=?")
+                vals.append(val)
+        if fill_content:
+            sets += ["content=?", "chat_type=?", "msg_type=?", "mentions_json=?", "create_time=?"]
+            vals += [m.content, m.chat_type or row["chat_type"], m.msg_type or row["msg_type"],
+                     json.dumps([asdict(x) for x in m.mentions], ensure_ascii=False), m.create_time or row["create_time"]]
+        vals.append(message_id)
+        with self.tx() as c:
+            c.execute(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=?", vals)
+
+    def set_received_by(self, message_id: str, received_by: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE messages SET received_by=? WHERE message_id=?", (received_by, message_id))
+
+    def sender_in(self, message_id: str, sender_ids: set[str]) -> bool:
+        """账本里这条消息的发送人在不在 sender_ids 里（7.26：主人本人、机器人）。"""
+        row = self.conn.execute("SELECT sender_id FROM messages WHERE message_id=?", (message_id,)).fetchone()
+        return bool(row and row["sender_id"] and row["sender_id"] in sender_ids)
+
+    # ---------- 7.26 别人私聊机器人、机器人不在的群 ----------
+    def bot_dm_replied_since(self, sender_id: str, since_iso: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM bot_dm_replies WHERE sender_id=? AND replied_at >= ? ORDER BY replied_at DESC LIMIT 1",
+            (sender_id, since_iso)).fetchone()
+
+    def add_bot_dm_reply(self, sender_id: str, chat_id: str, message_id: str, reply_message_id: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO bot_dm_replies(sender_id,chat_id,message_id,reply_message_id,replied_at) "
+                      "VALUES(?,?,?,?,?)", (sender_id, chat_id, message_id, reply_message_id, now_iso()))
+
+    def list_bot_dm_replies(self, since_iso: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM bot_dm_replies WHERE replied_at >= ? ORDER BY replied_at DESC",
+                                 (since_iso,)).fetchall()
+
+    def note_bot_absent(self, chat_id: str, chat_name: str, reason: str) -> None:
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("""INSERT INTO bot_absent_chats(chat_id,chat_name,fallbacks,last_reason,first_at,last_at)
+                         VALUES(?,?,1,?,?,?)
+                         ON CONFLICT(chat_id) DO UPDATE SET fallbacks=fallbacks+1, last_reason=excluded.last_reason,
+                             last_at=excluded.last_at, chat_name=COALESCE(NULLIF(excluded.chat_name,''), chat_name)""",
+                      (chat_id, chat_name or "", reason, ts, ts))
+
+    def bot_absent_chats(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM bot_absent_chats ORDER BY last_at DESC").fetchall()
+
+    def forget_bot_absent(self, chat_ids: set[str]) -> None:
+        """机器人已经在这些群里了：从「机器人不在」的清单里去掉。"""
+        if not chat_ids:
+            return
+        with self.tx() as c:
+            c.executemany("DELETE FROM bot_absent_chats WHERE chat_id=?", [(x,) for x in chat_ids])
 
     def update_content(self, message_id: str, m: Message, route: str | None = None,
                        reason: str | None = None, dispatch_state: str | None = None,
@@ -890,13 +987,14 @@ class Store:
                                  (root_message_id,)).fetchall()
 
     def add_send(self, idem_key: str, kind: str, topic_id: str, message_id: str, text: str, *,
-                 root_message_id: str = "", key: str = "", norm_key: str = "", target_message_id: str = "") -> None:
+                 root_message_id: str = "", key: str = "", norm_key: str = "", target_message_id: str = "",
+                 identity: str | None = None) -> None:
         with self.tx() as c:
             c.execute(
                 """INSERT OR IGNORE INTO sends(idem_key,kind,topic_id,message_id,root_message_id,key,norm_key,
-                       target_message_id,text,sent_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                       target_message_id,text,sent_at,identity) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (idem_key, kind, topic_id, message_id, root_message_id or None, key or None, norm_key or None,
-                 target_message_id or None, text, now_iso()))
+                 target_message_id or None, text, now_iso(), identity))
 
     def thread_messages_in_ledger(self, thread_id: str, root_message_id: str = "") -> list[sqlite3.Row]:
         """账本里这个话题的消息（含开头那条），按发送时间排。只读。"""
@@ -1373,6 +1471,7 @@ class Store:
         "owner_threads": "DELETE FROM owner_threads WHERE COALESCE(last_post_at, created_at) < ?",
         "sends": "DELETE FROM sends WHERE sent_at < ?",
         "seen_before_send": "DELETE FROM seen_before_send WHERE seen_at < ?",
+        "bot_dm_replies": "DELETE FROM bot_dm_replies WHERE replied_at < ?",
     }
 
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删

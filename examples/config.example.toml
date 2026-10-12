@@ -192,6 +192,25 @@ enabled = true
 # 用它检查通知。拉着飞书又设了它，sheepdog doctor 会提示。相对路径相对本文件所在目录；改了下一轮生效
 file = ""
 
+[identity]
+# 区分智能体（机器人）身份和你本人的身份。默认关，关着时和以前完全一样：代回一律用你本人的身份、卡片带代回标记。
+# 开着时：
+# - sheepdog run 另起一个常驻子进程，以机器人身份实时接收消息（lark-cli event consume im.message.receive_v1 --as bot），
+#   和你身份的每分钟搜索进同一个账本，同一条只记一次；sheepdog doctor 显示它在不在、最近一次收到事件的时间；
+# - 群里 @机器人 和 @你 一样处理；别人回复机器人发的消息和回复你的一样处理；机器人自己发的消息不分派、不算你的发言；
+# - 别人私聊机器人不接（你在飞书里看不到这些私聊）：不分派，机器人回一句 playbook/bot_dm.md 里的话，同一个人 24 小时内只回一次；
+# - sheepdog reply 按被回复的那条消息选身份：群里机器人在 → 机器人（不加代回标记）；私聊、机器人不在的群 → 你本人（加标记），
+#   机器人不在的群 sheepdog doctor 会列出来，建议把机器人拉进去。
+# enabled 改了要重启 sheepdog run；其余下一轮生效
+enabled = false
+# 机器人的 open_id / app_id：留空 = 启动时现查（不写死），只在查不到时手填
+# bot_open_id = "ou_xxx"
+# bot_app_id = "cli_xxx"
+bot_chats_cache_minutes = 10       # 机器人在哪些群：按机器人身份的群列表判断，缓存这么多分钟
+bot_dm_reply_hours = 24            # 别人私聊机器人的自动回复：同一个人这么多小时内只回一次
+restart_backoff_seconds = 5        # 机器人接收子进程退出后重启的退避：从这里起每次翻倍
+restart_backoff_max_seconds = 300  # 最多等这么久
+
 # 会话宿主（每个会话一个，默认 antigravity = 上面的 sink）。codex / claude 走各自的命令行，一轮在后台跑完。
 # 权限不归 sheepdog 管：这里没有沙箱、审批、权限项，全部来自宿主自己的配置
 # （Codex 看 ~/.codex/config.toml；Claude 看它自己的用户设置、workdir 下的设置，或下面 settings 指的文件）。

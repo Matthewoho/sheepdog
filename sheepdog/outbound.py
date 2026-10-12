@@ -2,7 +2,9 @@
 
 - ask / report：sheepdog 在正文前加开头一行（[threads] ask_header / report_header），以机器人身份私聊主人。
   带钥匙时，同一会话同一把钥匙第一次在主聊天里起一条（话题开头），之后回复到它的话题里（--reply-in-thread）。
-- reply：以主人身份代回（卡片，右下角带代回标记）。发之前只读检查：这个聊天里、从要回复的那条之后，主人本人有没有
+- reply：代回（卡片）。[identity] 关着：一律以主人身份、右下角带代回标记。开着（7.26）：按被回复的那条消息选身份——
+  群里机器人在用机器人（不加标记），私聊和机器人不在的群用主人本人（加标记）；机器人发送报「不在群里」（230002）时这一条
+  退回主人本人加标记，防重编号不变。发之前只读检查：这个聊天里、从要回复的那条之后，主人本人有没有
   新发言。检查只用搜索接口（不会把消息标成已读），不写账本里的消息、不动拉取进度、不点表情；
   主人说过就不发，把他的话原样打印给会话，记一个「发送前已看到」。
 - thread：只读列出一个话题的全部消息。
@@ -19,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import duty
+from . import identity as ident
 from . import session as sm
 from .card import build_reply_card
 from .config import Config
@@ -139,7 +142,8 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         new_thread = store.add_thread(mid, topic_id, key, nk, _one_line(title), ASK, res.get("thread_id") or "")
     else:
         root_mid = ""
-    store.add_send(ik, kind, topic_id, mid, text, root_message_id=root_mid, key=key, norm_key=nk)
+    store.add_send(ik, kind, topic_id, mid, text, root_message_id=root_mid, key=key, norm_key=nk,
+                   identity=ident.BOT if cfg.identity.enabled else None)
     # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
     return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
@@ -249,10 +253,11 @@ def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
                             "（要他定的事用 sheepdog ask，参数相同），会经机器人发给他，同一把钥匙回到同一个话题里。没有发送。")
 
 
-def reply_body(cfg: Config, text: str = "", card_text: str = "") -> tuple[str, dict | None]:
+def reply_body(cfg: Config, text: str = "", card_text: str = "", mark: bool = True) -> tuple[str, dict | None]:
     """代回的内容：卡片（沿用 reply-card：正文 + 右下角代回标记），或纯文本（末尾附同一个代回标记，别人一眼看出是代回、
-    sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。"""
-    suffix = cfg.session.reply_suffix
+    sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。
+    mark = False（7.26，以机器人身份发）：不加代回标记，其余一样。"""
+    suffix = cfg.session.reply_suffix if mark else ""
     if card_text:
         card = build_reply_card(card_text, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
         return card_text, card
@@ -284,27 +289,45 @@ class ReplyResult:
     spoke: OwnerSpoke | None = None
     newly_seen: int = 0
     text: str = ""
+    identity: str = ""      # 7.26：用哪个身份发的（user | bot）；[identity] 关着时是 user
+    why: str = ""           # 为什么用这个身份（identity.WHY_*）
+
+
+def _idem_text(cfg: Config, text: str, card_text: str) -> str:
+    """[identity] 开着时防重编号按不带代回标记的正文算：机器人发送报 230002、退回主人本人加标记时编号不变。"""
+    return card_text if card_text else (text or "").rstrip()
+
+
+def _send_reply(source, target_id: str, ik: str, shown: str, card: dict | None, identity: str) -> dict:
+    try:
+        return source.reply_to(target_id, identity=identity, idem_key=ik, text="" if card is not None else shown,
+                               card=card)
+    except LarkTimeout as e:
+        raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
 
 
 def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, text: str = "", card_text: str = "",
           even_if_owner_replied: bool = False) -> ReplyResult:
-    """代回：先查重（发过同样的就不再发），再发前检查（主人说过话就不发、记「发送前已看到」），最后以主人身份发。"""
+    """代回：先查重（发过同样的就不再发），再发前检查（主人说过话就不发、记「发送前已看到」），最后发。
+    [identity] 关着以主人身份发；开着按 identity.choose_reply_identity 选身份（7.26）。"""
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
     target_id = (target_id or "").strip()
     if not target_id.startswith("om_"):
         raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号，收到 {target_id!r}")
+    enabled = cfg.identity.enabled
     try:
         shown, card = reply_body(cfg, text, card_text)
     except ValueError as e:
         raise OutboundError(EXIT_INVALID, str(e))
     target = store.get_message(target_id)
     if target is not None:
-        reject_owner_chat(cfg, topic_id, target["chat_id"])
-    ik = reply_idem(store, topic_id, target_id, shown)
+        reject_owner_chat(cfg, topic_id, target["chat_id"])   # 热修：找主人聊天里一律拒绝，在选身份之前，不管开没开 [identity]
+    ik = reply_idem(store, topic_id, target_id, _idem_text(cfg, text, card_text) if enabled else shown)
     prev = store.get_send(ik)
     if prev is not None:
-        return ReplyResult(prev["message_id"], already=True, text=shown)  # 同样的内容已经发过（重试）
+        return ReplyResult(prev["message_id"], already=True, text=prev["text"] if enabled else shown,
+                           identity=(prev["identity"] or ident.USER) if enabled else ident.USER)  # 同样的内容已经发过（重试）
     if not even_if_owner_replied:
         if target is None:
             raise OutboundError(EXIT_INVALID, f"账本里没有 {target_id}，没法做发前检查（以账本里这条消息的时间为准）。"
@@ -313,17 +336,30 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
         if spoke.messages:
             n = sum(store.add_seen_before_send(topic_id, m.message_id, target_id) for m in spoke.messages)
             return ReplyResult(spoke=spoke, newly_seen=n, text=shown)
+    who, why = ident.choose_reply_identity(cfg, store, source, target)
+    if enabled and who == ident.BOT:
+        shown, card = reply_body(cfg, text, card_text, mark=False)
+    if enabled and why == ident.WHY_NOT_IN_CHAT and target is not None:
+        store.note_bot_absent(target["chat_id"], target["chat_name"] or "", why)
     try:
-        res = source.reply_to(target_id, identity="user", idem_key=ik, text="" if card is not None else shown,
-                              card=card)
-    except LarkTimeout as e:
-        raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
+        res = _send_reply(source, target_id, ik, shown, card, who)
     except SourceError as e:
-        raise OutboundError(EXIT_SEND_FAILED, f"发送失败：{e}")
+        if not (enabled and who == ident.BOT and ident.is_not_in_chat_error(e)):
+            raise OutboundError(EXIT_SEND_FAILED, f"发送失败：{e}")
+        # 7.26：机器人发送报不在群里（230002）：缓存作废，这一条退回主人本人加标记，防重编号不变
+        ident.invalidate_bot_chats(store)
+        if target is not None:
+            store.note_bot_absent(target["chat_id"], target["chat_name"] or "", ident.WHY_230002)
+        who, why = ident.USER, ident.WHY_230002
+        shown, card = reply_body(cfg, text, card_text)
+        try:
+            res = _send_reply(source, target_id, ik, shown, card, who)
+        except SourceError as e2:
+            raise OutboundError(EXIT_SEND_FAILED, f"发送失败（机器人不在群里，退回主人本人也没发出去）：{e2}")
     mid = res["message_id"]
-    store.add_send(ik, REPLY, topic_id, mid, shown, target_message_id=target_id)
+    store.add_send(ik, REPLY, topic_id, mid, shown, target_message_id=target_id, identity=who if enabled else None)
     store.add_bot_outbox(mid, topic_id, False, shown, now_iso())
-    return ReplyResult(mid, text=shown)
+    return ReplyResult(mid, text=shown, identity=who, why=why)
 
 
 def spoke_text(cfg: Config, spoke: OwnerSpoke) -> str:

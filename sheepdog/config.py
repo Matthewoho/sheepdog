@@ -486,6 +486,47 @@ class NotifyConfig:
 
 
 @dataclass
+class IdentityConfig:
+    """[identity]（7.26）：区分智能体（机器人）身份和主人本人身份。默认关；关着时行为和以前完全一样。
+
+    开着时：
+    - sheepdog run 另起一个常驻子进程，以机器人身份实时接收消息（lark-cli event consume im.message.receive_v1
+      --as bot），和主人身份的每分钟搜索进同一个账本，按 message_id 只记一条，记下是哪个身份收到的；
+    - 群里 @机器人 和 @主人 同等对待（路由原因 at_bot）；回复机器人发的消息和回复主人发的同等对待；
+    - 机器人自己发的消息认作自己（self_bot）：不分派、不算主人发言；
+    - 别人私聊机器人：不分派（drop，原因 bot_dm），机器人回一句 playbook/bot_dm.md 里的话，同一个人
+      bot_dm_reply_hours 内只回一次；
+    - sheepdog reply 按被回复的那条消息选身份：群里机器人在 → 机器人（不加代回标记）；私聊、机器人不在的群 → 主人本人加标记。
+    enabled 改了要重启 sheepdog run（机器人接收是启动时起的）；sheepdog reply 每次现读配置。"""
+    enabled: bool = False
+    # 机器人的 open_id / app_id：留空 = sheepdog run 启动时现查（open_id 查 bot/v3/info，app_id 查 lark-cli config show），
+    # 不写死。只在查不到时手填
+    bot_open_id: str = ""
+    bot_app_id: str = ""
+    # 机器人在哪些群：用机器人身份的群列表判断，缓存这么多分钟
+    bot_chats_cache_minutes: float = 10
+    # 别人私聊机器人的自动回复：同一个人这么多小时内只回一次
+    bot_dm_reply_hours: float = 24
+    # 机器人接收子进程退出后重启的退避：从 restart_backoff_seconds 起每次翻倍，最多 restart_backoff_max_seconds
+    restart_backoff_seconds: float = 5
+    restart_backoff_max_seconds: float = 300
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("[identity] enabled 必须是 true/false")
+        if not isinstance(self.bot_open_id, str) or (self.bot_open_id and not self.bot_open_id.startswith("ou_")):
+            raise ConfigError("[identity] bot_open_id 必须是 ou_ 开头的 open_id（留空 = 启动时现查）")
+        if not isinstance(self.bot_app_id, str) or (self.bot_app_id and not self.bot_app_id.startswith("cli_")):
+            raise ConfigError("[identity] bot_app_id 必须是 cli_ 开头的 app_id（留空 = 启动时现查）")
+        for k in ("bot_chats_cache_minutes", "bot_dm_reply_hours", "restart_backoff_seconds",
+                  "restart_backoff_max_seconds"):
+            if not _positive(getattr(self, k)):
+                raise ConfigError(f"[identity] {k} 必须是正数")
+        if self.restart_backoff_max_seconds < self.restart_backoff_seconds:
+            raise ConfigError("[identity] restart_backoff_max_seconds 不能小于 restart_backoff_seconds")
+
+
+@dataclass
 class SourceConfig:
     # false = 不拉飞书（测试环境用，7.18）：这时可以用 sheepdog inject 往账本里放合成消息
     enabled: bool = True
@@ -540,6 +581,7 @@ class Config:
     cli_name: str = "sheepdog"
     source: SourceConfig = field(default_factory=SourceConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    identity: IdentityConfig = field(default_factory=IdentityConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -643,6 +685,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.loop_guard, data.get("loop_guard", {}))
         _apply(cfg.source, data.get("source", {}))
         _apply(cfg.notify, data.get("notify", {}))
+        _apply(cfg.identity, data.get("identity", {}))
         _apply(cfg.audit, data.get("audit", {}))
         _apply(cfg.duty, data.get("duty", {}))
         _apply(cfg.threads, data.get("threads", {}))
@@ -672,6 +715,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.cli_name = cfg.cli_name.strip()
     cfg.source.validate()
     cfg.notify.validate()
+    cfg.identity.validate()
     owner_chat = cfg.threads.owner_chat_id
     if owner_chat and cfg.source.only_chat_ids and owner_chat not in cfg.source.only_chat_ids:
         raise ConfigError(f"[threads] owner_chat_id {owner_chat} 不在 [source] only_chat_ids 里：找主人的群拉不到，"

@@ -51,6 +51,8 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "duty_mail.md": "会话留言（sheepdog tell）后面附的话，可用 {{from_topic}} {{from_title}} {{key}}",
     "duty_digest.md": "总线批次里羊群看板摘要的标题（羊群看板有变化才附），可用 {{count}}",
     "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
+    # 区分智能体身份和本人身份（7.26）：[identity] 开着时用；缺了用代码里的一句默认话
+    "bot_dm.md": "别人私聊机器人时机器人回的那句话（请对方直接私聊主人本人；同一个人 24 小时内只回一次）",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
@@ -78,7 +80,14 @@ class Playbook:
             "watch_expire_minutes": str(w.expire_minutes),
             # 会话在终端里敲的 sheepdog 命令（cli_name，已加好 shell 引号）；playbook 里写 {{cli}}
             "cli": cfg.cli_command,
+            # 7.26：只在开着时有这个键，关着时占位符和以前完全一样
+            **({"identity_enabled": "1"} if getattr(getattr(cfg, "identity", None), "enabled", False) else {}),
         })
+
+    @property
+    def identity(self) -> bool:
+        """[identity] 开着（7.26）：接口说明里代回那一条补一句「sheepdog 自动选身份」。关着时 base_vars 里没有这个键。"""
+        return self.base_vars.get("identity_enabled") == "1"
 
     @property
     def cli(self) -> str:

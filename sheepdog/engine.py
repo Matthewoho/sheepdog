@@ -31,7 +31,8 @@ from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
 from .store import SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
-from .source.lark import parse_message as parse_thread_reply
+from .source.lark import parse_event, parse_message as parse_thread_reply
+from . import identity
 
 log = logging.getLogger("sheepdog")
 
@@ -343,6 +344,10 @@ class Collector:
         self._dynamic: dict[str, tuple[str, bool]] = {}
         # 正在冷却的聊天（7.14）：chat_id → until
         self._cooling: dict[str, datetime] = {}
+        # 机器人身份的实时接收（7.26，[identity] 开着时 sheepdog run 设）：BotEventConsumer，每轮 poll() 取事件
+        self.bot_events = None
+        # 机器人自己的 id（open_id、app_id），每批入账前按配置和 meta 现算；[identity] 关着是空集
+        self.bot_ids: frozenset[str] = frozenset()
 
     def _decide(self, m: Message, ctx: RouteContext):
         """路由 → 名册归属 → 等待归属 → 防循环。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
@@ -376,12 +381,22 @@ class Collector:
 
     def _loop_check(self, m: Message) -> None:
         """会话代回（主人身份、带代回前缀或代回卡片标记）计数：window 内超过 max_agent_replies、且窗口内最近一条非主人消息
-        来自 Agent 发送人 → 该聊天冷却，并提示总线一次。对方是真人时不熔断，只记 INFO。"""
+        来自 Agent 发送人 → 该聊天冷却，并提示总线一次。对方是真人时不熔断，只记 INFO。
+        7.26（[identity] 开着）：会话以机器人身份代回的（机器人在群里发的每一条）也算代回，「非主人消息」也不算机器人自己的。"""
         lg, me, oc = self.cfg.loop_guard, self.cfg.self_open_id, self.cfg.owner_context
+        bots = self.bot_ids
+        if bots and m.sender_id in bots:
+            if m.chat_id in self.cfg.owner_chat_ids:
+                return
+            self._loop_count(m, lg, me, oc, bots)
+            return
         if not (oc.skip_prefixes or oc.agent_markers) or m.chat_id in self.cfg.owner_chat_ids:
             return
         if not is_agent_reply(m.content, oc):
             return
+        self._loop_count(m, lg, me, oc, bots)
+
+    def _loop_count(self, m: Message, lg, me: str, oc, bots: frozenset[str]) -> None:
         until = self._cooling.get(m.chat_id)
         if until and _now() < until:
             return  # 已在冷却，不重复触发
@@ -393,12 +408,19 @@ class Collector:
                 continue
             if is_agent_reply(r["content"], oc):
                 n += 1
+        for b in sorted(bots):
+            for r in self.store.own_messages_in_chat(m.chat_id, b):  # 7.26：机器人身份的代回
+                t = _parse(r["create_time"])
+                if t is not None and t.tzinfo is not None and t >= start:
+                    n += 1
         if n <= lg.max_agent_replies:
             return
         name = m.chat_name or m.chat_id
         # 7.14 补丁：只在对方是 Agent 时熔断——窗口内最近一条非主人消息来自 Agent 发送人；真人对话只记 INFO
         latest = None
         for r in self.store.others_in_chat(m.chat_id, me):
+            if bots and r["sender_id"] in bots:
+                continue  # 7.26：机器人自己的不算「对方」
             t = _parse(r["create_time"])
             if t is not None and t.tzinfo is not None and t >= start:
                 latest = r
@@ -476,6 +498,8 @@ class Collector:
         return ids
 
     def _is_my_message(self, message_id: str) -> bool:
+        if self.bot_ids:
+            return self._is_mine_or_bots(message_id)
         me = self.cfg.self_open_id
         if not me or not message_id:
             return False
@@ -489,9 +513,28 @@ class Collector:
                 self._sender_cache[message_id] = ""
         return self._sender_cache.get(message_id) == me
 
-    def ingest(self, msgs: list[Message]) -> dict:
-        """一批消息入账：路由 → 归属 → 安全闸 → 等待 / 主人发言 / 防循环。poll_once 和 sheepdog inject 共用。"""
-        ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message)
+    def _is_mine_or_bots(self, message_id: str) -> bool:
+        """7.26：被回复的是主人发的、或机器人发的（会话以机器人身份代回的、找主人的）。"""
+        mine = {x for x in (self.cfg.self_open_id, *self.bot_ids) if x}
+        if not mine or not message_id:
+            return False
+        if self.store.sender_in(message_id, mine):
+            return True
+        if message_id not in self._sender_cache:
+            try:
+                self._sender_cache.update(self.source.senders_of([message_id]))
+            except Exception as e:
+                log.warning("查询被回复消息发送人失败: %s", e)
+                self._sender_cache[message_id] = ""
+        return self._sender_cache.get(message_id) in mine
+
+    def ingest(self, msgs: list[Message], received_by: str = "user") -> dict:
+        """一批消息入账：路由 → 归属 → 安全闸 → 等待 / 主人发言 / 防循环。poll_once 和 sheepdog inject 共用。
+        received_by（7.26）：这批是哪个身份收到的（user = 主人身份的搜索，bot = 机器人身份的实时接收）；[identity] 关着时不用。"""
+        self.bot_ids = identity.bot_ids(self.cfg, self.store)
+        enabled = self.cfg.identity.enabled
+        rb = received_by if enabled else None
+        ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message, self.bot_ids)
         self._dynamic = dynamic_owners(self.store)
         self._refresh_cooling()
         stats = {"fetched": len(msgs), "new": 0, "changed": 0, "dispatch": 0, "inbox": 0, "drop": 0, "self": 0}
@@ -504,20 +547,34 @@ class Collector:
                                  m.create_time))
         for m in msgs:
             existing = self.store.get_message(m.message_id)
+            if existing is not None and enabled and self._other_identity_copy(existing, m, received_by):
+                stats["merged"] = stats.get("merged", 0) + 1
+                continue
             if existing is None and me and m.sender_id == me:
                 self._own_message(m)
             if existing is None and m.chat_id in esc_chats:
                 d = self._escalation_message(m)
+                if rb:
+                    self.store.set_received_by(m.message_id, rb)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
+            elif existing is None and enabled and received_by == identity.BOT and self._is_bot_dm(m):
+                self.store.upsert_message(m, DROP, "bot_dm", [], None, rb)
+                self._bot_dm_reply(m)
+                stats["new"] += 1
+                stats[DROP] = stats.get(DROP, 0) + 1
             elif existing is None:
                 d, topic_id, w = self._decide(m, ctx)
-                self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id)
+                self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id, rb)
                 if d.route == DISPATCH:
                     self._close_watch(w, m.message_id, self._secure(m.message_id))
                 elif d.route == SELF and me and m.sender_id == me:
                     self._loop_check(m)
                     self._owner_context(m)
+                elif d.route == SELF and d.reason == "self_bot":
+                    # 7.26：机器人自己发的（会话以机器人身份代回的）：撤下它回应了的确认表情、算进防循环；不算主人发言
+                    self._own_message(m)
+                    self._loop_check(m)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
             else:
@@ -529,6 +586,96 @@ class Collector:
                     self.store.touch(m.message_id)
 
         return stats
+
+    # ---------- 7.26 两个身份进同一个账本 ----------
+    def _other_identity_copy(self, existing, m: Message, received_by: str) -> bool:
+        """账本里已经有这条，这一份是不是另一个身份收到的同一条。是就只合并（received_by 记成 both、补空着的字段），
+        不当成编辑重新路由，返回 True；不是返回 False（照旧按编辑 / 撤回处理）。
+        - 机器人身份收到的、账本里已经有：一律只合并（事件只报新消息，不报编辑；正文渲染也和搜索不一样）；
+        - 主人身份搜到的、账本里那份只是机器人收到的：合并，正文换成搜索的这一份（不当编辑）；这时撤回了照样按撤回处理。"""
+        prev = existing["received_by"] or identity.USER   # 开关打开以前入账的都是主人身份搜到的
+        if received_by == identity.BOT:
+            self.store.merge_identity_copy(m.message_id, m, received_by, fill_content=False)
+            return True
+        if prev != identity.BOT:
+            return False
+        self.store.merge_identity_copy(m.message_id, m, received_by, fill_content=True)
+        if m.deleted and not existing["deleted"]:
+            ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message, self.bot_ids)
+            self._handle_change(self.store.get_message(m.message_id), m, ctx)
+        return True
+
+    def _is_bot_dm(self, m: Message) -> bool:
+        """别人私聊机器人（7.26）：机器人身份收到的私聊，不是「找主人」聊天，不是主人本人、不是机器人自己发的。
+        （机器人只收得到它自己的私聊；主人和机器人的私聊是「找主人」聊天，照 7.22 走。）"""
+        me = self.cfg.self_open_id
+        return (m.chat_type == "p2p" and m.chat_id not in self.cfg.owner_chat_ids
+                and not (me and m.sender_id == me) and m.sender_id not in self.bot_ids)
+
+    def _bot_dm_reply(self, m: Message) -> None:
+        """机器人回一句固定的话（playbook/bot_dm.md），请对方直接私聊主人本人。同一个人 bot_dm_reply_hours 内只回一次；
+        别的机器人私聊过来不回（免得两个机器人来回）。失败只记日志，下一条私聊再试。"""
+        if m.sender_type in ("app", "bot") or not m.sender_id:
+            return
+        since = (_now() - timedelta(hours=self.cfg.identity.bot_dm_reply_hours)).isoformat(timespec="seconds")
+        if self.store.bot_dm_replied_since(m.sender_id, since) is not None:
+            log.info("%s 私聊机器人（%s），%g 小时内回过，不再回", m.sender_id, m.message_id, self.cfg.identity.bot_dm_reply_hours)
+            return
+        fn = getattr(self.source, "reply_to", None)
+        if fn is None:
+            return
+        text = identity.bot_dm_text(Playbook.from_config(self.cfg))
+        try:
+            res = fn(m.message_id, identity=identity.BOT, idem_key=identity.short_key("botdm", m.sender_id, m.message_id),
+                     text=text)
+        except Exception as e:
+            log.warning("回复私聊机器人的 %s 失败: %s", m.sender_id, e)
+            return
+        self.store.add_bot_dm_reply(m.sender_id, m.chat_id, m.message_id, res.get("message_id", ""))
+        log.info("%s 私聊机器人（%s），已回请他直接找主人", m.sender_id, m.message_id)
+
+    def _enrich_bot_events(self, msgs: list[Message]) -> list[Message]:
+        """机器人收到的新消息：先用主人身份 mget 取一份（和搜索同一套格式：群名、发送人名字、租户、序号都有，正文渲染一样），
+        取得到就用它，回复关系事件里有、mget 里没有的补上；取不到（主人不在的聊天、私聊机器人）用事件里的。只读。"""
+        ids = [m.message_id for m in msgs if m.message_id and self.store.get_message(m.message_id) is None]
+        if not ids:
+            return msgs
+        got: dict[str, Message] = {}
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            res, _ = self._mget(chunk)
+            if res is None and len(chunk) > 1:
+                res = []
+                for one in chunk:  # 整批失败（多半是有主人不在的聊天）：逐条再试
+                    r, _ = self._mget([one])
+                    res += r or []
+            got.update({x.message_id: x for x in res or [] if x.message_id})
+        out = []
+        for m in msgs:
+            x = got.get(m.message_id)
+            if x is None:
+                out.append(m)
+                continue
+            if not x.reply_to and m.reply_to:
+                x.reply_to = m.reply_to
+            if not x.thread_id and m.thread_id:
+                x.thread_id = m.thread_id
+            out.append(x)
+        return out
+
+    def _poll_bot_events(self) -> dict | None:
+        """取机器人身份这期间收到的事件，入账（received_by = bot）。没开 / 没起接收返回 None。"""
+        if self.bot_events is None or not self.cfg.identity.enabled:
+            return None
+        raws = self.bot_events.poll()
+        msgs = [parse_event(r, self.cfg.timezone_offset) for r in raws]
+        msgs = [m for m in msgs if m.message_id]
+        only = set(self.cfg.source.only_chat_ids)
+        if only:
+            msgs = [m for m in msgs if m.chat_id in only]
+        if not msgs:
+            return {"fetched": 0}
+        return self.ingest(self._enrich_bot_events(msgs), received_by=identity.BOT)
 
     def poll_once(self) -> dict:
         started = _now()
@@ -548,6 +695,9 @@ class Collector:
             # 真实飞书测试用（[source] only_chat_ids，7.22）：别的聊天的消息不入账本，所以也不会点表情、查已读
             msgs = [m for m in msgs if m.chat_id in only]
         stats = self.ingest(msgs)
+        bot = self._poll_bot_events()
+        if bot is not None:
+            stats["bot"] = bot
 
         self._tag_read_status()
         self._check_owner_reactions()

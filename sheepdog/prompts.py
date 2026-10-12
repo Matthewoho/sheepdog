@@ -22,6 +22,7 @@ from .store import SYSTEM_CHAT
 REASON_LABEL = {
     "p2p": "私聊",
     "at_me": "群里 @我",
+    "at_bot": "群里 @我的智能体（机器人）",
     "at_all": "群里 @所有人",
     "reply_to_me": "回复了我的消息",
     "vip_sender": "关键人发言",
@@ -150,7 +151,7 @@ def with_cli(text: str, cli: str) -> str:
 
 # ---------- sheepdog 接口说明（软件接口文档，由代码生成） ----------
 def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: int, extra: list[str] = (),
-                      cli_host: bool = False, cli: str = "sheepdog") -> str:
+                      cli_host: bool = False, cli: str = "sheepdog", identity: bool = False) -> str:
     lines = [
         "## sheepdog 接口说明",
         "### 回执",
@@ -168,7 +169,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         f"`watch_done:<id>`，否则下次回执后恢复等待、从回复时间重新计时；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
         *duty_interface(topic_id, cli_host),
-        *owner_interface(topic_id),
+        *owner_interface(topic_id, identity),
     ]
     if bus:
         lines += [
@@ -203,7 +204,11 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
     return with_cli("\n".join(lines), cli)
 
 
-def owner_interface(topic_id: str) -> list[str]:
+IDENTITY_REPLY_NOTE = ("开了身份区分（7.26）：sheepdog 按被回复的那条消息自动选身份，你不用管——群里机器人在，就以机器人（主人的智能体）"
+                       "身份发、不带代回标记；私聊和机器人不在的群，以主人身份发、带代回标记。输出里会写明用了哪个身份。")
+
+
+def owner_interface(topic_id: str, identity: bool = False) -> list[str]:
     """一事一串、发前再看一眼（7.22）的接口说明：找主人、代回、看话题。"""
     return [
         "### 找主人、代回",
@@ -217,7 +222,8 @@ def owner_interface(topic_id: str) -> list[str]:
         "以主人身份代回（卡片，右下角带代回标记；`--text` 是纯文本，末尾同样带标记）。"
         "只用来回别人：要回复的那条在「找主人」聊天（主人和机器人的私聊）里时 sheepdog 拒绝（退出码 2），"
         f"回主人用 `sheepdog report --topic {topic_id} --key <同一件事的钥匙>`。"
-        "发之前 sheepdog 会只读查一次：这个聊天里、从这条消息（和同一批里这个聊天更晚的消息）之后，主人本人有没有新发言。",
+        "发之前 sheepdog 会只读查一次：这个聊天里、从这条消息（和同一批里这个聊天更晚的消息）之后，主人本人有没有新发言。"
+        + (IDENTITY_REPLY_NOTE if identity else ""),
         "退出码：0 发出去了（或同样的内容已经发过，没再发）；1 发送失败或超时，原样重试（措辞不要改），防重编号保证只发一条；"
         "2 参数不对；3 主人已经回过，没发，他的话打印在输出里；4 发前检查失败，没发。"
         "退出码 3 时先读主人的话再决定：不用回了就不回，要改就改了再发，确实还要照样发加 `--even-if-owner-replied`；"
@@ -259,7 +265,7 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
         pb.render("bus.md", roster=roster_table(roster, dynamic), **v),
         pb.render("common.md", **v),
         overlay,
-        interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli),
+        interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity),
         "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -278,7 +284,7 @@ def standing_rules_bus(pb: Playbook, plain_title: str, roster_text: str, overlay
     v = dict(session_title=plain_title, topic_id="tp_bus")
     return _join(pb.render("security.md", **v), pb.render("bus.md", roster=roster_text, **v),
                  pb.render("common.md", **v), overlay,
-                 interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli))
+                 interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity))
 
 
 def _cli_host_rules(pb: Playbook, s: RosterSession) -> str:
@@ -295,7 +301,7 @@ def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], ex
     return _join(pb.render("security.md", **v), _onboarding_body(pb, s), pb.render("common.md", **v),
                  _cli_host_rules(pb, s),
                  interface_section(s.topic_id, bus=False, remind=remind, expire=expire, cli_host=s.is_cli_host,
-                                   cli=pb.cli))
+                                   cli=pb.cli, identity=pb.identity))
 
 
 def rules_update_message(rules: str, note: str = "") -> str:
@@ -336,7 +342,7 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
         _cli_host_rules(pb, s),
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=confirm, cli_host=s.is_cli_host,
-                          cli=pb.cli),
+                          cli=pb.cli, identity=pb.identity),
     )
 
 
@@ -364,7 +370,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
         _cli_host_rules(pb, s),
         owner_quote_section(*owner_quote) if owner_quote else "",
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host,
-                          cli=pb.cli),
+                          cli=pb.cli, identity=pb.identity),
         "" if s.predecessor_conversation_id else "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -525,7 +531,7 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     notes = notes or {}
     parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
                        pb.cli, agent_label, notes.get(r["message_id"])) for r in rows]
-    if any(r["reason"] in ("at_me", "at_all") for r in rows) and inbox:
+    if any(r["reason"] in ("at_me", "at_bot", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
         for r in inbox[:15]:

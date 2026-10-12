@@ -37,6 +37,13 @@ def _parse(ts: str) -> datetime | None:
     return d if d is None or d.tzinfo else d.astimezone()
 
 
+def _alias(reason: str, listed: list[str]) -> str:
+    """7.26：@机器人（at_bot）和 @主人（at_me）同等对待——配置里没单独写 at_bot 时按 at_me 算。"""
+    if reason == "at_bot" and reason not in listed:
+        return "at_me"
+    return reason
+
+
 class Acker:
     def __init__(self, cfg: AckConfig, store: Store, im, dry_run: bool = False):
         self.cfg = cfg
@@ -84,9 +91,9 @@ class Acker:
             return None  # 主人本人的发言只是背景，不点（7.13）
         if "owner_verified" in json.loads(r["tags_json"] or "[]"):
             reason = "owner_reply"
-        if reason in self.cfg.bot_reasons:
+        if _alias(reason, self.cfg.bot_reasons) in self.cfg.bot_reasons:
             return "bot"
-        if reason in self.cfg.reasons:
+        if _alias(reason, self.cfg.reasons) in self.cfg.reasons:
             return "user"
         return None
 
@@ -97,7 +104,7 @@ class Acker:
         out = []
         mentioned = {x.id for x in m.mentions if x.id}
         for a in self.store.removable_acks(m.chat_id):
-            if a["reason"] not in self.cfg.remove_on_reply_reasons:
+            if _alias(a["reason"] or "", self.cfg.remove_on_reply_reasons) not in self.cfg.remove_on_reply_reasons:
                 continue
             if a["chat_type"] == "p2p":
                 # 私聊：只撤点表情时间早于这条消息的
@@ -110,6 +117,7 @@ class Acker:
         return out
 
     def on_own_message(self, m: Message) -> None:
+        """入账一条主人自己发的消息（7.26 起也包括机器人自己发的，即会话以机器人身份代回的）时调。"""
         if not self.enabled:
             return
         for a in self.candidates(m):
