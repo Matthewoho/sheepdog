@@ -1674,7 +1674,7 @@ def main(argv: list[str] | None = None) -> int:
         g = sp.add_mutually_exclusive_group(required=True)
         g.add_argument("--text", help="正文")
         g.add_argument("--file", help="正文文件；- 表示标准输入")
-        sp.add_argument("--key", default="", help="钥匙（和在岗表的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
+        sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
         sp.add_argument("--batch", default="",
                         help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
         sp.set_defaults(func=cmd_ask)
