@@ -105,7 +105,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         raise OutboundError(EXIT_INVALID, "--title 不能为空：一句话说是什么事")
     if not (body or "").strip():
         raise OutboundError(EXIT_INVALID, "正文为空")
-    if not cfg.self_open_id:
+    if not cfg.self_open_id and not cfg.threads.owner_chat_id:
         raise OutboundError(EXIT_INVALID, "配置里没有 self_open_id，不知道主人是谁")
     key = _one_line(key)
     nk = duty.norm_key(key) if key else ""
@@ -118,6 +118,9 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     try:
         if root is not None:
             res = source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=text, in_thread=True)
+        elif cfg.threads.owner_chat_id:
+            # 真实飞书测试用：发进测试群，不私聊主人
+            res = source.send_to_chat(cfg.threads.owner_chat_id, text, ik, "bot")
         else:
             res = source.send_to_user(cfg.self_open_id, text, ik, "bot")
     except LarkTimeout as e:

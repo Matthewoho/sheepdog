@@ -74,6 +74,8 @@ class FakeLark:
         self.n = 0
         # 搜索结果带不带 message_position（消息在这个聊天里的序号，按发送先后，同一分钟里也分先后）
         self.positions = positions
+        # 聊天 → 类型（没写的是 p2p）：机器人往群里发的消息按这里定类型
+        self.chat_types: dict[str, str] = {}
 
     # ---------- 造数据 ----------
     def add(self, *, chat_id: str, sender_id: str, content: str, at: datetime | None = None, sender_type: str = "user",
@@ -173,7 +175,8 @@ class FakeLark:
         ident = _opt(args, "--as")
         chat = ESC_CHAT if _opt(args, "--user-id") and ident == "bot" else _opt(args, "--chat-id")
         mid = self.add(chat_id=chat, sender_id=BOT if ident == "bot" else ME,
-                       sender_type="app" if ident == "bot" else "user", content=self._content(args))
+                       sender_type="app" if ident == "bot" else "user", content=self._content(args),
+                       chat_type=self.chat_types.get(chat, "p2p"))
         if key:
             self.idem[key] = mid
         return self._created(mid)
@@ -980,3 +983,122 @@ class RulesAndDocsTest(ThreadsBase):
                                  encoding="utf-8")
         with self.assertRaises(ConfigError):
             load_config(self.cfg_file)
+
+
+# ======================= 第三轮：真实飞书测试用的两个开关 =======================
+TEST_GROUP = "oc_test_owner_group"
+
+
+class TestSwitchesTest(ThreadsBase):
+    def use_switches(self, only: list[str] | None = None, owner_chat: str = "") -> None:
+        """同时改测试里直接用的配置和 CLI 读的 config.toml。"""
+        self.cfg.source.only_chat_ids = list(only or [])
+        self.cfg.threads.owner_chat_id = owner_chat
+        extra = ""
+        if only is not None:
+            extra += "[source]\nonly_chat_ids = [" + ", ".join(f'"{c}"' for c in only) + "]\n"
+        if owner_chat:
+            extra += f'[threads]\nowner_chat_id = "{owner_chat}"\n'
+        self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + extra, encoding="utf-8")
+
+    def chats_in_ledger(self) -> set[str]:
+        return {r[0] for r in self.store.conn.execute("SELECT DISTINCT chat_id FROM messages")}
+
+    def test_only_chat_ids_keeps_other_chats_out_of_the_ledger(self):
+        self.lark.chat_types[TEST_GROUP] = "group"
+        self.use_switches(only=[TEST_GROUP])
+        before = self.chats_in_ledger()
+        kept = self.lark.add(chat_id=TEST_GROUP, chat_type="group", sender_id=ALICE, content="测试群里的话")
+        others = [self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="正式私聊里的话"),
+                  self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="主人在机器人私聊里说的"),
+                  self.lark.add(chat_id="oc_test_some_group", chat_type="group", sender_id=ALICE, content="别的群")]
+        self.poll()
+        self.d.dispatch_once()
+        self.assertIsNotNone(self.row(kept))
+        for mid in others:
+            self.assertIsNone(self.row(mid))                       # 不入账本（不是入账本再丢）
+        self.assertEqual(self.chats_in_ledger() - before - {"sheepdog"}, {TEST_GROUP})
+        read_ids = {i for c in self.lark.calls if c[1] == "+messages-read-status"
+                    for i in _opt(c, "--message-ids").split(",")}
+        self.assertFalse(read_ids & set(others))                    # 不查已读
+        self.assertNotIn("reactions", self.lark.subcommands())     # 不点表情
+
+    def test_without_only_chat_ids_everything_is_ingested(self):
+        mids = [self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="正式私聊里的话"),
+                self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="主人在机器人私聊里说的")]
+        self.poll()
+        for mid in mids:
+            self.assertIsNotNone(self.row(mid))
+
+    def test_owner_chat_id_sends_to_group_and_thread_reply_goes_back(self):
+        self.lark.chat_types[TEST_GROUP] = "group"
+        self.use_switches(only=[TEST_GROUP], owner_chat=TEST_GROUP)
+        rc, out, _ = self.ask("--key", "T1", text="测试群里问的")
+        self.assertEqual(rc, 0, out)
+        rc, out, _ = self.ask("--key", "T1", kind="report", title="进度", text="话题里汇报")
+        self.assertEqual(rc, 0, out)
+        send, reply = self.lark.sent()
+        self.assertEqual((send[1], _opt(send, "--chat-id"), _opt(send, "--as")), ("+messages-send", TEST_GROUP, "bot"))
+        self.assertNotIn("--user-id", send)                         # 不再私聊主人
+        root = self.store.thread_by_key("tp_alpha", "T1")["root_message_id"]
+        self.assertEqual(self.lark.msgs[root]["chat_id"], TEST_GROUP)
+        self.assertEqual((reply[1], _opt(reply, "--message-id")), ("+messages-reply", root))
+        self.assertIn("--reply-in-thread", reply)
+        self.poll()
+        self.assertIsNotNone(self.store.get_escalation(root))       # 测试群当成找主人聊天：登记「需要你定」
+        mid = self.lark.add(chat_id=TEST_GROUP, sender_id=ME, content="测试群里回：可以", thread_root=root)
+        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "1")   # 开头 -1，机器人的汇报 0，主人这条 1
+        self.poll()
+        r = self.row(mid)
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", "tp_alpha"))
+        text = self.deliver()
+        self.assertIn("🧵 主人在话题里回复", text)
+        self.assertIn("测试群里问的", text)
+        self.assertEqual(self.store.get_escalation(root)["close_reason"], "answered")
+
+    def test_owner_chat_plain_message_and_agent_reply(self):
+        self.lark.chat_types[TEST_GROUP] = "group"
+        self.use_switches(owner_chat=TEST_GROUP)
+        self.ask(text="一个问题")
+        self.poll()
+        # 主人在群里直接说（没引用、没话题）：按 owner_reply 走（唯一未结在 tp_alpha）
+        plain = self.lark.add(chat_id=TEST_GROUP, chat_type="group", sender_id=ME, content="好的")
+        # 会话以主人身份在群里代回的：不算主人发言
+        agent = self.lark.add(chat_id=TEST_GROUP, chat_type="group", sender_id=ME,
+                              content=f"<card>\n代回的话\n{MARK}\n</card>")
+        self.poll()
+        self.assertEqual((self.row(plain)["reason"], self.row(plain)["topic_id"]), ("owner_reply", "tp_alpha"))
+        self.assertEqual((self.row(agent)["route"], self.row(agent)["reason"]), ("drop", "escalation_agent_reply"))
+        self.assertNotIn("代回的话", self.deliver())
+
+    def test_without_owner_chat_id_ask_still_dms_owner(self):
+        self.ask("--key", "T2")
+        send = self.lark.sent()[0]
+        self.assertEqual((_opt(send, "--user-id"), _opt(send, "--chat-id")), (ME, ""))
+        self.assertEqual(self.cfg.owner_chat_ids, [ESC_CHAT])
+
+    def test_config_validation_and_doctor(self):
+        from sheepdog.cli import switches_report
+        from sheepdog.config import ConfigError, load_config
+        base = self.cfg_file.read_text(encoding="utf-8")
+        cases = [
+            (f'[source]\nonly_chat_ids = ["oc_test_a"]\n[threads]\nowner_chat_id = "{TEST_GROUP}"\n', "不在"),
+            ('[source]\nonly_chat_ids = ["ou_test_x"]\n', "only_chat_ids"),
+            ('[threads]\nowner_chat_id = "ou_test_x"\n', "owner_chat_id"),
+        ]
+        for extra, frag in cases:
+            self.cfg_file.write_text(base + extra, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, frag):
+                load_config(self.cfg_file)
+        no_regex = base.replace(f'chat_ids = ["{ESC_CHAT}"]\n', "").replace("header_regex", "unused_regex")
+        self.cfg_file.write_text(no_regex + f'[threads]\nowner_chat_id = "{TEST_GROUP}"\n', encoding="utf-8")
+        with self.assertRaisesRegex(ConfigError, "owner_chat_id 已配置但 \\[escalation\\] header_regex 为空"):
+            load_config(self.cfg_file)
+        self.cfg_file.write_text(base + f'[source]\nonly_chat_ids = ["{TEST_GROUP}"]\n'
+                                 f'[threads]\nowner_chat_id = "{TEST_GROUP}"\n', encoding="utf-8")
+        cfg = load_config(self.cfg_file)
+        self.assertEqual(cfg.owner_chat_ids, [ESC_CHAT, TEST_GROUP])
+        lines = switches_report(cfg)
+        self.assertTrue(any(x.startswith("⚠ 只拉这些聊天：" + TEST_GROUP) for x in lines))
+        self.assertTrue(any(x.startswith("⚠ 找主人改发到群 " + TEST_GROUP) for x in lines))
+        self.assertEqual(switches_report(self.cfg), [])

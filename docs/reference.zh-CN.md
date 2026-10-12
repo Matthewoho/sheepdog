@@ -322,6 +322,24 @@ sheepdog reply --topic tp_x --to om_x --text "收到"                           
 - 防重编号用「批次号 + 被回复的消息号 + 正文指纹」（账本里拿不到批次号时用会话 + 消息号 + 正文指纹）：内容一样才算重复。同一条先回「ok，稍等」、处理完再回结论，两条都发；同样的内容重试只发一条。代价：发送超时以后改了措辞再重试，可能多发一条。发出的记进 `sends` 和 `bot_outbox`。
 - 测试环境（`[source] enabled = false`）：ask、report、reply 不发飞书，设了 `[notify] file` 就写进那个文件（不写账本），没设就拒绝。
 
+### 真实飞书测试
+
+一事一串要在真实飞书上看效果（话题回复的提醒、显示），又不能动你的机器人私聊（正式的牧羊犬也在读它）。测试时另起一个只打印投递的牧羊犬（`sink = "dryrun"`，用自己的配置和状态目录），配上两个**只给测试用**的开关，让它只碰一个测试群：
+
+```toml
+[source]
+only_chat_ids = ["oc_测试群"]     # 只拉这个群：别的聊天的消息不入账本，也不点表情、不查已读
+
+[threads]
+owner_chat_id = "oc_测试群"       # ask / report 发进这个群（+messages-send --chat-id），不再私聊你
+```
+
+- `only_chat_ids`：拉到的消息只保留这些聊天的；其他聊天的消息直接扔掉、**不入账本**（不是入账本再丢），所以也不会点表情、查已读。没设时行为不变。
+- `owner_chat_id`：ask / report 发进这个群，往话题里回照旧用 `+messages-reply --reply-in-thread`；这个群同时当成「找主人」聊天（等同于加进 `[escalation] chat_ids`），你在群里的回复、话题回复都按 owner_reply 送回会话。「你」仍按 `self_open_id` 认；机器人发的、带代回标记的会话代回，都不算你的发言。没设时照旧私聊 `self_open_id`。
+- 校验：设了 `only_chat_ids`，`owner_chat_id` 就必须在里面；设了 `owner_chat_id`，`[escalation] header_regex` 不能为空。不满足就报配置错误。
+- `sheepdog doctor` 设了就提示「⚠ 只拉这些聊天：…（测试用）」「⚠ 找主人改发到群 …（测试用）」。
+- **正式环境不要设这两个开关。**
+
 ## 主人本人的发言作为背景
 
 主人自己发的消息原本只入账（供「回复我」判定和撤确认表情）。开启 `[owner_context]` 后，它们会作为背景送给负责的会话，避免各说各的：

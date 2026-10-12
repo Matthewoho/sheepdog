@@ -221,6 +221,11 @@ class LarkCliSource:
         return self._sent(self._run_once(["im", "+messages-send", "--user-id", user_id, "--text", text,
                                           "--idempotency-key", idem_key], identity))
 
+    def send_to_chat(self, chat_id: str, text: str, idem_key: str, identity: str = "bot") -> dict:
+        """发进一个群（[threads] owner_chat_id，真实飞书测试用）。返回 {message_id, chat_id, thread_id}。"""
+        return self._sent(self._run_once(["im", "+messages-send", "--chat-id", chat_id, "--text", text,
+                                          "--idempotency-key", idem_key], identity))
+
     def reply_to(self, message_id: str, *, identity: str, idem_key: str, text: str = "", card: dict | None = None,
                  in_thread: bool = False) -> dict:
         """回复一条消息：in_thread = 回到它的话题里（不出现在主聊天）；card = 卡片（interactive），否则纯文本。"""

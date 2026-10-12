@@ -358,7 +358,7 @@ class Collector:
         """会话代回（主人身份、带代回前缀或代回卡片标记）计数：window 内超过 max_agent_replies、且窗口内最近一条非主人消息
         来自 Agent 发送人 → 该聊天冷却，并提示总线一次。对方是真人时不熔断，只记 INFO。"""
         lg, me, oc = self.cfg.loop_guard, self.cfg.self_open_id, self.cfg.owner_context
-        if not (oc.skip_prefixes or oc.agent_markers) or m.chat_id in self.cfg.escalation.chat_ids:
+        if not (oc.skip_prefixes or oc.agent_markers) or m.chat_id in self.cfg.owner_chat_ids:
             return
         if not is_agent_reply(m.content, oc):
             return
@@ -478,7 +478,7 @@ class Collector:
 
         # 先入账「找主人」聊天里机器人的提问（同批次里主人的回复才找得到它），再入账自己发的消息
         # （保证同批次里「回复我」能判定），最后其他
-        esc_chats = set(self.cfg.escalation.chat_ids)
+        esc_chats = set(self.cfg.owner_chat_ids)
         me = self.cfg.self_open_id
         msgs.sort(key=lambda m: (0 if m.chat_id in esc_chats and m.sender_id != me else 1 if m.sender_id == me else 2,
                                  m.create_time))
@@ -523,6 +523,10 @@ class Collector:
         # 固定窗口 [start, started]：翻页期间新来的消息留给下一轮，水位线只推进到 started（7.16）
         msgs = self.source.fetch_since(start.isoformat(timespec="seconds"), started.isoformat(timespec="seconds"))
         partial = bool(getattr(self.source, "last_fetch_partial", False))
+        only = set(self.cfg.source.only_chat_ids)
+        if only:
+            # 真实飞书测试用（[source] only_chat_ids，7.22）：别的聊天的消息不入账本，所以也不会点表情、查已读
+            msgs = [m for m in msgs if m.chat_id in only]
         stats = self.ingest(msgs)
 
         self._tag_read_status()
@@ -564,7 +568,7 @@ class Collector:
         oc = self.cfg.owner_context
         if not oc.enabled:
             return False
-        if m.chat_id in self.cfg.escalation.chat_ids or m.chat_id in self.cfg.routing.ignore_chat_ids:
+        if m.chat_id in self.cfg.owner_chat_ids or m.chat_id in self.cfg.routing.ignore_chat_ids:
             return False
         # 会话以主人身份代回的（带代回前缀）不送
         return not is_agent_reply(m.content, oc)
@@ -677,6 +681,11 @@ class Collector:
         esc = self.cfg.escalation
         me = self.cfg.self_open_id
         if me and m.sender_id == me:
+            if m.chat_id == self.cfg.threads.owner_chat_id and is_agent_reply(m.content, self.cfg.owner_context):
+                # 测试用的找主人群（[threads] owner_chat_id）：会话以主人身份代回的，不算主人发言
+                d = RouteDecision(DROP, "escalation_agent_reply")
+                self.store.upsert_message(m, d.route, d.reason, [])
+                return d
             return self._owner_reply(m)
         if m.sender_type in ("app", "bot"):
             self._learn_thread(m)
@@ -986,13 +995,13 @@ class Collector:
         if not content_changed and not recalled:
             return False
         me = self.cfg.self_open_id
-        if me and m.sender_id == me and m.chat_id not in self.cfg.escalation.chat_ids:
+        if me and m.sender_id == me and m.chat_id not in self.cfg.owner_chat_ids:
             # 主人编辑 / 撤回自己的发言：只更新账本，按 7.13 的去向送一条背景（7.13 补充）
             self.store.update_content(m.message_id, m)
             self._owner_edit(old, m, recalled)
             return True
         old_route, old_state = old["route"], old["dispatch_state"]
-        if m.chat_id in self.cfg.escalation.chat_ids and old_route != DISPATCH:
+        if m.chat_id in self.cfg.owner_chat_ids and old_route != DISPATCH:
             # 「找主人」聊天里没投递过的消息（提问 / 其他）编辑后只更新内容，不重新路由
             self.store.update_content(m.message_id, m)
             return True

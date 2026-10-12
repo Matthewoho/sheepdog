@@ -84,6 +84,8 @@ complex_min_replies = 3
 recent_replies = 5
 root_chars = 300
 reply_chars = 120
+# 只给真实飞书测试用，正式环境不要设：ask / report 发进这个群、这个群当成找主人聊天（要在 [source] only_chat_ids 里）
+# owner_chat_id = "oc_xxx"
 
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
@@ -179,6 +181,8 @@ expire_minutes = 60
 [source]
 # false = 不拉 IM（测试环境用）：这时可以用 sheepdog inject 往账本里放一条合成消息；改了要重启
 enabled = true
+# 只给真实飞书测试用，正式环境不要设：只拉这些聊天，别的聊天的消息不入账本（见参考手册「真实飞书测试」）
+# only_chat_ids = ["oc_xxx"]
 
 [notify]
 # 给你的通知（羊群看板判会话中断 / 失联、会话卡在 attention 和自动恢复、危险命令报警、写锁提醒、登录失效）发到哪。

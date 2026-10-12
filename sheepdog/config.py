@@ -192,8 +192,13 @@ class ThreadsConfig:
     # 开头那条、最近几条各截到多少个字
     root_chars: int = 300
     reply_chars: int = 120
+    # 只给真实飞书测试用，正式环境不要设：ask / report 发进这个群（+messages-send --chat-id），不再私聊主人；
+    # 这个群同时当成「找主人」聊天（等同于加进 [escalation] chat_ids）。空 = 照旧私聊 self_open_id
+    owner_chat_id: str = ""
 
     def validate(self) -> None:
+        if not isinstance(self.owner_chat_id, str) or (self.owner_chat_id and not self.owner_chat_id.startswith("oc_")):
+            raise ConfigError("[threads] owner_chat_id 必须是 oc_ 开头的群 ID（测试用，正式环境不要设）")
         for k in ("ask_header", "report_header"):
             v = getattr(self, k)
             if not isinstance(v, str) or "{title}" not in v or "{topic}" not in v:
@@ -484,10 +489,16 @@ class NotifyConfig:
 class SourceConfig:
     # false = 不拉飞书（测试环境用，7.18）：这时可以用 sheepdog inject 往账本里放合成消息
     enabled: bool = True
+    # 只给真实飞书测试用，正式环境不要设（7.22）：拉到的消息只保留这些聊天的，其他聊天的消息不入账本、不点表情、
+    # 不查已读。空 = 全部
+    only_chat_ids: list[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ConfigError("[source] enabled 必须是 true/false")
+        v = self.only_chat_ids
+        if not isinstance(v, list) or not all(isinstance(x, str) and x.startswith("oc_") for x in v):
+            raise ConfigError("[source] only_chat_ids 必须是 oc_ 开头的聊天 ID 列表（测试用，正式环境不要设）")
 
 
 @dataclass
@@ -550,6 +561,14 @@ class Config:
     def cli_command(self) -> str:
         """cli_name 按 shell 规则加好引号（路径带空格时用引号括起来），直接拼进给会话看的命令里。"""
         return shlex.quote(self.cli_name)
+
+    @property
+    def owner_chat_ids(self) -> list[str]:
+        """「找主人」聊天：[escalation] chat_ids，加上 [threads] owner_chat_id（测试用的群，7.22）。"""
+        out = list(self.escalation.chat_ids)
+        if self.threads.owner_chat_id and self.threads.owner_chat_id not in out:
+            out.append(self.threads.owner_chat_id)
+        return out
 
     def host_enabled(self, host: str) -> bool:
         return host == ANTIGRAVITY or (host in self.hosts and self.hosts[host].enabled)
@@ -653,6 +672,12 @@ def load_config(path: Path | None = None) -> Config:
     cfg.cli_name = cfg.cli_name.strip()
     cfg.source.validate()
     cfg.notify.validate()
+    owner_chat = cfg.threads.owner_chat_id
+    if owner_chat and cfg.source.only_chat_ids and owner_chat not in cfg.source.only_chat_ids:
+        raise ConfigError(f"[threads] owner_chat_id {owner_chat} 不在 [source] only_chat_ids 里：找主人的群拉不到，"
+                          "主人的回复送不回会话")
+    if owner_chat and not cfg.escalation.header_regex:
+        raise ConfigError("[threads] owner_chat_id 已配置但 [escalation] header_regex 为空：ask 发的「需要你定」将无法识别")
     for h in cfg.hosts.values():
         h.validate()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)

@@ -271,6 +271,8 @@ def cmd_doctor(args) -> int:
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     esc = cfg.escalation
     print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
+    for line in switches_report(cfg):
+        print(line)
     for line in threads_report(cfg):
         print(line)
     # playbook 缺文件只告警不判失败：缺的那一段在 prompt 里为空
@@ -288,6 +290,16 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 1
 
 
+def switches_report(cfg) -> list[str]:
+    """doctor：真实飞书测试用的两个开关（7.22），设了就提示，正式环境不要设。"""
+    out = []
+    if cfg.source.only_chat_ids:
+        out.append(f"⚠ 只拉这些聊天：{', '.join(cfg.source.only_chat_ids)}（测试用，[source] only_chat_ids；正式环境不要设）")
+    if cfg.threads.owner_chat_id:
+        out.append(f"⚠ 找主人改发到群 {cfg.threads.owner_chat_id}（测试用，[threads] owner_chat_id；正式环境不要设）")
+    return out
+
+
 def threads_report(cfg) -> list[str]:
     """doctor：一事一串（7.22）。ask / report 加的开头一行要能被 [escalation] 的正则认出来，否则「需要你定」登记不上、
     主人的回复送不回去。"""
@@ -296,7 +308,7 @@ def threads_report(cfg) -> list[str]:
     sample = "tp_doctor_check"
     ask = tc.header("ask", "示例", sample)
     report = tc.header("report", "示例", sample)
-    if esc.chat_ids:
+    if cfg.owner_chat_ids:
         rx = esc.pattern
         hit = rx.search(ask) if rx is not None else None
         out.append(f"  ask 开头一行「{ask}」" + ("✓ 能被 header_regex 认出来" if hit and hit.group("topic") == sample
