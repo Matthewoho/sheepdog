@@ -269,8 +269,7 @@ def cmd_doctor(args) -> int:
           f"{lg.window_minutes:g} 分钟内代回超过 {lg.max_agent_replies} 次冷却 {lg.cooldown_minutes:g} 分钟"
           + ("" if cfg.owner_context.skip_prefixes or cfg.owner_context.agent_markers
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
-    esc = cfg.escalation
-    print(f"找主人聊天: {'✓ ' + str(len(esc.chat_ids)) + ' 个，未结保留 ' + format(esc.open_hours, 'g') + ' 小时' if esc.chat_ids else '（未配置：主人在 IM 上的回复不会送回会话）'}")
+    print(owner_chats_report(cfg))
     for line in switches_report(cfg):
         print(line)
     for line in threads_report(cfg):
@@ -288,6 +287,15 @@ def cmd_doctor(args) -> int:
         print(line)
     print(duty_report(cfg, store))
     return 0 if ok else 1
+
+
+def owner_chats_report(cfg) -> str:
+    """doctor：「找主人」聊天按 Config.owner_chat_ids 算（[escalation] chat_ids 加测试用的 [threads] owner_chat_id）。"""
+    chats, esc = cfg.owner_chat_ids, cfg.escalation
+    if not chats:
+        return "找主人聊天: （未配置：主人在 IM 上的回复不会送回会话）"
+    extra = "，含测试群 [threads] owner_chat_id" if cfg.threads.owner_chat_id else ""
+    return f"找主人聊天: ✓ {len(chats)} 个{extra}，未结保留 {esc.open_hours:g} 小时"
 
 
 def switches_report(cfg) -> list[str]:

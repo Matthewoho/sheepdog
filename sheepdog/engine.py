@@ -144,6 +144,26 @@ def is_thread_root(m: Message) -> bool:
     return bool(pos) and pos == root_position(m.chat_type)
 
 
+def _seq(value) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def order_thread_items(items: list[dict], last_id: str = "") -> list[dict]:
+    """话题里的消息排顺序：开头那条放最前；回复都有话题里的序号（tpos，thread_position）就按它排，否则都有聊天里的
+    序号（mpos，message_position）就按它排；都没有才按时间排（飞书时间只到分钟，同一分钟里分不清先后，10-13 实测
+    排反过）。last_id：按时间排时同一分钟里放最后的那条（主人刚回的这一条）。"""
+    roots = [x for x in items if x["root"]]
+    rest = [x for x in items if not x["root"]]
+    for k in ("tpos", "mpos"):
+        if rest and all(x.get(k) is not None for x in rest):
+            return roots + sorted(rest, key=lambda x: (x[k], x["message_id"]))
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    return roots + sorted(rest, key=lambda x: (_parse(x["at"]) or floor, x["message_id"] == last_id, x["message_id"]))
+
+
 def first_line(content: str) -> str:
     bodies = message_bodies(content)
     text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
@@ -937,27 +957,33 @@ class Collector:
         me = self.cfg.self_open_id
         out: dict[str, dict] = {}
 
-        def add(mid: str, at: str, who: str, text: str) -> None:
-            if mid and mid not in out:
-                out[mid] = {"message_id": mid, "at": at or "", "who": who, "text": text or "", "root": mid == root}
+        def add(mid: str, at: str, who: str, text: str, tpos=None, mpos=None) -> None:
+            if not mid:
+                return
+            if mid not in out:
+                out[mid] = {"message_id": mid, "at": at or "", "who": who, "text": text or "", "root": mid == root,
+                            "tpos": _seq(tpos), "mpos": _seq(mpos)}
+                return
+            for k, v in (("tpos", tpos), ("mpos", mpos)):   # 同一条从别处拿到了序号就补上
+                if out[mid][k] is None:
+                    out[mid][k] = _seq(v)
 
         def who_of(sender_id: str, sender_type: str) -> str:
             return "主人" if me and sender_id == me else "机器人" if sender_type in ("app", "bot") else "-"
 
         for r in self.store.thread_messages_in_ledger(thr["thread_id"] or m.thread_id, root):
-            add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), r["content"])
+            add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), r["content"],
+                r["thread_position"], r["message_position"])
         for x in extra:
-            add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), x.content)
+            add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), x.content, x.thread_position,
+                x.message_position)
         for s in self.store.sends_in_thread(root):
             add(s["message_id"], s["sent_at"], "机器人", s["text"])
-        add(m.message_id, m.create_time, "主人", m.content)
+        add(m.message_id, m.create_time, "主人", m.content, m.thread_position, m.message_position)
         if root not in out:
             o = self.store.get_bot_outbox(root)
             add(root, o["sent_at"] if o is not None else "", "机器人", o["text"] if o is not None else "")
-        rows = list(out.values())
-        rows.sort(key=lambda x: (not x["root"], _parse(x["at"]) or datetime.min.replace(tzinfo=timezone.utc),
-                                 x["message_id"] == m.message_id))
-        return rows
+        return order_thread_items(list(out.values()), m.message_id)
 
     def _thread_note(self, thr, m: Message, members: list[dict], live: list) -> str:
         """渐进式披露（参照 cc-connect 的 Linear 评论回复）：一般情况只附这件事开头那条；话题里除了开头那条已有

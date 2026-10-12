@@ -22,7 +22,7 @@ from . import duty
 from . import session as sm
 from .card import build_reply_card
 from .config import Config
-from .engine import BUS_TOPIC_ID, MANAGED_KINDS, display_time, is_agent_reply, root_position
+from .engine import BUS_TOPIC_ID, MANAGED_KINDS, display_time, is_agent_reply, order_thread_items, root_position
 from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
@@ -366,15 +366,23 @@ def view_thread(cfg: Config, store: Store, source, topic_id: str, key: str = "",
     def who(sender_id: str, sender_type: str) -> str:
         return "主人" if me and sender_id == me else "机器人" if sender_type in ("app", "bot") else (sender_id or "-")
 
-    def add(mid: str, at: str, w: str, text: str, src: str) -> None:
-        if mid and mid not in items:
-            items[mid] = {"message_id": mid, "at": at or "", "who": w, "text": text or "", "source": src, "root": False}
+    def add(mid: str, at: str, w: str, text: str, src: str, tpos=None, mpos=None) -> None:
+        if not mid:
+            return
+        if mid not in items:
+            items[mid] = {"message_id": mid, "at": at or "", "who": w, "text": text or "", "source": src, "root": False,
+                          "tpos": _position(tpos), "mpos": _position(mpos)}
+            return
+        for k, v in (("tpos", tpos), ("mpos", mpos)):   # 同一条从别处（话题列表）拿到了序号就补上
+            if items[mid][k] is None:
+                items[mid][k] = _position(v)
 
     rows = store.thread_messages_in_ledger(thread_id, root)
     if not root:  # 只给了话题编号：账本里序号是开头序号的那条就是开头
         root = next((r["message_id"] for r in rows if (r["thread_position"] or "") == root_position(r["chat_type"])), "")
     for r in rows:
-        add(r["message_id"], r["create_time"], who(r["sender_id"], r["sender_type"]), r["content"], "账本")
+        add(r["message_id"], r["create_time"], who(r["sender_id"], r["sender_type"]), r["content"], "账本",
+            r["thread_position"], r["message_position"])
     for s in store.sends_in_thread(root) if root else []:
         add(s["message_id"], s["sent_at"], "机器人", s["text"], "sheepdog 发出")
     warnings: list[str] = []
@@ -383,7 +391,8 @@ def view_thread(cfg: Config, store: Store, source, topic_id: str, key: str = "",
         try:
             for m in (fn([root]) if fn is not None else []):
                 if m.message_id == root:
-                    add(m.message_id, m.create_time, who(m.sender_id, m.sender_type), m.content, "飞书")
+                    add(m.message_id, m.create_time, who(m.sender_id, m.sender_type), m.content, "飞书",
+                        m.thread_position, m.message_position)
                     thread_id = thread_id or m.thread_id
         except SourceError as e:
             warnings.append(f"取开头那条失败：{e}")
@@ -391,7 +400,8 @@ def view_thread(cfg: Config, store: Store, source, topic_id: str, key: str = "",
     if fetch and fn is not None and (root or thread_id):
         try:
             for m in fn(root or thread_id, "asc"):
-                add(m.message_id, m.create_time, who(m.sender_id, m.sender_type), m.content, "飞书")
+                add(m.message_id, m.create_time, who(m.sender_id, m.sender_type), m.content, "飞书",
+                    m.thread_position, m.message_position)
         except SourceError as e:
             warnings.append(f"查飞书话题列表失败，只列出账本里有的：{e}")
     elif fetch and fn is None:
@@ -400,9 +410,8 @@ def view_thread(cfg: Config, store: Store, source, topic_id: str, key: str = "",
         items[root]["root"] = True
     elif root:
         warnings.append(f"开头那条（{root}）取不到")
-    rows_out = sorted(items.values(), key=lambda x: (not x["root"], _parse(x["at"]) is None,
-                                                     _parse(x["at"]) or datetime.min, x["message_id"]))
-    return ThreadView(thr, thread_id, root, rows_out, "；".join(warnings))
+    # 回复按话题里的序号排（没有再按聊天里的序号），都没有序号才按时间：同一分钟里按时间会排反
+    return ThreadView(thr, thread_id, root, order_thread_items(list(items.values())), "；".join(warnings))
 
 
 def render_thread(cfg: Config, v: ThreadView) -> str:

@@ -1102,3 +1102,57 @@ class TestSwitchesTest(ThreadsBase):
         self.assertTrue(any(x.startswith("⚠ 只拉这些聊天：" + TEST_GROUP) for x in lines))
         self.assertTrue(any(x.startswith("⚠ 找主人改发到群 " + TEST_GROUP) for x in lines))
         self.assertEqual(switches_report(self.cfg), [])
+
+
+# ======================= 第四轮：thread 排序、doctor 的找主人聊天 =======================
+class OrderAndDoctorTest(ThreadsBase):
+    def test_thread_command_orders_same_minute_by_position(self):
+        # 10-13 实测：同一分钟里机器人的「第二次进度」（话题里第 2 条）和主人的「B」（第 3 条），按时间排反了
+        m0 = now8()
+        self.ask("--key", "K40", text="开头")
+        root = self.store.thread_by_key("tp_alpha", "K40")["root_message_id"]
+        self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="A", thread_root=root, at=m0)
+        self.ask("--key", "K40", kind="report", title="进度", text="第二次进度")
+        b = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="B", thread_root=root, at=m0)
+        progress = self.store.conn.execute("SELECT message_id FROM sends WHERE kind='report'").fetchone()[0]
+        # sheepdog 发出的记录时间带秒（同一分钟的 50 秒），话题列表里的时间只到分钟：按时间排「B」会跑到前面
+        self.store.conn.execute("UPDATE sends SET sent_at=? WHERE message_id=?",
+                                ((m0 + timedelta(seconds=50)).isoformat(), progress))
+        self.store.conn.commit()
+        self.assertEqual(self.lark.raw(progress)["thread_message_position"], "1")
+        self.assertEqual(self.lark.raw(b)["thread_message_position"], "2")
+        rc, out, _ = self.cli("thread", "--topic", "tp_alpha", "--key", "K40")
+        self.assertEqual(rc, 0, out)
+        order = [out.index(x) for x in ("【开头】", "：\n  A", "第二次进度", "：\n  B")]
+        self.assertEqual(order, sorted(order), out)
+
+    def test_order_thread_items_rules(self):
+        from sheepdog.engine import order_thread_items
+        t = "2026-01-01T10:00:{:02d}+08:00"
+        root = {"message_id": "om_r", "root": True, "at": t.format(30), "tpos": -1, "mpos": 1}
+        a = {"message_id": "om_a", "root": False, "at": t.format(50), "tpos": 0, "mpos": 2}
+        b = {"message_id": "om_b", "root": False, "at": t.format(0), "tpos": 1, "mpos": 3}
+        ids = lambda xs: [x["message_id"] for x in xs]
+        self.assertEqual(ids(order_thread_items([b, a, root])), ["om_r", "om_a", "om_b"])      # 按话题里的序号
+        a2, b2 = dict(a, tpos=None), dict(b, tpos=None)
+        self.assertEqual(ids(order_thread_items([b2, root, a2])), ["om_r", "om_a", "om_b"])    # 退回聊天里的序号
+        a3, b3 = dict(a2, mpos=None), dict(b2, mpos=None)
+        self.assertEqual(ids(order_thread_items([a3, root, b3])), ["om_r", "om_b", "om_a"])    # 都没有才按时间
+
+    def test_doctor_owner_chats_follow_owner_chat_ids(self):
+        from sheepdog.cli import owner_chats_report
+        self.cfg.escalation.chat_ids = []
+        self.assertIn("未配置", owner_chats_report(self.cfg))
+        self.cfg.threads.owner_chat_id = TEST_GROUP
+        line = owner_chats_report(self.cfg)
+        self.assertNotIn("未配置", line)
+        self.assertIn("✓ 1 个，含测试群", line)
+        # 从配置文件读：只设 owner_chat_id、不设 [escalation] chat_ids
+        from sheepdog.config import load_config
+        text = self.cfg_file.read_text(encoding="utf-8").replace(f'chat_ids = ["{ESC_CHAT}"]\n', "")
+        self.cfg_file.write_text(text + f'[threads]\nowner_chat_id = "{TEST_GROUP}"\n', encoding="utf-8")
+        cfg = load_config(self.cfg_file)
+        self.assertEqual(cfg.owner_chat_ids, [TEST_GROUP])
+        self.assertIn("✓ 1 个", owner_chats_report(cfg))
+        rc, out, _ = self.cli("doctor")
+        self.assertIn("找主人聊天: ✓ 1 个，含测试群", out)
