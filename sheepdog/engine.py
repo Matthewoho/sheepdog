@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activ
                     scan_jsonl, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
-                      batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
+                      batch_prompt, bootstrap_prompt, compaction_rules_message, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
@@ -55,8 +56,43 @@ OWNER_VERIFIED_TAG = "owner_verified"
 # 主人本人的发言作为背景送给负责的会话（7.13）：不点表情、不要回执、不改状态
 OWNER_CONTEXT = "owner_context"
 ESCALATION_TAG_PREFIX = "escalation:"
-# 命令审计（7.19 K3）：同一个会话 10 分钟内的命中合并成一条报
+# 命令审计（7.19 K3）：同一个会话 10 分钟内已经报过的同一条命令不再单独报（并进那次报警）；没报过的命令马上报
 AUDIT_MERGE_MINUTES = 10
+
+# 给主人的通知账本（owner_notices）：第 n 次发送失败后隔几分钟再试，之后每次隔 NOTICE_BACKOFF_CAP 分钟
+NOTICE_BACKOFF_MINUTES = (1, 2, 4, 8)
+NOTICE_BACKOFF_CAP = 10
+# 从落账本（或人工 --retry）起这么久还没发出去：标放弃，记 ERROR，doctor / board 一直提示到有人处理
+NOTICE_GIVE_UP_HOURS = 2
+# 飞书同一个防重编号 1 小时内只发出一条。发送途中进程没了、不知道发出去没有：这么久以内用同一个编号补发（发出去过就被
+# 去重），更久了不敢补发（怕重复），标放弃等人看
+NOTICE_RESEND_SAFE_MINUTES = 50
+NOTICE_PENDING, NOTICE_SENT, NOTICE_ABANDONED = "pending", "sent", "abandoned"
+NOTICE_STATE_LABEL = {NOTICE_PENDING: "待发", NOTICE_SENT: "已发", NOTICE_ABANDONED: "放弃"}
+
+
+def new_idempotency_key() -> str:
+    """给主人的一条通知的防重编号：落账本时定好，每次重试都用它。lark-cli 的 --idempotency-key 最长 50 个字符。"""
+    return "sd-" + uuid.uuid4().hex
+
+
+def notice_backoff(attempts: int) -> timedelta:
+    """第 attempts 次发送失败以后隔多久再试：1、2、4、8 分钟，之后每次 10 分钟。"""
+    if 1 <= attempts <= len(NOTICE_BACKOFF_MINUTES):
+        return timedelta(minutes=NOTICE_BACKOFF_MINUTES[attempts - 1])
+    return timedelta(minutes=NOTICE_BACKOFF_CAP)
+
+
+def unsent_notice_line(store: Store, cli: str = "sheepdog") -> str:
+    """doctor / board 开头那一行：还有给主人的通知没发出去（还在重试的、放弃了没人处理的）。都发出去了是空串。"""
+    rows = store.unsent_owner_notices()
+    if not rows:
+        return ""
+    gave_up = sum(1 for r in rows if r["state"] == NOTICE_ABANDONED)
+    parts = ([f"{gave_up} 条已放弃"] if gave_up else []) + \
+        ([f"{len(rows) - gave_up} 条还在重试"] if len(rows) > gave_up else [])
+    return with_cli(f"⚠ 有 {len(rows)} 条给主人的通知没发出去（{'，'.join(parts)}）：`sheepdog notices` 查看，"
+                    f"确认没收到用 `sheepdog notices --retry` 重发，处理过了用 `sheepdog notices --ack`", cli)
 
 
 def open_escalations(store: Store, open_hours: float, topic_id: str | None = None) -> list:
@@ -138,6 +174,11 @@ def duty_notice_key(topic_id: str) -> str:
 def send_fail_key(topic_id: str) -> str:
     """meta 键：这个会话这一段连续投递失败的记录 {since, count, error, notified, covered}；发送成功就清掉。"""
     return f"send_fail:{topic_id}"
+
+
+def compaction_resend_key(topic_id: str) -> str:
+    """meta 键：认出压缩后立即补发过规则的那个压缩点 {cid, at, step}。同一个压缩点只补发一次（重启以后也一样）。"""
+    return f"compaction_resent:{topic_id}"
 
 
 def attention_reason_label(reason: str | None) -> str:
@@ -1136,8 +1177,8 @@ class Dispatcher:
                     + (f"（累计失败 {t['retries']} 次）" if t["retries"] else "") + f"，排着 {queued} 条信号；{tail}")
             log.warning("会话 %s 进入 attention（%s），%d 条信号排队（在岗表已通知过，发短的）", tid,
                         t["attention_reason"], queued)
-            if self._notify_owner(text, "attention 通知"):
-                self.store.set_meta(key, t["attention_at"] or "")
+            self._notify_owner(text, "attention 通知", tid,
+                               before_send=lambda: self.store.set_meta(key, t["attention_at"] or ""))
             return
         lines = [f"🐕 汇报 · 会话卡住了 [{BUS_TOPIC_ID}]",
                  f"「{title}」（topic `{tid}`，{host}）进入 attention：{reason}"
@@ -1151,8 +1192,8 @@ class Dispatcher:
         if why:
             lines.append(why)
         log.warning("会话 %s 进入 attention（%s），%d 条信号排队", tid, t["attention_reason"], queued)
-        if self._notify_owner("\n".join(lines), "attention 通知"):
-            self.store.set_meta(key, t["attention_at"] or "")
+        self._notify_owner("\n".join(lines), "attention 通知", tid,
+                           before_send=lambda: self.store.set_meta(key, t["attention_at"] or ""))
 
     def _mark_activity_start(self, t) -> None:
         """回执超时进 attention 时，「新动作」的读取偏移从记录现在的末尾开始（之后只看新写的行）。"""
@@ -1270,7 +1311,7 @@ class Dispatcher:
                 f"依据：{evidence}。")
         why = self.playbook.render("attention_recovered.md", session_title=title, topic_id=tid, host=host,
                                    evidence=evidence, queued=str(queued))
-        self._notify_owner(text + (f"\n{why}" if why else ""), "恢复通知")
+        self._notify_owner(text + (f"\n{why}" if why else ""), "恢复通知", tid)
 
     # ---------- 人类接管 ----------
     def _owner_typed_at(self, t, card=None) -> datetime | None:
@@ -1536,7 +1577,12 @@ class Dispatcher:
                         f"{display_time(_parse(rec['since']), self.cfg.timezone_offset)}起连续 {rec['count']} 次投递失败，"
                         f"最近一次：{rec['error']}。\n消息照常排队、一条不丢，sheepdog 每轮重试；发出去了会再告诉你。")
                 log.warning("会话 %s 连续 %d 次投递失败，私聊主人", tid, rec["count"])
-                rec["notified"] = self._notify_owner(text, "投递失败通知")
+
+                def mark() -> None:
+                    rec["notified"] = True
+                    self.store.set_meta(key, json.dumps(rec, ensure_ascii=False))
+
+                self._notify_owner(text, "投递失败通知", tid, before_send=mark)
         self.store.set_meta(key, json.dumps(rec, ensure_ascii=False))
 
     def _send_ok(self, t, sent: int) -> None:
@@ -1555,7 +1601,7 @@ class Dispatcher:
             return
         title = self._session_title(t) or tid
         self._notify_owner(f"🐕 汇报 · 投递已恢复 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）投递恢复了"
-                           f"（之前连续失败 {rec.get('count')} 次），这一批送出 {sent} 条。", "投递恢复通知")
+                           f"（之前连续失败 {rec.get('count')} 次），这一批送出 {sent} 条。", "投递恢复通知", tid)
 
     def _complete_delivery(self, t, batch_id: str, signals: list, context: list, sent_at: str | None = None) -> dict:
         """批次已送达后的记账：标记消息、改会话状态、关闭被回答的「需要你定」、点确认表情。正常发送与崩溃恢复共用。"""
@@ -1731,24 +1777,102 @@ class Dispatcher:
         self._bus_hint("host_failed", f"⚠️ {label} 会话「{name}」（topic `{r.topic_id}`）这一轮失败"
                                       f"（{r.error_kind}）：{r.error[-300:]}", about=r.topic_id)
 
-    def _notify_owner(self, text: str, what: str) -> bool:
-        """经机器人给主人发一条私聊（登录失效、写锁满 60 分钟、会话卡住）；没有发送渠道时只记日志。返回发出去没有。
+    def _notify_owner(self, text: str, what: str, topic_id: str = "", before_send=None) -> bool:
+        """给主人的通知（危险命令报警、在岗表中断 / 失联 / 已恢复、attention / 恢复、投递不出去 / 已恢复、写锁提醒、
+        登录提醒）。没有发送渠道时只记日志，返回 False。
 
-        notifier 有 notify(text, what) 方法的（[notify] file 写文件的那种）连同通知类型一起交给它；
-        否则只交正文（经机器人私聊、dry-run 打印、测试里的 list.append）。"""
+        - [notify] file（notifier.ledger 为 False）：照旧直接写文件，不落账本、不重试；写不进去返回 False；
+        - 其他（经机器人私聊、dry-run 打印、测试里的假渠道）：先落给主人的通知账本（正文原样字节 + 防重编号），再发。
+          发不出去留在待发，之后每一轮按退避重试，重启以后接着试（_retry_owner_notices）。落了账本就返回 True——
+          这条通知一定会发出去，或者 2 小时后标放弃、在 doctor / board 上一直提示到有人处理；调用方不要再拼一条重发。
+
+        before_send：调用方「这件事已经通知过」的记账，在落账本之后、真正发送之前做（写文件模式在写成以后做）。
+        记账放在发送之前，进程在「发出去了、还没记账」之间没了，重启以后不会把同一件事再拼一条新通知（那条会带新的
+        防重编号，飞书去不了重）；落了账本的那条由重试接着发、靠防重编号去重。
+        topic_id：说的是哪个会话（登录提醒说的是宿主，留空）。"""
         if self.notifier is None:
             return False
         text = with_cli(text, self.cfg.cli_command)
-        try:
-            notify = getattr(self.notifier, "notify", None)
-            if callable(notify):
-                notify(text, what)
-            else:
-                self.notifier(text)
-        except Exception as e:
-            log.warning("给主人发%s失败: %s", what, e)
-            return False
+        if not getattr(self.notifier, "ledger", True):
+            try:
+                self.notifier.notify(text, what)
+            except Exception as e:
+                log.warning("给主人发%s失败: %s", what, e)
+                return False
+            if before_send is not None:
+                before_send()
+            return True
+        nid = self.store.add_owner_notice(what, topic_id, text.encode("utf-8"), new_idempotency_key())
+        if before_send is not None:
+            before_send()
+        self._send_notice(self.store.get_owner_notice(nid))
         return True
+
+    def _notice_channel(self) -> bool:
+        """有没有能重试的发送渠道（[notify] file 和没有渠道都不重试）。"""
+        return self.notifier is not None and getattr(self.notifier, "ledger", True)
+
+    def _send_notice(self, row) -> bool:
+        """发一次账本里的一条通知：正文用落账本时的那份字节、防重编号用落账本时定的那个。返回发出去没有。
+
+        先记「正在发」再调发送：要是发出去了、还没记成已发就崩溃，重启后用同一个防重编号补发，飞书去重。"""
+        nid, what = row["id"], row["kind"]
+        body = bytes(row["body"]).decode("utf-8")
+        self.store.owner_notice_start(nid)
+        try:
+            send = getattr(self.notifier, "send", None)
+            if callable(send):
+                send(body, row["idem_key"])
+            else:
+                self.notifier(body)
+        except Exception as e:
+            row = self.store.get_owner_notice(nid)
+            n = row["attempts"] or 1
+            err = " ".join(str(e).split())[-300:] or type(e).__name__
+            window = _parse(row["window_at"] or "")
+            if window is not None and _now() - window >= timedelta(hours=NOTICE_GIVE_UP_HOURS):
+                self._abandon_notice(row, err)
+                return False
+            delay = notice_backoff(n)
+            self.store.owner_notice_failed(nid, err, (_now() + delay).isoformat(timespec="seconds"))
+            log.warning("给主人发%s失败（通知 #%d，第 %d 次）：%s；%d 分钟后重试", what, nid, n, err,
+                        int(delay.total_seconds() // 60))
+            return False
+        self.store.owner_notice_sent(nid)
+        if (row["attempts"] or 0) >= 1 or row["inflight_at"]:
+            log.info("给主人的%s（通知 #%d）重试后发出去了", what, nid)
+        return True
+
+    def _abandon_notice(self, row, error: str) -> None:
+        self.store.owner_notice_abandon(row["id"], error)
+        log.error("给主人的%s（通知 #%d%s）没发出去，放弃：%s。`%s notices` 查看，确认没收到用 `%s notices --retry %d` 重发，"
+                  "处理过了用 `%s notices --ack %d`", row["kind"], row["id"],
+                  f"，topic {row['topic_id']}" if row["topic_id"] else "", error, self.cfg.cli_command,
+                  self.cfg.cli_command, row["id"], self.cfg.cli_command, row["id"])
+
+    def _retry_owner_notices(self) -> None:
+        """每一轮：待发的通知到了重试时间就再发一次（重启以后也一样，状态在账本里）。
+
+        - 从落账本（或人工 --retry）起满 2 小时还没发出去：标放弃，记 ERROR，doctor / board 开头一直提示到有人处理；
+        - 上次发送中断（「正在发」还在，进程在发送途中没了）：不知道发出去没有。中断不到 NOTICE_RESEND_SAFE_MINUTES
+          就用同一个防重编号补发（发出去过的话飞书去重）；更久了飞书的防重窗口（1 小时）快过了，不自动补发，标放弃等人看。"""
+        now = _now()
+        for row in self.store.pending_owner_notices():
+            window = _parse(row["window_at"] or "")
+            inflight = _parse(row["inflight_at"] or "")
+            if inflight is not None:
+                if now - inflight >= timedelta(minutes=NOTICE_RESEND_SAFE_MINUTES):
+                    self._abandon_notice(row, f"{display_time(inflight, self.cfg.timezone_offset)}那次发送中断（进程在发送途中"
+                                              f"没了），不知道发出去没有；已超过飞书防重窗口，不自动补发")
+                    continue
+            elif window is not None and now - window >= timedelta(hours=NOTICE_GIVE_UP_HOURS):
+                self._abandon_notice(row, row["last_error"] or "2 小时内没发出去")
+                continue
+            elif (nxt := _parse(row["next_at"] or "")) is not None and now < nxt:
+                continue
+            if not self._notice_channel():
+                continue
+            self._send_notice(row)
 
     def _login_notice(self, host: str, reason: str) -> None:
         """登录失效：经机器人给主人发一条「需要你重新登录」，同一宿主 24 小时只发一次。"""
@@ -1804,7 +1928,7 @@ class Dispatcher:
             return  # 24 小时上限：还锁着的话，过了 24 小时再提醒
         self.store.set_meta(key, json.dumps({"mark": mark, "at": now_iso()}))
         log.warning("会话 %s 写锁冲突满 %d 分钟，提醒主人", t["topic_id"], LOCK_ALERT_MINUTES)
-        self._notify_owner(text, "写锁提醒")
+        self._notify_owner(text, "写锁提醒", t["topic_id"])
 
     # ---------- 护栏（7.19） ----------
     def _record_file(self, t) -> Path | None:
@@ -1896,6 +2020,75 @@ class Dispatcher:
             if found:
                 self.store.update_topic(t["topic_id"], rules_hash=None, compacted_at=now_iso())
                 log.info("topic %s: 检测到压缩（%d 处），下一批带上完整规则", t["topic_id"], len(found))
+                try:
+                    self._resend_rules(self.store.get_topic(t["topic_id"]), found[-1])
+                except Exception as e:  # 补发出错不挡别的：下一批照样带上完整规则
+                    log.warning("topic %s: 压缩后立即补发规则出错（下一批照样带上完整规则）: %s", t["topic_id"], e)
+
+    def _batch_in_hand(self, t) -> str:
+        """手上有批次在跑（送出了、在等回执），或者有没交差的批次（判过回执超时、退回重投的）：返回批次号，否则空串。
+        口径同在岗表的 _quiet_since：adopted / 总线新开的会话回执可选，回执超时记 missed，当作处理过；只有背景、
+        发送失败、不确定送没送到的批次不算。"""
+        if t["pending_batch_id"] and t["state"] == sm.RUNNING:
+            return t["pending_batch_id"]
+        for d in self.store.recent_dispatches(t["topic_id"]):  # 新的在前
+            if d["state"] in ("acked", ACKED_LATE, "missed"):
+                return ""
+            if d["state"] == "failed" and (d["error"] or "").startswith(RECEIPT_TIMEOUT):
+                return d["batch_id"]
+        return ""
+
+    def _compaction_point(self, t, d: dict) -> dict:
+        """一个压缩点的身份：会话编号、记录里的时间、步号。记录重读（文件换了、变短了）再认出来也是同一个。"""
+        at = record_time(self.topic_host(t), d)
+        return {"cid": t["conversation_id"] or "", "at": at.isoformat() if at is not None else "",
+                "step": d.get("step_index")}
+
+    @staticmethod
+    def _point_seen(last: dict, point: dict) -> bool:
+        """这个压缩点补发过了没有：和上次补发的是同一个，或者是同一个会话里更早的压缩点（记录重读又认出来的）。"""
+        if not last or last.get("cid") != point["cid"]:
+            return False
+        if last == point:
+            return True
+        a, b = _parse(last.get("at") or ""), _parse(point["at"])
+        return a is not None and b is not None and b <= a
+
+    def _resend_rules(self, t, point: dict) -> None:
+        """认出压缩时，Antigravity 会话手上有批次在跑（或有没交差的批次）：不等下一批，立即单独发一条系统消息，内容是
+        完整现行规则（和下一批重推的一样，开头写明是因为认出了压缩才补发）。
+
+        这条不是批次：不改 pending_batch_id、不记 dispatches，回执、回执超时、在岗表的批次口径都不受影响。发出去以后
+        规则指纹记成最新，下一批不再重推。同一个压缩点只补发一次（记在 meta 里，重启以后也一样）；发送失败不重试，
+        退回原来的做法（指纹已清空，下一批带上完整规则）。主人在会话里（human_attached）不插话。
+        Codex / Claude 会话一轮跑着的时候送不进去，保持原来的「下一批重推」。"""
+        tid = t["topic_id"]
+        if self.topic_host(t) != ANTIGRAVITY or t["state"] in (sm.HUMAN_ATTACHED, sm.CLOSED):
+            return
+        batch = self._batch_in_hand(t)
+        if not batch:
+            return
+        key = compaction_resend_key(tid)
+        pid = self._compaction_point(t, point)
+        try:
+            last = json.loads(self.store.get_meta(key) or "{}")
+        except json.JSONDecodeError:
+            last = {}
+        if isinstance(last, dict) and self._point_seen(last, pid):
+            log.info("topic %s: 这个压缩点已经补发过规则，不再补发", tid)
+            return
+        rules = self.standing_rules(t)
+        if not rules:
+            return
+        # 先记再发：同一个压缩点只补发一次
+        self.store.set_meta(key, json.dumps(pid, ensure_ascii=False, sort_keys=True))
+        try:
+            self._send(t, compaction_rules_message(rules, self._compaction_note(t), batch))
+        except SinkError as e:
+            log.warning("topic %s: 压缩后立即补发规则没发出去（%s），下一批带上完整规则", tid, e)
+            return
+        self.store.update_topic(tid, rules_hash=self.rules_hash(t), compacted_at=None)
+        log.info("topic %s: 检测到压缩，手上批次 %s 还没交差，已立即补发完整规则（不是批次；下一批不再重推）", tid, batch)
 
     def _compaction_note(self, t) -> str:
         if not t["compacted_at"]:
@@ -1942,19 +2135,47 @@ class Dispatcher:
         self._flush_audit()
 
     def _flush_audit(self) -> None:
-        """没报过的命中按会话报：上次报警满 10 分钟（或从没报过）才报，期间新命中的攒起来合并成一条。"""
+        """还没处理的命中按会话报。合并只合并已经报过的同一条命令：10 分钟内报过的（按整理后的命令文本比）只记一笔、
+        并进那次报警，不再单独报；之前没报过的命令马上再报一次，同一轮里新出现的几条合成一条。
+
+        每次报警都给主人发一条、给犯规的会话再排一条停手提示、照旧知会 also_notify。报不报只看命令有没有报过，
+        不看给主人的上一条通知发出去没有（还在待发的那条由通知账本接着重试），所以前一条没发出去也压不住新的。"""
         groups: dict[str, list] = {}
         for h in self.store.pending_audit_hits():
             groups.setdefault(h["topic_id"], []).append(h)
+        cutoff = _now() - timedelta(minutes=AUDIT_MERGE_MINUTES)
         for tid, hits in groups.items():
-            last = _parse(self.store.last_audit_notice(tid))
-            if last and _now() - last < timedelta(minutes=AUDIT_MERGE_MINUTES):
+            reported, alerts = self._audit_window(tid, cutoff)
+            repeats = [h for h in hits if h["command"] in reported]
+            fresh = [h for h in hits if h["command"] not in reported]
+            for h in repeats:
+                self.store.mark_audit_notified([h["id"]], reported[h["command"]], merged=True)
+            if repeats:
+                log.info("会话 %s 又跑了 %d 分钟内报过的命令 %d 条，并进之前的报警，不再单独报", tid,
+                         AUDIT_MERGE_MINUTES, len(repeats))
+            if not fresh:
                 continue
-            self._send_audit(tid, hits)
-            self.store.mark_audit_notified([h["id"] for h in hits])
+            self._send_audit(tid, fresh, alerts + 1,
+                             mark=lambda ids=[h["id"] for h in fresh]: self.store.mark_audit_notified(ids, ids[0]))
 
-    def _send_audit(self, tid: str, hits: list) -> None:
-        """经机器人私聊主人；给犯规的会话、[audit] also_notify 的会话各排一条系统提示。事实在这里，措辞在 playbook。"""
+    def _audit_window(self, tid: str, cutoff: datetime) -> tuple[dict[str, int], int]:
+        """这个会话从 cutoff 起报过的命令 {整理后的命令文本: 那次报警的编号}，和报过几次警。
+        并进别的报警的命中不算「报过」（同一条命令 10 分钟以后再跑会再报一次）。老账本里没有报警编号的，按报的时间认。"""
+        reported: dict[str, int] = {}
+        alerts: set = set()
+        for h in self.store.handled_audit_hits(tid):
+            at = _parse(h["notified_at"] or "")
+            if at is None or at.tzinfo is None or at < cutoff or h["merged"]:
+                continue
+            alert = h["alert_id"] if h["alert_id"] is not None else h["notified_at"]
+            alerts.add(alert)
+            reported.setdefault(h["command"], h["alert_id"] if h["alert_id"] is not None else h["id"])
+        return reported, len(alerts)
+
+    def _send_audit(self, tid: str, hits: list, nth: int = 1, mark=None) -> None:
+        """经机器人私聊主人；给犯规的会话、[audit] also_notify 的会话各排一条系统提示。事实在这里，措辞在 playbook。
+        nth：这是这个会话 10 分钟内第几次报警（三处都写明）。mark：把这些命中记成已报（在给主人的通知落了账本之后、
+        发出去之前做；没有发送渠道时也照样记）。两条系统提示先排进账本，再给主人发。"""
         t = self.store.get_topic(tid)
         title = (self._session_title(t) if t is not None else "") or tid
         label = HOST_LABEL.get(self.topic_host(t), self.topic_host(t)) if t is not None else ""
@@ -1969,26 +2190,32 @@ class Dispatcher:
         commands = "\n".join(lines)
         notify = [x for x in self.cfg.audit.also_notify if x != tid and self._audit_target_ok(x)]
         cli = self.cfg.cli_command
-        # 1. 主人
+        count = f"这是这个会话 {AUDIT_MERGE_MINUTES} 分钟内第 {nth} 次报警"
         offender_ok = t is not None and self._audit_target_ok(tid)
-        done = (["已提示这个会话停手"] if offender_ok else []) + ([f"已告诉 {'、'.join(notify)} 别重复操作"] if notify else [])
-        self._notify_owner(f"🐕 汇报 · 会话跑了危险命令 [{tid}]\n「{title}」（topic `{tid}`{'，' + label if label else ''}）"
-                           f"跑了下面的命令（命中 [audit] danger_patterns）：\n{commands}"
-                           + (f"\n{'；'.join(done)}。" if done else ""),
-                           "危险命令报警")
-        # 2. 犯规的会话
+        # 1. 犯规的会话：每次报警都再排一条停手提示
         if offender_ok:
-            why = self.playbook.render("audit_offender.md", session_title=title, topic_id=tid, commands=commands)
-            text = f"⚠️ sheepdog 在你的会话记录里看到你跑了下面的命令（命中危险命令清单）：\n{commands}"
+            why = self.playbook.render("audit_offender.md", session_title=title, topic_id=tid, commands=commands,
+                                       alert_count=str(nth))
+            text = f"⚠️ sheepdog 在你的会话记录里看到你跑了下面的命令（命中危险命令清单；{count}）：\n{commands}"
             self.store.add_system_message(tid, "audit_offender", with_cli(text + (f"\n{why}" if why else ""), cli))
-        # 3. 要另外知会的会话
+        # 2. 要另外知会的会话
         for x in notify:
             xt = self.store.get_topic(x)
             why = self.playbook.render("audit_notify.md", session_title=self._session_title(xt), topic_id=x,
-                                       commands=commands, offender_title=title, offender_topic=tid)
-            text = f"⚠️ 「{title}」（topic `{tid}`）跑了下面的命令：\n{commands}"
+                                       commands=commands, offender_title=title, offender_topic=tid,
+                                       alert_count=str(nth))
+            text = f"⚠️ 「{title}」（topic `{tid}`）跑了下面的命令（{count}）：\n{commands}"
             self.store.add_system_message(x, "audit_notify", with_cli(text + (f"\n{why}" if why else ""), cli))
-        log.warning("危险命令报警：%s 共 %d 条，已知会 %s", tid, len(hits), "、".join(["主人", tid] + notify))
+        # 3. 主人（先落通知账本、记下这些命中已报，再发；没有发送渠道时只记账）
+        done = (["已提示这个会话停手"] if offender_ok else []) + ([f"已告诉 {'、'.join(notify)} 别重复操作"] if notify else [])
+        sent = self._notify_owner(f"🐕 汇报 · 会话跑了危险命令 [{tid}]\n「{title}」（topic `{tid}`{'，' + label if label else ''}）"
+                                  f"跑了下面的命令（命中 [audit] danger_patterns；{count}）：\n{commands}"
+                                  + (f"\n{'；'.join(done)}。" if done else ""),
+                                  "危险命令报警", tid, before_send=mark)
+        if not sent and mark is not None:
+            mark()
+        log.warning("危险命令报警（%d 分钟内第 %d 次）：%s 共 %d 条，已知会 %s", AUDIT_MERGE_MINUTES, nth, tid, len(hits),
+                    "、".join(["主人", tid] + notify))
 
     def _audit_target_ok(self, topic_id: str) -> bool:
         """系统提示只排给还在投递的会话（总线、名册 managed、总线新开的），否则会被退回总线。"""
@@ -2290,9 +2517,12 @@ class Dispatcher:
         if why:
             lines.append(why)
         log.warning("会话 %s 判为%s：%s（%d 条信号排队）", tid, label, detail, queued)
-        if self._notify_owner("\n".join(lines), "在岗表通知"):
+
+        def mark() -> None:
             rec["sent"].append(state)
             self.store.set_meta(key, json.dumps(rec, ensure_ascii=False))
+
+        self._notify_owner("\n".join(lines), "在岗表通知", tid, before_send=mark)
 
     def _duty_record(self, tid: str) -> dict:
         try:
@@ -2339,7 +2569,7 @@ class Dispatcher:
         log.warning("会话 %s 又动起来了（%s），在岗表判定解除", tid, last_act.isoformat())
         self._notify_owner(f"🐕 汇报 · 会话已恢复 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）"
                            f"{display_time(last_act, self.cfg.timezone_offset)}又有动作了"
-                           + (f"，排着的 {queued} 条信号接着补送。" if queued else "。"), "恢复通知")
+                           + (f"，排着的 {queued} 条信号接着补送。" if queued else "。"), "恢复通知", tid)
 
     def _autofill_work(self) -> None:
         """第 5 步：watch → 等别人；「需要你定」→ 等主人（forward → 已转交在 forward_messages 里当场补）。
@@ -2465,6 +2695,11 @@ class Dispatcher:
     def dispatch_once(self) -> dict:
         # 这一轮里各会话的记录文件（自动恢复和护栏共用）
         self._record_cache = {}
+        # 给主人的通知：上一轮（或重启前）没发出去的，到了时间再发一次
+        try:
+            self._retry_owner_notices()
+        except Exception as e:  # 重试出错不能挡住投递
+            log.warning("重试给主人的通知出错: %s", e)
         self._recover_sending()
         self.collect_runs()
         self.sync_roster()

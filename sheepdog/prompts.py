@@ -277,6 +277,17 @@ def rules_update_message(rules: str, note: str = "") -> str:
     return _join(f"[sheepdog] {RULES_UPDATE_HEADER}", note, rules)
 
 
+# 认出压缩、手上批次还在跑时立即补发规则（不等下一批）：头一行之后的说明。这是机制事实（不是批次、回执照旧），写在代码里
+COMPACTION_RESEND_NOTE = ("（sheepdog 认出你的上下文刚被压缩过，不等下一批，现在单独补发完整现行规则。这条不是新批次，"
+                          "不用为它交回执；手上的批次 `{batch_id}` 照常做完、照常交回执。）")
+
+
+def compaction_rules_message(rules: str, note: str, batch_id: str) -> str:
+    """认出压缩、手上有批次在跑时立即单独补发的整份规则（和下一批重推的一样）。开头写明是因为认出了压缩才补发；
+    note 是 playbook 的 rules_after_compaction.md（缺了用默认那句）。"""
+    return _join(f"[sheepdog] {RULES_UPDATE_HEADER}", COMPACTION_RESEND_NOTE.format(batch_id=batch_id), note, rules)
+
+
 def _onboarding_body(pb: Playbook, s: RosterSession) -> str:
     v = dict(session_title=s.display_title, topic_id=s.topic_id)
     return pb.render(

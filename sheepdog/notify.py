@@ -12,6 +12,9 @@ attention 和恢复、危险命令报警、写锁提醒、登录失效）只记�
     ...
 
 read_notices() 按这个格式读回来。
+
+文件模式不走「给主人的通知账本」（owner_notices，不重试）：写文件是本机操作，失败了记日志就是。
+正式环境经机器人私聊用 OwnerDM：带防重编号发，发不出去由 Dispatcher 的通知账本按退避重试。
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ _HEADER_RE = re.compile(r"^### (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})（([^）]*)
 
 class FileNotifier:
     """Dispatcher 的 notifier：notify(text, what) 追加一条到文件。写不进去抛 OSError（由调用方记日志）。"""
+
+    # 不走给主人的通知账本、不重试（[notify] file 照旧）
+    ledger = False
 
     def __init__(self, path: Path, tz_offset: str = "+08:00"):
         self.path = Path(path)
@@ -72,3 +78,24 @@ def read_notices(path: Path) -> list[dict]:
             lines.pop()
         n["text"] = "\n".join(lines)
     return out
+
+
+class OwnerDM:
+    """经机器人私聊主人（没设 [notify] file 时）。send(text, idempotency_key)：发一次，失败抛异常，由 Dispatcher 的
+    通知账本按退避重试；每次重试带同一个防重编号（飞书 1 小时内同一个编号只发出一条）。"""
+
+    def __init__(self, source, open_id: str):
+        self.source = source
+        self.open_id = open_id
+
+    def send(self, text: str, idempotency_key: str = "") -> None:
+        if idempotency_key:
+            self.source.send_text(self.open_id, text, "bot", idempotency_key=idempotency_key)
+        else:
+            self.source.send_text(self.open_id, text, "bot")
+
+    def __call__(self, text: str) -> None:
+        self.send(text)
+
+    def __repr__(self) -> str:
+        return "OwnerDM(经机器人私聊主人)"

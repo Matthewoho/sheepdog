@@ -225,19 +225,43 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
     PRIMARY KEY (topic_id, purpose)
 );
 
--- 会话跑过的危险命令（7.19 K3）。同一条命令按（会话、step）去重；notified_at 为空 = 还没报
+-- 会话跑过的危险命令（7.19 K3）。同一条命令按（会话、step）去重；notified_at 为空 = 还没处理
 CREATE TABLE IF NOT EXISTS audit_hits (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     topic_id        TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     step            TEXT NOT NULL,
-    command         TEXT NOT NULL,     -- 已脱敏、已截断
+    command         TEXT NOT NULL,     -- 已脱敏、已截断（整理后的命令文本：判「同一条命令」按它比）
     pattern         TEXT,
     ran_at          TEXT,
     detected_at     TEXT NOT NULL,
-    notified_at     TEXT,
+    notified_at     TEXT,              -- 处理的时间：报了，或者并进了之前的报警
+    alert_id        INTEGER,           -- 属于哪一次报警（那次报警里第一条命中的 id）
+    merged          INTEGER DEFAULT 0, -- 1 = 10 分钟内报过同一条命令，并进那次报警、没有单独报
     UNIQUE (conversation_id, step)
 );
+
+-- 给主人的私聊通知（2026-10-12 事故后）：先落账本再发。发不出去留在待发，按退避重试，重启后接着试；
+-- 2 小时还没发出去标放弃，doctor / board 开头提示，直到人工 sheepdog notices --retry / --ack。[notify] file 模式不走这里
+CREATE TABLE IF NOT EXISTS owner_notices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,         -- 通知类型：危险命令报警 / 在岗表通知 / attention 通知 / 恢复通知 / 投递失败通知 …
+    topic_id    TEXT,                  -- 说的是哪个会话（登录提醒说的是宿主，为空）
+    body        BLOB NOT NULL,         -- 正文原样字节（UTF-8，命令名已换好）：每次重试发同一份，不重拼
+    idem_key    TEXT NOT NULL UNIQUE,  -- 防重编号（lark-cli --idempotency-key，≤ 50 字符）：落账本时定好，每次重试都用它
+    state       TEXT NOT NULL,         -- pending（待发）| sent（已发）| abandoned（放弃）
+    attempts    INTEGER DEFAULT 0,     -- 从 window_at 起试了几次（人工 --retry 清零）
+    last_error  TEXT,
+    created_at  TEXT NOT NULL,
+    window_at   TEXT NOT NULL,         -- 2 小时放弃计时的起点：落账本的时间；人工 --retry 以后从那一刻重新算
+    attempt_at  TEXT,                  -- 最近一次开始发送的时间
+    inflight_at TEXT,                  -- 发之前写、有结果后清空；重启后还在 = 上次发送中断，不知道发出去没有
+    next_at     TEXT,                  -- 待发：下一次重试不早于这个时间
+    sent_at     TEXT,
+    closed_at   TEXT,                  -- 标放弃的时间
+    acked_at    TEXT                   -- 人工确认已处理（sheepdog notices --ack）：不再提示、不再重发
+);
+CREATE INDEX IF NOT EXISTS idx_owner_notices_state ON owner_notices(state);
 
 -- 在岗表（7.20）：会话卡片，牧羊犬每轮算出来写入。run_state 见 duty.RUN_LABEL
 CREATE TABLE IF NOT EXISTS duty_cards (
@@ -349,6 +373,7 @@ MIGRATIONS = {
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
+    "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
 }
 
 
@@ -937,14 +962,80 @@ class Store:
     def pending_audit_hits(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM audit_hits WHERE notified_at IS NULL ORDER BY id").fetchall()
 
-    def last_audit_notice(self, topic_id: str) -> str:
-        row = self.conn.execute("SELECT MAX(notified_at) FROM audit_hits WHERE topic_id=?", (topic_id,)).fetchone()
-        return row[0] or ""
+    def handled_audit_hits(self, topic_id: str, limit: int = 500) -> list[sqlite3.Row]:
+        """这个会话已经处理过（报了，或并进了之前的报警）的命中，新的在前。"""
+        return self.conn.execute("SELECT * FROM audit_hits WHERE topic_id=? AND notified_at IS NOT NULL "
+                                 "ORDER BY id DESC LIMIT ?", (topic_id, limit)).fetchall()
 
-    def mark_audit_notified(self, ids: list[int]) -> None:
+    def mark_audit_notified(self, ids: list[int], alert_id: int | None = None, merged: bool = False) -> None:
+        """记下这些命中已经处理：alert_id 是它们属于的那次报警；merged = 并进了之前的报警、没有单独报。"""
         ts = now_iso()
         with self.tx() as c:
-            c.executemany("UPDATE audit_hits SET notified_at=? WHERE id=?", [(ts, i) for i in ids])
+            c.executemany("UPDATE audit_hits SET notified_at=?, alert_id=?, merged=? WHERE id=?",
+                          [(ts, alert_id, int(merged), i) for i in ids])
+
+    # ---------- 给主人的通知 ----------
+    def add_owner_notice(self, kind: str, topic_id: str, body: bytes, idem_key: str) -> int:
+        """落账本（待发）：正文字节和防重编号此后不变。"""
+        ts = now_iso()
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO owner_notices(kind,topic_id,body,idem_key,state,created_at,window_at,next_at) "
+                            "VALUES(?,?,?,?,'pending',?,?,?)", (kind, topic_id or None, body, idem_key, ts, ts, ts))
+            return int(cur.lastrowid)
+
+    def get_owner_notice(self, notice_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM owner_notices WHERE id=?", (notice_id,)).fetchone()
+
+    def pending_owner_notices(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM owner_notices WHERE state='pending' ORDER BY id").fetchall()
+
+    def unsent_owner_notices(self) -> list[sqlite3.Row]:
+        """没发出去、也没人处理的：还在重试的，和标了放弃、没 --ack 的。"""
+        return self.conn.execute("SELECT * FROM owner_notices WHERE state='pending' "
+                                 "OR (state='abandoned' AND acked_at IS NULL) ORDER BY id").fetchall()
+
+    def list_owner_notices(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM owner_notices ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def owner_notice_start(self, notice_id: int) -> None:
+        """开始发：先记下「正在发」（提交了再调发送），有结果后由 sent / failed 清掉。"""
+        ts = now_iso()
+        with self.tx() as c:
+            c.execute("UPDATE owner_notices SET inflight_at=?, attempt_at=?, attempts=COALESCE(attempts,0)+1 "
+                      "WHERE id=? AND state='pending'", (ts, ts, notice_id))
+
+    def owner_notice_sent(self, notice_id: int) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE owner_notices SET state='sent', sent_at=?, inflight_at=NULL, next_at=NULL WHERE id=?",
+                      (now_iso(), notice_id))
+
+    def owner_notice_failed(self, notice_id: int, error: str, next_at: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE owner_notices SET inflight_at=NULL, last_error=?, next_at=? WHERE id=?",
+                      (error, next_at, notice_id))
+
+    def owner_notice_abandon(self, notice_id: int, error: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE owner_notices SET state='abandoned', closed_at=?, inflight_at=NULL, next_at=NULL, "
+                      "last_error=? WHERE id=?", (now_iso(), error, notice_id))
+
+    def owner_notice_retry(self, notice_id: int) -> bool:
+        """人工重发：没发出去的（放弃的、还在重试的）回到待发，2 小时从现在重新算、马上可以发。已发的不动。"""
+        ts = now_iso()
+        with self.tx() as c:
+            cur = c.execute("UPDATE owner_notices SET state='pending', window_at=?, next_at=?, attempts=0, "
+                            "inflight_at=NULL, closed_at=NULL, acked_at=NULL "
+                            "WHERE id=? AND state IN ('pending','abandoned')", (ts, ts, notice_id))
+            return cur.rowcount > 0
+
+    def owner_notice_ack(self, notice_id: int) -> bool:
+        """人工确认已处理：不再提示、不再重发（还在重试的也停下，记成放弃）。已发的不动。"""
+        ts = now_iso()
+        with self.tx() as c:
+            cur = c.execute("UPDATE owner_notices SET state='abandoned', closed_at=COALESCE(closed_at,?), acked_at=?, "
+                            "inflight_at=NULL, next_at=NULL WHERE id=? AND state IN ('pending','abandoned')",
+                            (ts, ts, notice_id))
+            return cur.rowcount > 0
 
 
     # ---------- 在岗表（7.20） ----------
@@ -1102,6 +1193,9 @@ class Store:
         "loop_events": "DELETE FROM loop_events WHERE until < ?",
         "runs": "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at < ? AND state NOT IN ('running','retry_wait')",
         "audit_hits": "DELETE FROM audit_hits WHERE notified_at IS NOT NULL AND notified_at < ?",
+        # 给主人的通知：已发的、人工确认过的才删；还在待发、放弃了没人处理的留着
+        "owner_notices": """DELETE FROM owner_notices WHERE COALESCE(acked_at, sent_at) < ?
+                            AND (state = 'sent' OR acked_at IS NOT NULL)""",
     }
 
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删

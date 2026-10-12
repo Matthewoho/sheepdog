@@ -190,9 +190,18 @@ class LarkCliSource:
             raise SourceError(f"reactions create 没返回 reaction_id: {json.dumps(data, ensure_ascii=False)[:300]}")
         return str(rid)
 
-    def send_text(self, user_id: str, text: str, identity: str = "bot") -> None:
-        """经机器人给一个人发一条私聊（7.18：命令行宿主登录失效时提醒主人）。只试一次。"""
-        self._run_once(["im", "+messages-send", "--user-id", user_id, "--text", text], identity)
+    # 飞书消息的防重编号最长 50 个字符；同一个编号 1 小时内只发出一条（lark-cli im +messages-send --idempotency-key）
+    IDEMPOTENCY_KEY_MAX = 50
+
+    def send_text(self, user_id: str, text: str, identity: str = "bot", idempotency_key: str = "") -> None:
+        """经机器人给一个人发一条私聊（给主人的通知）。只试一次：失败由调用方（给主人的通知账本）按退避重试，
+        重试时带同一个 idempotency_key，飞书按它去重。"""
+        args = ["im", "+messages-send", "--user-id", user_id, "--text", text]
+        if idempotency_key:
+            if len(idempotency_key) > self.IDEMPOTENCY_KEY_MAX:
+                raise SourceError(f"防重编号超过 {self.IDEMPOTENCY_KEY_MAX} 个字符: {idempotency_key!r}")
+            args += ["--idempotency-key", idempotency_key]
+        self._run_once(args, identity)
 
     def remove_reaction(self, message_id: str, reaction_id: str) -> None:
         self._run_once(["im", "reactions", "delete",

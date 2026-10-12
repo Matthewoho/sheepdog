@@ -33,6 +33,7 @@
   sheepdog work done --topic T --key K --result ...      在岗表：登记 / 收掉会话名下的活（立即写入）
   sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
   sheepdog board [--topic T] [--json]                    在岗表：各会话在干什么
+  sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
 
 --dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
 
@@ -61,10 +62,10 @@ from .ack import Acker
 from .card import build_reply_card
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, load_config
 from . import duty
-from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, RETIRED, Collector, Dispatcher, add_watch,
-                     attention_notice_key, attention_reason_label, auto_recovers, bus_quote_verifier,
-                     close_session, display_time, duty_reset_key, escalation_summary, forward_messages,
-                     open_escalations, owner_quote_verifier, write_receipt)
+from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
+                     Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
+                     bus_quote_verifier, close_session, display_time, duty_reset_key, escalation_summary,
+                     forward_messages, open_escalations, owner_quote_verifier, unsent_notice_line, write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
 from .prompts import with_cli
@@ -75,7 +76,7 @@ from .sink.agentapi import AgentApiSink, DryRunSink
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
-from .notify import FileNotifier
+from .notify import FileNotifier, OwnerDM
 from .source import NullSource
 from .source.lark import LarkCliSource
 from .store import Store, now_iso
@@ -153,8 +154,9 @@ def _sinks(cfg, store: Store, dry: bool) -> dict:
 def _notifier(cfg, source, args):
     """给主人的通知（在岗表中断 / 失联、attention 和恢复、危险命令报警、写锁提醒、登录失效）怎么送：
 
-    - 配了 [notify] file：一律追加写进那个文件（带时间和通知类型），不发飞书（测试环境用；拉不拉 IM 都一样）；
-    - 否则经机器人私聊主人；不拉 IM、没有 self_open_id 时没有渠道（只记日志）。
+    - 配了 [notify] file：一律追加写进那个文件（带时间和通知类型），不发飞书（测试环境用；拉不拉 IM 都一样），不重试；
+    - 否则经机器人私聊主人（OwnerDM，带防重编号）；先落给主人的通知账本再发，发不出去按退避重试；
+      不拉 IM、没有 self_open_id 时没有渠道（只记日志）。
     dry-run 一律只打印，不写文件、不发飞书。"""
     path = cfg.notify_path
     dry = getattr(args, "dry_run", False)
@@ -166,7 +168,7 @@ def _notifier(cfg, source, args):
         return None
     if dry:
         return lambda text: print(f"[dryrun] 给主人发私聊：\n{text}\n")
-    return lambda text: source.send_text(cfg.self_open_id, text, "bot")
+    return OwnerDM(source, cfg.self_open_id)
 
 
 def notify_report(cfg) -> str:
@@ -204,6 +206,9 @@ def cmd_doctor(args) -> int:
     cfg = load_config()
     ok = True
     print(f"sheepdog {__version__}")
+    # 开头先说有没有给主人的通知没发出去（还在重试的、放弃了没人处理的），直到人工处理
+    if warn := unsent_notice_line(Store(cfg.db_path), cfg.cli_command):
+        print(warn)
     print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
     print(f"状态目录: {cfg.state_dir}")
     print(cli_name_report(cfg))
@@ -1222,11 +1227,92 @@ def cmd_board(args) -> int:
     if args.topic and not cards:
         print(f"topic {_topic_arg(args.topic)} 不存在", file=sys.stderr)
         return 2
+    warn = unsent_notice_line(store, cfg.cli_command)
     if args.json:
+        if warn:
+            print(warn, file=sys.stderr)  # stdout 只放 JSON
         print(json.dumps(cards, ensure_ascii=False, indent=2))
         return 0
+    if warn:
+        print(warn)
     now = datetime.now().astimezone()
     print(duty.render_board(cards, display_time(now, cfg.timezone_offset)))
+    return 0
+
+
+def _notice_ids(store: Store, spec: str) -> list[int]:
+    """--retry / --ack 的参数：all = 所有没发出去、没人处理的；否则逗号分隔的编号。"""
+    if spec.strip().lower() == "all":
+        return [r["id"] for r in store.unsent_owner_notices()]
+    out = []
+    for x in spec.split(","):
+        x = x.strip().lstrip("#")
+        if not x.isdigit():
+            raise ValueError(f"通知编号要是数字或 all：{x!r}")
+        out.append(int(x))
+    return out
+
+
+def _notice_line(cfg, r) -> str:
+    def t(ts):
+        dt = datetime.fromisoformat(ts) if ts else None
+        return display_time(dt, cfg.timezone_offset) if dt is not None and dt.tzinfo is not None else (ts or "")
+    state = NOTICE_STATE_LABEL.get(r["state"], r["state"]) + ("（已确认）" if r["acked_at"] else "")
+    head = (bytes(r["body"]).decode("utf-8", "replace").splitlines() or [""])[0]
+    parts = [f"#{r['id']} {state}", r["kind"], r["topic_id"] or "-", f"落账本 {t(r['created_at'])}",
+             f"试了 {r['attempts'] or 0} 次"]
+    if r["state"] == "sent":
+        parts.append(f"发出 {t(r['sent_at'])}")
+    elif r["state"] == "pending" and r["next_at"]:
+        parts.append(f"下次 {t(r['next_at'])}")
+    line = " · ".join(parts) + f"\n    {head}"
+    if r["last_error"] and r["state"] != "sent":
+        line += f"\n    最近一次错误：{r['last_error']}"
+    return line
+
+
+def cmd_notices(args) -> int:
+    """给主人的通知账本：默认列没发出去、没人处理的（还在重试的、放弃了的）。--retry 让它们回到待发、2 小时重新算
+    （常驻进程下一轮重发，防重编号不变）；--ack 确认已处理（不再提示、不再重发）；--show 打印正文原样。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    if args.show is not None:
+        r = store.get_owner_notice(args.show)
+        if r is None:
+            print(f"没有通知 #{args.show}", file=sys.stderr)
+            return 2
+        print(_notice_line(cfg, r))
+        print(f"防重编号: {r['idem_key']}")
+        print("正文:")
+        print(bytes(r["body"]).decode("utf-8", "replace"))
+        return 0
+    for spec, fn, verb in ((args.retry, store.owner_notice_retry, "回到待发，常驻进程下一轮重发"),
+                           (args.ack, store.owner_notice_ack, "已确认，不再提示、不再重发")):
+        if spec is None:
+            continue
+        try:
+            ids = _notice_ids(store, spec)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        if not ids:
+            print("没有没发出去的通知")
+            return 0
+        changed = [i for i in ids if fn(i)]
+        skipped = [i for i in ids if i not in changed]
+        if changed:
+            print(f"{'、'.join('#' + str(i) for i in changed)} {verb}")
+        if skipped:
+            print(f"{'、'.join('#' + str(i) for i in skipped)} 没改：不存在或已经发出去了", file=sys.stderr)
+        return 0 if changed else 2
+    rows = store.list_owner_notices(args.limit) if args.all else store.unsent_owner_notices()
+    if not rows:
+        print("给主人的通知都发出去了" if not args.all else "账本里还没有给主人的通知")
+        return 0
+    if not args.all and (warn := unsent_notice_line(store, cfg.cli_command)):
+        print(warn)
+    for r in rows:
+        print(_notice_line(cfg, r))
     return 0
 
 
@@ -1409,6 +1495,15 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--key", default="", help="说的是哪件活")
     sp.add_argument("--quote", default="", help="要转达的主人原话（核对同 forward）")
     sp.set_defaults(func=cmd_tell)
+
+    sp = sub.add_parser("notices", help="给主人的通知：没发出去的；人工重发 / 确认已处理")
+    sp.add_argument("--all", action="store_true", help="列最近的全部通知（含已发的）")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--show", type=int, help="打印这条通知的正文原样")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--retry", metavar="N|all", help="没发出去的回到待发（2 小时重新算），常驻进程下一轮重发")
+    g.add_argument("--ack", metavar="N|all", help="确认已处理：不再提示、不再重发")
+    sp.set_defaults(func=cmd_notices)
 
     sp = sub.add_parser("board", help="在岗表：各会话在干什么")
     sp.add_argument("--topic", default="", help="只看这个会话（附最近回执和动作）")

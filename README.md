@@ -76,14 +76,14 @@ Each session runs on one host. The roster and `new-session` can set host, model 
 
 When a host compacts a session's context, the rules from the session's opening prompt can be lost. sheepdog reads each session's transcript incrementally every round and adds three guardrails:
 
-- **Rules after compaction**: on a new compaction point, the next batch carries the full current rules, with one line in front saying why (`rules_after_compaction.md`). Compaction markers are recognised for Antigravity and Codex; the Claude marker is unverified.
+- **Rules after compaction**: on a new compaction point, the next batch carries the full current rules, with one line in front saying why (`rules_after_compaction.md`). If an Antigravity session is still working on an unfinished batch, the full rules are sent right away as a separate message instead of waiting for the next batch (it is not a batch; receipts are unchanged). Compaction markers are recognised for Antigravity and Codex; the Claude marker is unverified.
 - **Per-batch reminders**: if the playbook has `reminders/<key>.md` for a session, that file is appended to the end of every batch for it.
 - **Command audit** (`[audit]`): new commands run by audited sessions are matched against `danger_patterns`. On a hit:
   1. the bot DMs the owner with the session, time and command (sensitive values masked);
   2. the session that ran it gets a notice (`audit_offender.md`);
   3. sessions listed in `also_notify` are told to check the current state before acting again (`audit_notify.md`).
 
-  Commands that also match `ignore_patterns` are skipped, for example help lookups, `--dry-run`, or a command name mentioned in a chat message. Hits from one session within 10 minutes are merged into one alert. This alerts after the fact; the command has already run.
+  Commands that also match `ignore_patterns` are skipped, for example help lookups, `--dry-run`, or a command name mentioned in a chat message. A command already reported within the last 10 minutes is not reported again; a new command is reported at once, and the session gets another stop prompt each time. If the direct message to the owner fails (for example a Lark rate limit), it is retried with backoff; after 2 hours unsent, `sheepdog doctor` and `sheepdog board` show a warning at the top, and `sheepdog notices` lists it. This alerts after the fact; the command has already run.
 
 ## Speaking for the owner
 

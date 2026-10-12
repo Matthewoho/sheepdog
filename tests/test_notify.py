@@ -16,7 +16,7 @@ from sheepdog import cli
 from sheepdog import session as sm
 from sheepdog.config import ConfigError, load_config
 from sheepdog.engine import BUS_TOPIC_ID
-from sheepdog.notify import FileNotifier, read_notices
+from sheepdog.notify import FileNotifier, OwnerDM, read_notices
 
 from test_guardrails import GuardBase
 from test_roster import ME, msg
@@ -27,9 +27,11 @@ class FakeLark:
 
     def __init__(self):
         self.sent: list[tuple[str, str, str]] = []
+        self.keys: list[str] = []
 
-    def send_text(self, to, text, identity):
+    def send_text(self, to, text, identity, idempotency_key=""):
         self.sent.append((to, text, identity))
+        self.keys.append(idempotency_key)
 
 
 class NotifyConfigTest(unittest.TestCase):
@@ -58,6 +60,11 @@ class NotifyConfigTest(unittest.TestCase):
         self.assertNotIsInstance(n, FileNotifier)
         n("hi")
         self.assertEqual(lark.sent, [(ME, "hi", "bot")])  # 照旧经机器人私聊主人
+        # 走通知账本时带防重编号发（lark-cli --idempotency-key）
+        self.assertIsInstance(n, OwnerDM)
+        self.assertTrue(getattr(n, "ledger", True))
+        n.send("again", "sd-fx")
+        self.assertEqual((lark.sent[-1], lark.keys[-1]), ((ME, "again", "bot"), "sd-fx"))
         self.assertIsNone(cli._notifier(cfg, object(), mock.Mock(dry_run=False)))  # 不拉 IM：没有渠道
         self.assertEqual(cli.notify_report(cfg), "主人通知: 经机器人私聊")
 

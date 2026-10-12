@@ -98,7 +98,8 @@ max_new_sessions_per_day = 5
 [audit]
 # 命令审计：每轮增量读这些会话的记录（Antigravity transcript / Codex rollout / Claude 记录），
 # 看它们新跑的命令；命中 danger_patterns 就经机器人私聊你，给犯规的会话排一条系统提示（措辞在 playbook 的 audit_offender.md），
-# 并提示 also_notify 里的会话别重复操作（audit_notify.md）。同一个会话 10 分钟内的命中合并成一条。
+# 并提示 also_notify 里的会话别重复操作（audit_notify.md）。同一个会话 10 分钟内已经报过的同一条命令再跑不重复报；
+# 没报过的命令马上再报，每次报警都再给犯规会话排一条停手提示。
 # 第一次看某个会话时从它记录的末尾开始，不翻旧账。改了下一轮生效；danger_patterns = [] 等于关掉
 topics = ["tp_bus"]
 # 正则，对整理过的命令文本（续行合并、空白压成一个空格）做 search；不配就是下面这一份
@@ -169,7 +170,8 @@ enabled = true
 
 [notify]
 # 给你的通知（在岗表判会话中断 / 失联、会话卡在 attention 和自动恢复、危险命令报警、写锁提醒、登录失效）发到哪。
-# 留空 = 经机器人私聊你（正式环境就这样，不要设）。
+# 留空 = 经机器人私聊你（正式环境就这样，不要设）：先落通知账本再发，发不出去按退避重试，2 小时还没发出去标放弃，
+# doctor / board 开头提示，sheepdog notices 查看、--retry 重发、--ack 确认。
 # 设了路径 = 一律追加写进这个文件（每条带北京时间和通知类型），不发飞书：测试环境（[source] enabled = false）
 # 用它检查通知。拉着飞书又设了它，sheepdog doctor 会提示。相对路径相对本文件所在目录；改了下一轮生效
 file = ""

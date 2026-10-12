@@ -297,24 +297,45 @@ class AuditTest(GuardBase):
         self.assertEqual(len(self.notices), 1)
         self.assertTrue(p.exists())
 
-    def test_merge_within_ten_minutes(self):
+    def test_merge_only_repeats_of_reported_commands(self):
+        """合并只合并已经报过的同一条命令：10 分钟内新出现的命令马上再报（写明第几次），报过的命令再跑不再报。"""
         self.append("conv_test_bus", run_command("gh pr merge 12 --squash", step=1),
                     run_command("gh pr merge 12 --squash", step=2), run_command("gh workflow run deploy.yml", step=3))
         self.d.dispatch_once()
         self.assertEqual(len(self.notices), 1)                 # 同一轮三条合并成一条
         self.assertIn("`gh pr merge 12 --squash`（2 次）", self.notices[0])
         self.assertIn("`gh workflow run deploy.yml`", self.notices[0])
+        self.assertIn("这是这个会话 10 分钟内第 1 次报警", self.notices[0])
+        stops = lambda: [r["content"] for r in self.store.conn.execute(  # noqa: E731
+            "SELECT content FROM messages WHERE topic_id=? AND reason='audit_offender' ORDER BY rowid",
+            (BUS_TOPIC_ID,))]
+        self.assertEqual(len(stops()), 1)
+        # 10 分钟内出现一条没报过的命令：马上再报，犯规会话再收一条停手提示
         self.append("conv_test_bus", run_command("kubectl delete pod fx-1", step=4))
-        self.d.dispatch_once()
-        self.assertEqual(len(self.notices), 1)                 # 10 分钟内：先攒着
-        self.assertEqual(len(self.store.pending_audit_hits()), 1)
-        past = (datetime.now().astimezone() - timedelta(minutes=11)).isoformat(timespec="seconds")
-        self.store.conn.execute("UPDATE audit_hits SET notified_at=? WHERE notified_at IS NOT NULL", (past,))
-        self.store.conn.commit()
         self.d.dispatch_once()
         self.assertEqual(len(self.notices), 2)
         self.assertIn("kubectl delete pod fx-1", self.notices[1])
         self.assertNotIn("gh pr merge", self.notices[1])
+        self.assertIn("这是这个会话 10 分钟内第 2 次报警", self.notices[1])
+        self.assertEqual(len(stops()), 2)
+        self.assertIn("第 2 次报警", stops()[-1])
+        # 报过的同一条命令又跑：并进之前的报警，不再报、不再排提示
+        self.append("conv_test_bus", run_command("gh pr merge 12 --squash", step=5))
+        self.d.dispatch_once()
+        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(len(stops()), 2)
+        self.assertEqual(self.store.pending_audit_hits(), [])
+        merged = self.hits()[-1]
+        self.assertEqual((merged["merged"], merged["alert_id"]), (1, self.hits()[0]["id"]))
+        # 10 分钟以后同一条命令再跑：再报一次，从第 1 次数起
+        past = (datetime.now().astimezone() - timedelta(minutes=11)).isoformat(timespec="seconds")
+        self.store.conn.execute("UPDATE audit_hits SET notified_at=? WHERE notified_at IS NOT NULL", (past,))
+        self.store.conn.commit()
+        self.append("conv_test_bus", run_command("gh pr merge 12 --squash", step=6))
+        self.d.dispatch_once()
+        self.assertEqual(len(self.notices), 3)
+        self.assertIn("gh pr merge 12 --squash", self.notices[2])
+        self.assertIn("第 1 次报警", self.notices[2])
 
     def test_only_audited_topics(self):
         self.append("conv_test_alpha", {"type": "USER_INPUT"})   # 第一次看到：从末尾开始

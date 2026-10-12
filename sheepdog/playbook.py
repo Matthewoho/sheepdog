@@ -32,9 +32,10 @@ PLAYBOOK_FILES: dict[str, str] = {
     "host_locked.md": "命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明，可用 {{host}} {{since}}",
     # 护栏（7.19）
     "rules_after_compaction.md": "检测到宿主压缩、下一批重推完整规则时，规则前的那句话（缺了用代码里的一句默认话）",
-    "audit_offender.md": "会话跑了危险命令时，给它的系统提示里附的话，可用 {{commands}}",
+    "audit_offender.md": "会话跑了危险命令时，给它的系统提示里附的话（每次报警都发），可用 {{commands}} "
+                         "{{alert_count}}（这个会话 10 分钟内第几次报警）",
     "audit_notify.md": "会话跑了危险命令时，给 [audit] also_notify 会话的提示里附的话，"
-                       "可用 {{commands}} {{offender_title}} {{offender_topic}}",
+                       "可用 {{commands}} {{offender_title}} {{offender_topic}} {{alert_count}}",
 }
 
 # 可选文件：缺了用代码里的默认值，不算缺（doctor 不报）

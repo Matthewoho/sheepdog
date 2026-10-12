@@ -82,6 +82,9 @@ sheepdog redeliver --batch b   # 发送中断、不确定是否送达的批次�
 sheepdog watch-done --id N     # 会话确认真的等到了对方的回复
 sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
 sheepdog board [--topic tp_x] [--json]   # 在岗表：各会话的职责、运行状态、此刻 / 最近动作、名下的活、未读留言
+sheepdog notices [--all] [--show N]      # 给你的通知：没发出去的（还在重试的、放弃了的）；--all 连已发的
+sheepdog notices --retry N|all           # 没发出去的回到待发（2 小时重新算），常驻进程下一轮重发，防重编号不变
+sheepdog notices --ack N|all             # 确认已处理：不再提示、不再重发
 sheepdog work set --topic tp_x --key K --title "..." --state doing [--waiting-on 谁] [--until 几点] [--expect "..."] [--to tp_y]
 sheepdog work done --topic tp_x --key K --result "..."   # 会话登记 / 收掉名下的活（立即写入）
 sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   # 会话给别的会话留言，下一批送到
@@ -128,6 +131,7 @@ sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   
 - **重启**：`runs` 里还在跑的，进程还活着、命令行对得上就继续等；已经退出的按输出文件收尾；一律不重发。
 - **查看**：`sheepdog sessions` 多了宿主、模型、档位三列和最近一轮的状态；`sheepdog show --topic tp_x` 打印最近几轮问答，并告诉你去哪接着看（Codex：应用里的同名线程；Claude：在 workdir 里跑 `claude --resume <编号>`）。
 - **测试环境**：`[source] enabled = false` 时不拉 IM，用 `sheepdog inject` 把一条合成消息（编号以 `om_test_inject_` 开头）放进账本，走正常的路由和投递。
+- **给你的通知不会丢（通知账本）**：经机器人私聊你的每一条通知（危险命令报警、在岗表判中断 / 失联和已恢复、attention 和恢复、投递不出去 / 已恢复、写锁提醒、登录提醒）都先落账本（`owner_notices` 表：通知类型、会话、正文原样字节、防重编号、待发 / 已发 / 放弃、尝试次数、最近一次错误、时间），再发。发送带 `lark-cli im +messages-send --idempotency-key`（防重编号在落账本时定好，`sd-` 加 32 位十六进制，35 个字符），每次重试都用同一个编号、同一份正文字节，飞书 1 小时内同一个编号只发出一条。发不出去（比如飞书限流 429）留在待发，每一轮按退避重试（1、2、4、8 分钟，之后每 10 分钟一次），重启以后接着试；从落账本起 2 小时还没发出去就标放弃、记 ERROR 日志，`sheepdog doctor` 和 `sheepdog board` 的开头一直显示「⚠ 有 N 条给主人的通知没发出去」，直到你 `sheepdog notices --retry` 重发或 `--ack` 确认。进程在「发出去了、还没记成已发」之间没了：重启后 50 分钟以内用同一个编号补发（飞书去重）；更久了不敢补发，标放弃等你看。调用方「这件事已经通知过」的记账在发送之前做，重启以后不会为同一件事再拼一条新通知。`[notify] file` 模式照旧直接写文件，不落账本、不重试。
 - **给你的通知写到文件（测试环境）**：不拉 IM 时没有私聊你的渠道，原来给你的通知（在岗表判中断 / 失联、attention 和自动恢复、危险命令报警、写锁提醒、登录失效）只记日志。配置里设 `[notify] file = "路径"`（相对路径相对配置文件所在目录），这些通知一律追加写进这个文件，不发飞书；每条一段，头一行是 `### 2026-10-12 14:03:05（北京时间）· 在岗表通知` 这样的时间和通知类型，下面是原文。通知类型：`在岗表通知`、`attention 通知`、`恢复通知`、`投递失败通知`、`投递恢复通知`、`危险命令报警`、`写锁提醒`、`登录提醒`。`sheepdog.notify.read_notices()` 能把文件读回成列表。没设时行为不变。拉着飞书又设了它，写文件优先、不发飞书，`sheepdog doctor` 会提示「主人通知写到文件，不发飞书」，免得正式配置误设。`--dry-run` 只打印，不写文件。改了下一轮生效。
 
 ## 代回用卡片
@@ -316,7 +320,10 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
 
 会话的上下文被宿主压缩以后，开场时给的规则可能整段丢掉，会话自己不知道。sheepdog 每轮增量读各会话的记录（每个会话、每种用途记一个读到的字节偏移，存在账本 `transcript_cursors` 表；只读新写的完整行，不整份重读），补三道护栏：
 
-- **压缩后重推规则**：记录里出现新的压缩点，就清空这个会话的规则指纹，下一批带上完整现行规则（同「规则改了自动同步」），规则前加一句话说明为什么又发，这句话来自 playbook 的 `rules_after_compaction.md`，没有这个文件就用一句默认话。日志写「检测到压缩」；`sheepdog sessions` 在送达前显示「上下文 … 被压缩过」。认的压缩点：
+- **压缩后重推规则**：记录里出现新的压缩点，就清空这个会话的规则指纹，下一批带上完整现行规则（同「规则改了自动同步」），规则前加一句话说明为什么又发，这句话来自 playbook 的 `rules_after_compaction.md`，没有这个文件就用一句默认话。日志写「检测到压缩」；`sheepdog sessions` 在送达前显示「上下文 … 被压缩过」。
+  - Antigravity 会话认出压缩时手上有批次在跑（或者有没交差的批次：判过回执超时、还没交回执的），不等下一批：同一轮就单独发一条系统消息，内容是完整现行规则（和下一批重推的一样），开头写明是认出了压缩才补发、这条不是新批次、手上的批次照常做完交回执。这条消息不改批次记账（不记 dispatches、不改在等回执的批次、不影响回执超时和在岗表），发出去以后规则指纹记成最新，下一批不再重推。同一个压缩点只补发一次（记在账本 meta 的 `compaction_resent:<topic>`，重启、记录重读以后也一样）；发送失败不重试，退回「下一批带上」。你正在会话里（human_attached）时不插话。
+  - Codex / Claude 会话一轮跑着的时候送不进去，照旧下一批重推。
+  认的压缩点：
   - Antigravity：一行 `"type": "CHECKPOINT"`，content 以 `# Resuming from a compaction` 开头；
   - Codex：`type = response_item` 且 `payload.type = compaction`（老文件里的顶层 `type = compacted` 也认）；
   - Claude：`"subtype": "compact_boundary"`（没核实过，有就认）。
@@ -326,7 +333,7 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
   2. 给犯规的会话排一条系统提示（事实由 sheepdog 写，后面附 playbook 的 `audit_offender.md`）；
   3. 给 `[audit] also_notify` 里的会话各排一条系统提示（附 `audit_notify.md`）。
   命中 danger_patterns、但同时命中任一条 `ignore_patterns` 的不报。默认忽略：查帮助（`--help`、`-h`）、知识库记录脚本（`context_memory.py`、`pkm.py`）、sheepdog 自己的命令（包括 forward 的备注）、IM 收发（`lark-cli im`，消息正文里提到这些命令名）、`--dry-run`。忽略判断对整条命令做，不逐段拆：一条复合命令里如果既有危险命令、又有 `lark-cli im`（或其他忽略项），会被一起忽略。这是为了让总线写复盘记录、发消息时提到命令名不误报而接受的取舍。
-  同一条命令按（会话、step）去重；同一个会话 10 分钟内的命中合并：第一条马上报，之后 10 分钟内的攒到窗口结束一起报，同一条命令文本只列一行、标次数。
+  同一条命令按（会话、step）去重。合并只合并已经报过的同一条命令：同一个会话 10 分钟内已经报过的命令（按整理、脱敏后的命令文本比）再跑，只记一笔、并进那次报警，不再报；之前没报过的命令马上再报一次（同一轮里新出现的几条合成一条，同一条命令文本只列一行、标次数）。每次报警都给你发一条、给犯规的会话再排一条停手提示、照旧知会 `also_notify`，三处都写明「这是这个会话 10 分钟内第 N 次报警」。报不报只看命令有没有报过，不看上一条报警发出去没有：上一条还在通知账本里待发，也压不住新的。
 
 ```toml
 [audit]
@@ -385,8 +392,8 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `cli_host.md` | 只发给 Codex / Claude 会话（common.md 之后）：回执块怎么写、发不了 IM 时怎么办 | `{{host}}` |
 | `host_locked.md` | 命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明（为什么锁、怎么放锁） | `{{host}}` `{{since}}` |
 | `rules_after_compaction.md` | 检测到宿主压缩、重推完整规则时放在规则前的一句话（缺了用代码里的一句默认话） | — |
-| `audit_offender.md` | 会话跑了危险命令时，给它的系统提示里附的话 | `{{commands}}` |
-| `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` |
+| `audit_offender.md` | 会话跑了危险命令时，给它的系统提示里附的话（每次报警都发） | `{{commands}}` `{{alert_count}}`（10 分钟内第几次报警） |
+| `audit_notify.md` | 会话跑了危险命令时，给 `[audit] also_notify` 会话的提示里附的话 | `{{commands}}` `{{offender_title}}` `{{offender_topic}}` `{{alert_count}}` |
 | `attention_notice.md` | 可选：会话进入 attention 时私聊你的通知末尾附的话（事实由 sheepdog 写在前面，缺了只发事实，doctor 不报缺） | `{{host}}` `{{reason}}` `{{since}}` `{{queued}}` `{{auto_recover}}`（yes / no） |
 | `attention_recovered.md` | 可选：会话自动恢复时私聊你的通知末尾附的话 | `{{host}}` `{{evidence}}` `{{queued}}` |
 | `duty_collision.md` | 可选：撞车提醒后面附的话（事实由 sheepdog 写在前面） | `{{key}}` `{{owner_title}}` `{{owner_topic}}` `{{work_state}}` `{{run_state}}` `{{action}}` `{{ago}}` |
@@ -423,7 +430,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | 运行数据（账本、Inbox、回执） | `~/.local/state/sheepdog/`，超过 `retention_days`（默认 7 天）清理 | ❌ |
 | 业务产出 | 由各 session 自行写入你的知识库 / 任务系统 | ❌ |
 
-除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（同一会话 10 分钟内合并成一条）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次）、在岗表判会话中断 / 失联时的通知（同一段一次）和恢复时的「已恢复」、同一会话连续 3 次投递失败时的「投递不出去」和之后的「投递已恢复」，sheepdog 对 IM 只读。设了 `[notify] file`（测试环境）时，这些通知改写进文件，不发飞书。
+除了加、撤确认表情（`[ack]`），以及经机器人私聊你的几类提醒：Codex / Claude 登录失效时「需要你重新登录」（24 小时最多一次）、会话写锁冲突满 60 分钟时提醒你关掉 Codex 应用（同一会话 24 小时最多一次）、会话跑了危险命令时的报警（10 分钟内报过的同一条命令不重复报，新命令马上报）、会话卡在 attention 时的通知和自动恢复后的「已恢复」（同一次 attention 各一次）、在岗表判会话中断 / 失联时的通知（同一段一次）和恢复时的「已恢复」、同一会话连续 3 次投递失败时的「投递不出去」和之后的「投递已恢复」，sheepdog 对 IM 只读。设了 `[notify] file`（测试环境）时，这些通知改写进文件，不发飞书。
 
 清理（常驻进程每小时一次）覆盖：消息、投递记录、「需要你定」、机器人消息来源、确认表情（已撤 / 机器人身份 / 点失败的）、主人表情、已结束的等待、已执行的动作、熔断记录、回执文件、Codex / Claude 已结束的运行记录和 `runs/` 下的输入输出文件、已报过的危险命令记录、在岗表的履历和已结束的活（按 `[duty] history_days`，默认 7 天）、已回执的留言；还没结束、正在进行的不删（未结问题、还在等的等待、排队的动作、等回执的批次、不确定是否送达的批次）。已经送进 AI 会话的内容由 AI 宿主保存，不在 sheepdog 的清理范围内。
 
