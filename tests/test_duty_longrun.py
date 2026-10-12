@@ -312,6 +312,13 @@ class LongRun:
         # ---- 2. 不丢：排队要有原因 ----
         self.stats["inv2 检查"] += store.conn.execute(
             "SELECT COUNT(*) FROM messages WHERE route='dispatch'").fetchone()[0]
+        # 投出去、还没回执的消息，所在的批次一定还在等回执；批次判了回执超时，消息就该退回排队（不然它就丢了）
+        for r in store.conn.execute(
+                "SELECT m.message_id, m.batch_id, d.state AS dstate FROM messages m LEFT JOIN dispatches d "
+                "ON d.batch_id = m.batch_id WHERE m.route='dispatch' AND m.dispatch_state='delivered'"):
+            if r["dstate"] != "sent":
+                self.fail(f"不变量 2：{r['message_id']} 记着已投出，但它的批次 {r['batch_id']} 是 {r['dstate']}"
+                          "（没回执也没退回排队，等于丢了）")
         for r in store.conn.execute("SELECT message_id, topic_id, dispatch_state FROM messages WHERE route='dispatch' "
                                     "AND dispatch_state NOT IN ('delivered','acked','missed')"):
             st = r["dispatch_state"]
@@ -536,9 +543,10 @@ class LongRun:
             busy = any(w.store.get_topic(tid)["state"] == sm.RUNNING for tid in self.tids)
             if pending == 0 and not busy:
                 break
+        # 治好以后，每条消息都要有着落：会话交了回执（acked），或者 adopted 会话超时不交（missed）
         left = w.store.conn.execute(
             "SELECT message_id, topic_id, dispatch_state FROM messages WHERE route='dispatch' AND dispatch_state NOT IN "
-            "('delivered','acked','missed')").fetchall()
+            "('acked','missed')").fetchall()
         for r in left:
             self.fail(f"不变量 2（最终）：{r['message_id']}（{r['topic_id']}）最后还是 {r['dispatch_state']}")
         n = w.store.conn.execute("SELECT COUNT(*) FROM messages WHERE route='dispatch'").fetchone()[0]
