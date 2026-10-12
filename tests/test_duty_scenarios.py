@@ -444,6 +444,38 @@ class S5OwnerOccupied(Scenario):
         self.assertEqual(self.got("tp_alpha"), [[m1]])
 
 
+    def test_record_says_owner_typed_sink_says_no(self):
+        """主人在会话里打了字（记录里有 USER_INPUT），宿主却答「没有」——以前的 DryRunSink 永远这么答，只打印模式下卡片
+        写「被主人占着」、消息照投（黑盒 BUG-02）。现在投递只看卡片上的 human_at：扣着；每一轮卡片被主人占着 ⇔ 没投它；
+        engine 一次也没问宿主。"""
+        w, a = self.w, self.w["alpha"]
+        w.sink.human_answer = None
+        self.to(4)
+        a.owner_says("我在调这个会话")
+        mid = w.message("alpha", "打扰主人的消息")
+        for m in range(5, 20):  # 消息一直排着：每一轮都要决定投不投
+            self.to(m)
+            got = self.got("tp_alpha", m)
+            self.assertEqual(w.run_state("alpha") == duty.OCCUPIED, got == [], m)  # 卡片被主人占着 ⇔ 没投
+            self.assertEqual(got, [] if m < 19 else [[mid]], m)  # 09:04 说的话，09:19 起不算占着
+        self.assertEqual(w.topic("alpha")["state"], sm.RUNNING)
+        self.assertEqual(w.sink.human_asked, 0)
+        self.assertEqual(self.notes(), [])
+
+    def test_record_says_no_owner_sink_says_owner(self):
+        """反过来：记录里主人没说话，宿主每一轮都说主人刚说过——照投，卡片从来不是被主人占着。"""
+        w, a = self.w, self.w["alpha"]
+        for m in range(1, 8):
+            mid = w.message("alpha", f"第 {m} 件")
+            w.sink.human_answer = START + timedelta(minutes=m)  # 这一轮的「现在」
+            self.to(m)
+            self.assertEqual(self.got("tp_alpha", m), [[mid]], m)
+            self.assertNotEqual(w.run_state("alpha"), duty.OCCUPIED)
+            a.act("Handle it")
+            a.receipt()
+        self.assertEqual(w.sink.human_asked, 0)
+
+
 # ======================= S6 failed 照常重投 =======================
 class S6FailedRedelivered(Scenario):
     def test_receipt_timeout_failed_is_redelivered_even_when_card_says_stalled(self):
@@ -954,6 +986,69 @@ class S14OtherPaths(Scenario):
         self.assertEqual(w.store.get_dispatch(calls[0])["state"], "sent")
         self.assertEqual(self.got("tp_alpha"), [[mid]])  # 只投过那一次
         self.assertEqual(w.state(mid), "delivered")
+
+
+# ======================= S15 找不到会话记录（黑盒 BUG-01） =======================
+class S15NoRecord(Scenario):
+    def test_record_moved_away_lost_once_then_back_and_recovered(self):
+        """会话的 brain 目录被挪走了：投递照样「成功」，记录一行不写。以前卡片一直是「在做」、不扣消息、主人收不到任何
+        通知。现在从这一批送出起满 30 分钟判失联、私聊主人一次、扣消息；记录回来、有了动作，按正常规则恢复、补送、说「已恢复」。"""
+        w, a = self.w, self.w["alpha"]
+        moved = a.path.with_name("moved.jsonl")
+        a.path.rename(moved)
+        a.app_alive = False
+        m1 = w.message("alpha", "第一件")
+        self.to(1)
+        self.assertEqual(self.got("tp_alpha", 1), [[m1]])
+        self.to(16)  # 过了中断阈值也不判：可能只是还没写第一步
+        self.assert_card("tp_alpha", duty.WORKING)
+        rc, out = self.cli("board", "--topic", "tp_alpha")
+        self.assertIn("此刻动作：（找不到会话记录）", out)
+        self.to(30)
+        self.assertNotIn(w.run_state("alpha"), duty.STUCK)
+        self.assertEqual(self.notes(), [])
+        self.to(31)  # 09:01 送出起满 30 分钟
+        self.assert_card("tp_alpha", duty.LOST, "找不到会话记录（conv_test_alpha），批次 09:01 送出后无从判断")
+        self.assertEqual(self.notes(), [("09:31", "在岗表通知", "🐕 汇报 · 会话失联了 [tp_bus]")])
+        rc, out = self.cli("board", "--topic", "tp_alpha")
+        self.assertIn("最近动作：（找不到会话记录）", out)
+        m2 = w.message("alpha", "第二件")
+        self.to(40)
+        self.assertEqual(self.got("tp_alpha"), [[m1]])  # 扣着
+        self.assertIn("在岗表判为失联", w.last_result["topics"]["tp_alpha"]["queued"])
+        self.assertEqual(w.card("alpha")["queued"], 1)
+        self.assertEqual(len(self.notes()), 1)  # 同一段只说一次
+        # 目录挪回来，会话有了动作：恢复，补送，说「已恢复」
+        moved.rename(a.path)
+        a.app_alive = True
+        a.act("Reopen the session")
+        self.to(41)
+        self.assertEqual(self.got("tp_alpha"), [[m1], [m2]])
+        self.assert_card("tp_alpha", duty.WORKING)
+        self.assertEqual([x[:2] for x in self.notes()], [("09:31", "在岗表通知"), ("09:41", "恢复通知")])
+        c = duty.board_cards(w.store, w.cfg, topic="tp_alpha")[0]
+        self.assertEqual((c["action"], c["no_record"]), ("Reopen the session", False))
+        self.assert_nothing_else_received(BUS_TOPIC_ID, "tp_beta")
+
+    def test_new_session_without_record_for_a_while_is_not_judged(self):
+        """新建的会话第一步之前可能还没有记录文件：二十分钟没有文件（超过中断阈值）不判卡住、不通知；文件出现以后照常算。"""
+        w, a = self.w, self.w["alpha"]
+        a.path.unlink()
+        a.app_alive = False
+        mid = w.message("alpha", "新会话的第一件")
+        for m in range(1, 20):
+            self.to(m)
+            self.assert_card("tp_alpha", duty.WORKING)
+        self.assertEqual(self.got("tp_alpha"), [[mid]])
+        a.app_alive = True
+        a.act("First step")  # 记录文件这才出现
+        self.to(20)
+        self.assert_card("tp_alpha", duty.WORKING)
+        self.assertEqual(duty.board_cards(w.store, w.cfg, topic="tp_alpha")[0]["action"], "First step")
+        a.receipt()
+        self.to(60)
+        self.assert_card("tp_alpha", duty.IDLE)
+        self.assertEqual(self.notes(), [])
 
 
 class DefaultsGuardTest(unittest.TestCase):

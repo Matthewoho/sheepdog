@@ -186,6 +186,8 @@ def main() -> int:
         t = store.get_topic(tid)
         store.update_topic(tid, onboarded_at=iso(ago(180)), rules_hash=d.rules_hash(t))
     store.set_meta("roster_notify_bus", "0")
+    # 总线也有会话记录（只有开场）；没有记录的会话，卡片的动作会写「（找不到会话记录）」
+    write_record(app, "conv_test_bus", [], mtime=ago(60))
 
     # ---- 2. 发版：批次 8 分钟前送出，在做审批单；最近一次工具调用 5 分钟前 ----
     store.record_dispatch("b_test_release", "tp_release", [])

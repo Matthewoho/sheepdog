@@ -124,7 +124,7 @@ sheepdog tell --topic tp_x --to tp_y "话" [--key K] [--quote "主人原话"]   
 - **权限不归 sheepdog 管**：不传任何沙箱、审批、权限参数，全部来自宿主自己的配置（Codex 看 `~/.codex/config.toml`，`[hosts.codex] profile` 设了名字时，sheepdog 读 `~/.codex/<名字>.config.toml`，展开成 `-c` 参数传给自己起的 app-server（app-server 不接受 `-p`），你自己在 Codex 应用里的会话不受影响；配置档只对之后新开的 Codex 会话生效（2026-10-10 实测：Codex 建线程时把沙箱策略记在线程上，之后用新进程、带不同的 -c 续接也照样沿用旧策略），改了配置档，老会话要退休换新才会跟着变；配置档读不到或解析失败时这一轮直接失败、不重试，会话标 attention 并提示总线；示例见 `examples/codex-profile.example.toml`；Claude 看用户设置、workdir 下的设置，或 `settings` 指的文件，sheepdog 只传文件名）。Codex 发来的审批请求一律拒绝，方法名记进运行记录。`sheepdog doctor` 会列出每个宿主的命令、登录状态、Codex 的配置档名，以及（设了配置档就读配置档，没设读用户配置）`sandbox_mode`、网络开关、`writable_roots`；只读或网络关着时提示「能读、能分析，但发不了飞书」。
 - **回执**：这两类会话多半写不了 sheepdog 的状态目录，所以给它们的批次脚注和接口说明里只写一种交法：在回答末尾附一个 ```` ```sheepdog-receipt ```` 块（内容同 `receipt --json` 的 JSON），不让它们先试回执命令（第三层实测：命令失败后会话把「交不了回执」当成受阻，回执写成 waiting_external）。一轮结束时：会话自己交过回执就以它为准；没交就取回执块；都没有就按回执超时处理。写法和「什么才算受阻」在 playbook 的 `cli_host.md`，只发给这两类会话。
 - **出错**：按输出内容认，不靠退出码。容量满 / 5xx：同一批次 5、10、20 分钟后重试，最多 3 次，还不行会话标 attention、提示总线，不换模型。写锁冲突（你在 Codex 应用里看过这个线程：应用对看过的线程一直持写锁，切走也不会马上放；这条线程在应用里闲置满 3 小时，或之后又看了 10 条以上别的线程才自动放开，想马上放开就关掉应用；3 小时、10 条是 Codex 桌面版 26.1007.21159 里的常量，以后可能会变）：视同主人正在用，批次退回排队（一条不丢）；连续 60 分钟提示总线，并经机器人私聊提醒你关掉 Codex 应用（同一段冲突只提醒一次，同一会话 24 小时最多一次），说明文字来自 playbook 的 `host_locked.md`。登录失效：这个宿主整体排队，经机器人给你发一条「需要你重新登录」（24 小时一次）。超过 `timeout_minutes`：杀掉整个进程组，会话标 attention。Claude 的 `permission_denials` 记日志，并在 `sheepdog sessions` 里显示。
-- **你在用时让路**：Codex 读线程的 rollout 文件（`~/.codex/sessions/**/rollout-*-<编号>.jsonl`），Claude 读 `~/.claude/projects/*/<编号>.jsonl`；sheepdog 自己发的（带 `[sheepdog]` 头的）和第一条开场不算，其他用户消息算你的发言。另外有交互式 `claude --resume <编号>` 在跑也算你在用。
+- **你在用时让路**：Codex 读线程的 rollout 文件（`~/.codex/sessions/**/rollout-*-<编号>.jsonl`），Claude 读 `~/.claude/projects/*/<编号>.jsonl`；sheepdog 自己发的（带 `[sheepdog]` 头的）和第一条开场不算，其他用户消息算你的发言。你的发言时间记在在岗表卡片上（记录里来了新的用户消息才重新认一遍），投递要不要让路只看这个值。另外有交互式 `claude --resume <编号>` 在跑也算你在用（和写锁一样，每轮问宿主）。
 - **重启**：`runs` 里还在跑的，进程还活着、命令行对得上就继续等；已经退出的按输出文件收尾；一律不重发。
 - **查看**：`sheepdog sessions` 多了宿主、模型、档位三列和最近一轮的状态；`sheepdog show --topic tp_x` 打印最近几轮问答，并告诉你去哪接着看（Codex：应用里的同名线程；Claude：在 workdir 里跑 `claude --resume <编号>`）。
 - **测试环境**：`[source] enabled = false` 时不拉 IM，用 `sheepdog inject` 把一条合成消息（编号以 `om_test_inject_` 开头）放进账本，走正常的路由和投递。
@@ -189,8 +189,8 @@ sheepdog reply-card --text-file body.md     # 正文从文件读；- 表示标�
 
 1. **撞车检查**：用 `[duty] key_patterns` 从消息正文认编号（默认：审批单号 12 位数字、`PR #123`、Linear 单号 `ABC-123`）。以路由事实为主：这个编号的消息最近送到过别的会话，就附一行「🔀 撞车提醒：202610120022 的消息最近送到了「发版」（topic `tp_release`）：最近一次 12 分钟前，共 3 条；它现在在做，最近动作「…」5 分钟前」；别的会话手上还开着这把钥匙的活（自动补的、会话自报的）也算，写成「…在「发版」手上；会话自报：进行中（更新于 10 分钟前）」，可能过期的带上那几个字。后面接 playbook 的 `duty_collision.md`（多了 `{{basis}}`：路由 / 会话自报 / 自动）。只提醒不拦，送给谁不变。sheepdog 自己生成的消息（留言、提醒）不查、也不记路由事实。
 2. **运行状态**，按顺序取第一个命中：
-   - **被主人占着**：你在 Antigravity 里亲自说话（会话状态 `human_attached`，或记录里 `human_attach_minutes` 内有 `USER_INPUT`），或 Codex 应用开着它（写锁冲突）；
-   - **失联**：后台进程没了还没交结果（Codex / Claude 这一轮「进程退出，没有结果」），或批次送出后会话记录 `lost_minutes`（默认 30）分钟完全不动（文件没写过）；
+   - **被主人占着**：你在会话里亲自说话（会话状态 `human_attached`，或 `human_attach_minutes` 内说过话：Antigravity 看记录里的 `USER_INPUT`，Codex / Claude 看记录里不是牧羊犬发的、也不是第一条初始提示词的用户消息），或 Codex 应用开着它（写锁冲突）。「你说没说话」只有一个判断：卡片上记的那个时间；投递要不要暂停也看它，卡片和投递不会一个说占着、一个照投（只打印模式也一样）；
+   - **失联**：后台进程没了还没交结果（Codex / Claude 这一轮「进程退出，没有结果」），或批次送出后会话记录 `lost_minutes`（默认 30）分钟完全不动（文件没写过），或**找不到会话记录**（Antigravity / Codex 的会话被删了、目录被挪走、找不到 rollout）而手上有没交差的批次、从这一批送出起满 `lost_minutes`（依据写「找不到会话记录（会话编号），批次 HH:MM 送出后无从判断」；新建的会话第一步之前可能还没有记录文件，所以不用 `stall_minutes`）。找不到记录、手上又没有没交差的批次时运行状态不变，卡片的最近动作写「（找不到会话记录）」；
    - **中断**：批次送出后 `stall_minutes`（默认 15）分钟没有新动作（会话没碰过它，或者动过以后停下了；动过以后停下的，从最后一次动作算起，只要那之后手上一直有没交差的批次——总线回执超时重投同一批不重新计时），或这一轮失败、超时、卡在 attention；
    - **在做**：批次在跑、`stall_minutes` 内有新动作；同一条命令 / 同一个工具调用连续 `spin_repeat`（默认 3）次以上标「空转」；
    - **等回复**：最近回执是 `waiting_external` / `needs_decision`，或登记了还开着的 `watch`（等别人回复），或有没答的「需要你定」。只看这些事实，会话自报的「等别人」「等主人」不算；

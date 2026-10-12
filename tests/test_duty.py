@@ -17,8 +17,10 @@ from sheepdog.sink import RunResult
 from sheepdog.sink.agentapi import transcript_path
 from sheepdog.sink.cli_host import NO_RESULT
 
-from test_guardrails import GuardBase
-from test_roster import msg
+from pathlib import Path
+
+from test_guardrails import CliSink, GuardBase
+from test_roster import later, msg, owner_says
 
 KEY = "202610100035"
 
@@ -286,6 +288,234 @@ class RunStateTest(DutyBase):
             DutyConfig(key_patterns=["("]).validate()
 
 
+# ======================= 找不到会话记录（黑盒 BUG-01） =======================
+def hm(dt: datetime) -> str:
+    return dt.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M")
+
+
+class NoRecordTest(DutyBase):
+    """会话有编号却找不到它的记录（会话被删、brain 目录被挪走、Codex 找不到 rollout）。以前整段中断 / 失联判定被跳过，
+    卡片一直停在「在做」，不扣消息、主人收不到通知。现在：手上有没交差的批次，从这一批送出起满 lost_minutes 判失联。"""
+
+    def setUp(self):
+        super().setUp()
+        self.assertFalse(transcript_path("conv_test_alpha").exists())  # 这些测试里 alpha 从来没有记录文件
+
+    def test_untouched_batch_lost_after_lost_minutes_queues_and_notifies_once(self):
+        bid = self.sent_batch("tp_alpha", 31)
+        sent = datetime.fromisoformat(self.store.get_dispatch(bid)["sent_at"])
+        self.poll([msg(message_id="om_test_nr1", chat_type="p2p", chat_id="oc_test_alpha_p2p")])
+        before = len(self.sink.to("conv_test_alpha"))
+        r = self.d.dispatch_once()
+        c = self.card("tp_alpha")
+        self.assertEqual(c["run_state"], duty.LOST)
+        self.assertEqual(c["detail"], f"找不到会话记录（conv_test_alpha），批次 {hm(sent)} 送出后无从判断")
+        self.assertEqual(c["no_record"], 1)
+        # 照常扣消息（adopted 回执超时以后回到可投递，但在岗表判失联）
+        self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.ACTIVE)
+        self.assertEqual(len(self.sink.to("conv_test_alpha")), before)
+        self.assertIn("失联", r["topics"]["tp_alpha"]["queued"])
+        self.assertEqual(self.row("om_test_nr1")["dispatch_state"], "pending")
+        # 私聊主人一次，同一段不重复
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("会话失联了 [tp_bus]", self.notices[0])
+        self.assertIn("找不到会话记录（conv_test_alpha）", self.notices[0])
+        self.assertIn("排着 1 条信号", self.notices[0])
+        self.d.dispatch_once()
+        self.d.dispatch_once()
+        self.assertEqual(len(self.notices), 1)
+        # 记录出现了、有了动作：按正常规则恢复，补送，说「已恢复」
+        self.append("conv_test_alpha", tool(datetime.now().astimezone() + timedelta(seconds=2), "Reopen the session"))
+        self.d.dispatch_once()
+        self.assertIn("om_test_nr1", self.sink.to("conv_test_alpha")[-1])
+        self.assertEqual(self.card("tp_alpha")["no_record"], 0)
+        self.assertEqual(len(self.notices), 2)
+        self.assertIn("会话已恢复 [tp_bus]", self.notices[1])
+
+    def test_under_lost_minutes_not_judged_even_past_stall_minutes(self):
+        """新建的会话第一步之前可能还没有记录文件：用 lost_minutes，不用 stall_minutes。"""
+        self.sent_batch("tp_alpha", 29)
+        self.round()
+        self.assertEqual(self.state("tp_alpha"), duty.WORKING)
+        self.assertEqual(self.notices, [])
+        rc, out = self.cli("board", "--topic", "tp_alpha")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("此刻动作：（找不到会话记录）", out)
+
+    def test_running_batch_record_moved_away_after_acting(self):
+        """动过以后记录没了（brain 目录被挪走）：口径同 _quiet_since，从最后一次动作算起。"""
+        self.sent_batch("tp_alpha", 45)
+        p = self.append("conv_test_alpha", tool(ago(40), "Run the long job"))
+        self.round()
+        self.assertEqual(self.state("tp_alpha"), duty.STALLED)  # 有记录时：动过以后 40 分钟没动作 → 中断
+        n = len(self.notices)
+        moved = p.with_name("moved.jsonl")
+        p.rename(moved)
+        self.round()
+        c = self.card("tp_alpha")
+        self.assertEqual(c["run_state"], duty.LOST)
+        self.assertEqual(c["detail"], f"找不到会话记录（conv_test_alpha），批次在跑，最近动作 {hm(ago(40))} 之后无从判断")
+        self.assertEqual(len(self.notices), n + 1)  # 同一段：中断说过一次，失联再说一次
+        self.round()
+        self.assertEqual(len(self.notices), n + 1)
+        # 挪回来，没有新动作：回到按记录判，同一段不再通知、也不说「已恢复」
+        moved.rename(p)
+        self.set_mtime("conv_test_alpha", ago(40))
+        self.round()
+        self.assertEqual(self.state("tp_alpha"), duty.LOST)
+        self.assertIn("完全不动", self.card("tp_alpha")["detail"])
+        self.assertEqual(len(self.notices), n + 1)
+
+    def test_no_pending_batch_keeps_state_and_card_says_no_record(self):
+        p = self.append("conv_test_alpha", tool(ago(5), "Check dashboards"))
+        self.round()
+        c = duty.board_cards(self.store, self.cfg, topic="tp_alpha")[0]
+        self.assertEqual((c["run_state"], c["action"]), (duty.IDLE, "Check dashboards"))
+        p.unlink()
+        self.round()
+        c = duty.board_cards(self.store, self.cfg, topic="tp_alpha")[0]
+        self.assertEqual(c["run_state"], duty.IDLE)  # 运行状态不变
+        self.assertEqual((c["action"], c["action_ago"], c["no_record"]), (duty.NO_RECORD_ACTION, "", True))
+        self.assertEqual(self.card("tp_alpha")["action"], "Check dashboards")  # 账本里的最近一次工具调用不丢
+        self.assertEqual(self.notices, [])
+        out = duty.render_board([c], "FX")
+        self.assertIn("最近动作：（找不到会话记录）", out)
+        self.assertNotIn("「（找不到会话记录）」", out)
+        line = duty.digest_line({**c, "run_state": duty.STALLED, "run_label": "中断"})
+        self.assertIn("最近动作（找不到会话记录）", line)
+        # 撞车提醒里的「最近动作」也照卡片写
+        duty.set_work(self.store, "tp_alpha", KEY, title="发版", state="doing")
+        self.poll([msg(message_id="om_test_nr2", chat_type="p2p", chat_id="oc_test_stranger", content=f"{KEY} 呢")])
+        self.d.dispatch_once()
+        self.assertIn("最近动作（找不到会话记录）", self.sink.to("conv_test_bus")[-1])
+
+    def test_codex_rollout_not_found(self):
+        cli_sink = CliSink({})  # 找不到 rollout
+        self.d = self.make({"antigravity": self.sink, "codex": cli_sink})
+        self.store.update_topic("tp_alpha", host="codex")
+        bid = self.sent_batch("tp_alpha", 35)
+        sent = datetime.fromisoformat(self.store.get_dispatch(bid)["sent_at"])
+        self.round()
+        c = self.card("tp_alpha")
+        self.assertEqual(c["run_state"], duty.LOST)
+        self.assertEqual(c["detail"], f"找不到会话记录（conv_test_alpha），批次 {hm(sent)} 送出后无从判断")
+        self.assertEqual(len(self.notices), 1)
+
+    def test_claude_and_conversationless_sessions_unchanged(self):
+        """Claude 的记录格式没核实过，在岗表本来就只按投递状态判；没有会话编号的不算「找不到记录」。"""
+        self.store.update_topic("tp_alpha", host="claude")
+        self.d = self.make({"antigravity": self.sink, "claude": CliSink({})})
+        self.sent_batch("tp_alpha", 60)
+        self.round()
+        self.assertEqual((self.state("tp_alpha"), self.card("tp_alpha")["no_record"]), (duty.WORKING, 0))
+        self.store.update_topic("tp_alpha", host="antigravity", conversation_id=None)
+        self.round()
+        self.assertEqual((self.state("tp_alpha"), self.card("tp_alpha")["no_record"]), (duty.WORKING, 0))
+        self.assertEqual(self.notices, [])
+
+
+# ======================= 主人在会话里说话只有一个判断源（黑盒 BUG-02） =======================
+def codex_user_line(at: datetime, text: str) -> dict:
+    return {"type": "event_msg", "timestamp": utc(at), "payload": {"type": "item_completed", "item": {
+        "type": "UserMessage", "content": [{"type": "text", "text": text}]}}}
+
+
+class OwnerOneSourceTest(DutyBase):
+    """投递要不要暂停只看在岗表卡片上的 human_at（每轮先扫会话记录），不问 sink；命令行宿主的「主人说话」由宿主
+    自己的读法写进卡片，写锁 / 交互式进程仍走 occupied_at。"""
+
+    class TrapSink(CliSink):
+        def __init__(self, files, typed=None, held=None):
+            super().__init__(files)
+            self.typed, self.held, self.asked = typed, held, 0
+
+        def human_message_at(self, cid):
+            return self.typed
+
+        def occupied_at(self, cid):
+            return self.held
+
+        def last_human_activity(self, cid):  # 以前的接口：engine 不该再问它
+            self.asked += 1
+            return datetime.now().astimezone()
+
+    def codex(self, typed=None, held=None, lines=()):
+        rollout = Path(self.tmp.name) / "codex" / "rollout-2026-10-12T00-00-00-conv_test_alpha.jsonl"
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        with rollout.open("a", encoding="utf-8") as f:
+            for ln in lines:
+                f.write(json.dumps(ln, ensure_ascii=False) + "\n")
+        sink = self.TrapSink({"conv_test_alpha": rollout}, typed, held)
+        self.d = self.make({"antigravity": self.sink, "codex": sink})
+        self.store.update_topic("tp_alpha", host="codex")
+        return sink, rollout
+
+    def deliver(self, mid):
+        """来一条给 alpha 的消息、跑一轮：投进 Codex 会话了没有。"""
+        self.poll([msg(message_id=mid, chat_type="p2p", chat_id="oc_test_alpha_p2p")])
+        self.d.dispatch_once()
+        return any(mid in c for c in self.d.sinks["codex"].to("conv_test_alpha"))
+
+    def test_codex_owner_message_held_through_the_card(self):
+        typed = ago(2).replace(microsecond=0)
+        sink, rollout = self.codex(typed=typed, lines=[codex_user_line(typed, "主人：先别发")])
+        self.assertFalse(self.deliver("om_test_os1"))
+        self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.HUMAN_ATTACHED)
+        c = self.card("tp_alpha")
+        self.assertEqual(c["run_state"], duty.OCCUPIED)
+        self.assertEqual(datetime.fromisoformat(c["human_at"]), typed)  # 宿主的读法写进卡片
+        self.assertIn("主人在会话里亲自说话", c["detail"])
+        self.assertEqual(sink.asked, 0)
+        # 15 分钟以后：主人走了，照投
+        with later(16):
+            self.d.dispatch_once()
+        self.assertIn("om_test_os1", sink.to("conv_test_alpha")[-1])
+        self.assertEqual(sink.asked, 0)
+
+    def test_codex_reader_only_rerun_when_a_user_message_arrives(self):
+        calls = []
+        sink, rollout = self.codex()
+        sink.human_message_at = lambda cid: calls.append(cid) or None
+        self.round()
+        self.assertEqual(len(calls), 1)  # 第一次看这个会话：认一遍
+        with rollout.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg", "timestamp": utc(ago(1)), "payload": {
+                "type": "item_completed", "item": {"type": "CommandExecution", "id": "c1", "command": ["ls"]}}}) + "\n")
+        self.round()
+        self.assertEqual(len(calls), 1)  # 只有动作：不重读
+        with rollout.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(codex_user_line(ago(0.5), "主人：等一下"), ensure_ascii=False) + "\n")
+        self.round()
+        self.assertEqual(len(calls), 2)  # 来了用户消息：用宿主的读法重认
+
+    def test_write_lock_still_goes_the_old_way(self):
+        sink, _ = self.codex(held=ago(1))
+        self.assertFalse(self.deliver("om_test_os2"))
+        self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.HUMAN_ATTACHED)
+        self.assertEqual(self.state("tp_alpha"), duty.OCCUPIED)
+        self.assertIsNone(self.card("tp_alpha")["human_at"])  # 写锁不算主人说过话
+        self.assertEqual(sink.asked, 0)
+
+    def test_sink_claiming_owner_is_ignored(self):
+        """以前的接口说主人刚说过话、会话记录里没有：照投，卡片也不是被主人占着。"""
+        sink, _ = self.codex(lines=[codex_user_line(ago(30), "初始提示词")])
+        self.assertTrue(self.deliver("om_test_os3"))
+        self.assertNotEqual(self.state("tp_alpha"), duty.OCCUPIED)
+        self.assertEqual(sink.asked, 0)
+
+    def test_user_turn_lines(self):
+        self.assertTrue(guard.user_turn("codex", codex_user_line(ago(1), "x")))
+        self.assertTrue(guard.user_turn("codex", {"type": "event_msg", "payload": {"type": "user_message", "message": "x"}}))
+        self.assertFalse(guard.user_turn("codex", {"type": "response_item", "payload": {"type": "message", "role": "user"}}))
+        self.assertFalse(guard.user_turn("codex", {"type": "event_msg", "payload": {
+            "type": "item_completed", "item": {"type": "AgentMessage"}}}))
+        self.assertTrue(guard.user_turn("claude", {"type": "user", "message": {"role": "user", "content": "主人：换个思路"}}))
+        self.assertFalse(guard.user_turn("claude", {"type": "user", "message": {
+            "role": "user", "content": [{"type": "tool_result", "content": "ok"}]}}))
+        self.assertFalse(guard.user_turn("claude", {"type": "user", "isMeta": True, "message": {"content": "x"}}))
+        self.assertFalse(guard.user_turn("antigravity", {"type": "USER_INPUT", "step_index": 3}))
+
+
 # ======================= 第 3 步：撞车 =======================
 class CollisionTest(DutyBase):
     def test_reminder_attached_but_delivery_unchanged(self):
@@ -445,11 +675,11 @@ class MailTest(DutyBase):
         self.store.update_topic("tp_alpha", state=sm.HUMAN_ATTACHED)
         self.cli("tell", "--topic", "tp_bus", "--to", "alpha", "有空看一下")
         before = len(self.sink.to("conv_test_alpha"))
-        self.sink.human["conv_test_alpha"] = datetime.now().astimezone()
+        owner_says("conv_test_alpha")
         self.d.dispatch_once()
         self.assertEqual(len(self.sink.to("conv_test_alpha")), before)  # 主人占着：排队，不丢
-        self.sink.human.clear()
-        self.d.dispatch_once()
+        with later(16):  # 主人那句话过了 15 分钟
+            self.d.dispatch_once()
         self.assertIn("有空看一下", self.sink.to("conv_test_alpha")[-1])
 
     def test_pair_rate_limit_pauses_and_notifies_bus(self):
@@ -577,6 +807,23 @@ class PruneTest(DutyBase):
 
 
 class SnapshotTest(DutyBase):
+    def test_old_duty_cards_get_no_record_column(self):
+        import sqlite3
+        from sheepdog.store import Store
+        old = Path(self.tmp.name) / "old_cards.sqlite3"
+        c = sqlite3.connect(str(old))
+        c.execute("CREATE TABLE duty_cards (topic_id TEXT PRIMARY KEY, run_state TEXT, action TEXT, idle_since TEXT)")
+        c.execute("INSERT INTO duty_cards(topic_id, run_state, action) VALUES ('tp_x', 'idle', 'Read')")
+        c.commit()
+        c.close()
+        st = Store(old)
+        try:
+            self.assertEqual(st.get_card("tp_x")["no_record"], 0)
+            self.assertEqual(duty.card_data(st, {"topic_id": "tp_x", "title": "x", "duty": "", "state": "active",
+                                                 "host": None}, st.get_card("tp_x"))["action"], "Read")
+        finally:
+            st.close()
+
     def test_dry_run_snapshot_of_old_ledger_has_duty_tables(self):
         import sqlite3
         from sheepdog.store import Store

@@ -250,11 +250,12 @@ CREATE TABLE IF NOT EXISTS duty_cards (
     last_act_at  TEXT,                 -- 会话记录里最近一次动作（含没有工具调用的回答）
     last_sig     TEXT,                 -- 空转判定：最近一次工具调用的签名
     sig_repeat   INTEGER DEFAULT 0,
-    human_at     TEXT,                 -- 主人最近一次在会话里亲自说话（Antigravity 的 USER_INPUT）
+    human_at     TEXT,                 -- 主人最近一次在会话里亲自说话（Antigravity 的 USER_INPUT；Codex / Claude 按宿主的读法）。投递要不要暂停也只看它
     compacted_at TEXT,                 -- 最近一次压缩点
     queued       INTEGER DEFAULT 0,    -- 排队的信号数
     stuck_since  TEXT,                 -- 中断 / 失联从几点算起
     idle_since   TEXT,                 -- 这一段空闲从几点算起（不空闲时为空）：自报的活「可能过期」要看它
+    no_record    INTEGER DEFAULT 0,    -- 找不到会话记录（Antigravity / Codex 有会话编号却没有记录文件）：最近动作写「（找不到会话记录）」
     updated_at   TEXT
 );
 
@@ -346,7 +347,7 @@ MIGRATIONS = {
                ("attention_reason", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
-    "duty_cards": [("idle_since", "TEXT")],
+    "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
 }
 

@@ -8,9 +8,12 @@ work set / done、压缩、等待、重启、session-reset，然后检查不变�
    这一轮发送失败）；最后把所有会话治好，排队的全部投出去。
 3. 每个会话每一段卡住（从会话最后一次动作或 session-reset 算起的一段沉默），给主人的在岗表通知中断最多一条、
    失联最多一条；attention 通知每进一次 attention 最多一条，恢复通知不多于 attention 通知。
-4. 卡片和账本、会话记录对得上：被主人占着那一轮一定没投它（总线 failed 时主人在说话是已知例外，单独计数）；
-   在做 ⇒ 批次在跑、且从「最后一次动作 / 这一串没交差的批次最早送出」起不到中断阈值；路径判的中断 / 失联 ⇒
-   会话真的沉默够久（失联还要记录文件真的不动）；排队数 = 账本里排队的信号数。
+4. 卡片和账本、会话记录对得上：卡片是「被主人占着」⇔ 这一轮因为主人没投它（决定那一刻卡片被主人占着，就一定
+   没投；因为主人排队——会话是 human_attached，或 failed 时「主人在会话里」——卡片一定是被主人占着）；主人在会话
+   里说话只有一个判断源：卡片上的 human_at 和真相一致，engine 从不问 sink（SimSink 的 last_human_activity 像以前的
+   DryRunSink 一样永远答「没有」，旧写法在这里会露馅）；在做 ⇒ 批次在跑、且从「最后一次动作 / 这一串没交差的批次
+   最早送出」起不到中断阈值；路径判的中断 / 失联 ⇒ 会话真的沉默够久（失联还要记录文件真的不动）；
+   排队数 = 账本里排队的信号数。
 5. board、摘要、--json 渲染不报错，摘要不超过行数上限。
 6. 指纹稳定：在岗表（按规格的口径，自己独立算）没变的轮次不附摘要，变了的下一批一定附。
 
@@ -87,7 +90,7 @@ class LongRun:
         self.owed: dict[str, int] = {}   # 说过中断 / 失联 / attention、还没说「已恢复」的：会话 → 这一段说了几条
         self.owed_at: dict[str, object] = {}  # 最后一条「卡住」类通知的时间
         self.fail_told: dict[str, bool] = {}
-        self.w = World(KEYS, real_human_reader=False, fast_db=True)
+        self.w = World(KEYS, fast_db=True)
         self.tids = [BUS_TOPIC_ID] + [f"tp_{k}" for k in KEYS]
         self.beh = {tid: Behaviour() for tid in self.tids}
         self.stats: Counter = Counter()
@@ -454,6 +457,14 @@ class LongRun:
             info = self.decisions.get(tid)
             owner_recent = s.owner_spoke is not None and now - s.owner_spoke < timedelta(
                 minutes=cfg.session.human_attach_minutes)
+            if info is not None:
+                # 卡片是「被主人占着」⇔ 这一轮因为主人没投它（卡片和投递是同一个判断）
+                for_owner = info["state"] == sm.HUMAN_ATTACHED or "主人在会话里" in info["res"].get("queued", "")
+                if info["card"] == duty.OCCUPIED and info["sent"]:
+                    self.fail(f"不变量 4：{tid} 决定时卡片是被主人占着（{info['state']}），这一轮却投了")
+                if for_owner and info["card"] != duty.OCCUPIED:
+                    self.fail(f"不变量 4：{tid} 因为主人排队（{info['state']} {info['res']}），卡片却是 {info['card']}")
+                self.stats["inv4 卡片被主人占着的投递决定"] += info["card"] == duty.OCCUPIED
             if info is not None and info["sent"]:
                 if info["state"] == sm.HUMAN_ATTACHED:
                     self.fail(f"不变量 4：{tid} 状态是被主人占着，这一轮却投了")
@@ -536,14 +547,15 @@ class LongRun:
             tuple((n["at"], n["what"], n["text"]) for n in new_notices),
             tuple((tid, (store.get_card(tid) or {"run_state": None})["run_state"], store.get_topic(tid)["state"])
                   for tid in self.tids)))
-        # 主人在会话里说话：拿真读法（AgentApiSink 整份读合成的记录）和真相对一遍；前 2000 轮每 50 轮一次，之后每 1000 轮
-        if self.w.round_no % (50 if self.w.round_no <= 2000 else 1000) == 0:
-            from sheepdog.sink.agentapi import AgentApiSink
-            for tid in self.tids:
-                s = w.sessions[tid]
-                real = AgentApiSink().last_human_activity(s.cid)
-                if (real is None) != (s.owner_spoke is None) or (real is not None and real != s.owner_spoke):
-                    self.fail(f"主人说话的真读法和真相不一致：{tid} {real} vs {s.owner_spoke}")
+        # 主人在会话里说话只有一个判断源：在岗表扫会话记录写进卡片的 human_at。它和真相一致；engine 从不问 sink
+        if w.sink.human_asked:
+            self.fail(f"不变量 4：engine 问了 sink 主人有没有说话（{w.sink.human_asked} 次），判断源不止一个")
+        for tid in self.tids:
+            c = store.get_card(tid)
+            got = datetime.fromisoformat(c["human_at"]) if c is not None and c["human_at"] else None
+            if got != w.sessions[tid].owner_spoke:
+                self.fail(f"不变量 4：{tid} 卡片上主人说话的时间 {got}，真相是 {w.sessions[tid].owner_spoke}")
+        self.stats["inv4 主人说话判断源检查"] += 1
 
     def canon(self, mid: str) -> str:
         """消息编号在两次跑里要能对上：sheepdog 自己生成的系统消息编号带随机串，换成「原因 + 正文」的摘要。"""
@@ -716,9 +728,9 @@ class LongRunTest(unittest.TestCase):
                 diffs, n = compare(a, b)
                 self.assertEqual(diffs, [], "\n".join(diffs))
                 self.assertGreater(n["通知"], 0)
-                # 长跑真的覆盖到了：卡住、通知、重投、摘要、留言暂停、乱登记都出现过
+                # 长跑真的覆盖到了：卡住、通知、重投、摘要、留言暂停、乱登记、主人占着时有消息要投都出现过
                 for k in ("通知 中断", "通知 恢复", "合法重投", "摘要附上", "摘要没变不附", "进入 stuck", "tell 被拒", "登记",
-                          "登记被拒", "登记 done"):
+                          "登记被拒", "登记 done", "inv4 卡片被主人占着的投递决定"):
                     self.assertGreater(a.stats[k], 0, f"seed {seed} 没跑到「{k}」：{dict(a.stats)}")
                 self.assertEqual(b.stats["登记"], 0)
 

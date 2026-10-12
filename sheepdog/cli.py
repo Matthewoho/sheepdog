@@ -1194,8 +1194,7 @@ def cmd_work(args) -> int:
     for o in others:
         card = store.get_card(o["topic_id"])
         run = duty.RUN_LABEL.get(card["run_state"], "") if card is not None and card["run_state"] else ""
-        act = (f"，最近动作「{card['action']}」{duty.ago_text(card['action_at'] or '')}"
-               if card is not None and card["action"] else "")
+        act = "，" + phrase if (phrase := duty.last_action_phrase(card)) else ""
         print(f"⚠ 这把钥匙{duty.topic_label(store, o['topic_id'])}也在做：{duty.WORK_LABEL.get(o['state'], o['state'])}"
               + (f"，会话{run}" if run else "") + act + "。仍已登记；需要它配合就用 tell 跟它说，不要动手做它的活")
     return 0

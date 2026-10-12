@@ -34,6 +34,8 @@ KEEP_ORDER = (LOST, STALLED, OCCUPIED, WORKING, WAITING, IDLE)
 # 卡片上最近一次工具调用的叫法：只有在做时它才是「此刻」的动作，其他状态下是过去的事
 ACTION_NOW = "此刻动作"
 ACTION_LAST = "最近动作"
+# 找不到会话记录时，卡片上的动作写这句（不加引号：它不是会话的动作说明）
+NO_RECORD_ACTION = "（找不到会话记录）"
 # 总线摘要里空闲会话合成的那一行：每个标题最多几个字、整行最多几个字（超了用「等」收尾）
 IDLE_TITLE_LIMIT = 16
 IDLE_LINE_LIMIT = 120
@@ -404,6 +406,17 @@ def minutes_ago(ts: str, now: datetime | None = None) -> int | None:
     return max(0, int(((now or datetime.now().astimezone()) - dt).total_seconds() // 60))
 
 
+def last_action_phrase(card, now: datetime | None = None) -> str:
+    """撞车提醒、work set 的提示里「最近动作」那半句：最近动作「…」N 分钟前；找不到会话记录时写那句话；没有就空串。"""
+    if card is None:
+        return ""
+    if "no_record" in card.keys() and card["no_record"]:
+        return f"{ACTION_LAST}{NO_RECORD_ACTION}"
+    if not card["action"]:
+        return ""
+    return f"{ACTION_LAST}「{card['action']}」{ago_text(card['action_at'] or '', now)}"
+
+
 def ago_text(ts: str, now: datetime | None = None) -> str:
     m = minutes_ago(ts, now)
     if m is None:
@@ -546,11 +559,13 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
         "run_label": RUN_LABEL.get(state, "（还没算，等下一轮）"),
         "spinning": bool(c.get("spinning")),
         "detail": c.get("detail") or "",
-        "action": c.get("action") or "",
+        # 找不到会话记录：动作写那句话，不带时间（卡片里留着的是记录消失以前的最后一次工具调用，不再当「最近」）
+        "no_record": bool(c.get("no_record")),
+        "action": NO_RECORD_ACTION if c.get("no_record") else (c.get("action") or ""),
         "action_label": action_label(state),
-        "action_at": c.get("action_at") or "",
-        "action_ago": ago_text(c.get("action_at") or "", now),
-        "action_minutes": minutes_ago(c.get("action_at") or "", now),
+        "action_at": "" if c.get("no_record") else (c.get("action_at") or ""),
+        "action_ago": "" if c.get("no_record") else ago_text(c.get("action_at") or "", now),
+        "action_minutes": None if c.get("no_record") else minutes_ago(c.get("action_at") or "", now),
         "compacted_at": c.get("compacted_at") or "",
         "queued": c.get("queued") or 0,
         "updated_at": c.get("updated_at") or "",
@@ -568,6 +583,8 @@ def state_text(d: dict) -> str:
 
 
 def action_text(d: dict) -> str:
+    if d.get("no_record"):
+        return NO_RECORD_ACTION
     if not d["action"]:
         return "—"
     return f"「{d['action']}」" + (f"（{d['action_ago']}）" if d["action_ago"] else "")
@@ -606,7 +623,9 @@ def digest_line(d: dict) -> str:
     parts = [f"「{d['title']}」{d['topic_id']}", d["run_label"] + ("（空转）" if d["spinning"] else "")]
     if d["run_state"] in STUCK and d["detail"]:
         parts[-1] += f"（{short(d['detail'], 50)}）"
-    if d["action"]:
+    if d.get("no_record"):
+        parts.append(f"{action_label(d['run_state'])}{NO_RECORD_ACTION}")
+    elif d["action"]:
         parts.append(f"{action_label(d['run_state'])}「{short(d['action'], 40)}」{d['action_ago']}")
     items = d.get("on_hand") or []
     if items:

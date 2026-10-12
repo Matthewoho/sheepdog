@@ -28,6 +28,13 @@
   先解一次），再没有就是工具名；主人亲自说话是 `USER_INPUT`（第 0 步是开场提示词，不算）
 - Codex：跑的命令（同命令审计）
 - Claude：记录格式没核实过，不认
+
+主人亲自说话（卡片上的 human_at，投递要不要暂停也只看它）：Antigravity 在这里认 `USER_INPUT`；命令行宿主在这里只认出
+「来了一条用户消息」（user_turn），是不是主人说的交给宿主自己的读法（7.18 第 7 条：去掉第一条初始提示词和带牧羊犬
+批次头的）：
+- Codex：`{"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage"}}}`，
+  老格式 `{"type": "event_msg", "payload": {"type": "user_message"}}`
+- Claude：`{"type": "user"}` 且不是工具结果（content 里没有 tool_result），isMeta / isSidechain 的不算
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ _NEEDLES = {
     AUDIT: (b"run_command", b"CommandExecution", b"custom_tool_call", b"tool_use"),
     ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
     DUTY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed", b"custom_tool_call", b"USER_INPUT", b"CHECKPOINT",
-           b"compaction", b"compacted", b"compact_boundary"),
+           b"compaction", b"compacted", b"compact_boundary", b"user_message", b'"type":"user"', b'"type": "user"'),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
 LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
@@ -329,10 +336,32 @@ def tool_actions(host: str, d: dict, line_offset: int) -> list[ToolAction]:
 
 
 def human_input_at(host: str, d: dict) -> datetime | None:
-    """主人在会话里亲自说话（Antigravity 的 USER_INPUT，第 0 步的开场提示词不算）；其他宿主不认，返回 None。"""
+    """主人在会话里亲自说话（Antigravity 的 USER_INPUT，第 0 步的开场提示词不算）；其他宿主不在这里认，返回 None
+    （命令行宿主见 user_turn）。"""
     if host == ANTIGRAVITY and d.get("type") == "USER_INPUT" and d.get("step_index") not in (0, None):
         return parse_ts(str(d.get("created_at") or ""))
     return None
+
+
+def user_turn(host: str, d: dict) -> bool:
+    """命令行宿主（Codex / Claude）的这一行是不是一条用户消息：可能是主人说的，也可能是牧羊犬发的批次、初始提示词。
+    在岗表只拿它当「该用宿主的读法重新认一遍主人说话了」的信号，不在这里判是不是主人。"""
+    if host == "codex":
+        if d.get("type") != "event_msg":
+            return False
+        pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        if pl.get("type") == "user_message":
+            return True
+        item = pl.get("item") if isinstance(pl.get("item"), dict) else {}
+        return pl.get("type") == "item_completed" and item.get("type") == "UserMessage"
+    if host == "claude":
+        if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+            return False
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        content = msg.get("content")
+        return not (isinstance(content, list)
+                    and any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content))
+    return False
 
 
 def record_time(host: str, d: dict) -> datetime | None:

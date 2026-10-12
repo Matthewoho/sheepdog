@@ -406,7 +406,8 @@ class CodexSinkTest(HostBase):
         self.assertIn("thread/resume: thread thr_test_l already has an active writer", res.error)
         self.assertNotIn("turn/start", [r.get("method") for r in self.codex_requests()])
         self.assertIsNotNone(s.lock_streak_since("thr_test_l"))
-        self.assertIsNotNone(s.last_human_activity("thr_test_l"))  # 撞上写锁视同主人正在用
+        self.assertIsNotNone(s.occupied_at("thr_test_l"))  # 撞上写锁视同主人正在用
+        self.assertIsNone(s.human_message_at("thr_test_l"))  # 但不算主人说过话
 
     def test_logged_out_marks_host_unavailable(self):
         os.environ["FAKE_CODEX_MODE"] = "logout"
@@ -493,14 +494,14 @@ class CodexSinkTest(HostBase):
             ("2026-10-10T02:20:00Z", "user_message", "主人直接说：先别发"),
             ("2026-10-10T02:30:00Z", "user_message", "📌 规则已更新（以下为现行完整规则，取代之前的版本）\n..."),
         ])
-        last = s.last_human_activity("thr_test_h")
+        last = s.human_message_at("thr_test_h")
         self.assertEqual(last, datetime.fromisoformat("2026-10-10T02:20:00+00:00"))
         self.assertTrue(s.transcript_contains("thr_test_h", "b_test_x"))
         self.assertFalse(s.transcript_contains("thr_test_h", "b_test_nope"))
         hist = s.history("thr_test_h", 2)
         self.assertEqual([h[0] for h in hist], ["问", "问"])
         self.write_rollout("thr_test_h2", [("2026-10-10T02:00:01Z", "user_message", "初始提示词")])
-        self.assertIsNone(s.last_human_activity("thr_test_h2"))
+        self.assertIsNone(s.human_message_at("thr_test_h2"))
 
     def test_injected_response_items_are_not_the_owner(self):
         s = self.codex()
@@ -510,7 +511,7 @@ class CodexSinkTest(HostBase):
             ("2026-10-10T02:10:00Z", "user_message", "[sheepdog] 新信号批次 `b_test_y`（topic `tp_cx`，共 1 条）"),
         ], injected=[("2026-10-10T02:40:00Z", "<recommended_plugins>...</recommended_plugins> b_test_only_ri"),
                      ("2026-10-10T02:41:00Z", "# AGENTS.md instructions for /work\n<environment_context>...")])
-        self.assertIsNone(s.last_human_activity("thr_test_inj"))
+        self.assertIsNone(s.human_message_at("thr_test_inj"))
         self.assertTrue(s.transcript_contains("thr_test_inj", "b_test_y"))
         self.assertFalse(s.transcript_contains("thr_test_inj", "b_test_only_ri"))
         hist = s.history("thr_test_inj")
@@ -525,7 +526,7 @@ class CodexSinkTest(HostBase):
             ("2026-10-10T02:10:00Z", "user_message", "[sheepdog] 新信号批次 `b_test_lg`"),
             ("2026-10-10T02:20:00Z", "user_message", "主人：等一下"),
         ], legacy=True)
-        self.assertEqual(s.last_human_activity("thr_test_lg"), datetime.fromisoformat("2026-10-10T02:20:00+00:00"))
+        self.assertEqual(s.human_message_at("thr_test_lg"), datetime.fromisoformat("2026-10-10T02:20:00+00:00"))
         self.assertTrue(s.transcript_contains("thr_test_lg", "b_test_lg"))
         self.assertEqual(len(s.history("thr_test_lg", 10)), 4)
 
@@ -797,12 +798,14 @@ class ClaudeSinkTest(HostBase):
              "message": {"role": "user", "content": [{"type": "text", "text": "主人：换个思路"}]}},
         ]
         (d / f"{cid}.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
-        self.assertEqual(s.last_human_activity(cid), datetime.fromisoformat("2026-10-10T02:15:00+00:00"))
+        self.assertEqual(s.human_message_at(cid), datetime.fromisoformat("2026-10-10T02:15:00+00:00"))
+        self.assertIsNone(s.occupied_at(cid))
         self.assertTrue(s.transcript_contains(cid, "b_test_cl1"))
         self.assertIn("claude --resume", s.resume_hint(cid))
         with mock.patch.object(ClaudeSink, "_ps_lines", return_value=[(4242, f"node /x/claude --resume {cid}")]):
             self.assertTrue(s.interactive_attached(cid))
-            self.assertGreater(s.last_human_activity(cid), datetime.now().astimezone() - timedelta(seconds=5))
+            self.assertGreater(s.occupied_at(cid), datetime.now().astimezone() - timedelta(seconds=5))
+            self.assertEqual(s.human_message_at(cid), datetime.fromisoformat("2026-10-10T02:15:00+00:00"))
         with mock.patch.object(ClaudeSink, "_ps_lines", return_value=[(4242, f"claude -p --resume {cid}")]):
             self.assertFalse(s.interactive_attached(cid))  # -p 是牧羊犬这类非交互调用，不算主人
 

@@ -155,7 +155,8 @@ class ClaudeSink(CliHostSink):
         return any(pid not in ours and pat.search(cmd) and not _PRINT_FLAG.search(cmd)
                    for pid, cmd in self._ps_lines())
 
-    def last_human_activity(self, conversation_id: str) -> datetime | None:
+    def occupied_at(self, conversation_id: str) -> datetime | None:
+        """有交互式 claude --resume 在跑也视同主人正在用（Claude 没有写锁，两边同时写会把历史搅乱）。"""
         if self.interactive_attached(conversation_id):
             return _now()
-        return super().last_human_activity(conversation_id)
+        return super().occupied_at(conversation_id)

@@ -18,7 +18,7 @@ from sheepdog.prompts import OWNER_CONTEXT_LABEL
 
 from test_ack import FakeIM, ack_config
 from test_escalation import ESC_CHAT, esc_config
-from test_roster import ME, Base, FakeSource, msg
+from test_roster import ME, Base, FakeSource, msg, owner_says
 
 PREFIX = "FX-PREFIX "
 
@@ -122,7 +122,7 @@ class OwnerContextTest(_OwnerBase):
         self.assertIn("om_test_x2", self.sink.to("conv_test_bus")[-1])
 
     def test_queued_while_human_attached(self):
-        self.sink.human["conv_test_alpha"] = datetime.now().astimezone()
+        owner_says("conv_test_alpha")
         self.poll([mine("om_test_h1", "oc_test_alpha_p2p", "等等", chat_type="p2p")])
         self.d.dispatch_once()
         self.assertEqual(self.row("om_test_h1")["dispatch_state"], "pending")

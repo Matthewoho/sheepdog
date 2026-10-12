@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 from . import SinkError
@@ -113,32 +112,6 @@ class AgentApiSink:
     def resume_hint(self, conversation_id: str, title: str = "") -> str:
         return f"在 Antigravity App 里打开会话 {conversation_id}"
 
-    def last_human_activity(self, conversation_id: str) -> datetime | None:
-        """读 session transcript，返回人类最后一次在 App 里发言（USER_INPUT）的时间。
-
-        agentapi 投递的消息在 transcript 里是 SYSTEM_MESSAGE，人类输入是 USER_INPUT，以此区分。
-        """
-        p = transcript_path(conversation_id)
-        if not p.exists():
-            return None
-        last: datetime | None = None
-        with p.open(encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # 第 0 步是 new-conversation 的初始 prompt，不算人类介入
-                if i == 0 or d.get("type") != "USER_INPUT":
-                    continue
-                ts = d.get("created_at")
-                if ts:
-                    try:
-                        last = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except ValueError:
-                        pass
-        return last
-
 
 class DryRunSink:
     """不真正投递，只打印，用于调试规则。每个宿主一个，打印时带上宿主名（7.18）。"""
@@ -169,6 +142,3 @@ class DryRunSink:
 
     def transcript_contains(self, conversation_id: str, text: str) -> bool:
         return False
-
-    def last_human_activity(self, conversation_id: str) -> datetime | None:
-        return None

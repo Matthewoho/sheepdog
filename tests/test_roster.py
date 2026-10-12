@@ -1,11 +1,13 @@
 """P0.5 名册、按聊天归属路由、onboarding、转交、代回前缀的单测。全部使用合成数据（*_test_*）。"""
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from sheepdog import session as sm
 from sheepdog.config import Config, RoutingConfig
@@ -15,6 +17,7 @@ from sheepdog.playbook import PLAYBOOK_FILES, Playbook
 from sheepdog.prompts import batch_prompt, bootstrap_prompt, onboarding_prompt
 from sheepdog.roster import Roster, RosterError, load_roster, parse_roster
 from sheepdog.router import DISPATCH, DROP, INBOX, RouteContext, route
+from sheepdog.sink.agentapi import transcript_path
 from sheepdog.store import Store
 
 ME = "ou_test_me"
@@ -54,6 +57,24 @@ def roster_data(**over) -> dict:
     return data
 
 
+def owner_says(conversation_id: str, at: datetime | None = None, text: str = "我来看一下") -> None:
+    """主人在 Antigravity 会话里亲自说话：往合成的 transcript 追加一行 USER_INPUT（第 0 步是开场提示词，不算主人，
+    所以用别的步号）。在岗表扫到它写进卡片的 human_at；投递要不要暂停只看那个值，不问 sink。
+    数据目录由 Base 指到临时目录（ANTIGRAVITY_APP_DATA_DIR）。"""
+    at = at or datetime.now().astimezone()
+    p = transcript_path(conversation_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    row = {"step_index": 7, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+           "created_at": at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "content": text}
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def later(minutes: float):
+    """engine 眼里的「现在」往后挪 minutes 分钟：主人说过的话随之变旧（用法：with later(16): d.dispatch_once()）。"""
+    return mock.patch("sheepdog.engine._now", return_value=datetime.now().astimezone() + timedelta(minutes=minutes))
+
+
 class FakeSource:
     def __init__(self, batches, muted=()):
         self.batches = list(batches)
@@ -78,7 +99,6 @@ class FakeSink:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []
-        self.human: dict[str, datetime] = {}
         # 调用顺序：("new", title) / ("send", cid)
         self.log: list[tuple[str, str]] = []
 
@@ -93,9 +113,6 @@ class FakeSink:
     def send_message(self, cid, content):
         self.sent.append((cid, content))
         self.log.append(("send", cid))
-
-    def last_human_activity(self, cid):
-        return self.human.get(cid)
 
     def to(self, cid):
         return [c for k, c in self.sent if k == cid]
@@ -175,6 +192,10 @@ class BotKeywordTest(unittest.TestCase):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # 会话记录（在岗表、主人说话）读临时目录，不碰本机的 Antigravity 数据目录
+        env = mock.patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(Path(self.tmp.name) / "app")})
+        env.start()
+        self.addCleanup(env.stop)
         self.cfg = test_config(Path(self.tmp.name))
         self.cfg.routing = RoutingConfig(keywords=["故障"], ignore_chat_ids=["oc_test_ignored"],
                                          drop_bot_message_prefixes=[DROP_PREFIX])
@@ -307,6 +328,14 @@ class DispatchTest(Base):
         self.assertIn("sheepdog forward --topic", bootstrap)
         self.assertIn("sheepdog spawn --key", bootstrap)
 
+    def test_init_holds_onboarding_while_owner_typing(self):
+        """init 发登记通知前也看主人在不在：先扫一遍会话记录（卡片上的 human_at），主人刚在会话里说过话就先不发。"""
+        owner_says("conv_test_alpha", datetime.now().astimezone() - timedelta(minutes=2))
+        rep = self.disp().init()
+        self.assertIn("排队：状态 human_attached", rep["onboarding"]["tp_alpha"])
+        self.assertEqual(self.sink.to("conv_test_alpha"), [])
+        self.assertIsNotNone(self.store.get_card("tp_alpha")["human_at"])
+
     def test_adopted_timeout_counts_missed_without_requeue(self):
         d = self.disp()
         d.init()
@@ -338,13 +367,13 @@ class DispatchTest(Base):
         d.init()
         self.ack("tp_alpha")
         d.dispatch_once()
-        self.sink.human["conv_test_alpha"] = datetime.now().astimezone() - timedelta(minutes=1)
+        owner_says("conv_test_alpha", datetime.now().astimezone() - timedelta(minutes=1))
         self.poll([msg(message_id="om_test_h1", chat_id="oc_test_alpha_p2p")])
         res = d.dispatch_once()
         self.assertEqual(res["topics"]["tp_alpha"]["sent"], 0)
         self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.HUMAN_ATTACHED)
-        self.sink.human["conv_test_alpha"] = datetime.now().astimezone() - timedelta(minutes=30)
-        res = d.dispatch_once()
+        with later(16):  # 主人那句话过了 15 分钟
+            res = d.dispatch_once()
         self.assertEqual(res["topics"]["tp_alpha"]["sent"], 1)
 
     def test_adopted_done_receipt_does_not_close(self):

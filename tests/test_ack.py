@@ -22,7 +22,7 @@ from sheepdog.roster import Roster
 from sheepdog.source.lark import LarkCliSource
 from sheepdog.source import SourceError
 
-from test_roster import ME, Base, FakeSource, msg
+from test_roster import ME, Base, FakeSource, later, msg, owner_says
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 
@@ -111,12 +111,12 @@ class AckTest(Base):
     def test_queued_not_acked_until_delivered(self):
         self.d.ensure_bus_topic()
         self.store.update_topic(BUS_TOPIC_ID, conversation_id="conv_test_bus")
-        self.sink.human["conv_test_bus"] = datetime.now().astimezone() - timedelta(minutes=1)
+        owner_says("conv_test_bus", datetime.now().astimezone() - timedelta(minutes=1))
         self.poll([msg(message_id="om_test_q1", chat_type="p2p", chat_id="oc_test_p1")])
         self.d.dispatch_once()
         self.assertEqual(self.im.added, [])
-        self.sink.human["conv_test_bus"] = datetime.now().astimezone() - timedelta(minutes=30)
-        self.d.dispatch_once()
+        with later(16):  # 主人那句话过了 15 分钟
+            self.d.dispatch_once()
         self.assertEqual(self.acked(), ["om_test_q1"])
 
     def test_once_per_message(self):
@@ -304,7 +304,7 @@ class BotAckTest(Base):
     def test_forwarded_owner_reply_first_delivery_is_the_forward(self):
         from sheepdog.engine import forward_messages
         self.poll([self.ask("om_test_q1", "tp_alpha", "一"), self.ask("om_test_q2", BUS_TOPIC_ID, "二")])
-        self.sink.human["conv_test_bus"] = datetime.now().astimezone()  # 总线被主人接管，回复卡在队列
+        owner_says("conv_test_bus")  # 总线被主人接管，回复卡在队列
         self.poll([self.reply("om_test_r4", "第一个按 A")])
         self.d.dispatch_once()
         self.assertEqual(self.im.added, [])

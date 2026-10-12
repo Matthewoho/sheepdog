@@ -4,7 +4,7 @@
 输入、输出、错误分别在 state_dir/runs/<batch_id>.in / .out / .err，运行记录在账本 runs 表。
 主循环每轮调 collect_finished()：收已经结束的运行，按输出内容分类（不靠退出码）：
 - 容量满 / 5xx：同一批次 5、10、20 分钟后重试，最多 3 次；还不行记 failed。不换模型。
-- 写锁冲突：记 locked，engine 视同主人正在用，批次退回排队。
+- 写锁冲突：记 locked，engine 视同主人正在用（occupied_at），批次退回排队。
 - 登录失效：整个宿主标为不可用（available() 返回原因），过一阵再放一轮试。
 - 其他：failed。
 超过 timeout_minutes 的杀掉整个进程组，记 timeout。
@@ -354,16 +354,18 @@ class CliHostSink:
             since = _parse(r["started_at"]) or since
         return since
 
-    def _last_locked_at(self, conversation_id: str) -> datetime | None:
+    def occupied_at(self, conversation_id: str) -> datetime | None:
+        """会话被别处占着的最近时间：最近一轮撞上写锁（应用开着它），视同主人正在用；不是就 None。
+        主人在会话里说话不在这里算（engine 看在岗表卡片上的 human_at，由 human_message_at 写进去）。"""
         for r in self.store.runs_for_conversation(conversation_id, limit=1):
             if r["state"] == "locked":
                 return _parse(r["ended_at"]) or _parse(r["started_at"])
         return None
 
-    def last_human_activity(self, conversation_id: str) -> datetime | None:
-        """主人最后一次在这个会话里说话的时间；最近一轮撞上写锁也视同主人正在用。"""
+    def human_message_at(self, conversation_id: str) -> datetime | None:
+        """主人最后一次在这个会话里说话的时间（7.18 第 7 条：去掉第一条初始提示词和带牧羊犬批次头的）。
+        在岗表扫到记录里来了新的用户消息时调它，结果写进卡片的 human_at；投递要不要暂停看的就是那个值。"""
         times = [_parse(ts) for ts, _ in human_messages(self._user_entries(conversation_id))]
-        times.append(self._last_locked_at(conversation_id))
         times = [t for t in times if t is not None]
         return max(times) if times else None
 

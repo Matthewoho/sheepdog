@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from sheepdog import session as sm
 from sheepdog.config import Config, RoutingConfig
@@ -14,6 +15,8 @@ from sheepdog.models import Mention, Message
 from sheepdog.router import DISPATCH, DROP, INBOX, SELF, RouteContext, route
 from sheepdog.source.lark import parse_message
 from sheepdog.store import Store
+
+from test_roster import owner_says
 
 ME = "ou_test_me"
 
@@ -110,7 +113,6 @@ class FakeSink:
     def __init__(self):
         self.sent = []
         self.created = []
-        self.human = None
 
     def available(self):
         return True, "ok"
@@ -121,9 +123,6 @@ class FakeSink:
 
     def send_message(self, cid, content):
         self.sent.append((cid, content))
-
-    def last_human_activity(self, cid):
-        return self.human
 
 
 class EngineTest(unittest.TestCase):
@@ -195,9 +194,10 @@ class EngineTest(unittest.TestCase):
         disp = Dispatcher(self.cfg, self.store, self.sink)
         disp.ensure_bus_topic()
         self.store.update_topic(BUS_TOPIC_ID, conversation_id="conv_test_1")
-        self.sink.human = datetime.now().astimezone() - timedelta(minutes=1)
-        col.poll_once()
-        res = disp.dispatch_once()
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(Path(self.tmp.name) / "app")}):
+            owner_says("conv_test_1", datetime.now().astimezone() - timedelta(minutes=1))  # 主人在会话里说话（会话记录）
+            col.poll_once()
+            res = disp.dispatch_once()
         self.assertEqual(res["sent"], 0)
         self.assertEqual(self.store.get_topic(BUS_TOPIC_ID)["state"], sm.HUMAN_ATTACHED)
 

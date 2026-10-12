@@ -33,7 +33,7 @@ from sheepdog.models import Mention, Message
 from sheepdog.notify import FileNotifier, read_notices
 from sheepdog.roster import parse_roster
 from sheepdog.sink import SinkError
-from sheepdog.sink.agentapi import AgentApiSink, DryRunSink, transcript_contains, transcript_path
+from sheepdog.sink.agentapi import DryRunSink, transcript_contains, transcript_path
 from sheepdog.source import NullSource
 from sheepdog.store import Store
 
@@ -196,13 +196,18 @@ class SimSession:
 
 
 class SimSink(DryRunSink):
-    """DryRunSink：不调 agentapi。记下每次投递（批次号从正文认），按需要模拟发送失败；
-    主人有没有在会话里说话：real_human_reader=True 时用 AgentApiSink 的真读法读合成的记录，否则用会话的真相（快）。"""
+    """DryRunSink：不调 agentapi。记下每次投递（批次号从正文认），按需要模拟发送失败。
 
-    def __init__(self, world: "World", real_human_reader: bool = True):
+    主人有没有在会话里说话，engine 只看在岗表扫会话记录得到的 human_at，不问 sink。这里故意留一个以前的接口
+    last_human_activity，默认像以前的 DryRunSink 一样永远答「没有」：要是有人又让投递去问 sink，主人说话时卡片是
+    「被主人占着」、投递却照样投，长跑不变量 4 和 S5 场景都会红。human_answer 可以改成别的答案（故意和会话记录唱反调），
+    human_asked 记它被问了几次（应该一直是 0）。"""
+
+    def __init__(self, world: "World"):
         super().__init__("antigravity")
         self.world = world
-        self.real_human_reader = real_human_reader
+        self.human_asked = 0
+        self.human_answer = None
         self.fail: set[str] = set()
         self.deliveries: list[dict] = []
         self.sends = 0
@@ -228,10 +233,8 @@ class SimSink(DryRunSink):
         return transcript_contains(conversation_id, text)
 
     def last_human_activity(self, conversation_id: str):
-        if self.real_human_reader:
-            return AgentApiSink().last_human_activity(conversation_id)
-        s = self.world.by_cid.get(conversation_id)
-        return s.owner_spoke if s is not None else None
+        self.human_asked += 1
+        return self.human_answer
 
     def to(self, cid: str) -> list[dict]:
         return [d for d in self.deliveries if d["cid"] == cid]
@@ -248,8 +251,8 @@ def roster_for(keys: list[str]) -> dict:
 class World:
     """一套隔离的环境：临时目录做 state_dir、Antigravity 数据目录、playbook、通知文件；真实的 Collector / Dispatcher。"""
 
-    def __init__(self, keys: list[str] = ("alpha", "beta"), real_human_reader: bool = True,
-                 start: datetime = START, fast_db: bool = False, cfg_hook=None):
+    def __init__(self, keys: list[str] = ("alpha", "beta"), start: datetime = START, fast_db: bool = False,
+                 cfg_hook=None):
         self.tmp = tempfile.TemporaryDirectory(prefix="sheepdog-sim-")
         self.root = Path(self.tmp.name)
         self.stack = ExitStack()
@@ -277,7 +280,7 @@ class World:
             self.store.conn.execute("PRAGMA synchronous=OFF")
         self.keys = list(keys)
         self.roster = parse_roster(roster_for(self.keys))
-        self.sink = SimSink(self, real_human_reader)
+        self.sink = SimSink(self)
         self.notifier = FileNotifier(self.cfg.notify_path, self.cfg.timezone_offset)
         self.d = Dispatcher(self.cfg, self.store, {"antigravity": self.sink}, self.roster, notifier=self.notifier)
         self.collector = Collector(self.cfg, self.store, NullSource(), self.roster)

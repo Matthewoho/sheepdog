@@ -15,7 +15,7 @@ from .models import Message
 from . import duty
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
                     human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
-                    scan_jsonl, tool_actions)
+                    scan_jsonl, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
                       batch_prompt, bootstrap_prompt, onboarding_prompt, with_cli,
@@ -40,6 +40,8 @@ RETIRED = "retired"
 DYNAMIC = "dynamic"
 # 会往里投信号的会话类型
 MANAGED_KINDS = (ADOPTED, DYNAMIC)
+# 在岗表看会话记录判中断 / 失联的宿主（Claude 的记录格式没核实过，只按投递状态判）
+RECORD_HOSTS = (ANTIGRAVITY, "codex")
 # 总线职责写在 playbook 的 bus.md 里（7.6），topics 表只存指向
 BUS_DUTY = "见 playbook/bus.md"
 # watches 表的两个提醒时间列，按 watch.remind_minutes 的第 1、2 档使用（列名沿用规格）
@@ -1271,14 +1273,29 @@ class Dispatcher:
         self._notify_owner(text + (f"\n{why}" if why else ""), "恢复通知")
 
     # ---------- 人类接管 ----------
+    def _owner_typed_at(self, t, card=None) -> datetime | None:
+        """主人最后一次在会话里亲自说话的时间。只有这一个判断源：在岗表卡片上的 human_at（_duty_scan 扫会话记录写的）。
+        卡片的「被主人占着」和投递要不要暂停（_check_human）都看它，不会一个说占着、一个照投（黑盒 BUG-02）。"""
+        if card is None:
+            card = self.store.get_card(t["topic_id"])
+        return _parse(card["human_at"] or "") if card is not None else None
+
+    def _owner_recent(self, at: datetime | None) -> bool:
+        return at is not None and _now() - at < timedelta(minutes=self.cfg.session.human_attach_minutes)
+
     def _check_human(self, t) -> None:
+        """主人在不在（human_attached）。主人亲自说话看卡片上的 human_at：调这里之前，这一轮的 _duty_round 已经扫过会话
+        记录（dispatch_once 先跑在岗表；init 先扫一遍），所以和卡片是同一个值。命令行宿主另外还有「会话被别处占着」
+        （Codex 最近一轮撞上写锁、Claude 有交互式 claude --resume 在跑），照原来的路问宿主（occupied_at）。"""
         if not t["conversation_id"]:
             return
         sink = self.sinks.get(self.topic_host(t))
         if sink is None:
             return
-        last = sink.last_human_activity(t["conversation_id"])
-        recent = bool(last and _now() - last < timedelta(minutes=self.cfg.session.human_attach_minutes))
+        recent = self._owner_recent(self._owner_typed_at(t))
+        held = getattr(sink, "occupied_at", None)
+        if not recent and held is not None:
+            recent = self._owner_recent(held(t["conversation_id"]))
         if recent and sm.can(t["state"], "human_attach") and t["state"] != sm.RUNNING:
             self.store.update_topic(t["topic_id"], state=sm.transition(t["state"], "human_attach"))
             log.info("topic %s: 主人接管，暂停投递", t["topic_id"])
@@ -1809,6 +1826,20 @@ class Dispatcher:
         self._record_cache[key] = path
         return path
 
+    def _record_mtime(self, t) -> datetime | None:
+        """会话记录最后一次写入的时间（失联看它）；找不到记录（没有文件、读不了、Codex 找不到 rollout）就是 None。"""
+        path = self._record_file(t)
+        if path is None:
+            return None
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+        except OSError:
+            return None
+
+    def _record_missing(self, t) -> bool:
+        """在岗表看会话记录的宿主（Antigravity、Codex），会话有编号，却找不到它的记录。"""
+        return self.topic_host(t) in RECORD_HOSTS and bool(t["conversation_id"]) and self._record_mtime(t) is None
+
     def _read_from_start(self, topic_id: str, conversation_id: str) -> None:
         """sheepdog 自己刚建的会话：各种用途都从头读（第一轮跑的命令也要审）。记录文件还没有，路径先空着。"""
         if not topic_id or not conversation_id:
@@ -1989,7 +2020,7 @@ class Dispatcher:
                     idle_since = card["idle_since"] if keep else now_iso()
                 self.store.upsert_card(tid, run_state=state, detail=detail, stuck_since=since or None,
                                        spinning=int(spinning), queued=self.store.count_pending_signals(tid),
-                                       idle_since=idle_since)
+                                       idle_since=idle_since, no_record=int(self._record_missing(t)))
                 if notify:
                     self._duty_notice(self.store.get_topic(tid), state, detail, since)
                 else:
@@ -2000,20 +2031,31 @@ class Dispatcher:
     def _duty_scan(self, t) -> None:
         """增量读会话记录（复用护栏的 _follow，用途 duty）：最近一次工具调用、最近一次动作、空转计数、主人发言、压缩点。
         卡片上的动作（在做时叫此刻动作，其他状态叫最近动作）只取工具调用的动作说明（Antigravity 的 toolSummary /
-        toolAction，Codex 的命令），不读模型的思考。"""
+        toolAction，Codex 的命令），不读模型的思考。
+
+        主人发言写进卡片的 human_at，投递要不要暂停也只看它（_check_human）。Antigravity 在增量读里直接认 USER_INPUT；
+        命令行宿主（Codex / Claude）增量读里一出现用户消息（或者第一次看这个会话），就用宿主自己的读法（7.18 第 7 条，
+        human_message_at）重新认一遍。Claude 的动作格式没核实过，只认主人发言。"""
         host = self.topic_host(t)
-        if host not in (ANTIGRAVITY, "codex") or not t["conversation_id"]:
+        if host not in (ANTIGRAVITY, "codex", "claude") or not t["conversation_id"]:
             return
-        card = self.store.get_card(t["topic_id"])
+        tid, cid = t["topic_id"], t["conversation_id"]
+        card = self.store.get_card(tid)
         c = dict(card) if card is not None else {}
+        cur = self.store.get_cursor(tid, DUTY)
         state = {"sig": c.get("last_sig"), "rep": c.get("sig_repeat") or 0,
-                 "act": _parse(c.get("last_act_at") or ""), "upd": {}}
+                 "act": _parse(c.get("last_act_at") or ""), "upd": {},
+                 "typed": cur is None or cur["conversation_id"] != cid}
 
         def iso(dt: datetime) -> str:
             return dt.astimezone().isoformat(timespec="seconds")
 
         def handle(off: int, d: dict) -> None:
             upd = state["upd"]
+            if user_turn(host, d):
+                state["typed"] = True
+            if host == "claude":
+                return
             at = activity_at(host, d)
             for a in tool_actions(host, d, off):
                 state["rep"] = state["rep"] + 1 if a.sig == state["sig"] else 1
@@ -2032,14 +2074,18 @@ class Dispatcher:
 
         self._follow(t, DUTY, handle, backfill=LAST_ACTIVITY_TAIL)
         upd = state["upd"]
+        reader = getattr(self.sinks.get(host), "human_message_at", None)
+        if host != ANTIGRAVITY and state["typed"] and reader is not None and self._record_file(t) is not None:
+            h = reader(cid)
+            upd["human_at"] = iso(h) if h is not None else None
         if state["act"] is not None:
             upd["last_act_at"] = iso(state["act"])
         if state["sig"] != c.get("last_sig") or state["rep"] != (c.get("sig_repeat") or 0):
             upd.update(last_sig=state["sig"], sig_repeat=state["rep"])
         if upd:
-            self.store.upsert_card(t["topic_id"], **upd)
+            self.store.upsert_card(tid, **upd)
             if upd.get("action") and upd["action"] != c.get("action"):
-                self.store.add_history(t["topic_id"], "action", upd["action"], upd.get("action_at", ""))
+                self.store.add_history(tid, "action", upd["action"], upd.get("action_at", ""))
 
     def _unanswered_since(self, t, last_act: datetime | None) -> datetime | None:
         """会话还没碰过的批次里最早送出的时间：在跑的这一批，以及回执超时、之后会话记录里再没动作的批次。
@@ -2118,11 +2164,11 @@ class Dispatcher:
         def mins(delta: timedelta) -> int:
             return int(delta.total_seconds() // 60)
 
-        # 1. 被主人占着：主人在 Antigravity 里亲自说话，或 Codex 应用开着它（写锁冲突）
+        # 1. 被主人占着：主人在会话里亲自说话（卡片上的 human_at，投递看的是同一个值），或 Codex 应用开着它（写锁冲突）
         if t["state"] == sm.HUMAN_ATTACHED:
             return duty.OCCUPIED, "主人在会话里亲自说话，暂停投递", "", False
-        human = _parse(c.get("human_at") or "")
-        if human is not None and now - human < timedelta(minutes=self.cfg.session.human_attach_minutes):
+        human = self._owner_typed_at(t, card)
+        if self._owner_recent(human):
             return duty.OCCUPIED, f"主人 {hm(human)} 在会话里说过话", "", False
         sink = self.sinks.get(host)
         lock = getattr(sink, "lock_streak_since", None)
@@ -2135,14 +2181,19 @@ class Dispatcher:
                 return duty.LOST, f"后台进程没了，没交结果（{hm(_parse(run['ended_at'] or ''))}）", \
                     run["ended_at"] or "", False
         # 2、3. 看会话记录：批次送出后完全不动 → 失联；批次在跑但没有新动作 → 中断
-        path = self._record_file(t) if host in (ANTIGRAVITY, "codex") else None
-        mtime = None
-        if path is not None:
-            try:
-                mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
-            except OSError:
-                path = None
-        if path is not None:
+        watched = host in RECORD_HOSTS and bool(t["conversation_id"])
+        mtime = self._record_mtime(t) if watched else None
+        if watched and mtime is None:
+            # 找不到会话记录（会话被删了、目录被挪走；Codex 找不到 rollout）：手上有没交差的批次（口径同下面），从这一批
+            # 送出起满 lost_minutes 判失联。新建的会话第一步之前可能还没有记录文件，所以不用 stall_minutes
+            since, untouched = self._unanswered_since(t, last_act), True
+            quiet_since = self._quiet_since(t, last_act)
+            if quiet_since is not None and (since is None or quiet_since < since):
+                since, untouched = quiet_since, False
+            if since is not None and now - since >= timedelta(minutes=dc.lost_minutes):
+                head = f"批次 {hm(since)} 送出后" if untouched else f"批次在跑，最近动作 {hm(since)} 之后"
+                return duty.LOST, f"找不到会话记录（{t['conversation_id']}），{head}无从判断", since.isoformat(), True
+        elif mtime is not None:
             # since：会话没碰过的批次里最早送出的；或者批次在跑、会话动过以后停下来的那一刻（从那以后手上一直有没交差的
             # 批次——总线回执超时重投同一批，不算重新开始）
             since, untouched = self._unanswered_since(t, last_act), True
@@ -2366,7 +2417,7 @@ class Dispatcher:
         card = self.store.get_card(owner_tid)
         run = duty.RUN_LABEL.get(card["run_state"], "") if card is not None and card["run_state"] else ""
         ago = duty.ago_text(card["action_at"] or "", now) if card is not None else ""
-        action = f"，最近动作「{card['action']}」{ago}" if card is not None and card["action"] else ""
+        action = "，" + phrase if (phrase := duty.last_action_phrase(card, now)) else ""
         now_text = (f"它现在{run}" if run else "") + (action if run else action.lstrip("，"))
         if route is not None:
             fact = (f"🔀 撞车提醒：{key} 的消息最近送到了「{title}」（topic `{owner_tid}`）：最近一次 "
@@ -2780,6 +2831,10 @@ class Dispatcher:
             if t["onboarded_at"]:
                 report["onboarding"][s.topic_id] = f"跳过：已于 {t['onboarded_at']} onboarding"
                 continue
+            try:
+                self._duty_scan(t)  # 主人说没说话看卡片上的 human_at：先扫一遍会话记录
+            except Exception as e:
+                log.warning("扫会话 %s 的记录出错: %s", s.topic_id, e)
             self._check_human(t)
             t = self.store.get_topic(s.topic_id)
             if not self._deliverable(t):
