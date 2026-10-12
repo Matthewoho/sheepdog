@@ -103,6 +103,16 @@ When a host compacts a session's context, the rules from the session's opening p
 - Whether and how to reply is up to the playbook. Messages from bots or agents get a label line, whose text comes from `agent_sender_label.md`. The example says to reply politely once and not to keep a back-and-forth going. Without that file the label is just "🤖 来自机器人 / Agent" ("from a bot / agent").
 - Loop breaker: if a session replies in one chat more than 4 times in 10 minutes and the other side is a bot, the chat is paused for 30 minutes. During the pause its messages go to the inbox and the bus is told. `sheepdog loops --clear` lifts it by hand.
 
+### Agent identity vs. the owner (`[identity]`, off by default)
+
+Colleagues said that even with the card marker they often couldn't tell whether the owner or the bot was talking. With `[identity]` on:
+
+- Both identities listen. The owner's once-a-minute search stays as it is, and a long-running child process receives messages in real time as the bot (`lark-cli event consume im.message.receive_v1 --as bot`). A message seen by both is recorded once, and the ledger notes who received it. If the child process exits it is restarted with backoff; `sheepdog doctor` shows whether it is running and when it last received an event.
+- In groups, @bot counts the same as @owner, and a reply to a bot message counts the same as a reply to the owner. The bot's own messages are never dispatched and never count as the owner speaking.
+- `sheepdog reply` picks the identity: in a group the bot is in, it replies as the bot without `[🐕Sheepdog Reply]`; in DMs and in groups without the bot, it replies as the owner with the marker, and `sheepdog doctor` lists those groups. Asking the owner (ask / report) still goes through the bot.
+- DMs to the bot from other people are not taken (the owner can't see those chats in Lark): they are not dispatched, and the bot answers once with the text in `playbook/bot_dm.md`, asking them to message the owner directly, at most once per person per 24 hours.
+- When off, behaviour is exactly as before.
+
 ## Following the owner's own actions
 
 - With `[owner_context]` on, what the owner says in Lark, the reactions they add, and their edits and recalls are passed to the owning session as background. The session uses this so it doesn't repeat a reply the owner already gave, and defers to the owner on any conflict.
