@@ -795,3 +795,50 @@ class ConfigDoctorTest(IdentityBase):
             self.cfg.identity.enabled = True
             self.assertIsNone(cli._start_bot_events(self.cfg, self.store, self.source, mock.Mock(dry_run=True)))
         self.assertEqual(len(started), 1)
+
+
+# ======================= 和 10-13 热修（92a7d2d）一起：找主人聊天 =======================
+class OwnerChatWithIdentityTest(IdentityBase):
+    """[identity] 开着时，热修的两条照样成立：reply 目标在找主人聊天里一律拒绝（在选身份之前）；找主人聊天里带代回标记的
+    消息——不管是主人身份还是机器人身份发的——都不算主人回复。"""
+
+    def setUp(self):
+        super().setUp()
+        rc, out, _ = self.ask("--key", "PR #12")
+        self.assertEqual(rc, 0, out)
+        self.ask_mid = next(k for k, v in self.lark.msgs.items() if v["chat_id"] == ESC_CHAT)
+        self.pull(self.ask_mid)
+        self.owner = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="周五发", at=now8() - timedelta(minutes=2))
+        self.pull(self.owner)
+        self.deliver()
+        self.lark.calls.clear()
+
+    def test_reply_in_owner_chat_rejected_before_choosing_identity(self):
+        self.assertTrue(self.cfg.identity.enabled)
+        before = snapshot(self.cfg.db_path)
+        for to in (self.owner, self.ask_mid):
+            with self.assertRaises(outbound.OutboundError) as cm:
+                outbound.reply(self.cfg, self.store, self.source, "tp_alpha", to, card_text="收到")
+            self.assertEqual(cm.exception.code, outbound.EXIT_INVALID)
+            self.assertIn("sheepdog report --topic tp_alpha --key", str(cm.exception))
+            rc, out, err = self.cli("reply", "--topic", "tp_alpha", "--to", to, "--card-text", "收到",
+                                    "--even-if-owner-replied")
+            self.assertEqual((rc, out), (outbound.EXIT_INVALID, ""))
+        self.assertEqual(self.lark.calls, [])           # 不调飞书：没查机器人的群、没发前检查、没发
+        from test_threads import diff_tables
+        self.assertEqual(diff_tables(before, snapshot(self.cfg.db_path)), set())
+
+    def test_marked_messages_in_owner_chat_are_not_owner_reply(self):
+        by_owner = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content=f"<card>\n主人身份的代回\n{MARK}\n</card>")
+        by_bot = self.lark.add(chat_id=ESC_CHAT, sender_id="ou_test_bot", sender_type="app",
+                               content=f"<card>\n机器人身份的代回\n{MARK}\n</card>")
+        self.pull(by_owner, by_bot)
+        ev = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content=f"事件先到的代回\n{MARK}")
+        self.bot_hears(self.lark.event(ev))             # 机器人身份先收到也一样
+        for mid in (by_owner, by_bot, ev):
+            r = self.row(mid)
+            self.assertNotEqual(r["reason"], "owner_reply", mid)
+            self.assertNotEqual(r["route"], DISPATCH, mid)
+        self.assertEqual(self.row(by_owner)["reason"], "agent_reply_in_owner_chat")
+        self.assertEqual(self.row(ev)["reason"], "agent_reply_in_owner_chat")
+        self.assertEqual(self.store.pending_dispatch(), [])
