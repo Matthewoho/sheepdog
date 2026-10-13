@@ -12,7 +12,8 @@
 2 @机器人 = @主人（at_bot，免打扰之前）；回复机器人发的消息 = 回复主人。
 3 机器人自己的消息：不分派、不算主人发言（背景、发前检查都不算），防循环照样计数。
 4 别人私聊机器人：drop / bot_dm，自动回一句，同一个人 24 小时一次；主人和机器人的私聊照旧。
-5 代回选身份：私聊本人加标记；群里机器人在用机器人不加标记；不在退回本人加标记并记下；230002 退回、编号不变；缓存 10 分钟。
+5 代回选身份：私聊本人；群里机器人在用机器人；不在退回本人并记下；两个身份都带代回标记（Matthew 10-13 15:2x「还是要带
+  这是我的logo 有广告意义」），防重编号按带标记的正文算（同 9544894）；230002 退回、内容和编号不变；缓存 10 分钟。
 6 主动新发（ask / report 以外没有新发命令）：不改。
 7 找主人（ask / report）：机器人，不改。
 8 开关关着：和以前完全一样（路由、代回、账本、飞书调用逐项对比）。
@@ -554,15 +555,20 @@ class ReplyIdentityTest(IdentityBase):
     def sent_reply(self):
         return [c for c in self.lark.sent() if c[1] == "+messages-reply"]
 
-    def test_group_with_bot_uses_bot_without_mark(self):
+    def test_group_with_bot_uses_bot_with_mark(self):
         q = self.target()
         r = self.reply(q)
         self.assertEqual((r.identity, r.why), ("bot", identity.WHY_IN_CHAT))
         c = self.sent_reply()[-1]
         self.assertEqual((_opt(c, "--as"), _opt(c, "--msg-type")), ("bot", "interactive"))
         card = json.loads(_opt(c, "--content"))
-        self.assertNotIn(MARK, json.dumps(card, ensure_ascii=False))
-        self.assertEqual(len(card["body"]["elements"]), 1)
+        # 带标记，带法和主人身份完全一样（同一张卡片：正文 + 右下角灰字）
+        self.assertEqual(card, outbound.reply_body(self.cfg, card_text="收到，下班前给结论")[1])
+        self.assertIn(MARK, json.dumps(card, ensure_ascii=False))
+        self.assertEqual(len(card["body"]["elements"]), 2)
+        # 防重编号按带标记的正文算，和 9544894 的口径一样
+        self.assertEqual(_opt(c, "--idempotency-key"),
+                         outbound.idem_key("reply", "tp_alpha", q, outbound.text_fingerprint("收到，下班前给结论")))
         self.assertEqual(self.store.conn.execute("SELECT identity FROM sends WHERE kind='reply'").fetchone()[0], "bot")
         # 发前检查照样做（主人身份搜索）
         self.assertEqual(self.lark.subcommands()[0], "+messages-search")
@@ -570,11 +576,14 @@ class ReplyIdentityTest(IdentityBase):
         self.pull(r.message_id)
         self.assertEqual(self.row(r.message_id)["reason"], "self_bot")
 
-    def test_plain_text_bot_reply_has_no_mark(self):
+    def test_plain_text_bot_reply_has_mark(self):
         q = self.target()
         r = outbound.reply(self.cfg, self.store, self.source, "tp_alpha", q, text="好的")
         self.assertEqual(r.identity, "bot")
-        self.assertEqual(_opt(self.sent_reply()[-1], "--text"), "好的")
+        c = self.sent_reply()[-1]
+        self.assertEqual(_opt(c, "--text"), "好的\n" + MARK)
+        self.assertEqual(_opt(c, "--idempotency-key"),
+                         outbound.idem_key("reply", "tp_alpha", q, outbound.text_fingerprint("好的\n" + MARK)))
 
     def test_p2p_uses_owner_with_mark(self):
         q = self.target(chat=ALPHA_P2P, chat_type="p2p")
@@ -614,6 +623,7 @@ class ReplyIdentityTest(IdentityBase):
         bot_try, user_try = self.sent_reply()[-2:]
         self.assertEqual((_opt(bot_try, "--as"), _opt(user_try, "--as")), ("bot", "user"))
         self.assertEqual(_opt(bot_try, "--idempotency-key"), _opt(user_try, "--idempotency-key"))
+        self.assertEqual(_opt(bot_try, "--content"), _opt(user_try, "--content"))   # 内容一样，都带标记
         self.assertIn(MARK, _opt(user_try, "--content"))
         self.assertEqual(self.store.get_meta(identity.META_CHATS_AT), "")   # 缓存作废
         self.assertEqual(self.store.bot_absent_chats()[0]["last_reason"], "230002")

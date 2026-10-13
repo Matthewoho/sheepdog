@@ -109,7 +109,7 @@ Colleagues said that even with the card marker they often couldn't tell whether 
 
 - Both identities listen. The owner's once-a-minute search stays as it is, and a long-running child process receives messages in real time as the bot (`lark-cli event consume im.message.receive_v1 --as bot`). A message seen by both is recorded once, and the ledger notes who received it. If the child process exits it is restarted with backoff; `sheepdog doctor` shows whether it is running and when it last received an event.
 - In groups, @bot counts the same as @owner, and a reply to a bot message counts the same as a reply to the owner. The bot's own messages are never dispatched and never count as the owner speaking.
-- `sheepdog reply` picks the identity: in a group the bot is in, it replies as the bot without `[🐕Sheepdog Reply]`; in DMs and in groups without the bot, it replies as the owner with the marker, and `sheepdog doctor` lists those groups. Asking the owner (ask / report) still goes through the bot.
+- `sheepdog reply` picks the identity: in a group the bot is in, it replies as the bot; in DMs and in groups without the bot, it replies as the owner. Both carry the `[🐕Sheepdog Reply]` marker. `sheepdog doctor` lists the groups without the bot. Asking the owner (ask / report) still goes through the bot.
 - DMs to the bot from other people are not taken (the owner can't see those chats in Lark): they are not dispatched, and the bot answers once with the text in `playbook/bot_dm.md`, asking them to message the owner directly, at most once per person per 24 hours.
 - When off, behaviour is exactly as before.
 

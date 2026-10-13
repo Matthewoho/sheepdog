@@ -496,7 +496,7 @@ class IdentityConfig:
     - 机器人自己发的消息认作自己（self_bot）：不分派、不算主人发言；
     - 别人私聊机器人：不分派（drop，原因 bot_dm），机器人回一句 playbook/bot_dm.md 里的话，同一个人
       bot_dm_reply_hours 内只回一次；
-    - sheepdog reply 按被回复的那条消息选身份：群里机器人在 → 机器人（不加代回标记）；私聊、机器人不在的群 → 主人本人加标记。
+    - sheepdog reply 按被回复的那条消息选身份：群里机器人在 → 机器人；私聊、机器人不在的群 → 主人本人。两个身份都带代回标记。
     enabled 改了要重启 sheepdog run（机器人接收是启动时起的）；sheepdog reply 每次现读配置。"""
     enabled: bool = False
     # 机器人的 open_id / app_id：留空 = sheepdog run 启动时现查（open_id 查 bot/v3/info，app_id 查 lark-cli config show），

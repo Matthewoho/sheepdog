@@ -205,7 +205,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
 
 
 IDENTITY_REPLY_NOTE = ("开了身份区分（7.26）：sheepdog 按被回复的那条消息自动选身份，你不用管——群里机器人在，就以机器人（主人的智能体）"
-                       "身份发、不带代回标记；私聊和机器人不在的群，以主人身份发、带代回标记。输出里会写明用了哪个身份。")
+                       "身份发；私聊和机器人不在的群，以主人身份发。两个身份都带代回标记。输出里会写明用了哪个身份。")
 
 
 def owner_interface(topic_id: str, identity: bool = False) -> list[str]:

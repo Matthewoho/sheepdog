@@ -1542,7 +1542,7 @@ def cmd_reply(args) -> int:
         return outbound.EXIT_OWNER_REPLIED
     who = ""
     if cfg.identity.enabled:
-        who = ("（机器人身份，不加代回标记）" if r.identity == ident.BOT
+        who = ("（机器人身份，带代回标记）" if r.identity == ident.BOT
                else f"（主人本人身份，带代回标记：{ident.WHY_LABEL.get(r.why, r.why)}）" if r.why else "")
     if r.already:
         print(f"之前已经发过同样的代回（防重编号相同，这次没再发）：message_id {r.message_id}")

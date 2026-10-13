@@ -4,7 +4,7 @@
   现查一次记进账本的 meta，配置里手填的优先。
 - 机器人在不在一个群：用机器人身份的群列表判断，缓存 [identity] bot_chats_cache_minutes 分钟（记在 meta 里，
   sheepdog reply 在另一个进程里也能用）；发送报「不在群里」（230002）时作废缓存。
-- 代回用谁的身份：按被回复的那条消息所在的聊天选（见 choose_reply_identity）。
+- 代回用谁的身份：按被回复的那条消息所在的聊天选（见 choose_reply_identity）；两个身份都带代回标记。
 - 别人私聊机器人：机器人回的那句话（playbook/bot_dm.md，缺了用 DEFAULT_BOT_DM）。
 """
 

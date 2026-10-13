@@ -2,9 +2,9 @@
 
 - ask / report：sheepdog 在正文前加开头一行（[threads] ask_header / report_header），以机器人身份私聊主人。
   带钥匙时，同一会话同一把钥匙第一次在主聊天里起一条（话题开头），之后回复到它的话题里（--reply-in-thread）。
-- reply：代回（卡片）。[identity] 关着：一律以主人身份、右下角带代回标记。开着（7.26）：按被回复的那条消息选身份——
-  群里机器人在用机器人（不加标记），私聊和机器人不在的群用主人本人（加标记）；机器人发送报「不在群里」（230002）时这一条
-  退回主人本人加标记，防重编号不变。发之前只读检查：这个聊天里、从要回复的那条之后，主人本人有没有
+- reply：代回（卡片，右下角带代回标记）。[identity] 关着：一律以主人身份发。开着（7.26）：按被回复的那条消息选身份——
+  群里机器人在用机器人，私聊和机器人不在的群用主人本人；两个身份都带代回标记（Matthew 10-13 15:2x：「还是要带 这是我的
+  logo 有广告意义」）。机器人发送报「不在群里」（230002）时这一条退回主人本人，防重编号不变。发之前只读检查：这个聊天里、从要回复的那条之后，主人本人有没有
   新发言。检查只用搜索接口（不会把消息标成已读），不写账本里的消息、不动拉取进度、不点表情；
   主人说过就不发，把他的话原样打印给会话，记一个「发送前已看到」。
 - thread：只读列出一个话题的全部消息。
@@ -253,11 +253,11 @@ def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
                             "（要他定的事用 sheepdog ask，参数相同），会经机器人发给他，同一把钥匙回到同一个话题里。没有发送。")
 
 
-def reply_body(cfg: Config, text: str = "", card_text: str = "", mark: bool = True) -> tuple[str, dict | None]:
+def reply_body(cfg: Config, text: str = "", card_text: str = "") -> tuple[str, dict | None]:
     """代回的内容：卡片（沿用 reply-card：正文 + 右下角代回标记），或纯文本（末尾附同一个代回标记，别人一眼看出是代回、
     sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。
-    mark = False（7.26，以机器人身份发）：不加代回标记，其余一样。"""
-    suffix = cfg.session.reply_suffix if mark else ""
+    7.26：主人本人、机器人两个身份发的都一样带标记。"""
+    suffix = cfg.session.reply_suffix
     if card_text:
         card = build_reply_card(card_text, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
         return card_text, card
@@ -293,11 +293,6 @@ class ReplyResult:
     why: str = ""           # 为什么用这个身份（identity.WHY_*）
 
 
-def _idem_text(cfg: Config, text: str, card_text: str) -> str:
-    """[identity] 开着时防重编号按不带代回标记的正文算：机器人发送报 230002、退回主人本人加标记时编号不变。"""
-    return card_text if card_text else (text or "").rstrip()
-
-
 def _send_reply(source, target_id: str, ik: str, shown: str, card: dict | None, identity: str) -> dict:
     try:
         return source.reply_to(target_id, identity=identity, idem_key=ik, text="" if card is not None else shown,
@@ -323,10 +318,10 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     target = store.get_message(target_id)
     if target is not None:
         reject_owner_chat(cfg, topic_id, target["chat_id"])   # 热修：找主人聊天里一律拒绝，在选身份之前，不管开没开 [identity]
-    ik = reply_idem(store, topic_id, target_id, _idem_text(cfg, text, card_text) if enabled else shown)
+    ik = reply_idem(store, topic_id, target_id, shown)   # 两个身份正文一样（都带标记）：230002 退回本人时编号不变
     prev = store.get_send(ik)
     if prev is not None:
-        return ReplyResult(prev["message_id"], already=True, text=prev["text"] if enabled else shown,
+        return ReplyResult(prev["message_id"], already=True, text=shown,
                            identity=(prev["identity"] or ident.USER) if enabled else ident.USER)  # 同样的内容已经发过（重试）
     if not even_if_owner_replied:
         if target is None:
@@ -337,8 +332,6 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
             n = sum(store.add_seen_before_send(topic_id, m.message_id, target_id) for m in spoke.messages)
             return ReplyResult(spoke=spoke, newly_seen=n, text=shown)
     who, why = ident.choose_reply_identity(cfg, store, source, target)
-    if enabled and who == ident.BOT:
-        shown, card = reply_body(cfg, text, card_text, mark=False)
     if enabled and why == ident.WHY_NOT_IN_CHAT and target is not None:
         store.note_bot_absent(target["chat_id"], target["chat_name"] or "", why)
     try:
@@ -346,12 +339,11 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     except SourceError as e:
         if not (enabled and who == ident.BOT and ident.is_not_in_chat_error(e)):
             raise OutboundError(EXIT_SEND_FAILED, f"发送失败：{e}")
-        # 7.26：机器人发送报不在群里（230002）：缓存作废，这一条退回主人本人加标记，防重编号不变
+        # 7.26：机器人发送报不在群里（230002）：缓存作废，这一条退回主人本人，内容和防重编号都不变
         ident.invalidate_bot_chats(store)
         if target is not None:
             store.note_bot_absent(target["chat_id"], target["chat_name"] or "", ident.WHY_230002)
         who, why = ident.USER, ident.WHY_230002
-        shown, card = reply_body(cfg, text, card_text)
         try:
             res = _send_reply(source, target_id, ik, shown, card, who)
         except SourceError as e2:
