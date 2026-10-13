@@ -23,10 +23,12 @@ from datetime import datetime
 
 from . import duty
 from . import identity as ident
+from . import pending as pend
 from . import session as sm
 from .card import build_reply_card
 from .config import Config
-from .engine import BUS_TOPIC_ID, MANAGED_KINDS, display_time, is_agent_reply, order_thread_items, root_position
+from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, display_time, is_agent_reply, open_escalations, order_thread_items,
+                     root_position)
 from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
@@ -57,6 +59,9 @@ class SendResult:
     root_message_id: str = ""       # 带钥匙时所在话题的开头那条
     new_thread: bool = False        # 这条是新起的话题开头
     text: str = ""
+    origin: str = ""                # ask 记下的来源是怎么来的（7.36）：about | batch；空 = 没记
+    sources: list = field(default_factory=list)      # [(消息号, 聊天)]
+    duplicates: list = field(default_factory=list)   # 同一来源已有别的会话在问（还开着）
 
 
 @dataclass
@@ -98,9 +103,20 @@ def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str) -> str
     return cfg.threads.header(kind, _one_line(title), topic_id) + "\n" + body.strip()
 
 
+def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None, batch: str = "") -> tuple[str, list]:
+    """ask 的来源（7.36）：给了 --about 就是它们（要在账本里），否则是这个会话最近一批送到的消息。返回 (origin, 来源)。"""
+    if about and any((a or "").strip() for a in about):
+        try:
+            return pend.ORIGIN_ABOUT, pend.about_sources(cfg, store, about)
+        except ValueError as e:
+            raise OutboundError(EXIT_INVALID, str(e))
+    return pend.ORIGIN_BATCH, pend.batch_sources(cfg, store, batch or current_batch(store, topic_id))
+
+
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
-                  key: str = "", batch: str = "") -> SendResult:
-    """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。"""
+                  key: str = "", batch: str = "", about: list[str] | None = None) -> SendResult:
+    """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。
+    ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。"""
     if kind not in (ASK, REPORT):
         raise OutboundError(EXIT_INVALID, f"未知种类 {kind!r}")
     if not target_ok(store, topic_id):
@@ -115,9 +131,11 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     nk = duty.norm_key(key) if key else ""
     text = compose(cfg, kind, topic_id, title, body)
     ik = idem_key(kind, topic_id, nk, batch or current_batch(store, topic_id), text)
+    origin, srcs = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [])
     prev = store.get_send(ik)
     if prev is not None:
-        return SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text)
+        res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text)
+        return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
     root = store.thread_by_key(topic_id, nk) if nk else None
     try:
         if root is not None:
@@ -149,7 +167,113 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
                    identity=ident.BOT if cfg.identity.enabled else None)
     # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
-    return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
+    res = SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
+    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+
+
+def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: str, origin: str,
+                        srcs: list) -> SendResult:
+    """ask 发出去了（或之前已经发过）：记来源，查同一来源有没有别的会话在问。report 不记。"""
+    if not origin:
+        return res
+    if srcs:
+        store.add_escalation_sources(res.message_id, topic_id, srcs, origin)
+    res.origin, res.sources = origin, srcs
+    res.duplicates = pend.duplicate_asks(cfg, store, topic_id, srcs, exclude=res.message_id)
+    return res
+
+
+def duplicate_text(store: Store, cfg: Config, dups: list) -> list[str]:
+    """命令输出里的重复提示：这件事 <会话> <时间> 已经在问。"""
+    out = []
+    for d in dups:
+        at = pend._parse(d["asked_at"])
+        out.append(f"⚠ 这件事 {pend.session_label(store, d['topic_id'])} "
+                   f"{display_time(at, cfg.timezone_offset) if at else d['asked_at']}已经在问（message_id {d['message_id']}）。"
+                   "这次照样发了；同一件事不要两个会话各问一次，可以用 tell 跟它对一下")
+    return out
+
+
+# ======================= resolve：会话结案自己的「需要你定」（7.36） =======================
+@dataclass
+class ResolveResult:
+    closed: list = field(default_factory=list)   # 这次结掉的提问消息号
+    notice_message_id: str = ""
+    already: bool = False                       # 之前已经结过、那句话也发过（重试）
+    notice_error: str = ""                      # 测试环境没发那句话的原因
+    text: str = ""
+
+
+def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, key: str) -> tuple[list, str, str]:
+    """要结的提问（这个会话名下、还开着的）、那句话回到哪条下面、话题开头那条。"""
+    opens = open_escalations(store, cfg.escalation.open_hours, topic_id)
+    if key:
+        thr = store.thread_by_key(topic_id, duty.norm_key(key))
+        if thr is None:
+            raise OutboundError(EXIT_INVALID, f"{topic_id} 名下没有钥匙 {key!r} 的话题（ask 带这把 --key 发过才有）")
+        root = thr["root_message_id"]
+        in_thread = {s["message_id"] for s in store.sends_in_thread(root)} | {root}
+        return [e for e in opens if e["message_id"] in in_thread], root, root
+    message_id = (message_id or "").strip()
+    if not message_id.startswith("om_"):
+        raise OutboundError(EXIT_INVALID, f"--message-id 要给 om_ 开头的提问消息号，收到 {message_id!r}")
+    e = store.get_escalation(message_id)
+    if e is None:
+        raise OutboundError(EXIT_INVALID, f"账本里没有 {message_id} 这条「需要你定」（`sheepdog escalations` 看还开着的）")
+    if e["topic_id"] != topic_id:
+        raise OutboundError(EXIT_INVALID, f"{message_id} 是 {e['topic_id']} 问的，不是你的；只能结自己名下的")
+    s = store.send_by_message(message_id)
+    root = s["root_message_id"] if s is not None and s["root_message_id"] else ""
+    return [x for x in opens if x["message_id"] == message_id], root or message_id, root
+
+
+def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, message_id: str = "", key: str = "",
+            playbook=None) -> ResolveResult:
+    """会话结案：只结自己名下、还开着的；结案后机器人在那条提问的话题里补一句「已结案：依据（会话）」。
+    先发那句话（带防重编号，超时原样重试只发一条），发成了再在账本里结案；source 为 None（测试环境）只结案、不发。"""
+    if not target_ok(store, topic_id):
+        raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
+    why = _one_line(why)
+    if not why:
+        raise OutboundError(EXIT_INVALID, "--why 不能为空：一句话写依据（主人在哪说了什么 / 你核实到什么）")
+    if bool(message_id) == bool(key):
+        raise OutboundError(EXIT_INVALID, "--message-id 和 --key 给一个")
+    targets, notice_to, root = _resolve_targets(cfg, store, topic_id, message_id, _one_line(key))
+    t = store.get_topic(topic_id)
+    session = (t["title"] or "").strip() or topic_id
+    text = pend.resolve_notice(cfg, playbook, why, session)
+    ik = idem_key(pend.SEND_RESOLVE, pend.SEND_RESOLVE, topic_id, notice_to, text)
+    prev = store.get_send(ik)
+    if not targets:
+        if prev is not None:
+            return ResolveResult([], prev["message_id"], already=True, text=text)
+        raise OutboundError(EXIT_INVALID, "没有还开着的「需要你定」可结（已答、已结或已过期的不用再结）"
+                            + (f"：钥匙 {key} 的话题里没有开着的" if key else ""))
+    shown = with_owner_at(cfg, text) if cfg.escalation.resolve_notice_at else text
+    mid, err = "", ""
+    if source is None:
+        err = "测试环境（[source] enabled = false），没发飞书"
+    elif prev is not None:
+        mid = prev["message_id"]
+    else:
+        try:
+            res = source.reply_to(notice_to, identity="bot", idem_key=ik, text=shown, in_thread=True)
+        except LarkTimeout as e:
+            raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话发送超时，不确定发出去没有（{e}），还没结案：用同样的参数重试，"
+                                                  "防重编号保证只发一条")
+        except SourceError as e:
+            raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话没发出去，还没结案：{e}")
+        mid = res["message_id"]
+        if root and store.thread_by_root(root) is not None:
+            store.touch_thread(root)
+            if not store.set_thread_id(root, res.get("thread_id") or "") and not store.thread_by_root(root)["thread_id"]:
+                learn_thread_id(store, source, root)
+        store.add_send(ik, pend.SEND_RESOLVE, topic_id, mid, text, root_message_id=root or notice_to,
+                       target_message_id=notice_to, identity=ident.BOT if cfg.identity.enabled else None)
+        # 主人引用这句话回复（比如「还没办完」）时送回这个会话；is_question = 0，不是新提问
+        store.add_bot_outbox(mid, topic_id, False, text, now_iso())
+    closed = [e["message_id"] for e in targets if store.resolve_escalation(e["message_id"], topic_id, why)]
+    return ResolveResult(closed, mid, notice_error=err, text=text)
 
 
 def owner_at(open_id: str) -> str:

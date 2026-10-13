@@ -130,9 +130,31 @@ CREATE TABLE IF NOT EXISTS escalations (
     asked_at          TEXT NOT NULL,
     answered_at       TEXT,
     answer_message_id TEXT,
-    closed_at         TEXT,              -- 已答或超过 open_hours 时写入；为空 = 未结
-    close_reason      TEXT               -- answered | expired
+    closed_at         TEXT,              -- 已答、会话结案或超过 open_hours 时写入；为空 = 未结
+    close_reason      TEXT,              -- answered | expired | resolved（会话自己结案，7.36）
+    resolved_by       TEXT,              -- 结案的会话（7.36）
+    resolve_note      TEXT,              -- 结案依据（会话写的一句话）
+    possibly_handled_at          TEXT,   -- 标「可能已处理」的时间（7.36）：主人在来源聊天里后来说过话 / 对来源消息点了表情 /
+                                         -- 同来源的另一条提问被答复或结案
+    possibly_handled_message_id  TEXT,   -- 触发的那条：主人的发言 / 被点表情的来源消息 / 同来源的另一条提问
+    possibly_handled_reason      TEXT,   -- 触发的是哪种：owner_spoke | owner_reaction | sibling_answered | sibling_resolved
+    possibly_handled_notified_at TEXT,   -- 已经给负责会话排了核实提醒（每条只提醒一次）
+    expiry_reminded_at           TEXT    -- 快到期提醒已排（[escalation] remind_before_hours，每条一次）
 );
+
+-- 「需要你定」为哪条消息问的（7.36）：ask 发成功后当场写；提问登记进 escalations 时按 ask_message_id 连上。
+-- 一行 = 一条提问的一条来源消息
+CREATE TABLE IF NOT EXISTS escalation_sources (
+    ask_message_id   TEXT NOT NULL,     -- 机器人那条提问（= escalations.message_id）
+    about_message_id TEXT NOT NULL,     -- 为它问的那条消息
+    about_chat_id    TEXT,              -- 那条消息所在的聊天
+    origin           TEXT NOT NULL,     -- about（--about 指定）| batch（这个会话最近一批送到的）| backfill（老提问按提问时间补的）
+    topic_id         TEXT,              -- 提问的会话
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (ask_message_id, about_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_esc_src_about ON escalation_sources(about_message_id);
+CREATE INDEX IF NOT EXISTS idx_esc_src_chat ON escalation_sources(about_chat_id);
 
 -- 机器人发给主人的消息来自哪个 topic（7.15）：主人引用回复它时按这里送回。
 -- 7.22 起 sheepdog ask / report / reply 替会话发出的消息也当场记进来（reply 是以主人身份代回的，is_question = 0）
@@ -449,6 +471,9 @@ MIGRATIONS = {
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
     "sends": [("identity", "TEXT")],
+    "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
+                    ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
+                    ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT")],
 }
 
 
@@ -937,6 +962,54 @@ class Store:
         with self.tx() as c:
             c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
                       (now_iso(), message_id))
+
+    def resolve_escalation(self, message_id: str, topic_id: str, note: str) -> bool:
+        """会话自己结案（7.36）：只结这个会话名下、还开着的。返回是否结了。"""
+        ts = now_iso()
+        with self.tx() as c:
+            return c.execute("""UPDATE escalations SET closed_at=?, close_reason='resolved', resolved_by=?, resolve_note=?
+                                WHERE message_id=? AND topic_id=? AND closed_at IS NULL""",
+                             (ts, topic_id, note, message_id, topic_id)).rowcount > 0
+
+    def mark_possibly_handled(self, message_id: str, trigger_message_id: str, reason: str, at: str = "") -> bool:
+        """标「可能已处理」（7.36）：只标还开着、没标过的。返回是否标了。"""
+        with self.tx() as c:
+            return c.execute("""UPDATE escalations SET possibly_handled_at=?, possibly_handled_message_id=?,
+                                       possibly_handled_reason=?
+                                WHERE message_id=? AND closed_at IS NULL AND possibly_handled_at IS NULL""",
+                             (at or now_iso(), trigger_message_id, reason, message_id)).rowcount > 0
+
+    def set_escalation_mark(self, message_id: str, column: str, at: str = "") -> bool:
+        """记一次提醒（possibly_handled_notified_at / expiry_reminded_at）：只记空的。返回是否记了。"""
+        if column not in ("possibly_handled_notified_at", "expiry_reminded_at"):
+            raise ValueError(column)
+        with self.tx() as c:
+            return c.execute(f"UPDATE escalations SET {column}=? WHERE message_id=? AND {column} IS NULL",
+                             (at or now_iso(), message_id)).rowcount > 0
+
+    def add_escalation_sources(self, ask_message_id: str, topic_id: str, sources: list[tuple[str, str]],
+                               origin: str) -> int:
+        """记一条提问的来源消息（(消息号, 聊天) 列表）。同一条提问同一条来源只记一次。返回新记了几条。"""
+        ts = now_iso()
+        n = 0
+        with self.tx() as c:
+            for mid, chat in sources:
+                n += c.execute("""INSERT OR IGNORE INTO escalation_sources(ask_message_id,about_message_id,about_chat_id,
+                                      origin,topic_id,created_at) VALUES(?,?,?,?,?,?)""",
+                               (ask_message_id, mid, chat or None, origin, topic_id, ts)).rowcount
+        return n
+
+    def escalation_sources(self, ask_message_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM escalation_sources WHERE ask_message_id=? ORDER BY rowid",
+                                 (ask_message_id,)).fetchall()
+
+    def sources_about(self, about_message_ids: list[str]) -> list[sqlite3.Row]:
+        """这些来源消息被哪些提问记过。"""
+        if not about_message_ids:
+            return []
+        marks = ",".join("?" * len(about_message_ids))
+        return self.conn.execute(f"SELECT * FROM escalation_sources WHERE about_message_id IN ({marks}) ORDER BY rowid",
+                                 list(about_message_ids)).fetchall()
 
     # ---------- 一事一串（7.22） ----------
     def thread_by_key(self, topic_id: str, norm_key: str) -> sqlite3.Row | None:
@@ -1472,6 +1545,9 @@ class Store:
         "sends": "DELETE FROM sends WHERE sent_at < ?",
         "seen_before_send": "DELETE FROM seen_before_send WHERE seen_at < ?",
         "bot_dm_replies": "DELETE FROM bot_dm_replies WHERE replied_at < ?",
+        # 7.36：提问的来源；提问本身还开着的不删
+        "escalation_sources": """DELETE FROM escalation_sources WHERE created_at < ? AND ask_message_id NOT IN
+                                 (SELECT message_id FROM escalations WHERE closed_at IS NULL)""",
     }
 
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删

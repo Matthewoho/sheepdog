@@ -862,9 +862,22 @@ class Collector:
                 d = RouteDecision(SELF, "agent_reply_in_owner_chat")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
+            from . import pending as pend
+            if not m.reply_to and (not m.thread_id or is_thread_root(m)) and pend.is_pending_query(m.content):
+                # 7.36：主人单独发「待办」（顶层消息）：牧羊犬当轮用机器人回清单，不送总线、不当成回答哪条提问
+                d = RouteDecision(DROP, "pending_query")
+                self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
+                self._pending_reply(m)
+                return d
             return self._owner_reply(m)
         if m.sender_type in ("app", "bot"):
             self._learn_thread(m)
+            own = self.store.send_by_message(m.message_id)
+            if own is not None and own["kind"] in ("resolve", "pending"):
+                # 7.36：牧羊犬自己的话（结案那一句、待办清单）：不登记「需要你定」、不当成会话的提问、不投给任何会话
+                d = RouteDecision(DROP, f"sheepdog_{own['kind']}")
+                self.store.upsert_message(m, d.route, d.reason, [])
+                return d
             question = ""
             if esc.pattern is not None:
                 question = next((mt.group("topic") for b in message_bodies(m.content)
@@ -880,12 +893,41 @@ class Collector:
                 if question and ok:
                     self.store.add_escalation(m.message_id, topic, m.chat_id, m.content, m.create_time or now_iso())
                     log.info("登记「需要你定」%s -> %s", m.message_id, topic)
+                    try:  # 7.36：ask 当场记过来源就连上；没记过（老版本、别的途径发的）按提问时间补
+                        from . import pending as pend
+                        pend.ensure_sources(self.cfg, self.store, self.store.get_escalation(m.message_id))
+                    except Exception as e:
+                        log.warning("补「需要你定」%s 的来源出错: %s", m.message_id, e)
                 elif not ok:
                     log.warning("机器人消息 %s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
                 return d
         d = RouteDecision(DROP, "escalation_chat_other")
         self.store.upsert_message(m, d.route, d.reason, [])
         return d
+
+    def _pending_reply(self, m: Message) -> None:
+        """「待办」快捷问法（7.36）：机器人回复主人那条，正文是 sheepdog pending 的清单。只读账本拼清单；
+        发出去的记进 sends（kind = pending），拉回来时认得出是自己的话。失败只记日志，主人再发一次就行。"""
+        from . import pending as pend
+        fn = getattr(self.source, "reply_to", None)
+        if fn is None:
+            return
+        try:
+            text = pend.render(pend.build(self.cfg, self.store), header="📋 待办清单")
+        except Exception as e:
+            log.warning("拼待办清单出错: %s", e)
+            return
+        ik = identity.short_key(pend.SEND_PENDING, pend.SEND_PENDING, m.message_id)
+        if self.store.get_send(ik) is not None:
+            return
+        try:
+            res = fn(m.message_id, identity=identity.BOT, idem_key=ik, text=text)
+        except Exception as e:
+            log.warning("回主人的「待办」%s 失败: %s", m.message_id, e)
+            return
+        self.store.add_send(ik, pend.SEND_PENDING, "", res.get("message_id", ""), text, target_message_id=m.message_id,
+                            identity=identity.BOT if self.cfg.identity.enabled else None)
+        log.info("主人发了「待办」%s，已回清单 %s", m.message_id, res.get("message_id", ""))
 
     def _agent_reply_text(self, content: str) -> bool:
         """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix（代回卡片右下角的
@@ -3021,6 +3063,8 @@ class Dispatcher:
             if mid in live:
                 return None
             e = self.store.get_escalation(mid)
+            if e is not None and e["close_reason"] == "resolved":
+                return f"会话已结案：{duty.short(e['resolve_note'] or '', 40)}"
             return "主人已答" if e is not None and e["answered_at"] else "「需要你定」已过期"
 
         duty.close_auto_work(self.store, duty.SRC_ESCALATION, escalation_closed)
@@ -3136,6 +3180,11 @@ class Dispatcher:
         self._check_handovers()
         self._tick_watches(set(tids))
         self._expire_escalations()
+        try:  # 7.36：开着的「需要你定」补来源、判可能已处理、排核实 / 快到期提醒。出错不挡投递
+            from . import pending as pend
+            pend.followup_round(self.cfg, self.store, self.playbook)
+        except Exception as e:
+            log.warning("「需要你定」跟进检查出错: %s", e)
         # 在岗表（7.20）：先自动补活（第 5 步），再算各会话的运行状态（第 4 步，等回复要看名下的活）
         self._duty_round(tids)
         # 护栏（7.19）：增量读会话记录，压缩了就清指纹（这一轮的批次就带上完整规则）；危险命令报警（系统提示这一轮就排上）

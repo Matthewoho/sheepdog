@@ -68,6 +68,10 @@ header_regex = '^🐕 (?=.*需要你定).*?\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)
 attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'
 # 一条「需要你定」多久内算未结，超时自动关闭
 open_hours = 24
+# 离到期还剩这么多小时还开着，提醒负责会话核实一次（7.36）；0 = 不提醒
+remind_before_hours = 2
+# 会话结案（sheepdog resolve）后机器人在话题里补的那句「已结案」要不要 @ 你；默认不 @
+resolve_notice_at = false
 
 [escalation.aliases]
 # 第一行没有 topic_id、只有 [..·名字] 时，按名字认会话；认不出再和各会话标题比（唯一命中才算）

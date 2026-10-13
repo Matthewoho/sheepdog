@@ -45,6 +45,8 @@ REASON_LABEL = {
     "loop_guard": "疑似循环",
     "collect_partial": "采集不完整",
     "escalation_list": "未结的「需要你定」",
+    "escalation_check": "「需要你定」可能已处理",
+    "escalation_expiring": "「需要你定」快到期",
     "audit_offender": "危险命令提醒",
     "audit_notify": "别的会话跑了危险命令",
     # 在岗表（7.20）

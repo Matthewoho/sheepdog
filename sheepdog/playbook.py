@@ -53,6 +53,13 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
     # 区分智能体身份和本人身份（7.26）：[identity] 开着时用；缺了用代码里的一句默认话
     "bot_dm.md": "别人私聊机器人时机器人回的那句话（请对方直接私聊主人本人；同一个人 24 小时内只回一次）",
+    # 第一期 1–3 件（7.36）：事实由代码拼，这里只放对会话的说明；缺了用代码里的默认话
+    "escalation_check.md": "「需要你定」可能已处理时给负责会话的提醒末尾附的话（请核实、怎么结案），可用 {{topic_id}} "
+                           "{{ask_message_id}} {{key}} {{title}}",
+    "escalation_expiring.md": "「需要你定」快到期时给负责会话的提醒末尾附的话，可用 {{topic_id}} {{ask_message_id}} {{key}} "
+                              "{{title}} {{hours_left}}",
+    "resolve_notice.md": "会话结案后机器人在话题里补的那一句（只取一行），可用 {{why}}（结案依据）{{session}}（会话标题）；"
+                         "开头不要写成「🐕 需要你定」",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。

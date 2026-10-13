@@ -35,9 +35,13 @@
   sheepdog board [--topic T] [--json]                    羊群看板：各会话在干什么
   sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
   sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B（默认当前 / 最近一批）]
+               [--about om_x ...（为哪条消息问的，可多次；不给 = 这批送到的全部消息）]
                                                          经机器人找主人「需要你定」（sheepdog 加开头一行）；带 --key：
                                                          同一把钥匙第一次在主聊天里起一条，之后回到它的话题里（一事一串）
-  sheepdog report ...（参数同 ask）                       经机器人向主人汇报
+  sheepdog report ...（参数同 ask，没有 --about）          经机器人向主人汇报
+  sheepdog resolve --topic T (--message-id om_x | --key K) --why 依据
+                                                         会话结案自己名下还开着的「需要你定」；机器人在话题里补一句「已结案」
+  sheepdog pending [--json]                              只读：要主人定的、可能已处理的、各会话在等主人的（待办清单）
   sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied]
                                                          代回：发前只读检查主人有没有新发言；说过就不发（退出码 3）
   sheepdog thread --topic T (--key K | --thread omt_x)    只读：列出一个话题的全部消息
@@ -979,8 +983,11 @@ def cmd_escalations(args) -> int:
     for e in rows:
         if e["answered_at"]:
             state = f"已答 @ {e['answered_at']}（答复 {e['answer_message_id']}）"
+        elif e["close_reason"] == "resolved":
+            state = f"会话结案 @ {e['closed_at']}（{e['resolved_by']}：{e['resolve_note']}）"
         elif e["message_id"] in open_ids:
-            state = "未结"
+            state = "未结" + (f"，可能已处理（{e['possibly_handled_reason']}，{e['possibly_handled_message_id']}）"
+                             if e["possibly_handled_at"] else "")
         else:
             state = f"已关闭（{e['close_reason'] or '超时'}）"
         print(f"- [{state}] topic={e['topic_id']} 提问 {e['asked_at']} message_id={e['message_id']}")
@@ -1486,13 +1493,22 @@ def cmd_ask(args) -> int:
         if not outbound.target_ok(store, tid):
             print(f"{kind} 没发: {tid} 不是在投递的会话", file=sys.stderr)
             return outbound.EXIT_INVALID
+        if kind == outbound.ASK and getattr(args, "about", None):
+            try:
+                outbound.ask_sources(cfg, store, tid, args.about)
+            except outbound.OutboundError as e:
+                print(f"{kind} 没发: {e}", file=sys.stderr)
+                return e.code
         return _test_env_write(cfg, "需要你定" if kind == outbound.ASK else "汇报",
                                outbound.compose(cfg, kind, tid, args.title, body))
     try:
-        r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch)
+        r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
+                                   about=getattr(args, "about", None) or None)
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
+    for line in outbound.duplicate_text(store, cfg, r.duplicates):
+        print(line)
     if r.already:
         print(f"之前已经发过同样的内容（防重编号相同，这次没再发）：message_id {r.message_id}")
     elif r.new_thread:
@@ -1502,6 +1518,46 @@ def cmd_ask(args) -> int:
     else:
         print(f"已发给主人：message_id {r.message_id}")
     return outbound.EXIT_OK
+
+
+def cmd_resolve(args) -> int:
+    """sheepdog resolve（7.36）：会话结案自己名下还开着的「需要你定」，机器人在那条提问的话题里补一句「已结案」。"""
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    tid = _topic_arg(args.topic)
+    source = _source(cfg) if cfg.source.enabled else None
+    try:
+        r = outbound.resolve(cfg, store, source, tid, args.why or "", message_id=args.message_id or "", key=args.key or "",
+                             playbook=Playbook.from_config(cfg))
+    except outbound.OutboundError as e:
+        print(f"resolve 没做: {e}", file=sys.stderr)
+        return e.code
+    if r.already:
+        print(f"之前已经结过案，「已结案」那句话也发过了（message_id {r.notice_message_id}），这次什么都没动")
+        return outbound.EXIT_OK
+    print(f"已结案 {len(r.closed)} 条：{', '.join(r.closed)}")
+    if r.notice_message_id:
+        print(f"已在话题里补了一句（message_id {r.notice_message_id}）：{r.text}")
+    elif r.notice_error:
+        if cfg.notify_path is not None:
+            FileNotifier(cfg.notify_path, cfg.timezone_offset).notify(r.text, "已结案")
+            print(f"{r.notice_error}，那句话写进了 {cfg.notify_path}")
+        else:
+            print(f"{r.notice_error}：{r.text}")
+    return outbound.EXIT_OK
+
+
+def cmd_pending(args) -> int:
+    """sheepdog pending（7.36）：只读列出要主人定的、可能已处理的、各会话在等主人的。不写账本。"""
+    from . import pending as pend
+    cfg = load_config()
+    store = Store(cfg.db_path)
+    data = pend.build(cfg, store)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(pend.render(data))
+    return 0
 
 
 def cmd_reply(args) -> int:
@@ -1769,7 +1825,23 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
         sp.add_argument("--batch", default="",
                         help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
+        if name == "ask":
+            sp.add_argument("--about", action="append", default=[],
+                            help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。"
+                                 "主人之后在那个聊天里说过话，sheepdog 会提醒你核实")
         sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
+    sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--message-id", help="那条提问的消息号（om_）")
+    g.add_argument("--key", help="钥匙：结掉这个话题里所有还开着的提问")
+    sp.add_argument("--why", required=True, help="依据，一句话（主人在哪说了什么 / 你核实到什么）")
+    sp.set_defaults(func=cmd_resolve)
+
+    sp = sub.add_parser("pending", help="只读：待办清单（要主人定的、可能已处理的、各会话在等主人的）")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_pending)
 
     sp = sub.add_parser("reply", help="代回：以主人身份回复一条消息（卡片带代回标记）；发前先查主人有没有新发言")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
