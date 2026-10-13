@@ -238,6 +238,17 @@ def owner_spoke_since(cfg: Config, store: Store, source, target: sqlite3.Row) ->
     return OwnerSpoke(hits, since)
 
 
+def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
+    """10-13 热修：要回复的那条在「找主人」聊天里（[escalation] chat_ids、[threads] owner_chat_id）就拒绝。
+    sheepdog reply 是以主人身份回别人的；在找主人聊天里用它，等于以主人身份回主人自己，还会被当成主人亲自回复投回会话。"""
+    if chat_id and chat_id in cfg.owner_chat_ids:
+        raise OutboundError(EXIT_INVALID,
+                            "要回复的那条在「找主人」聊天里（主人和机器人的私聊），sheepdog reply 只用来以主人身份回别人，"
+                            "不能在这里用。回主人请用 "
+                            f"`sheepdog report --topic {topic_id} --key <同一件事的钥匙> --title \"<短标题>\" --text \"<正文>\"`"
+                            "（要他定的事用 sheepdog ask，参数相同），会经机器人发给他，同一把钥匙回到同一个话题里。没有发送。")
+
+
 def reply_body(cfg: Config, text: str = "", card_text: str = "") -> tuple[str, dict | None]:
     """代回的内容：卡片（沿用 reply-card：正文 + 右下角代回标记），或纯文本（末尾附同一个代回标记，别人一眼看出是代回、
     sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。"""
@@ -287,11 +298,13 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
         shown, card = reply_body(cfg, text, card_text)
     except ValueError as e:
         raise OutboundError(EXIT_INVALID, str(e))
+    target = store.get_message(target_id)
+    if target is not None:
+        reject_owner_chat(cfg, topic_id, target["chat_id"])
     ik = reply_idem(store, topic_id, target_id, shown)
     prev = store.get_send(ik)
     if prev is not None:
         return ReplyResult(prev["message_id"], already=True, text=shown)  # 同样的内容已经发过（重试）
-    target = store.get_message(target_id)
     if not even_if_owner_replied:
         if target is None:
             raise OutboundError(EXIT_INVALID, f"账本里没有 {target_id}，没法做发前检查（以账本里这条消息的时间为准）。"

@@ -706,6 +706,12 @@ class Collector:
                 d = RouteDecision(DROP, "escalation_agent_reply")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
+            if self._agent_reply_text(m.content):
+                # 10-13 热修：会话误用 sheepdog reply 以主人身份把代回卡片发进了找主人聊天。发送人是主人、但带代回标记：
+                # 不是主人亲自回复，不投递（否则会被当成 owner_reply 投回会话，甚至投错会话）
+                d = RouteDecision(SELF, "agent_reply_in_owner_chat")
+                self.store.upsert_message(m, d.route, d.reason, [])
+                return d
             return self._owner_reply(m)
         if m.sender_type in ("app", "bot"):
             self._learn_thread(m)
@@ -730,6 +736,12 @@ class Collector:
         d = RouteDecision(DROP, "escalation_chat_other")
         self.store.upsert_message(m, d.route, d.reason, [])
         return d
+
+    def _agent_reply_text(self, content: str) -> bool:
+        """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix（代回卡片右下角的
+        标记；没配 agent_markers 时也认得出）。"""
+        suffix = self.cfg.session.reply_suffix
+        return is_agent_reply(content, self.cfg.owner_context) or bool(suffix and suffix in (content or ""))
 
     # 机器人消息第一行里的 [..] 标签（7.15）：按「·」拆开逐段和 aliases、会话标题比
     _BRACKET = re.compile(r"\[([^\[\]]+)\]")

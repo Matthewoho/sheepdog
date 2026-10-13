@@ -1437,6 +1437,13 @@ def cmd_reply(args) -> int:
         if not outbound.target_ok(store, tid):
             print(f"代回没发: {tid} 不是在投递的会话", file=sys.stderr)
             return outbound.EXIT_INVALID
+        target = store.get_message((args.to or "").strip())
+        try:
+            if target is not None:
+                outbound.reject_owner_chat(cfg, tid, target["chat_id"])
+        except outbound.OutboundError as e:
+            print(f"代回没发: {e}", file=sys.stderr)
+            return e.code
         try:
             shown, _ = outbound.reply_body(cfg, args.text or "", card_text)
         except ValueError as e:
