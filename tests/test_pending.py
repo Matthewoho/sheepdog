@@ -463,6 +463,14 @@ class PendingListTest(PendingBase):
         self.assertEqual(data["possibly_handled"][0]["asks"][0]["possibly_handled"]["reason"], "owner_spoke")
         self.assertEqual([w["key"] for w in data["waiting_owner"]], ["AGIF-9", "AGIF-1"])
 
+    def test_same_session_same_batch_asks_are_not_grouped(self):
+        # 10-13 的 kc 测试库和 Leon GitHub App：总线同一批里问的两件事，来源是同一批消息，不是同一件事
+        self.alice_batch()
+        self.asked(title="第一件", text="A？")
+        self.asked(title="第二件", text="B？")
+        data = json.loads(self.cli("pending", "--json")[1])
+        self.assertEqual([len(g["asks"]) for g in data["decide"]], [1, 1])
+
     def test_pending_is_read_only(self):
         self.scene()
         from test_threads import diff_tables, snapshot

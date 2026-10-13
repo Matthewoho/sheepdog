@@ -164,6 +164,19 @@ def duplicate_asks(cfg, store: Store, topic_id: str, sources: list[tuple[str, st
     return sorted(seen.values(), key=lambda x: x["asked_at"] or "")
 
 
+def same_matter(topic_a: str, srcs_a, topic_b: str, srcs_b) -> bool:
+    """两条提问是不是为同一件事问的：共用一条来源消息，并且不在同一个会话；同一个会话的，要两边都是 --about 指定的
+    那条（按批次记的来源一批里常有好几件事，同一个会话在一批里问好几件很常见，不算同一件）。"""
+    a = {s["about_message_id"]: s["origin"] for s in srcs_a}
+    b = {s["about_message_id"]: s["origin"] for s in srcs_b}
+    shared = set(a) & set(b)
+    if not shared:
+        return False
+    if topic_a != topic_b:
+        return True
+    return any(a[m] == ORIGIN_ABOUT and b[m] == ORIGIN_ABOUT for m in shared)
+
+
 # ======================= 可能已处理 =======================
 @dataclass
 class Hit:
@@ -236,15 +249,13 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
                        (m["chat_name"] or "") if m is not None else "", (m["chat_type"] or "") if m is not None else "",
                        _short(m["content"] if m is not None else "", 80), emoji=r["emoji_type"] or "")
     # 3. 同来源的另一条提问被主人答复或被会话结案
-    mine_about = {s["about_message_id"] for s in srcs if s["origin"] == ORIGIN_ABOUT}
-    for r in store.sources_about(about):
-        other = r["ask_message_id"]
+    for other in dict.fromkeys(r["ask_message_id"] for r in store.sources_about(about)):
         if other == e["message_id"]:
             continue
-        if r["topic_id"] == e["topic_id"] and not (r["origin"] == ORIGIN_ABOUT and r["about_message_id"] in mine_about):
-            continue  # 同一个会话、按批次记的来源：一批里问好几件事很常见，不互相牵连
         o = store.get_escalation(other)
         if o is None or o["close_reason"] not in ("answered", "resolved"):
+            continue
+        if not same_matter(e["topic_id"], srcs, o["topic_id"], store.escalation_sources(other)):
             continue
         at = _parse(o["closed_at"])
         if at is None or at <= asked or not _before(at, until):
@@ -312,21 +323,28 @@ def session_label(store: Store, topic_id: str) -> str:
     return f"{topic_id}「{title}」" if title else topic_id
 
 
-def hit_line(cfg, store: Store, hit: Hit, me_word: str = "主人") -> str:
+def short_time(dt: datetime | None, offset: str) -> str:
+    """清单里用的短时间（月-日 时:分，时区写在清单开头一次）。"""
+    return dt.astimezone(eng._tz(offset)[0]).strftime("%m-%d %H:%M") if dt is not None else "-"
+
+
+def hit_line(cfg, store: Store, hit: Hit, me_word: str = "主人", short: bool = False) -> str:
     off = cfg.timezone_offset
-    at = eng.display_time(_parse(hit.at), off) if _parse(hit.at) else "-"
+    dt = _parse(hit.at)
+    at = (short_time(dt, off) + " ") if short and dt else eng.display_time(dt, off) if dt else "- "
+    mid = hit.message_id if short else f"`{hit.message_id}`"   # 给主人看的清单不带反引号（飞书纯文本会原样显示）
     if hit.reason == PH_SPOKE:
-        return (f"{me_word} {at}在{where(hit.chat_type, hit.chat_name, hit.chat_id)}说过：「{hit.text}」"
-                f"（message_id `{hit.message_id}`）")
+        return (f"{me_word} {at}在{chat_label(cfg, store, hit.chat_id, hit.chat_type, hit.chat_name)}说过：「{hit.text}」"
+                f"（message_id {mid}）")
     if hit.reason == PH_REACTION:
-        return (f"{me_word}对来源消息点了 {hit.emoji or '表情'}（{at}看到）：{where(hit.chat_type, hit.chat_name, hit.chat_id)}"
-                f"「{hit.text}」（message_id `{hit.message_id}`）")
+        return (f"{me_word}对来源消息点了 {hit.emoji or '表情'}（{at}看到）：{chat_label(cfg, store, hit.chat_id, hit.chat_type, hit.chat_name)}"
+                f"「{hit.text}」（message_id {mid}）")
     who = session_label(store, hit.other_topic) if hit.other_topic else "别的会话"
     if hit.reason == PH_SIBLING_RESOLVED:
         return (f"同来源的另一条提问（{who} 问的「{hit.text}」）{at}已被结案：{hit.note or '-'}"
-                f"（message_id `{hit.message_id}`）")
+                f"（message_id {mid}）")
     if hit.reason == PH_SIBLING_ANSWERED:
-        return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复（message_id `{hit.message_id}`）"
+        return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复（message_id {mid}）"
     return f"标为可能已处理（{hit.reason or '-'}，{hit.message_id or '-'}）"
 
 
@@ -431,10 +449,23 @@ def waited(minutes: int | None) -> str:
     return f"{h} 小时" + (f" {m} 分" if m else "")
 
 
-def _chat_label(store: Store, chat_id: str) -> str:
-    r = store.conn.execute("SELECT chat_name, chat_type FROM messages WHERE chat_id=? AND chat_name != '' "
-                           "ORDER BY last_seen DESC LIMIT 1", (chat_id,)).fetchone()
-    return where(r["chat_type"] or "", r["chat_name"] or "", chat_id) if r is not None else f"聊天 {chat_id}"
+def chat_label(cfg, store: Store, chat_id: str, chat_type: str = "", chat_name: str = "") -> str:
+    """聊天的叫法：群用群名；私聊（账本里没有名字）用对方最近一次发言的名字。"""
+    if chat_name and chat_type != "p2p":
+        return where(chat_type, chat_name, chat_id)
+    r = store.conn.execute("SELECT chat_name, chat_type FROM messages WHERE chat_id=? ORDER BY last_seen DESC LIMIT 1",
+                           (chat_id,)).fetchone()
+    ctype = chat_type or (r["chat_type"] if r is not None else "") or ""
+    name = chat_name or (r["chat_name"] if r is not None else "") or ""
+    if ctype == "p2p":
+        peer = store.conn.execute(
+            "SELECT sender_name FROM messages WHERE chat_id=? AND sender_id != ? AND COALESCE(sender_name,'') != '' "
+            "AND COALESCE(sender_type,'') NOT IN ('app','bot','system') ORDER BY last_seen DESC LIMIT 1",
+            (chat_id, cfg.self_open_id or "")).fetchone()
+        return f"和 {peer[0]} 的私聊" if peer is not None else "私聊"
+    if r is None and not name:
+        return f"聊天 {chat_id}"
+    return where(ctype, name, chat_id)
 
 
 def build(cfg, store: Store, now: datetime | None = None) -> dict:
@@ -443,7 +474,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
     off = cfg.timezone_offset
     opens = eng.open_escalations(store, cfg.escalation.open_hours)
     items: dict[str, dict] = {}
-    about_of: dict[str, set[str]] = {}
+    about_of: dict[str, tuple] = {}
     for e in opens:
         srcs = store.escalation_sources(e["message_id"])
         if not srcs:  # 只读：不写账本，按补记的规则现算
@@ -458,18 +489,18 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
             "message_id": e["message_id"], "topic_id": e["topic_id"], "session": session_label(store, e["topic_id"]),
             "title": ask_title(cfg, e["text"]), "body": ask_body(e["text"]),
             "key": sent["key"] if sent is not None and sent["key"] else "",
-            "asked_at": e["asked_at"], "asked_label": eng.display_time(asked, off) if asked else e["asked_at"],
+            "asked_at": e["asked_at"], "asked_label": short_time(asked, off) if asked else e["asked_at"],
             "waited_minutes": _minutes(asked, now),
             "source_origin": srcs[0]["origin"] if srcs else "",
-            "source_chats": [{"chat_id": c, "label": _chat_label(store, c)} for c in chats],
-            "possibly_handled": None if hit is None else {**hit.as_dict(), "line": hit_line(cfg, store, hit, "你"),
+            "source_chats": [{"chat_id": c, "label": chat_label(cfg, store, c)} for c in chats],
+            "possibly_handled": None if hit is None else {**hit.as_dict(), "line": hit_line(cfg, store, hit, "你", short=True),
                                                           "marked": bool(e["possibly_handled_at"])},
         }
-        about_of[e["message_id"]] = {s["about_message_id"] for s in srcs}
-    # 同来源的合成一组（共用任何一条来源消息就算同一件事）
+        about_of[e["message_id"]] = (e["topic_id"], srcs)
+    # 同一件事合成一组（same_matter：共用来源消息、不在同一个会话，或同一个会话都 --about 指定了它）
     groups: list[list[str]] = []
     for mid in items:
-        joined = [g for g in groups if any(about_of[mid] & about_of[x] for x in g)]
+        joined = [g for g in groups if any(same_matter(*about_of[mid], *about_of[x]) for x in g)]
         merged = [mid] + [x for g in joined for x in g]
         groups = [g for g in groups if g not in joined] + [merged]
     decide, handled = [], []
@@ -499,12 +530,12 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
                         "updated_minutes": _minutes(upd, now), "stale": stale,
                         "stale_label": duty.stale_label(stale_h) if stale else ""})
     waiting.sort(key=lambda x: (x["stale"], x["updated_at"]))
-    return {"generated_at": now.isoformat(timespec="seconds"), "now_label": eng.display_time(now, off),
+    return {"generated_at": now.isoformat(timespec="seconds"), "now_label": f"{short_time(now, off)}，{eng._tz(off)[1]}",
             "decide": decide, "possibly_handled": handled, "waiting_owner": waiting}
 
 
 def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
-    head = f"{n}「{a['title']}」— {a['session']}，{a['asked_label']}问的，等了 {waited(a['waited_minutes'])}"
+    head = f"{n}「{a['title']}」— {a['session']}，{a['asked_label']} 问的，等了 {waited(a['waited_minutes'])}"
     if a["key"]:
         head += f"，钥匙 {a['key']}"
     lines = [head]
