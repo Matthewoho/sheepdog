@@ -2,6 +2,7 @@
 
 - ask / report：sheepdog 在正文前加开头一行（[threads] ask_header / report_header），以机器人身份私聊主人。
   带钥匙时，同一会话同一把钥匙第一次在主聊天里起一条（话题开头），之后回复到它的话题里（--reply-in-thread）。
+  话题里的那几条末尾另起一行 @ 主人（7.29：话题回复不提醒）；第一条不加。防重编号和记账的正文都不含这一行。
 - reply：代回（卡片，右下角带代回标记）。[identity] 关着：一律以主人身份发。开着（7.26）：按被回复的那条消息选身份——
   群里机器人在用机器人，私聊和机器人不在的群用主人本人；两个身份都带代回标记（Matthew 10-13 15:2x：「还是要带 这是我的
   logo 有广告意义」）。机器人发送报「不在群里」（230002）时这一条退回主人本人，防重编号不变。发之前只读检查：这个聊天里、从要回复的那条之后，主人本人有没有
@@ -120,7 +121,9 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     root = store.thread_by_key(topic_id, nk) if nk else None
     try:
         if root is not None:
-            res = source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=text, in_thread=True)
+            # 7.29：话题里的回复不提醒主人，末尾另起一行 @ 他（第一行不变，照旧认得出「需要你定」和会话）
+            res = source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=with_owner_at(cfg, text),
+                                  in_thread=True)
         elif cfg.threads.owner_chat_id:
             # 真实飞书测试用：发进测试群，不私聊主人
             res = source.send_to_chat(cfg.threads.owner_chat_id, text, ik, "bot")
@@ -147,6 +150,21 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
     return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
+
+
+def owner_at(open_id: str) -> str:
+    """飞书文本消息里 @ 一个人的写法（lark-cli im +messages-reply 的说明：text 消息用 <at user_id="ou_xxx"></at>，
+    卡片才用 <at id=ou_xxx></at>）。"""
+    return f'<at user_id="{open_id}"></at>'
+
+
+def with_owner_at(cfg: Config, text: str) -> str:
+    """7.29：往找主人聊天的话题里发的 ask / report，正文末尾另起一行 @ 主人（话题里的回复默认不提醒他）。
+    只加在发给飞书的那一份上：防重编号、sends、bot_outbox 记的都是不含这一行的正文（compose 的结果）。
+    不知道主人是谁（没配 self_open_id）就不加。"""
+    if not cfg.self_open_id:
+        return text
+    return text.rstrip("\n") + "\n" + owner_at(cfg.self_open_id)
 
 
 def learn_thread_id(store: Store, source, root_mid: str) -> str:

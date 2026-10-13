@@ -53,7 +53,7 @@ Lark (lark-cli, as the owner)
 ## Sessions
 
 - Every batch has an ID. The session answers with a receipt (`handled`, `needs_decision`, `waiting_external`, `done`), and the receipt sets the session state: idle, waiting on the owner, waiting on someone else, or closed.
-- When a session is unsure, it asks the owner with `sheepdog ask` (reports go through `sheepdog report`), one question per message. sheepdog adds the first line with the session's topic ID (`[tp_xxx]`), which is how the owner's reply finds its way back. Messages about the same thing carry the same `--key`: the first one starts a message in the main chat, later ones go into its thread, and the owner's replies in that thread go back to the session by thread.
+- When a session is unsure, it asks the owner with `sheepdog ask` (reports go through `sheepdog report`), one question per message. sheepdog adds the first line with the session's topic ID (`[tp_xxx]`), which is how the owner's reply finds its way back. Messages about the same thing carry the same `--key`: the first one starts a message in the main chat, later ones go into its thread with an @owner on the last line (thread replies don't notify the owner otherwise), and the owner's replies in that thread go back to the session by thread.
 - Waiting on someone is registered with `sheepdog watch`. By default the session is reminded at 15 and 30 minutes, and reports to the owner at 60. A reply only counts once the session confirms it is the answer it was waiting for.
 - Handover: a retiring session writes a handover note. Its successor reads the full predecessor transcript first and lists what it read in its receipt.
 - When the rules change, running sessions get the full new rules with their next batch.
