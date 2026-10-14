@@ -78,6 +78,8 @@ class SourceTimingTest(PendingBase):
         self.assertEqual(self.sources(q), [(g, "backfill")])
         self.assertEqual(pend.backfill_batch(self.store, "tp_alpha", self.at_sec(0), self.at_sec(40)), b1)
         self.assertEqual(pend.backfill_batch(self.store, "tp_alpha", self.at_sec(0)), b2)   # 不给入账时间：取到 :50 那批
+        # 入账和送出同一秒（:30）：同一轮先拉取后投递，那批是入账以后才送的，不算
+        self.assertEqual(pend.backfill_batch(self.store, "tp_alpha", self.at_sec(0), self.at_sec(30)), "b_test_prev")
 
     def test_sheepdog_ask_without_sources_is_never_backfilled(self):
         # 经 sheepdog ask 发的、那一批来自两个聊天：故意不记来源。之后每轮补来源不能绕过这条规则（更不能补成上一批）

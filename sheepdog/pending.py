@@ -108,7 +108,8 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = ""
     提问的时间按能拿到的最准的算：
     - sent_at（sends 表，经 sheepdog ask 发的才有，到秒）：取不晚于它送到的最近一批；
     - 没有就只能用 asked_at（飞书 create_time，只到分钟）：会话常在收到一批的同一分钟里就提问，所以当成「那一分钟里的
-      某一刻」，取那一分钟结束前送到的最近一批；给了 seen_at（这条提问入账的时间，到秒）再要求不晚于它。入账可能比提问
+      某一刻」，取那一分钟结束前送到的最近一批；给了 seen_at（这条提问入账的时间，到秒）再要求早于它（同一秒算在后：
+      每轮先拉取后投递，入账和送出同一秒说明这批是入账以后才送的）。入账可能比提问
       晚一两分钟（搜索有延迟），所以这条路只是尽量，sent_at 有的时候一律用 sent_at。"""
     exact = _parse(sent_at)
     asked = _parse(asked_at)
@@ -128,7 +129,7 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = ""
         if exact is not None:
             if sent <= exact:
                 return d["batch_id"]
-        elif sent < until and (seen is None or sent <= seen):
+        elif sent < until and (seen is None or sent < seen):   # 同一秒：同一轮先拉取（入账）后投递，批次在后
             return d["batch_id"]
     return ""
 

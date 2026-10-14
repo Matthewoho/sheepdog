@@ -289,6 +289,10 @@ class SourcesTest(PendingBase):
         self.ack("tp_alpha")
         self.store.record_dispatch("b_test_two_chats", "tp_alpha", [a, g])
         self.store.finish_dispatch("b_test_two_chats", "acked")
+        ago = lambda sec: (datetime.now().astimezone() - timedelta(seconds=sec)).isoformat(timespec="seconds")   # noqa: E731
+        for bid, sec in ((self.row(a)["batch_id"], 10), ("b_test_two_chats", 5)):   # 提问入账前几秒送到（不和入账同一秒）
+            self.store.conn.execute("UPDATE dispatches SET sent_at=? WHERE batch_id=?", (ago(sec), bid))
+        self.store.conn.commit()
         old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", at=at(1),
                             content="🐕 需要你定 · 老办法发的 [tp_alpha]\n要不要？")
         self.pull(old)
@@ -319,6 +323,11 @@ class SourcesTest(PendingBase):
         a = self.alice_batch()
         self.ack("tp_alpha")
         self.d.dispatch_once()
+        # 真实世界里会话收到一批到提问再到入账至少隔几秒；同一秒入账按「同一轮先拉取后投递」算批次在后（pending.backfill_batch）
+        self.store.conn.execute("UPDATE dispatches SET sent_at=? WHERE batch_id=?",
+                                ((datetime.now().astimezone() - timedelta(seconds=5)).isoformat(timespec="seconds"),
+                                 self.row(a)["batch_id"]))
+        self.store.conn.commit()
         old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", at=at(1),
                             content="🐕 需要你定 · 老办法发的 [tp_alpha]\n要不要？")
         self.pull(old)
