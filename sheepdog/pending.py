@@ -2,7 +2,8 @@
 
 - 来源（escalation_sources）：ask 发成功后当场记——`--about` 指定的消息（origin = about），不给就记这个会话最近一批
   送到的消息（origin = batch，批次号同 outbound.current_batch）。没定过来源的老提问（没经 sheepdog ask 发的、7.36 以前的
-  版本发的），按提问那一分钟结束前（且不晚于它入账）送到这个会话的最近一批补（origin = backfill）；ask 发出时定过的
+  版本发的），按提问时间之前送到这个会话的最近一批补（origin = backfill；提问时间有 sends.sent_at 用它，到秒；没有才用
+  只到分钟的 asked_at，当成那一分钟里的某一刻、且不晚于入账）；ask 发出时定过的
   （sends.sources_origin）没记就是故意不记，不补。sheepdog 自己生成的消息、「找主人」聊天里的消息不算来源。
 - 可能已处理：提问还开着，并且（按先后取第一种）
   1. 主人本人后来在来源聊天里说过话（不是代回、不在找主人聊天）；
@@ -101,16 +102,19 @@ def default_sources(cfg, store: Store, batch_id: str) -> tuple[list[tuple[str, s
     return (cands if n == 1 else []), n
 
 
-def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = "") -> str:
+def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = "", sent_at: str = "") -> str:
     """老提问补来源：提问时会话手上最近送到的一批（没送到的、不带消息的、主人插话批次不算）。没有是空串。
 
-    asked_at 来自飞书的 create_time，只到分钟；批次的 sent_at 到秒。会话常在收到一批的同一分钟里就提问，所以 asked_at 当成
-    「那一分钟里的某一刻」：取那一分钟结束前送到的最近一批；给了 seen_at（这条提问入账的时间，到秒）就再要求不晚于它——
-    同一轮先拉取后投递，提问入账以后才送出的那批不是它看到的。"""
+    提问的时间按能拿到的最准的算：
+    - sent_at（sends 表，经 sheepdog ask 发的才有，到秒）：取不晚于它送到的最近一批；
+    - 没有就只能用 asked_at（飞书 create_time，只到分钟）：会话常在收到一批的同一分钟里就提问，所以当成「那一分钟里的
+      某一刻」，取那一分钟结束前送到的最近一批；给了 seen_at（这条提问入账的时间，到秒）再要求不晚于它。入账可能比提问
+      晚一两分钟（搜索有延迟），所以这条路只是尽量，sent_at 有的时候一律用 sent_at。"""
+    exact = _parse(sent_at)
     asked = _parse(asked_at)
-    if asked is None:
+    if exact is None and asked is None:
         return ""
-    until = asked.replace(second=0, microsecond=0) + timedelta(minutes=1)   # 不含
+    until = None if exact is not None else asked.replace(second=0, microsecond=0) + timedelta(minutes=1)   # 不含
     seen = _parse(seen_at)
     rows = store.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC LIMIT 500",
                               (topic_id,)).fetchall()
@@ -119,7 +123,12 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = ""
                 or d["batch_id"].startswith(eng.PRIORITY_PREFIX)):
             continue  # 没送到的、不带消息的（onboarding、规则推送）、主人插话批次（同 current_batch）不算一批
         sent = _parse(d["sent_at"])
-        if sent is not None and sent < until and (seen is None or sent <= seen):
+        if sent is None:
+            continue
+        if exact is not None:
+            if sent <= exact:
+                return d["batch_id"]
+        elif sent < until and (seen is None or sent <= seen):
             return d["batch_id"]
     return ""
 
@@ -127,13 +136,14 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = ""
 def backfill_sources(cfg, store: Store, e) -> list[tuple[str, str]]:
     """一条没记来源的提问该补什么（只算、不写）。ask 发出时定过来源口径的（sends.sources_origin 有值）不补：没记是故意的
     （那一批来自多个聊天，7.38 第 2 条），补了会绕过单聊天规则，还可能补成上一批。没定过的照补：没经 sheepdog ask 发的、
-    7.36 以前的版本发的（正式账本里现有的提问都是这种）。"""
+    7.36 以前的版本发的（正式账本里现有的提问都是这种）；后者有 sends.sent_at，按它取批次。"""
     s = store.send_by_message(e["message_id"])
     if s is not None and s["sources_origin"]:
         return []
     m = store.get_message(e["message_id"])
     seen = m["first_seen"] if m is not None else ""
-    return default_sources(cfg, store, backfill_batch(store, e["topic_id"], e["asked_at"], seen))[0]
+    b = backfill_batch(store, e["topic_id"], e["asked_at"], seen, s["sent_at"] if s is not None else "")
+    return default_sources(cfg, store, b)[0]
 
 
 def about_sources(cfg, store: Store, about_ids: list[str]) -> list[tuple[str, str]]:

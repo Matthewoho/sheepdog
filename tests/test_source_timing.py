@@ -95,15 +95,19 @@ class SourceTimingTest(PendingBase):
         self.assertEqual([(a["source_origin"], a["source_chats"]) for a in mine], [("", [])])   # 清单现算也不补
         self.assertIsNotNone(a0)
 
-    def test_ask_sent_by_an_older_version_is_still_backfilled(self):
-        # 7.36 以前的版本经 sheepdog ask 发的（sends 有记录、来源口径没定过）：正式账本里现有的提问都是这种，照补
-        _, _, g, b1 = self.two_batches()
+    def test_ask_sent_by_an_older_version_is_still_backfilled_by_its_send_time(self):
+        # 7.36 以前的版本经 sheepdog ask 发的（sends 有记录、来源口径没定过）：正式账本里现有的提问都是这种，照补；
+        # 提问时间用 sends.sent_at（到秒），不用只到分钟的 asked_at，也不用可能晚一两分钟的入账时间
+        a0, _, g, b1 = self.two_batches()
         self.store.update_topic("tp_alpha", state="running", pending_batch_id=b1)
         q = self.asked()
         self.assertEqual(self.store.send_by_message(q)["sources_origin"], "batch")      # 新版本当场定了
-        self.store.conn.execute("DELETE FROM escalation_sources")
-        self.store.conn.execute("UPDATE sends SET sources_origin=NULL WHERE message_id=?", (q,))
-        self.store.conn.execute("UPDATE escalations SET asked_at=? WHERE message_id=?", (self.at_sec(0), q))
-        self.store.conn.commit()
-        self.assertEqual(pend.followup_round(self.cfg, self.store, self.d.playbook)["backfilled"], 1)
-        self.assertEqual(self.sources(q), [(g, "backfill")])
+        for sent, want in ((40, g), (10, a0)):   # :40 发的提问在 :30 那批之后；:10 发的在它之前，是上一批
+            self.store.conn.execute("DELETE FROM escalation_sources")
+            self.store.conn.execute("UPDATE sends SET sources_origin=NULL, sent_at=? WHERE message_id=?",
+                                    (self.at_sec(sent), q))
+            self.store.conn.execute("UPDATE escalations SET asked_at=? WHERE message_id=?", (self.at_sec(0), q))
+            self.store.conn.execute("UPDATE messages SET first_seen=? WHERE message_id=?", (self.at_sec(100), q))
+            self.store.conn.commit()
+            self.assertEqual(pend.followup_round(self.cfg, self.store, self.d.playbook)["backfilled"], 1)
+            self.assertEqual(self.sources(q), [(want, "backfill")], sent)
