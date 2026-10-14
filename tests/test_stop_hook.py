@@ -312,7 +312,7 @@ class TranscriptTest(HookBase):
 
     def test_sdk_and_system_inputs_do_not_count(self):
         # hook 插的 userMessage 记成 SYSTEM_SDK 来源的 USER_INPUT（E2）；agentapi 送的是 SYSTEM_MESSAGE；都不是主人亲自打字
-        record(BUS_CID, step(11, "SYSTEM_SDK", "USER_INPUT", "<USER_REQUEST>插话</USER_REQUEST>"),
+        record(BUS_CID, step(11, "SYSTEM_SDK", "USER_INPUT", "<USER_REQUEST>插话：source 是 USER_EXPLICIT 才算</USER_REQUEST>"),
                step(12, "SYSTEM", "SYSTEM_MESSAGE", "Stop hook blocked termination: 先交回执"),
                step(13, "MODEL", "PLANNER_RESPONSE", "USER_EXPLICIT 这个词出现在回答里不算"))
         self.assertTrue(self.blocks())
