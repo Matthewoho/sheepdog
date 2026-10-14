@@ -404,6 +404,9 @@ class SourcesTest(PendingBase):
         self.assertIn(mine, out)
         rc, out, _ = self.cli("escalations")
         self.assertIn(theirs, out)
+        rc, out, _ = self.cli("escalations", "--all", "--topic", "tp_alpha")   # --all 也只列这个会话的
+        self.assertIn(mine, out)
+        self.assertNotIn(theirs, out)
         self.resolve("--message-id", mine, "--why", "办完了")
         rc, out, _ = self.cli("escalations", "--topic", "tp_alpha")
         self.assertIn("tp_alpha 名下没有未结的「需要你定」", out)

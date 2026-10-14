@@ -223,7 +223,8 @@ def _thread_root_id(store: Store, thread_id: str) -> str:
 
 def _owner_followups(cfg, store: Store, srcs) -> list:
     """主人本人在来源上的后续发言（还没按时间、代回筛）：私聊来源 → 这个私聊里主人的全部发言；群来源 → 回复 / 引用来源消息的、
-    在来源消息所在话题里的（来源本身在话题里，或者它就是话题开头那条）。找主人聊天里的不算。"""
+    在来源消息所在话题里的（按来源消息的 thread_id 比：它本身在话题里，或者它就是话题开头那条、账本里已经补上了话题编号——
+    engine._learn_source_thread 在主人在群话题里说话时补）。找主人聊天里的不算。"""
     me = cfg.self_open_id
     owner_chats = set(cfg.owner_chat_ids)
     out: dict[str, object] = {}
@@ -241,10 +242,10 @@ def _owner_followups(cfg, store: Store, srcs) -> list:
         tid = (src["thread_id"] if src is not None else "") or ""
         rows = store.conn.execute(
             "SELECT * FROM messages WHERE sender_id=? AND chat_id=? AND COALESCE(deleted,0)=0 "
-            "AND (reply_to=? OR COALESCE(thread_id,'') != '')", (me, chat, mid)).fetchall()
+            "AND (reply_to=? OR (? != '' AND thread_id=?))", (me, chat, mid, tid, tid)).fetchall()
         for r in rows:
             rtid = r["thread_id"] or ""
-            if r["reply_to"] == mid or (tid and rtid == tid) or (rtid and _thread_root_id(store, rtid) == mid):
+            if r["reply_to"] == mid or (tid and rtid == tid):
                 out[r["message_id"]] = r
     if p2p_chats:
         marks = ",".join("?" * len(p2p_chats))
