@@ -79,12 +79,28 @@ class SessionConfig:
     reply_suffix: str = "[🐕Sheepdog Reply]"
     # 代回卡片宽度：compact（400px）| default（≤600px）| fill（撑满）
     reply_card_width: str = "compact"
+    # 7.40 开关（热加载）：会话在跑上一批时，主人在找主人聊天里的回复当轮单独插队送到（7.37 第 4 件）。
+    # 关掉后回到原来的排队：等手上那批交回执（或回执超时）再随下一批送
+    owner_priority: bool = True
 
     def validate(self) -> None:
+        if not isinstance(self.owner_priority, bool):
+            raise ConfigError("[session] owner_priority 必须是 true/false")
         if self.reply_card_width not in ("compact", "default", "fill"):
             raise ConfigError("session.reply_card_width 只能是 compact / default / fill")
         if not isinstance(self.reply_suffix, str):
             raise ConfigError("session.reply_suffix 必须是字符串")
+
+
+@dataclass
+class HooksConfig:
+    """[hooks]（7.40）：Antigravity 生命周期 hook 的开关。hook 每次被调用都现读配置，改完下一次就生效。"""
+    # Stop hook（sheepdog hook stop）：这批没交回执就不让会话结束。关掉后什么都不输出，会话照常结束
+    stop: bool = True
+
+    def validate(self) -> None:
+        if not isinstance(self.stop, bool):
+            raise ConfigError("[hooks] stop 必须是 true/false")
 
 
 @dataclass
@@ -122,13 +138,19 @@ class EscalationConfig:
     remind_before_hours: float = 2
     # 7.36：会话结案后机器人在话题里补的那句「已结案」要不要 @ 主人（话题回复默认不提醒他）。默认不 @
     resolve_notice_at: bool = False
+    # 7.40 开关（热加载，常驻进程下一轮生效）：「需要你定」的跟进——判「可能已处理」、发核实提醒和快到期提醒、
+    # 原会话已收掉的转给总线提醒。关掉后这些都不做；resolve、来源记录、pending 清单照常
+    followup: bool = True
+    # 7.40 开关：主人在找主人聊天里单独发「待办」，机器人直接回清单。关掉后不拦，照旧当普通回复处理
+    owner_shortcut: bool = True
 
     def validate(self) -> None:
         if (isinstance(self.remind_before_hours, bool) or not isinstance(self.remind_before_hours, (int, float))
                 or self.remind_before_hours < 0):
             raise ConfigError("[escalation] remind_before_hours 必须是 >= 0 的数（0 = 不提醒）")
-        if not isinstance(self.resolve_notice_at, bool):
-            raise ConfigError("[escalation] resolve_notice_at 必须是 true/false")
+        for k in ("resolve_notice_at", "followup", "owner_shortcut"):
+            if not isinstance(getattr(self, k), bool):
+                raise ConfigError(f"[escalation] {k} 必须是 true/false")
         if not isinstance(self.chat_ids, list) or not all(isinstance(c, str) and c for c in self.chat_ids):
             raise ConfigError("escalation.chat_ids 必须是非空字符串列表")
         if isinstance(self.open_hours, bool) or not isinstance(self.open_hours, (int, float)) or self.open_hours <= 0:
@@ -591,6 +613,7 @@ class Config:
     source: SourceConfig = field(default_factory=SourceConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
+    hooks: HooksConfig = field(default_factory=HooksConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -698,6 +721,7 @@ def load_config(path: Path | None = None) -> Config:
         _apply(cfg.audit, data.get("audit", {}))
         _apply(cfg.duty, data.get("duty", {}))
         _apply(cfg.threads, data.get("threads", {}))
+        _apply(cfg.hooks, data.get("hooks", {}))
         hosts = data.get("hosts", {})
         if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
             raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -719,6 +743,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.audit.validate()
     cfg.duty.validate()
     cfg.threads.validate()
+    cfg.hooks.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

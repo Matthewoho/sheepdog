@@ -162,7 +162,9 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None)
     cid = data.get("conversationId")
     if not isinstance(cid, str) or not cid.strip():
         return None
-    cfg = cfg or load_config()
+    cfg = cfg or load_config()   # 每次调用都是新进程、现读配置：[hooks] stop 改完下一次收工就生效
+    if not cfg.hooks.stop:
+        return None   # 7.40 开关关掉：什么都不输出，会话照常结束
     now = now or datetime.now().astimezone()
     if not cfg.db_path.is_file():
         return None

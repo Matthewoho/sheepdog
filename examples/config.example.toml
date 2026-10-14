@@ -55,6 +55,10 @@ receipt_timeout_minutes = 20
 # 代回以卡片发出：正文 + 右下角灰色小字标记（sheepdog reply-card 生成；playbook 里的 {{reply_suffix}}）
 reply_suffix = "[🐕Sheepdog Reply]"
 reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill（撑满）
+# 会话在跑上一批（等回执）时，你在找主人聊天里的回复当轮单独插队送到（7.37）。
+# 关掉（false）：回到原来的排队，你的回复要等那个会话交了手上那批的回执（或回执超时，见 receipt_timeout_minutes）才随下一批送到；
+# 省掉的是插队那一批（每次插话多送一次、会话多读一段）。改完常驻进程下一轮生效，不用重启
+owner_priority = true
 # 旧的代回前缀：playbook 里的 {{reply_prefix}}，保留兼容
 reply_prefix = "🐕 [Agent 代回] "
 
@@ -72,6 +76,14 @@ open_hours = 24
 remind_before_hours = 2
 # 会话结案（sheepdog resolve）后机器人在话题里补的那句「已结案」要不要 @ 你；默认不 @
 resolve_notice_at = false
+# 「需要你定」的跟进（7.36 / 7.38）：每轮判「可能已处理」（你后来在来源聊天说过话、点过表情、同一件事另一条已答 / 已结），
+# 给负责会话发一次核实提醒；快到期提醒一次；原会话已收掉的这两种提醒发给总线。
+# 关掉（false）：这些都不做，会话不会因为这个多收消息、多跑一轮；提问照旧 open_hours 后到期关闭，
+# resolve、来源记录、pending 清单照常（清单里不再写「↳ 你几点在哪说过」那一行）。改完下一轮生效
+followup = true
+# 你在找主人聊天里单独发「待办」，机器人当轮直接回清单，不经过总线（7.36）。
+# 关掉（false）：「待办」不拦截，照旧当一句普通回复（只有一个会话有未结提问时送给它，否则送总线）。改完下一轮生效
+owner_shortcut = true
 
 [escalation.aliases]
 # 第一行没有 topic_id、只有 [..·名字] 时，按名字认会话；认不出再和各会话标题比（唯一命中才算）
@@ -250,3 +262,9 @@ timeout_minutes = 60
 max_concurrent = 2
 ask_owner_before_new = true    # 同上：new-session --host claude 必须带核对过的 --quote
 # settings = "~/.config/sheepdog/claude-settings.json"   # 可选，原样传 --settings；sheepdog 不写它的内容
+
+[hooks]
+# Antigravity 的 Stop hook（sheepdog hook stop，7.37）：会话这一轮要结束、手上那批还没交回执，就不让它停（同一批最多拦 2 次）。
+# 关掉（false）：hook 什么都不输出，会话照常结束，没交的回执等回执超时处理；省掉的是被拦以后会话多跑的那一轮。
+# hook 每次调用都现读这个文件，改完下一次收工就生效，不用重启，也不用改 hooks.json
+stop = true

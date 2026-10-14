@@ -782,8 +782,9 @@ class Collector:
         """7.38：主人在群里某个话题里说话，账本里还不知道这个话题的开头是哪条时，看它是不是某条还开着的提问的来源消息：
         只读 mget 这个群里还没记话题编号的来源消息（最多 50 条），把话题编号补进账本，「可能已处理」才认得出
         「在来源消息的话题里说的」。私聊、找主人聊天不用。失败只记日志。"""
-        if not m.thread_id or m.chat_type == "p2p" or m.chat_id in self.cfg.owner_chat_ids:
-            return
+        if (not self.cfg.escalation.followup or not m.thread_id or m.chat_type == "p2p"
+                or m.chat_id in self.cfg.owner_chat_ids):
+            return   # 7.40：跟进关掉时不判可能已处理，也就不用为它 mget
         try:
             from . import pending as pend
             if pend._thread_root_id(self.store, m.thread_id):
@@ -902,7 +903,8 @@ class Collector:
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
             from . import pending as pend
-            if not m.reply_to and (not m.thread_id or is_thread_root(m)) and pend.is_pending_query(m.content):
+            if (self.cfg.escalation.owner_shortcut and not m.reply_to and (not m.thread_id or is_thread_root(m))
+                    and pend.is_pending_query(m.content)):
                 # 7.36：主人单独发「待办」（顶层消息）：牧羊犬当轮用机器人回清单，不送总线、不当成回答哪条提问
                 d = RouteDecision(DROP, "pending_query")
                 self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
@@ -1955,7 +1957,7 @@ class Dispatcher:
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
-            if t["state"] == sm.RUNNING and (urgent := self._priority_rows(rows)):
+            if t["state"] == sm.RUNNING and self.cfg.session.owner_priority and (urgent := self._priority_rows(rows)):
                 # 7.37 第 4 件：会话在跑上一批，主人的回复不等那批回执，当轮单独送到；其余信号照旧排队
                 return self._dispatch_priority(t, urgent, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
@@ -3315,7 +3317,7 @@ class Dispatcher:
         self._expire_escalations()
         try:  # 7.36：开着的「需要你定」补来源、判可能已处理、排核实 / 快到期提醒。出错不挡投递
             from . import pending as pend
-            pend.followup_round(self.cfg, self.store, self.playbook)
+            pend.followup_round(self.cfg, self.store, self.playbook)   # [escalation] followup 关掉时只补来源
         except Exception as e:
             log.warning("「需要你定」跟进检查出错: %s", e)
         # 在岗表（7.20）：先自动补活（第 5 步），再算各会话的运行状态（第 4 步，等回复要看名下的活）

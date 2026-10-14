@@ -492,6 +492,8 @@ def followup_round(cfg, store: Store, playbook) -> dict:
         srcs = ensure_sources(cfg, store, e)
         if srcs and not had:
             out["backfilled"] += 1
+        if not esc.followup:
+            continue   # 7.40 [escalation] followup 关掉：来源照记，不判可能已处理、不排任何提醒
         if not e["possibly_handled_at"]:
             hit = detect(cfg, store, e, sources=srcs)
             if hit is not None and store.mark_possibly_handled(mid, hit.message_id, hit.reason):
@@ -565,14 +567,18 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
             b = backfill_batch(store, e["topic_id"], e["asked_at"])
             srcs = [{"about_message_id": m, "about_chat_id": c, "origin": ORIGIN_BACKFILL}
                     for m, c in default_sources(cfg, store, b)[0]]
-        hit = hit_of(cfg, store, e) if e["possibly_handled_at"] else detect(cfg, store, e, sources=srcs)
+        if not cfg.escalation.followup:
+            hit = None   # 7.40：跟进关掉时清单不写「↳」那一行（没人会去提醒，写了是假话）
+        else:
+            hit = hit_of(cfg, store, e) if e["possibly_handled_at"] else detect(cfg, store, e, sources=srcs)
         sent = store.send_by_message(e["message_id"])
         asked = _parse(e["asked_at"])
         chats = list(dict.fromkeys(s["about_chat_id"] for s in srcs if s["about_chat_id"]))
         items[e["message_id"]] = {
             "message_id": e["message_id"], "topic_id": e["topic_id"], "session": session_label(store, e["topic_id"]),
             "session_closed": not _deliverable_topic(store, e["topic_id"]),
-            "follower": follower_of(store, e),
+            "follower": follower_of(store, e) if cfg.escalation.followup else "",
+            "followup": cfg.escalation.followup,
             "title": ask_title(cfg, e["text"]), "body": ask_body(e["text"]),
             "key": sent["key"] if sent is not None and sent["key"] else "",
             "asked_at": e["asked_at"], "asked_label": short_time(asked, off) if asked else e["asked_at"],
@@ -648,7 +654,12 @@ def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
         done = "已提醒" if ph["notified"] else "下一轮会提醒"
         lines.append(f"{indent}↳ {ph['line']}，{done} {a['session']}核实")
     elif a["session_closed"]:
-        lines.append(f"{indent}⚠ 原会话已收掉，由总线跟进" if a["follower"] else f"{indent}⚠ 提问的会话已收掉，没人跟进这件事")
+        if a["follower"]:
+            lines.append(f"{indent}⚠ 原会话已收掉，由总线跟进")
+        elif not a["followup"]:
+            lines.append(f"{indent}⚠ 提问的会话已收掉；跟进提醒关着，没人会提醒总线（总线可以 resolve 它）")
+        else:
+            lines.append(f"{indent}⚠ 提问的会话已收掉，没人跟进这件事")
     return lines
 
 
