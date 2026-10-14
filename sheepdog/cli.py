@@ -12,7 +12,7 @@
   sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
   sheepdog watches [--all]  /  sheepdog unwatch --id N  /  sheepdog watch-done --id N（确认真等到了）
   sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
-  sheepdog escalations [--all]                           列出未结 / 全部「需要你定」
+  sheepdog escalations [--all] [--topic T]               列出未结 / 全部「需要你定」（--topic 只列这个会话名下的）
   sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
   sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...]
                        [--host antigravity|codex|claude] [--model M] [--effort E] [--quote 主人原话] [--dry-run]
@@ -973,12 +973,16 @@ def cmd_security_log(args) -> int:
 def cmd_escalations(args) -> int:
     cfg = load_config()
     store = Store(cfg.db_path)
-    open_ids = {e["message_id"] for e in open_escalations(store, cfg.escalation.open_hours)}
+    tid = _topic_arg(args.topic) if getattr(args, "topic", "") else ""
+    open_ids = {e["message_id"] for e in open_escalations(store, cfg.escalation.open_hours, tid or None)}
     rows = store.list_escalations(include_closed=args.all)
+    if tid:
+        rows = [e for e in rows if e["topic_id"] == tid]   # 7.38：只列这个会话名下的
     if not args.all:
         rows = [e for e in rows if e["message_id"] in open_ids]  # 超时还没被常驻进程关掉的也不算未结
     if not rows:
-        print("没有未结的「需要你定」" if not args.all else "没有「需要你定」记录")
+        who = f"{tid} 名下" if tid else ""
+        print(f"{who}没有未结的「需要你定」" if not args.all else f"{who}没有「需要你定」记录")
         return 0
     for e in rows:
         if e["answered_at"]:
@@ -1509,6 +1513,8 @@ def cmd_ask(args) -> int:
         return e.code
     for line in outbound.duplicate_text(store, cfg, r.duplicates):
         print(line)
+    if hint := outbound.source_hint(r):
+        print(hint)
     if r.already:
         print(f"之前已经发过同样的内容（防重编号相同，这次没再发）：message_id {r.message_id}")
     elif r.new_thread:
@@ -1683,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("escalations")
     sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
+    sp.add_argument("--topic", default="", help="只列这个会话（tp_x）名下的")
     sp.set_defaults(func=cmd_escalations)
 
     sp = sub.add_parser("new-session")

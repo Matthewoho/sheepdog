@@ -92,6 +92,14 @@ def batch_sources(cfg, store: Store, batch_id: str) -> list[tuple[str, str]]:
     return out
 
 
+def default_sources(cfg, store: Store, batch_id: str) -> tuple[list[tuple[str, str]], int]:
+    """不给 --about 时的来源（7.38 第 2 条）：这一批的候选消息都来自同一个聊天才算；来自多个聊天就不记（主人在其中任何一个
+    聊天说话都会触发，太宽）。返回 (来源, 候选消息来自几个聊天)。"""
+    cands = batch_sources(cfg, store, batch_id)
+    n = len({c for _, c in cands})
+    return (cands if n == 1 else []), n
+
+
 def backfill_batch(store: Store, topic_id: str, asked_at: str) -> str:
     """老提问补来源：提问时间之前送到这个会话的最近一批（没送到的、不带消息的不算）。没有是空串。"""
     asked = _parse(asked_at)
@@ -130,7 +138,7 @@ def ensure_sources(cfg, store: Store, e) -> list:
     rows = store.escalation_sources(e["message_id"])
     if rows:
         return rows
-    srcs = batch_sources(cfg, store, backfill_batch(store, e["topic_id"], e["asked_at"]))
+    srcs, _ = default_sources(cfg, store, backfill_batch(store, e["topic_id"], e["asked_at"]))
     if srcs:
         store.add_escalation_sources(e["message_id"], e["topic_id"], srcs, ORIGIN_BACKFILL)
         rows = store.escalation_sources(e["message_id"])
@@ -204,6 +212,49 @@ def _before(dt: datetime | None, until: datetime | None) -> bool:
     return dt is not None and (until is None or dt <= until)
 
 
+def _thread_root_id(store: Store, thread_id: str) -> str:
+    """账本里这个话题开头那条的消息号（按话题里的序号认）；不知道是空串。"""
+    for r in store.conn.execute("SELECT message_id, chat_type, thread_position FROM messages WHERE thread_id=?",
+                                (thread_id,)):
+        if (r["thread_position"] or "") == eng.root_position(r["chat_type"] or ""):
+            return r["message_id"]
+    return ""
+
+
+def _owner_followups(cfg, store: Store, srcs) -> list:
+    """主人本人在来源上的后续发言（还没按时间、代回筛）：私聊来源 → 这个私聊里主人的全部发言；群来源 → 回复 / 引用来源消息的、
+    在来源消息所在话题里的（来源本身在话题里，或者它就是话题开头那条）。找主人聊天里的不算。"""
+    me = cfg.self_open_id
+    owner_chats = set(cfg.owner_chat_ids)
+    out: dict[str, object] = {}
+    p2p_chats: set[str] = set()
+    for s in srcs:
+        chat = s["about_chat_id"]
+        if not chat or chat in owner_chats:
+            continue
+        src = store.get_message(s["about_message_id"])
+        ctype = (src["chat_type"] if src is not None else "") or ""
+        if ctype == "p2p":
+            p2p_chats.add(chat)
+            continue
+        mid = s["about_message_id"]
+        tid = (src["thread_id"] if src is not None else "") or ""
+        rows = store.conn.execute(
+            "SELECT * FROM messages WHERE sender_id=? AND chat_id=? AND COALESCE(deleted,0)=0 "
+            "AND (reply_to=? OR COALESCE(thread_id,'') != '')", (me, chat, mid)).fetchall()
+        for r in rows:
+            rtid = r["thread_id"] or ""
+            if r["reply_to"] == mid or (tid and rtid == tid) or (rtid and _thread_root_id(store, rtid) == mid):
+                out[r["message_id"]] = r
+    if p2p_chats:
+        marks = ",".join("?" * len(p2p_chats))
+        for r in store.conn.execute(
+                f"SELECT * FROM messages WHERE sender_id=? AND chat_id IN ({marks}) AND COALESCE(deleted,0)=0",
+                (me, *sorted(p2p_chats))):
+            out[r["message_id"]] = r
+    return list(out.values())
+
+
 def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | None = None) -> Hit | None:
     """只读：这条提问是不是「可能已处理」。依次看主人后来在来源聊天里的发言、对来源消息点的表情、同来源的另一条提问。
     until：只看这个时间以前的（回放用）。"""
@@ -214,17 +265,12 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
     if not srcs:
         return None
     me = cfg.self_open_id
-    owner_chats = set(cfg.owner_chat_ids)
-    chats = sorted({s["about_chat_id"] for s in srcs if s["about_chat_id"] and s["about_chat_id"] not in owner_chats})
     about = [s["about_message_id"] for s in srcs]
-    # 1. 主人本人后来在来源聊天里说过话
-    if me and chats:
-        marks = ",".join("?" * len(chats))
-        rows = store.conn.execute(
-            f"SELECT * FROM messages WHERE sender_id=? AND chat_id IN ({marks}) AND COALESCE(deleted,0)=0",
-            (me, *chats)).fetchall()
+    # 1. 主人本人后来说过话（7.38 第 3 条）：来源是私聊的，主人之后在这个私聊说话就算；来源是群的，只认主人回复 / 引用
+    #    来源消息、或在来源消息所在话题里说的
+    if me and srcs:
         best = None
-        for r in rows:
+        for r in _owner_followups(cfg, store, srcs):
             at = _parse(r["create_time"])
             if at is None or at <= asked or not _before(at, until) or is_agent_text(cfg, r["content"]):
                 continue
@@ -332,19 +378,20 @@ def hit_line(cfg, store: Store, hit: Hit, me_word: str = "主人", short: bool =
     off = cfg.timezone_offset
     dt = _parse(hit.at)
     at = (short_time(dt, off) + " ") if short and dt else eng.display_time(dt, off) if dt else "- "
-    mid = hit.message_id if short else f"`{hit.message_id}`"   # 给主人看的清单不带反引号（飞书纯文本会原样显示）
+    # 给主人看的清单（short）不带消息号；给会话的提醒带上（反引号）
+    ref = "" if short else f"（message_id `{hit.message_id}`）"
     if hit.reason == PH_SPOKE:
         return (f"{me_word} {at}在{chat_label(cfg, store, hit.chat_id, hit.chat_type, hit.chat_name)}说过：「{hit.text}」"
-                f"（message_id {mid}）")
+                f"{ref}")
     if hit.reason == PH_REACTION:
         return (f"{me_word}对来源消息点了 {hit.emoji or '表情'}（{at}看到）：{chat_label(cfg, store, hit.chat_id, hit.chat_type, hit.chat_name)}"
-                f"「{hit.text}」（message_id {mid}）")
+                f"「{hit.text}」{ref}")
     who = session_label(store, hit.other_topic) if hit.other_topic else "别的会话"
     if hit.reason == PH_SIBLING_RESOLVED:
         return (f"同来源的另一条提问（{who} 问的「{hit.text}」）{at}已被结案：{hit.note or '-'}"
-                f"（message_id {mid}）")
+                f"{ref}")
     if hit.reason == PH_SIBLING_ANSWERED:
-        return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复（message_id {mid}）"
+        return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复{ref}"
     return f"标为可能已处理（{hit.reason or '-'}，{hit.message_id or '-'}）"
 
 
@@ -480,7 +527,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         if not srcs:  # 只读：不写账本，按补记的规则现算
             b = backfill_batch(store, e["topic_id"], e["asked_at"])
             srcs = [{"about_message_id": m, "about_chat_id": c, "origin": ORIGIN_BACKFILL}
-                    for m, c in batch_sources(cfg, store, b)]
+                    for m, c in default_sources(cfg, store, b)[0]]
         hit = hit_of(cfg, store, e) if e["possibly_handled_at"] else detect(cfg, store, e, sources=srcs)
         sent = store.send_by_message(e["message_id"])
         asked = _parse(e["asked_at"])
@@ -493,8 +540,9 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
             "waited_minutes": _minutes(asked, now),
             "source_origin": srcs[0]["origin"] if srcs else "",
             "source_chats": [{"chat_id": c, "label": chat_label(cfg, store, c)} for c in chats],
-            "possibly_handled": None if hit is None else {**hit.as_dict(), "line": hit_line(cfg, store, hit, "你", short=True),
-                                                          "marked": bool(e["possibly_handled_at"])},
+            "possibly_handled": None if hit is None else {
+                **hit.as_dict(), "line": hit_line(cfg, store, hit, "你", short=True),
+                "marked": bool(e["possibly_handled_at"]), "notified": bool(e["possibly_handled_notified_at"])},
         }
         about_of[e["message_id"]] = (e["topic_id"], srcs)
     # 同一件事合成一组（same_matter：共用来源消息、不在同一个会话，或同一个会话都 --about 指定了它）
@@ -503,13 +551,14 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         joined = [g for g in groups if any(same_matter(*about_of[mid], *about_of[x]) for x in g)]
         merged = [mid] + [x for g in joined for x in g]
         groups = [g for g in groups if g not in joined] + [merged]
-    decide, handled = [], []
+    decide = []
     for g in groups:
         asks = sorted((items[x] for x in g), key=lambda x: x["asked_at"] or "")
         grp = {"asks": asks, "same_source": len(asks) > 1}
-        (handled if any(a["possibly_handled"] for a in asks) else decide).append(grp)
+        decide.append(grp)   # 7.38：可能已处理的不挪出「要你定的」，真正关掉靠会话核实后 resolve
     decide.sort(key=lambda g: g["asks"][0]["asked_at"] or "")
-    handled.sort(key=lambda g: g["asks"][0]["asked_at"] or "")
+    asks_all = [a for g in decide for a in g["asks"]]
+    handled = [a for a in asks_all if a["possibly_handled"]]
     # 各会话在等你：看板上「等主人」的活。自动补的「需要你定」就是上面那些，不重复列；
     # 会话自报的、钥匙和上面某条提问相同的也不重复列
     asked_keys = {(i["topic_id"], duty.norm_key(i["key"])) for i in items.values() if i["key"]}
@@ -531,7 +580,10 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
                         "stale_label": duty.stale_label(stale_h) if stale else ""})
     waiting.sort(key=lambda x: (x["stale"], x["updated_at"]))
     return {"generated_at": now.isoformat(timespec="seconds"), "now_label": f"{short_time(now, off)}，{eng._tz(off)[1]}",
-            "decide": decide, "possibly_handled": handled, "waiting_owner": waiting}
+            "decide": decide, "decide_count": len(asks_all), "possibly_handled_count": len(handled),
+            "possibly_handled_notified_count": sum(1 for a in handled if a["possibly_handled"]["notified"]),
+            "possibly_handled_all_spoke": all(a["possibly_handled"]["reason"] == PH_SPOKE for a in handled),
+            "waiting_owner": waiting}
 
 
 def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
@@ -546,8 +598,10 @@ def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
                      + (f" 等 {len(a['source_chats'])} 个聊天" if len(a["source_chats"]) > 3 else ""))
     else:
         lines.append(f"{indent}来源：没记到")
-    if a["possibly_handled"]:
-        lines.append(f"{indent}⚠ 可能已处理：{a['possibly_handled']['line']}")
+    ph = a["possibly_handled"]
+    if ph:
+        done = "已提醒" if ph["notified"] else "下一轮会提醒"
+        lines.append(f"{indent}↳ {ph['line']}，{done} {a['session']}核实")
     return lines
 
 
@@ -564,19 +618,19 @@ def _group_lines(groups: list[dict]) -> list[str]:
 
 
 def render(data: dict, header: str = "") -> str:
-    d, h, w = data["decide"], data["possibly_handled"], data["waiting_owner"]
-    n_d = sum(len(g["asks"]) for g in d)
-    n_h = sum(len(g["asks"]) for g in h)
+    d, w = data["decide"], data["waiting_owner"]
+    n_d, n_h = data["decide_count"], data["possibly_handled_count"]
     head = header or "待办清单"
-    lines = [f"{head}（{data['now_label']}）：要你定的 {n_d} 条，可能已处理的 {n_h} 条，各会话在等你的 {len(w)} 件"]
+    what = ("你后来在来源聊天说过话" if data["possibly_handled_all_spoke"]
+            else "你后来在来源上有回应（说过话、点过表情，或同一件事的另一条已答复 / 结案）")
+    told = "已提醒会话核实" if data["possibly_handled_notified_count"] == n_h else "已经或下一轮会提醒会话核实"
+    extra = f"（其中 {n_h} 条{what}，{told}）" if n_h else ""
+    lines = [f"{head}（{data['now_label']}）：要你定的 {n_d} 条{extra}，各会话在等你的 {len(w)} 件"]
     lines.append("")
     lines.append(f"一、要你定的（{n_d}）")
     lines += _group_lines(d)
     lines.append("")
-    lines.append(f"二、可能已经处理了，请核实（{n_h}）")
-    lines += _group_lines(h)
-    lines.append("")
-    lines.append(f"三、各会话在等你（羊群看板「等主人」，{len(w)}）")
+    lines.append(f"二、各会话在等你（羊群看板「等主人」，{len(w)}）")
     for i, x in enumerate(w, 1):
         line = f"{i}. {x['session']}：{x['key']}" + (f" {duty.short(x['title'], 40)}" if x["title"] else "")
         line += f"（{x['source']}，{waited(x['updated_minutes'])}前更新）" if x["updated_minutes"] is not None \

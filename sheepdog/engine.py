@@ -571,6 +571,7 @@ class Collector:
                 elif d.route == SELF and me and m.sender_id == me:
                     self._loop_check(m)
                     self._owner_context(m)
+                    self._learn_source_thread(m)
                 elif d.route == SELF and d.reason == "self_bot":
                     # 7.26：机器人自己发的（会话以机器人身份代回的）：撤下它回应了的确认表情、算进防循环；不算主人发言
                     self._own_message(m)
@@ -768,6 +769,36 @@ class Collector:
         # 回复的是哪条由投递时统一附的「↪ 回复的是」说明（7.15）
         self.store.route_owner_context(m.message_id, topic_id, "")
         log.info("主人的发言 %s 作为背景送给 %s", m.message_id, topic_id)
+
+    def _learn_source_thread(self, m: Message) -> None:
+        """7.38：主人在群里某个话题里说话，账本里还不知道这个话题的开头是哪条时，看它是不是某条还开着的提问的来源消息：
+        只读 mget 这个群里还没记话题编号的来源消息（最多 50 条），把话题编号补进账本，「可能已处理」才认得出
+        「在来源消息的话题里说的」。私聊、找主人聊天不用。失败只记日志。"""
+        if not m.thread_id or m.chat_type == "p2p" or m.chat_id in self.cfg.owner_chat_ids:
+            return
+        try:
+            from . import pending as pend
+            if pend._thread_root_id(self.store, m.thread_id):
+                return
+            open_ids = [e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)]
+            cands = []
+            for r in self.store.conn.execute(
+                    "SELECT DISTINCT s.about_message_id FROM escalation_sources s JOIN messages x "
+                    "ON x.message_id = s.about_message_id WHERE s.about_chat_id=? AND COALESCE(x.thread_id,'')=''",
+                    (m.chat_id,)):
+                cands.append(r[0])
+            srcs = {r["about_message_id"] for r in self.store.conn.execute(
+                "SELECT about_message_id FROM escalation_sources WHERE ask_message_id IN (%s)" % ",".join("?" * len(open_ids)),
+                open_ids)} if open_ids else set()
+            cands = [c for c in cands if c in srcs][:50]
+            if not cands:
+                return
+            got, _ = self._mget(cands)
+            for x in got or []:
+                if x.thread_id and self.store.fill_thread_fields(x.message_id, x.thread_id, x.thread_position):
+                    log.info("来源消息 %s 有了话题 %s，补进账本", x.message_id, x.thread_id)
+        except Exception as e:
+            log.warning("补来源消息的话题编号出错 %s: %s", m.message_id, e)
 
     def _owner_edit(self, old, m: Message, recalled: bool) -> None:
         if not self._owner_context_wanted(m):

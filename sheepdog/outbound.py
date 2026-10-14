@@ -62,6 +62,7 @@ class SendResult:
     origin: str = ""                # ask 记下的来源是怎么来的（7.36）：about | batch；空 = 没记
     sources: list = field(default_factory=list)      # [(消息号, 聊天)]
     duplicates: list = field(default_factory=list)   # 同一来源已有别的会话在问（还开着）
+    batch_chats: int = 0            # 不给 --about 时这一批候选消息来自几个聊天（7.38：多于一个就不记来源）
 
 
 @dataclass
@@ -103,14 +104,17 @@ def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str) -> str
     return cfg.threads.header(kind, _one_line(title), topic_id) + "\n" + body.strip()
 
 
-def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None, batch: str = "") -> tuple[str, list]:
-    """ask 的来源（7.36）：给了 --about 就是它们（要在账本里），否则是这个会话最近一批送到的消息。返回 (origin, 来源)。"""
+def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None,
+                batch: str = "") -> tuple[str, list, int]:
+    """ask 的来源（7.36）：给了 --about 就是它们（要在账本里）；否则是这个会话最近一批送到的消息，并且只在它们都来自
+    同一个聊天时才记（7.38）。返回 (origin, 来源, 这批候选消息来自几个聊天；--about 时是 0)。"""
     if about and any((a or "").strip() for a in about):
         try:
-            return pend.ORIGIN_ABOUT, pend.about_sources(cfg, store, about)
+            return pend.ORIGIN_ABOUT, pend.about_sources(cfg, store, about), 0
         except ValueError as e:
             raise OutboundError(EXIT_INVALID, str(e))
-    return pend.ORIGIN_BATCH, pend.batch_sources(cfg, store, batch or current_batch(store, topic_id))
+    srcs, n = pend.default_sources(cfg, store, batch or current_batch(store, topic_id))
+    return pend.ORIGIN_BATCH, srcs, n
 
 
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
@@ -131,10 +135,11 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     nk = duty.norm_key(key) if key else ""
     text = compose(cfg, kind, topic_id, title, body)
     ik = idem_key(kind, topic_id, nk, batch or current_batch(store, topic_id), text)
-    origin, srcs = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [])
+    origin, srcs, n_chats = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [], 0)
     prev = store.get_send(ik)
     if prev is not None:
-        res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text)
+        res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text,
+                         batch_chats=n_chats)
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
     root = store.thread_by_key(topic_id, nk) if nk else None
     try:
@@ -167,7 +172,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
                    identity=ident.BOT if cfg.identity.enabled else None)
     # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
-    res = SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
+    res = SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text, batch_chats=n_chats)
     return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
 
 
@@ -181,6 +186,14 @@ def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: st
     res.origin, res.sources = origin, srcs
     res.duplicates = pend.duplicate_asks(cfg, store, topic_id, srcs, exclude=res.message_id)
     return res
+
+
+def source_hint(res: SendResult) -> str:
+    """不给 --about、这一批消息来自好几个聊天：没记来源，提示会话（7.38）。"""
+    if res.origin == pend.ORIGIN_BATCH and res.batch_chats > 1:
+        return (f"⚠ 这批消息来自 {res.batch_chats} 个聊天，用 --about 指明为哪条问的，否则不会有来源提醒"
+                "（主人在那个聊天里处理了，sheepdog 不会提醒你核实）")
+    return ""
 
 
 def duplicate_text(store: Store, cfg: Config, dups: list) -> list[str]:

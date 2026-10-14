@@ -252,6 +252,39 @@ class SourcesTest(PendingBase):
         self.store.record_dispatch("b_test_mixed", "tp_alpha", [a, esc, "sd_test_x"])
         self.assertEqual(pend.batch_sources(self.cfg, self.store, "b_test_mixed"), [(a, ALPHA_P2P)])
 
+    def test_multi_chat_batch_records_no_source_and_hints(self):
+        # 7.38 第 2 条：这一批的候选消息来自好几个聊天就不记来源，ask 输出提示用 --about
+        a = self.alice_batch()
+        g = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ALICE, content="群里的一句", chat_type="group",
+                          at=at(-8))
+        self.pull(g)
+        self.store.record_dispatch("b_test_two_chats", "tp_alpha", [a, g])
+        rc, out, _ = self.ask("--batch", "b_test_two_chats")
+        self.assertEqual(rc, 0)
+        self.assertIn("这批消息来自 2 个聊天，用 --about 指明为哪条问的，否则不会有来源提醒", out)
+        q = self.lark.sent()[-1]
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM escalation_sources").fetchone()[0], 0)
+        # 同一个聊天的：记、不提示
+        self.store.record_dispatch("b_test_one_chat", "tp_alpha", [a])
+        rc, out, _ = self.ask("--batch", "b_test_one_chat", text="另一件")
+        self.assertNotIn("个聊天", out)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM escalation_sources").fetchone()[0], 1)
+        self.assertIsNotNone(q)
+
+    def test_backfill_same_rule_multi_chat_records_nothing(self):
+        a = self.alice_batch()
+        g = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ALICE, content="群里的一句", chat_type="group",
+                          at=at(-8))
+        self.pull(g)
+        self.ack("tp_alpha")
+        self.store.record_dispatch("b_test_two_chats", "tp_alpha", [a, g])
+        self.store.finish_dispatch("b_test_two_chats", "acked")
+        old = self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", at=at(1),
+                            content="🐕 需要你定 · 老办法发的 [tp_alpha]\n要不要？")
+        self.pull(old)
+        self.assertEqual(self.store.escalation_sources(old), [])
+        self.assertEqual(pend.followup_round(self.cfg, self.store, self.d.playbook)["backfilled"], 0)
+
     def test_ask_about_explicit_and_invalid(self):
         a = self.alice_batch()
         b = self.alice_batch("另一件事", chat="oc_test_alpha_grp")
@@ -312,6 +345,68 @@ class SourcesTest(PendingBase):
         for _ in range(3):
             self.deliver()
         self.assertEqual(len(self.system_msgs("escalation_check")), 1)
+
+    def group_source(self) -> tuple[str, str]:
+        """群里的来源消息（不 @ 主人，进 Inbox），ask 用 --about 指它。返回 (来源, 提问)。"""
+        src = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ALICE, content="群里：周五能上线吗？",
+                            chat_type="group", at=at(-10))
+        self.pull(src)
+        return src, self.asked("--about", src)
+
+    def test_group_source_plain_speech_does_not_count(self):
+        # 7.38 第 3 条：来源是群的，主人在群里随便说话不算
+        _, q = self.group_source()
+        m = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ME, content="大家午饭吃什么", chat_type="group",
+                          at=at(2))
+        self.pull(m)
+        self.d.dispatch_once()
+        self.assertIsNone(self.store.get_escalation(q)["possibly_handled_at"])
+
+    def test_group_source_quote_reply_counts(self):
+        src, q = self.group_source()
+        m = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ME, content="下周一", chat_type="group", at=at(2))
+        msg = parse_message(self.lark.raw(m))
+        msg.reply_to = src
+        Collector(self.cfg, self.store, self.source, self.roster).ingest([msg])
+        self.d.dispatch_once()
+        e = self.store.get_escalation(q)
+        self.assertEqual((e["possibly_handled_reason"], e["possibly_handled_message_id"]), ("owner_spoke", m))
+
+    def test_group_source_thread_reply_counts_after_learning_root(self):
+        # 来源消息拉进账本时还没有话题；主人后来在它下面开话题回复：mget 一次来源消息补上话题编号，认得出
+        src, q = self.group_source()
+        m = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ME, content="话题里：下周一", thread_root=src,
+                          at=at(2))
+        self.assertFalse(self.row(src)["thread_id"])
+        self.pull(m)
+        self.assertEqual(self.row(src)["thread_id"], self.lark.msgs[src]["thread_id"])
+        mgets = [c for c in self.lark.calls if c[1] == "+messages-mget"]
+        self.assertEqual([_opt(c, "--message-ids") for c in mgets], [src])
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_escalation(q)["possibly_handled_message_id"], m)
+        # 别的话题里说的不算
+        other = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ALICE, content="另一件事", chat_type="group",
+                              at=at(-9))
+        self.pull(other)
+        q2 = self.asked("--about", src, title="第二问", text="还有一问")
+        x = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ME, content="别的话题", thread_root=other, at=at(3))
+        self.pull(x)
+        self.assertNotEqual(pend.detect(self.cfg, self.store, self.store.get_escalation(q2)).message_id, x)
+
+    def test_escalations_topic_filter(self):
+        mine = self.asked()
+        theirs = self.asked(topic=BUS_TOPIC_ID, title="总线的事", text="总线问的")
+        rc, out, _ = self.cli("escalations", "--topic", "tp_alpha")
+        self.assertEqual(rc, 0)
+        self.assertIn(mine, out)
+        self.assertNotIn(theirs, out)
+        rc, out, _ = self.cli("escalations", "--topic", "alpha")      # 不带 tp_ 也认
+        self.assertIn(mine, out)
+        rc, out, _ = self.cli("escalations")
+        self.assertIn(theirs, out)
+        self.resolve("--message-id", mine, "--why", "办完了")
+        rc, out, _ = self.cli("escalations", "--topic", "tp_alpha")
+        self.assertIn("tp_alpha 名下没有未结的「需要你定」", out)
 
     def test_owner_reaction_on_source_marks(self):
         a = self.alice_batch()
@@ -436,32 +531,50 @@ class PendingListTest(PendingBase):
         self.store.conn.commit()
         return {"dup": (q_dup1, q_dup2), "done": q_done, "plain": q_plain}
 
-    def test_pending_order_groups_and_marks(self):
+    def test_pending_single_section_with_check_line(self):
+        # 7.38 第 1 条：可能已处理的不挪出「要你定的」，条目下加一行「↳ 你几点在哪说过：……，已提醒 <会话> 核实」
         ids = self.scene()
         rc, out, _ = self.cli("pending")
         self.assertEqual(rc, 0)
-        i1, i2, i3 = out.index("一、要你定的"), out.index("二、可能已经处理了"), out.index("三、各会话在等你")
-        self.assertLess(i1, i2)
-        self.assertLess(i2, i3)
-        first, second, third = out[i1:i2], out[i2:i3], out[i3:]
+        first_line = out.splitlines()[0]
+        self.assertTrue(first_line.startswith("待办清单（"))
+        self.assertIn("要你定的 4 条（其中 1 条你后来在来源聊天说过话，已提醒会话核实）", first_line)
+        self.assertNotIn("可能已经处理了", out)
+        i1, i2 = out.index("一、要你定的（4）"), out.index("二、各会话在等你")
+        first, second = out[i1:i2], out[i2:]
         self.assertIn("同一件事 2 个提问", first)
         self.assertIn("「Felix 接码」", first)
         self.assertIn("「延期」", first)
-        self.assertNotIn("Leon GitHub App", first)
-        self.assertIn("「Leon GitHub App」", second)
-        self.assertIn("GitHub App 我已经批了", second)
-        self.assertIn("AGIF-9 等主人看方案", third)
-        self.assertIn("AGIF-1 老的等主人", third)
-        self.assertIn("⚠ 可能过期", third)
-        self.assertNotIn("自动·需要你定", third)     # 自动补的「需要你定」就是第一、二部分那些，不重复列
-        self.assertTrue(out.startswith("待办清单（"))
+        self.assertIn("「Leon GitHub App」", first)
+        leon = first[first.index("「Leon GitHub App」"):]
+        self.assertIn("↳ 你 ", leon)
+        self.assertIn("说过：「GitHub App 我已经批了」，已提醒 tp_alpha「Alpha 需求」核实", leon)
+        self.assertEqual(first.count("↳ "), 1)
+        self.assertNotIn("message_id", first)            # 给主人看的清单不带消息号
+        self.assertIn("AGIF-9 等主人看方案", second)
+        self.assertIn("AGIF-1 老的等主人", second)
+        self.assertIn("⚠ 可能过期", second)
+        self.assertNotIn("自动·需要你定", second)     # 自动补的「需要你定」就是第一部分那些，不重复列
         rc, js, _ = self.cli("pending", "--json")
         data = json.loads(js)
-        self.assertEqual([len(g["asks"]) for g in data["decide"]], [2, 1])
+        self.assertNotIn("possibly_handled", data)
+        self.assertEqual((data["decide_count"], data["possibly_handled_count"]), (4, 1))
+        self.assertEqual([len(g["asks"]) for g in data["decide"]], [2, 1, 1])
         self.assertEqual({a["message_id"] for a in data["decide"][0]["asks"]}, set(ids["dup"]))
-        self.assertEqual(data["possibly_handled"][0]["asks"][0]["message_id"], ids["done"])
-        self.assertEqual(data["possibly_handled"][0]["asks"][0]["possibly_handled"]["reason"], "owner_spoke")
+        leon_ask = data["decide"][1]["asks"][0]
+        self.assertEqual(leon_ask["message_id"], ids["done"])
+        self.assertEqual((leon_ask["possibly_handled"]["reason"], leon_ask["possibly_handled"]["notified"]),
+                         ("owner_spoke", True))
         self.assertEqual([w["key"] for w in data["waiting_owner"]], ["AGIF-9", "AGIF-1"])
+
+    def test_check_line_before_reminder_is_queued(self):
+        # 还没轮到提醒（只读现算出来的）：写「下一轮会提醒」，不说已提醒
+        self.alice_batch()
+        self.asked()
+        self.owner_says("下周一上")
+        rc, out, _ = self.cli("pending")
+        self.assertIn("，下一轮会提醒 tp_alpha「Alpha 需求」核实", out)
+        self.assertIn("已经或下一轮会提醒会话核实", out.splitlines()[0])
 
     def test_same_session_same_batch_asks_are_not_grouped(self):
         # 10-13 的 kc 测试库和 Leon GitHub App：总线同一批里问的两件事，来源是同一批消息，不是同一件事
@@ -533,4 +646,5 @@ class PendingListTest(PendingBase):
     def test_empty_list(self):
         rc, out, _ = self.cli("pending")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.count("（无）"), 3)
+        self.assertEqual(out.count("（无）"), 2)
+        self.assertIn("要你定的 0 条，各会话在等你的 0 件", out)
