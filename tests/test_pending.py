@@ -583,6 +583,25 @@ class PendingListTest(PendingBase):
                          ("owner_spoke", True))
         self.assertEqual([w["key"] for w in data["waiting_owner"]], ["AGIF-9", "AGIF-1"])
 
+    def test_closed_session_ask_is_flagged_not_promised_a_reminder(self):
+        # 回放发现：tp_sammy（总线新开、已收掉）名下还开着一条，提醒发不出去，清单不能写「会提醒它」
+        a = self.alice_batch()
+        q = self.asked("--about", a)
+        q2 = self.asked(title="第二件", text="另一件事")
+        self.store.update_topic("tp_alpha", state="closed")
+        self.store.conn.execute("DELETE FROM escalation_sources WHERE ask_message_id=?", (q2,))
+        self.store.conn.commit()
+        self.owner_says("这事我办了")
+        pend.followup_round(self.cfg, self.store, self.d.playbook)   # 不走 dispatch_once：名册同步会把 tp_alpha 重新打开
+        e = self.store.get_escalation(q)
+        self.assertTrue(e["possibly_handled_at"])
+        self.assertIsNone(e["possibly_handled_notified_at"])   # 收掉的会话不排提醒
+        rc, out, _ = self.cli("pending")
+        self.assertIn("说过：「这事我办了」；提问的会话已收掉，不会提醒谁核实，请你自己看一眼", out)
+        self.assertIn("⚠ 提问的会话已收掉，没人跟进这件事", out)
+        self.assertNotIn("会提醒 tp_alpha", out)
+        self.assertIn("（其中 1 条你后来在来源聊天说过话，1 条的会话已收掉、要你自己看）", out.splitlines()[0])
+
     def test_check_line_before_reminder_is_queued(self):
         # 还没轮到提醒（只读现算出来的）：写「下一轮会提醒」，不说已提醒
         self.alice_batch()

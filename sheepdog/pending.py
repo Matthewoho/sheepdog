@@ -535,6 +535,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         chats = list(dict.fromkeys(s["about_chat_id"] for s in srcs if s["about_chat_id"]))
         items[e["message_id"]] = {
             "message_id": e["message_id"], "topic_id": e["topic_id"], "session": session_label(store, e["topic_id"]),
+            "session_closed": not _deliverable_topic(store, e["topic_id"]),
             "title": ask_title(cfg, e["text"]), "body": ask_body(e["text"]),
             "key": sent["key"] if sent is not None and sent["key"] else "",
             "asked_at": e["asked_at"], "asked_label": short_time(asked, off) if asked else e["asked_at"],
@@ -583,6 +584,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
     return {"generated_at": now.isoformat(timespec="seconds"), "now_label": f"{short_time(now, off)}，{eng._tz(off)[1]}",
             "decide": decide, "decide_count": len(asks_all), "possibly_handled_count": len(handled),
             "possibly_handled_notified_count": sum(1 for a in handled if a["possibly_handled"]["notified"]),
+            "possibly_handled_orphan_count": sum(1 for a in handled if a["session_closed"]),
             "possibly_handled_reasons": sorted({a["possibly_handled"]["reason"] for a in handled}),
             "waiting_owner": waiting}
 
@@ -600,9 +602,13 @@ def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
     else:
         lines.append(f"{indent}来源：没记到")
     ph = a["possibly_handled"]
-    if ph:
+    if ph and a["session_closed"]:
+        lines.append(f"{indent}↳ {ph['line']}；提问的会话已收掉，不会提醒谁核实，请你自己看一眼")
+    elif ph:
         done = "已提醒" if ph["notified"] else "下一轮会提醒"
         lines.append(f"{indent}↳ {ph['line']}，{done} {a['session']}核实")
+    elif a["session_closed"]:
+        lines.append(f"{indent}⚠ 提问的会话已收掉，没人跟进这件事")
     return lines
 
 
@@ -626,8 +632,12 @@ def render(data: dict, header: str = "") -> str:
     what = ("你后来在来源聊天说过话" if reasons <= {PH_SPOKE}
             else "你后来在来源聊天说过话或点过表情" if reasons <= {PH_SPOKE, PH_REACTION}
             else "你后来在来源上有过回应")
-    told_n = data["possibly_handled_notified_count"]
-    told = "已提醒会话核实" if told_n == n_h else "下一轮会提醒会话核实" if told_n == 0 else "已提醒或下一轮会提醒会话核实"
+    told_n, orphan = data["possibly_handled_notified_count"], data["possibly_handled_orphan_count"]
+    live = n_h - orphan
+    told = ("已提醒会话核实" if told_n >= live else "下一轮会提醒会话核实" if told_n == 0
+            else "已提醒或下一轮会提醒会话核实") if live else ""
+    if orphan:
+        told = "，".join(x for x in (told, f"{orphan} 条的会话已收掉、要你自己看") if x)
     extra = f"（其中 {n_h} 条{what}，{told}）" if n_h else ""
     lines = [f"{head}（{data['now_label']}）：要你定的 {n_d} 条{extra}，各会话在等你的 {len(w)} 件"]
     lines.append("")
