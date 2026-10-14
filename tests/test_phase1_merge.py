@@ -48,6 +48,8 @@ class ChatLabelAfterMainMergeTest(Base):
 
     def add(self, mid: str, chat: str, name: str, at: str) -> None:
         self.store.upsert_message(msg(message_id=mid, chat_id=chat, chat_name=name, create_time=at), "inbox", "group", [])
+        self.store.conn.execute("UPDATE messages SET first_seen=?, last_seen=? WHERE message_id=?", (at, at, mid))  # 入账先后
+        self.store.conn.commit()
 
     def test_group_name_from_an_earlier_message_when_the_latest_has_none(self):
         # 机器人事件先到的那条群名是空的，且正好是最近一条：仍用账本里记过的群名
