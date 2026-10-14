@@ -200,7 +200,9 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None)
     receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
     waiting = (f"{cli} receipt --topic {tid} --batch {batch} "
                f"--json '{{\"status\": \"waiting_external\", \"summary\": \"等谁、等什么\"}}'")
-    reason = Playbook.from_config(cfg).render_or(
+    pb = Playbook.from_config(cfg)
+    pb.strict = True   # 模板读不了就抛出去、由 stop_main 兜成不输出（出错一律当不拦），不拿默认话去拦
+    reason = pb.render_or(
         STOP_TEMPLATE, DEFAULT_STOP_REASON, topic_id=tid, batch_id=batch, receipt_command=receipt,
         waiting_command=waiting, blocked=str(n))
     return {"decision": "continue", "reason": reason}

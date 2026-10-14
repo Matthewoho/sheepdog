@@ -8,8 +8,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+# 每个 playbook 文件上一次读成功的内容（常驻进程内有效）：文件读不了 / 不是 UTF-8 时沿用它并 WARNING，不让这一轮失败
+_LAST_GOOD: dict[Path, str] = {}
 
 # 文件名 → 用在哪（文件名是和架构侧的约定，不要改）
 PLAYBOOK_FILES: dict[str, str] = {
@@ -79,8 +84,10 @@ _COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
 class Playbook:
-    def __init__(self, directory: Path, base_vars: dict[str, str] | None = None):
+    def __init__(self, directory: Path, base_vars: dict[str, str] | None = None, strict: bool = False):
         self.directory = directory
+        # strict：读不了就抛出去（Stop hook 用：出错一律当不拦，不能拿默认话去拦会话，7.37）；常驻进程不 strict，沿用上一份
+        self.strict = strict
         # 通用占位符里与具体会话无关的部分（代回前缀、等待分钟数），由配置决定
         self.base_vars = dict(base_vars or {})
 
@@ -119,10 +126,21 @@ class Playbook:
         return self.base_vars.get("cli") or "sheepdog"
 
     def read(self, name: str) -> str:
+        """现读文件。不存在 = 这一段为空（用代码里的默认话）；读不了 / 不是 UTF-8 = 改坏了，沿用上一次读成功的内容
+        （没有就当空）并 WARNING，不让组装 prompt 的那一轮失败（7.40）。"""
+        p = self.directory / name
         try:
-            return (self.directory / name).read_text(encoding="utf-8")
+            text = p.read_text(encoding="utf-8")
         except (FileNotFoundError, NotADirectoryError):
             return ""
+        except (OSError, UnicodeDecodeError) as e:
+            if self.strict:
+                raise
+            last = _LAST_GOOD.get(p)
+            log.warning("playbook %s 读不了，%s: %s", p, "沿用上一份" if last is not None else "这一段先用默认话", e)
+            return last or ""
+        _LAST_GOOD[p] = text
+        return text
 
     def render(self, name: str, **variables: str) -> str:
         """读 name 并替换占位符。通用占位符 session_title、topic_id 由调用方按会话传入。"""

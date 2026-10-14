@@ -242,6 +242,8 @@ def load_roster(path: Path, required: bool) -> Roster:
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise RosterError(f"名册 TOML 解析失败 {path}: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:   # 读不了 / 不是 UTF-8：同样当名册无效（常驻进程沿用上一份）
+        raise RosterError(f"名册读不了 {path}: {e}") from e
     try:
         return parse_roster(data)
     except RosterError as e:

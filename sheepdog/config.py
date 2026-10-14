@@ -19,6 +19,18 @@ class ConfigError(ValueError):
     pass
 
 
+_TOML_AT = re.compile(r"\s*\(at line (\d+), column (\d+)\)\s*$")
+
+
+def toml_error_text(path: Path, e: tomllib.TOMLDecodeError) -> str:
+    """TOML 语法错误写成「哪个文件 第几行第几列：原因」，日志里一眼看得出是哪一行坏了。"""
+    msg = str(e)
+    m = _TOML_AT.search(msg)
+    if m is None:
+        return f"{path} TOML 语法错误：{msg}"
+    return f"{path} 第 {m.group(1)} 行第 {m.group(2)} 列 TOML 语法错误：{msg[:m.start()]}"
+
+
 def default_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "sheepdog"
@@ -698,41 +710,54 @@ def _apply(dc, data: dict) -> None:
             setattr(dc, k, v)
 
 
+def _apply_file(cfg: "Config", data: dict) -> None:
+    """把整份配置文件（tomllib 的输出）写进 cfg；值的合法性由各节的 validate() 管。"""
+    _apply(cfg, data)
+    _apply(cfg.routing, data.get("routing", {}))
+    _apply(cfg.session, data.get("session", {}))
+    _apply(cfg.watch, data.get("watch", {}))
+    _apply(cfg.escalation, data.get("escalation", {}))
+    if "aliases" in data.get("escalation", {}):
+        cfg.escalation.aliases = data["escalation"]["aliases"]
+    _apply(cfg.bus, data.get("bus", {}))
+    _apply(cfg.owner_context, data.get("owner_context", {}))
+    _apply(cfg.loop_guard, data.get("loop_guard", {}))
+    _apply(cfg.source, data.get("source", {}))
+    _apply(cfg.notify, data.get("notify", {}))
+    _apply(cfg.identity, data.get("identity", {}))
+    _apply(cfg.audit, data.get("audit", {}))
+    _apply(cfg.duty, data.get("duty", {}))
+    _apply(cfg.threads, data.get("threads", {}))
+    _apply(cfg.hooks, data.get("hooks", {}))
+    hosts = data.get("hosts", {})
+    if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
+        raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
+    for h in CLI_HOSTS:
+        _apply(cfg.hosts[h], hosts.get(h, {}))
+        cfg.hosts[h].name = h
+    if isinstance(data.get("ack"), dict):
+        _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
+        cfg.ack.enabled = True
+    if "state_dir" in data:
+        cfg.state_dir = Path(data["state_dir"]).expanduser()
+
+
 def load_config(path: Path | None = None) -> Config:
     cfg = Config()
     path = path or default_config_path()
     cfg.config_path = path
     if path.exists():
-        with path.open("rb") as f:
-            data = tomllib.load(f)
-        _apply(cfg, data)
-        _apply(cfg.routing, data.get("routing", {}))
-        _apply(cfg.session, data.get("session", {}))
-        _apply(cfg.watch, data.get("watch", {}))
-        _apply(cfg.escalation, data.get("escalation", {}))
-        if "aliases" in data.get("escalation", {}):
-            cfg.escalation.aliases = data["escalation"]["aliases"]
-        _apply(cfg.bus, data.get("bus", {}))
-        _apply(cfg.owner_context, data.get("owner_context", {}))
-        _apply(cfg.loop_guard, data.get("loop_guard", {}))
-        _apply(cfg.source, data.get("source", {}))
-        _apply(cfg.notify, data.get("notify", {}))
-        _apply(cfg.identity, data.get("identity", {}))
-        _apply(cfg.audit, data.get("audit", {}))
-        _apply(cfg.duty, data.get("duty", {}))
-        _apply(cfg.threads, data.get("threads", {}))
-        _apply(cfg.hooks, data.get("hooks", {}))
-        hosts = data.get("hosts", {})
-        if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
-            raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
-        for h in CLI_HOSTS:
-            _apply(cfg.hosts[h], hosts.get(h, {}))
-            cfg.hosts[h].name = h
-        if isinstance(data.get("ack"), dict):
-            _apply(cfg.ack, {k: v for k, v in data["ack"].items() if k != "enabled"})
-            cfg.ack.enabled = True
-        if "state_dir" in data:
-            cfg.state_dir = Path(data["state_dir"]).expanduser()
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(toml_error_text(path, e)) from e
+        except (OSError, UnicodeDecodeError) as e:   # 读不了 / 不是 UTF-8
+            raise ConfigError(f"{path} 读不了：{e}") from e
+        try:
+            _apply_file(cfg, data)
+        except (AttributeError, TypeError) as e:     # 某一节写成了单个值（如 session = 1）、路径写成了数字
+            raise ConfigError(f"{path} 结构不对（某一节写成了单个值，或该写字符串的写成了别的）：{e}") from e
     cfg.session.validate()
     cfg.watch.validate()
     cfg.escalation.validate()

@@ -212,8 +212,8 @@ class StopHookSwitchTest(HookBase):
         env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": str(self.cfg.state_dir),
                "XDG_CONFIG_HOME": str(self.dir / "xdg")}
 
-        def call(stop: str) -> str:
-            cfg_file.write_text(f'self_open_id = "{ME}"\n[hooks]\nstop = {stop}\n', encoding="utf-8")
+        def call(stop: str, text: str = "") -> str:
+            cfg_file.write_text(text or f'self_open_id = "{ME}"\n[hooks]\nstop = {stop}\n', encoding="utf-8")
             out = io.StringIO()
             with mock.patch.dict(os.environ, env):
                 hook.stop_main(io.BytesIO(stop_input().encode("utf-8")), out, None, self.now)
@@ -223,6 +223,8 @@ class StopHookSwitchTest(HookBase):
         self.assertEqual(json.loads(call("true"))["decision"], "continue")
         self.assertEqual(call("false"), "")
         self.assertEqual(call('"no"'), "")          # 写坏了（不是 true/false）：读配置报错，兜成不输出
+        self.assertEqual(call("", f'self_open_id = "{ME}"\n[hooks\nstop = true\n'), "")   # 语法错：同样不输出
+        self.assertEqual(json.loads(call("true"))["decision"], "continue")             # 改好了下一次照常
 
     def test_bad_value_rejected_by_config(self):
         p = self.dir / "bad.toml"

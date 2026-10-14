@@ -145,6 +145,8 @@ def load_security(path: Path) -> SecurityConfig:
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise SecurityError(f"{path}: TOML 解析失败: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:   # 读不了 / 不是 UTF-8：同样当规则无效（常驻进程沿用上一份）
+        raise SecurityError(f"{path}: 读不了: {e}") from e
     try:
         return parse_security(data)
     except SecurityError as e:

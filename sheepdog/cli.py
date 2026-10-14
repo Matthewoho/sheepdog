@@ -132,7 +132,7 @@ def _roster(cfg) -> Roster:
     try:
         return load_checked_roster(cfg)
     except RosterError as e:
-        print(f"名册无效: {e}", file=sys.stderr)
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR 名册无效: {e}", file=sys.stderr)
         raise _Abort() from e
 
 
@@ -141,7 +141,7 @@ def _security(cfg) -> SecurityConfig:
     try:
         return load_security(cfg.security_file)
     except SecurityError as e:
-        print(f"安全规则无效: {e}", file=sys.stderr)
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR 安全规则无效: {e}", file=sys.stderr)
         raise _Abort() from e
 
 
@@ -550,11 +550,16 @@ def _queued(args, store: Store, cfg, kind: str, payload: dict) -> int | None:
 
 
 def _reload_config(old, args, store: Store, source, collector: Collector, dispatcher: Dispatcher):
-    """run 每轮重读 config.toml（7.16）：改坏了沿用上一份并 WARNING；state_dir / sink 变了只提示需要重启。"""
+    """run 每轮重读 config.toml（7.16）：改坏了沿用上一份并 WARNING；state_dir / sink 变了只提示需要重启。
+    改坏包括语法错误、读不了、结构不对（load_config 都包成 ConfigError，写明文件和行号）；万一漏网的别的异常也一样
+    沿用上一份，不让这一轮的拉取和投递停下来（7.40）。"""
     try:
         new = load_config()
     except ConfigError as e:
         logging.warning("配置无效，沿用上一份: %s", e)
+        return old
+    except Exception as e:  # 兜底：读配置不该让整轮失败
+        logging.warning("配置无效，沿用上一份（读配置出错 %s）: %s", type(e).__name__, e)
         return old
     if new.state_dir != old.state_dir:
         logging.warning("state_dir 改成了 %s，需要重启 sheepdog 才生效；本次沿用 %s", new.state_dir, old.state_dir)
@@ -1886,7 +1891,8 @@ def main(argv: list[str] | None = None) -> int:
     except _Abort:
         return 2
     except ConfigError as e:
-        print(f"配置无效: {e}", file=sys.stderr)
+        # 带时间和 ERROR：常驻进程启动时配置就坏了会被反复拉起，sidecar.log 里每次一行，看得出是哪个文件哪一行、多久一次
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR 配置无效: {e}", file=sys.stderr)
         return 2
 
 
