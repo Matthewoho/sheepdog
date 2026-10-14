@@ -414,7 +414,9 @@ CREATE TABLE IF NOT EXISTS sends (
     target_message_id TEXT,            -- reply：回复的是哪条
     text              TEXT,            -- 发出去的正文（卡片记卡片正文）
     sent_at           TEXT NOT NULL,
-    identity          TEXT             -- 用哪个身份发的（7.26，[identity] 开着才写）：user（主人本人）| bot（机器人）
+    identity          TEXT,            -- 用哪个身份发的（7.26，[identity] 开着才写）：user（主人本人）| bot（机器人）
+    sources_origin    TEXT             -- ask 发出时定下的来源口径（about | batch，来源可以是空的：一批来自多个聊天就故意不记）；
+                                       -- 空 = 没定过（7.36 以前的版本发的、report、reply）。定过的不再补来源
 );
 CREATE INDEX IF NOT EXISTS idx_sends_message ON sends(message_id);
 CREATE INDEX IF NOT EXISTS idx_sends_root ON sends(root_message_id);
@@ -471,7 +473,7 @@ MIGRATIONS = {
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
-    "sends": [("identity", "TEXT")],
+    "sends": [("identity", "TEXT"), ("sources_origin", "TEXT")],
     "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
                     ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
                     ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT")],
@@ -1070,6 +1072,11 @@ class Store:
                        target_message_id,text,sent_at,identity) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (idem_key, kind, topic_id, message_id, root_message_id or None, key or None, norm_key or None,
                  target_message_id or None, text, now_iso(), identity))
+
+    def set_send_sources_origin(self, message_id: str, origin: str) -> None:
+        """ask 发出时定下的来源口径（7.36）：记了以后补来源不再动它，没记来源也是定过的。"""
+        with self.tx() as c:
+            c.execute("UPDATE sends SET sources_origin=? WHERE message_id=? AND kind='ask'", (origin, message_id))
 
     def thread_messages_in_ledger(self, thread_id: str, root_message_id: str = "") -> list[sqlite3.Row]:
         """账本里这个话题的消息（含开头那条），按发送时间排。只读。"""

@@ -1,8 +1,9 @@
 """第一期「问得准、答得快」第 1–3 件（7.36）：「需要你定」的来源、可能已处理、快到期提醒、待办清单。
 
 - 来源（escalation_sources）：ask 发成功后当场记——`--about` 指定的消息（origin = about），不给就记这个会话最近一批
-  送到的消息（origin = batch，批次号同 outbound.current_batch）。没经 sheepdog ask 发的老提问没记来源的，按提问那一分钟
-  结束前（且不晚于它入账）送到这个会话的最近一批补（origin = backfill）；经 ask 发的没记就是故意不记，不补。sheepdog 自己生成的消息、「找主人」聊天里的消息不算来源。
+  送到的消息（origin = batch，批次号同 outbound.current_batch）。没定过来源的老提问（没经 sheepdog ask 发的、7.36 以前的
+  版本发的），按提问那一分钟结束前（且不晚于它入账）送到这个会话的最近一批补（origin = backfill）；ask 发出时定过的
+  （sends.sources_origin）没记就是故意不记，不补。sheepdog 自己生成的消息、「找主人」聊天里的消息不算来源。
 - 可能已处理：提问还开着，并且（按先后取第一种）
   1. 主人本人后来在来源聊天里说过话（不是代回、不在找主人聊天）；
   2. 主人对来源消息点了表情（_check_owner_reactions 记下的，sheepdog 自己点的确认表情不算）；
@@ -124,10 +125,11 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = ""
 
 
 def backfill_sources(cfg, store: Store, e) -> list[tuple[str, str]]:
-    """一条没记来源的提问该补什么（只算、不写）。经 sheepdog ask 发的（sends 里有）不补：来源在发的时候就定了，
-    没记是故意的（那一批来自多个聊天，7.38 第 2 条）；补了会绕过单聊天规则，还可能补成上一批。"""
+    """一条没记来源的提问该补什么（只算、不写）。ask 发出时定过来源口径的（sends.sources_origin 有值）不补：没记是故意的
+    （那一批来自多个聊天，7.38 第 2 条），补了会绕过单聊天规则，还可能补成上一批。没定过的照补：没经 sheepdog ask 发的、
+    7.36 以前的版本发的（正式账本里现有的提问都是这种）。"""
     s = store.send_by_message(e["message_id"])
-    if s is not None and s["kind"] == "ask":
+    if s is not None and s["sources_origin"]:
         return []
     m = store.get_message(e["message_id"])
     seen = m["first_seen"] if m is not None else ""

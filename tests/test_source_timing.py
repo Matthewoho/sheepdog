@@ -94,3 +94,16 @@ class SourceTimingTest(PendingBase):
         mine = [a for g in pend.build(self.cfg, self.store)["decide"] for a in g["asks"] if a["message_id"] == q]
         self.assertEqual([(a["source_origin"], a["source_chats"]) for a in mine], [("", [])])   # 清单现算也不补
         self.assertIsNotNone(a0)
+
+    def test_ask_sent_by_an_older_version_is_still_backfilled(self):
+        # 7.36 以前的版本经 sheepdog ask 发的（sends 有记录、来源口径没定过）：正式账本里现有的提问都是这种，照补
+        _, _, g, b1 = self.two_batches()
+        self.store.update_topic("tp_alpha", state="running", pending_batch_id=b1)
+        q = self.asked()
+        self.assertEqual(self.store.send_by_message(q)["sources_origin"], "batch")      # 新版本当场定了
+        self.store.conn.execute("DELETE FROM escalation_sources")
+        self.store.conn.execute("UPDATE sends SET sources_origin=NULL WHERE message_id=?", (q,))
+        self.store.conn.execute("UPDATE escalations SET asked_at=? WHERE message_id=?", (self.at_sec(0), q))
+        self.store.conn.commit()
+        self.assertEqual(pend.followup_round(self.cfg, self.store, self.d.playbook)["backfilled"], 1)
+        self.assertEqual(self.sources(q), [(g, "backfill")])

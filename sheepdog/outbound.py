@@ -186,6 +186,8 @@ def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: st
         return res
     if srcs:
         store.add_escalation_sources(res.message_id, topic_id, srcs, origin)
+    # 来源这就定了（没记也是定了：一批来自多个聊天故意不记）；之后每轮补来源不再补它
+    store.set_send_sources_origin(res.message_id, origin)
     res.origin, res.sources = origin, srcs
     res.duplicates = pend.duplicate_asks(cfg, store, topic_id, srcs, exclude=res.message_id)
     return res
