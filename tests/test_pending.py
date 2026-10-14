@@ -599,10 +599,10 @@ class PendingListTest(PendingBase):
         self.assertEqual(self.system_msgs("escalation_check", "tp_alpha"), [])
         bus = self.system_msgs("escalation_check", BUS_TOPIC_ID)
         self.assertEqual(len(bus), 1)
-        self.assertTrue(bus[0].startswith("🔎 tp_alpha「Alpha 需求」 的「需要你定」可能已经处理了：它 "))
-        self.assertIn("原提问会话 tp_alpha「Alpha 需求」 已经收掉，这件事由你（总线）跟进", bus[0])
+        self.assertTrue(bus[0].startswith("🔎 tp_alpha「Alpha 需求」的「需要你定」可能已经处理了：它 "))
+        self.assertIn("原提问会话 tp_alpha「Alpha 需求」已经收掉，这件事由你（总线）跟进", bus[0])
         self.assertIn(f"`sheepdog resolve --topic tp_bus --message-id {q} --why", bus[0])
-        self.assertIn(f"FX-ESC-CHECK topic=tp_bus ask={q}", bus[0])
+        self.assertNotIn("FX-ESC-CHECK", bus[0])          # 通用说明里的 --key 总线用不了，不附
         rc, out, _ = self.cli("pending")
         self.assertIn("说过：「这事我办了」，已提醒总线核实（原会话已收掉）", out)
         self.assertIn("⚠ 原会话已收掉，由总线跟进", out)
@@ -618,8 +618,9 @@ class PendingListTest(PendingBase):
         self.assertEqual(self.system_msgs("escalation_expiring", "tp_alpha"), [])
         bus = self.system_msgs("escalation_expiring", BUS_TOPIC_ID)
         self.assertEqual(len(bus), 1)
-        self.assertIn("原提问会话 tp_alpha「Alpha 需求」 已经收掉", bus[0])
-        self.assertIn(f"FX-ESC-EXPIRING topic=tp_bus ask={q}", bus[0])
+        self.assertIn("原提问会话 tp_alpha「Alpha 需求」已经收掉", bus[0])
+        self.assertIn(f"--topic tp_bus --message-id {q}", bus[0])
+        self.assertRegex(bus[0], r"约 (59 分钟|1 小时)后")
 
     def test_bus_resolves_only_orphaned_asks(self):
         orphan = self.asked()

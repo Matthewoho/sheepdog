@@ -421,9 +421,10 @@ def _who_asked(store: Store, e, follower: str) -> tuple[str, str, str]:
     if follower == e["topic_id"]:
         return "你的", "你 ", ""
     who = session_label(store, e["topic_id"])
-    return (f"{who} 的", "它 ",
-            f"原提问会话 {who} 已经收掉，这件事由你（总线）跟进；结案用 `{{{{cli}}}} resolve --topic {follower} "
-            f"--message-id {e['message_id']} --why \"<依据>\"`（钥匙记在原会话名下，--key 用不了）。")
+    return (f"{who}的", "它 ",
+            f"原提问会话 {who}已经收掉，这件事由你（总线）跟进：请核实主人是不是已经处理了，处理了就用 `{{{{cli}}}} resolve "
+            f"--topic {follower} --message-id {e['message_id']} --why \"<依据>\"` 结案（钥匙记在原会话名下，--key 用不了）；"
+            "还要等主人定就不用管。")
 
 
 def check_message(cfg, store: Store, playbook, e, hit: Hit, follower: str = "") -> str:
@@ -436,10 +437,11 @@ def check_message(cfg, store: Store, playbook, e, hit: Hit, follower: str = "") 
     lines = [f"🔎 {whose}「需要你定」可能已经处理了：{subj}{asked}问的「{ask_title(cfg, e['text'])}」"
              f"（message_id `{e['message_id']}`" + (f"，钥匙 {key}" if key else "") + "）。",
              hit_line(cfg, store, hit) + "。"]
-    if orphan:
+    if orphan:   # 原会话已收掉：说明和命令都在这一行里，不再附 escalation_check.md（那里写的 --key 总线用不了）
         lines.append(_guide(None, "", orphan, cli=_cli(playbook)))
-    lines.append(_guide(playbook, "escalation_check.md", DEFAULT_CHECK_GUIDE, topic_id=follower,
-                        ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"])))
+    else:
+        lines.append(_guide(playbook, "escalation_check.md", DEFAULT_CHECK_GUIDE, topic_id=follower,
+                            ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"])))
     return "\n".join(lines)
 
 
@@ -452,12 +454,14 @@ def expiring_message(cfg, store: Store, playbook, e, until: datetime, follower: 
     key = sent["key"] if sent is not None and sent["key"] else ""
     whose, subj, orphan = _who_asked(store, e, follower)
     lines = [f"⏰ {whose}「需要你定」快到期了：{subj}{asked}问的「{ask_title(cfg, e['text'])}」（message_id `{e['message_id']}`"
-             + (f"，钥匙 {key}" if key else "") + f"）还开着，约 {left:.1f} 小时后（{eng.display_time(until, off)}）自动关闭。"]
+             + (f"，钥匙 {key}" if key else "") + f"）还开着，约 {waited(int(left * 60))}后（{eng.display_time(until, off)}）"
+             "自动关闭。"]
     if orphan:
         lines.append(_guide(None, "", orphan, cli=_cli(playbook)))
-    lines.append(_guide(playbook, "escalation_expiring.md", DEFAULT_EXPIRING_GUIDE, topic_id=follower,
-                        ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"]),
-                        hours_left=f"{left:.1f}"))
+    else:
+        lines.append(_guide(playbook, "escalation_expiring.md", DEFAULT_EXPIRING_GUIDE, topic_id=follower,
+                            ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"]),
+                            hours_left=f"{left:.1f}"))
     return "\n".join(lines)
 
 
