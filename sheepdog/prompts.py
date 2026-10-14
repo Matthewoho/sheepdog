@@ -272,6 +272,10 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
 
 # 规则同步（7.11）
 RULES_UPDATE_HEADER = "📌 规则已更新（以下为现行完整规则，取代之前的版本）"
+# 主人插话批次（7.37 第 4 件）：playbook 的 owner_priority.md 缺了用这句
+OWNER_PRIORITY_FILE = "owner_priority.md"
+DEFAULT_OWNER_PRIORITY = ("主人插话：先回答主人这条，再继续手上的事。这批不用单独交回执；"
+                          "手上那批 `{{pending_batch}}` 做完照常交回执。")
 # 检测到宿主压缩后重推规则时，规则前面那句话（7.19 K2）：playbook 的 rules_after_compaction.md 优先，没有就用这句
 DEFAULT_COMPACTION_NOTE = "你的上下文刚被压缩过，以下是现行完整规则，以此为准。"
 # 总线常驻规则算指纹时 {{roster}} 用这句占位：名册变化走「名册更新」，不触发整份规则重发
@@ -557,6 +561,24 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         footer = pb.render(name, session_title=session_title, topic_id=topic_id)
         if footer:
             parts += ["", footer]
+    if reminder:
+        parts += ["", reminder]
+    return "\n".join(parts)
+
+
+def priority_prompt(pb: Playbook, topic_id: str, batch_id: str, pending_batch: str, rows: list[sqlite3.Row],
+                    session_title: str, security: SecurityConfig | None = None, quotes: dict | None = None,
+                    max_lines: int = 200, notes: dict | None = None, reminder: str = "") -> str:
+    """主人插话批次（7.37 第 4 件）：会话在跑上一批（running）时，找主人聊天里主人的回复不排队，当轮单独送到。
+    开头说清这是插话、先答主人；不要回执（手上那批照常交），所以没有回执那一行和每批末尾的提醒；红线照附。"""
+    head = pb.render_or(OWNER_PRIORITY_FILE, DEFAULT_OWNER_PRIORITY, session_title=session_title, topic_id=topic_id,
+                        batch_id=batch_id, pending_batch=pending_batch)
+    parts = [f"[sheepdog] 主人插话批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", "", head, ""]
+    quotes = quotes or {}
+    notes = notes or {}
+    agent_label = agent_sender_label(pb)
+    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
+                       pb.cli, agent_label, notes.get(r["message_id"])) for r in rows]
     if reminder:
         parts += ["", reminder]
     return "\n".join(parts)

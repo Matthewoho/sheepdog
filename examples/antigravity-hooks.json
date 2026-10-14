@@ -1,0 +1,7 @@
+{
+  "sheepdog": {
+    "Stop": [
+      {"type": "command", "command": "/Users/<you>/.local/bin/sheepdog hook stop", "timeout": 10}
+    ]
+  }
+}

@@ -53,6 +53,11 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
     "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
     # 区分智能体身份和本人身份（7.26）：[identity] 开着时用；缺了用代码里的一句默认话
     "bot_dm.md": "别人私聊机器人时机器人回的那句话（请对方直接私聊主人本人；同一个人 24 小时内只回一次）",
+    # 第一期第 4、5 件（7.37）：缺了用代码里的默认话
+    "owner_priority.md": "主人插话批次（会话在跑上一批时，找主人聊天里主人的回复当轮单独送到）开头的说明，可用 {{batch_id}} "
+                         "{{pending_batch}}（手上那批，回执照常交它）",
+    "stop_receipt.md": "Stop hook 不让会话结束时给它的提示（这批还没交回执），可用 {{batch_id}} {{receipt_command}} "
+                       "{{waiting_command}} {{blocked}}（这批第几次被拦）",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
@@ -105,6 +110,13 @@ class Playbook:
         text = _COMMENT.sub("", self.read(name))
         if not text.strip():
             return ""
+        return self._fill(text, variables)
+
+    def render_or(self, name: str, default: str, **variables: str) -> str:
+        """同 render；文件缺失或为空时按同样的规则渲染代码里的默认话 default。"""
+        return self.render(name, **variables) or self._fill(_COMMENT.sub("", default), variables)
+
+    def _fill(self, text: str, variables: dict) -> str:
         values = {**self.base_vars, **{k: "" if v is None else str(v) for k, v in variables.items()}}
         return _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), text).strip()
 

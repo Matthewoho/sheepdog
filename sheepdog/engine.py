@@ -22,7 +22,7 @@ from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
                       batch_prompt, bootstrap_prompt, compaction_rules_message, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
-                      standing_rules_managed, watch_message)
+                      standing_rules_managed, watch_message, priority_prompt)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
@@ -58,6 +58,12 @@ SECURITY_RELEASE_TAG = "security_release:quote"
 OWNER_VERIFIED_TAG = "owner_verified"
 # 主人本人的发言作为背景送给负责的会话（7.13）：不点表情、不要回执、不改状态
 OWNER_CONTEXT = "owner_context"
+# 主人在「找主人」聊天里的回复（_owner_reply）。会话在跑上一批时不排队，当轮单独发一批「主人插话」（7.37 第 4 件）
+OWNER_REPLY = "owner_reply"
+# 主人插话批次：批次号前缀（b 普通 / o onboarding / h 读前任 / r 退休通知）和发完后 dispatches 里的终态。
+# 不要回执、不改会话状态、不参与回执超时；消息直接记成已回执（acked），不会再当待推消息送一遍、也不会随超时退回重投
+PRIORITY_PREFIX = "p"
+PRIORITY_DISPATCH = "priority"
 ESCALATION_TAG_PREFIX = "escalation:"
 # 命令审计（7.19 K3）：同一个会话 10 分钟内已经报过的同一条命令不再单独报（并进那次报警）；没报过的命令马上报
 AUDIT_MERGE_MINUTES = 10
@@ -944,7 +950,7 @@ class Collector:
         不走安全闸（发送人已由 IM 账号核实）。"""
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
         tags = [OWNER_VERIFIED_TAG]
-        d = RouteDecision(DISPATCH, "owner_reply", tags)
+        d = RouteDecision(DISPATCH, OWNER_REPLY, tags)
         if not m.reply_to and m.thread_id and not is_thread_root(m):
             # 7.22：在话题里回复（话题里的消息没有 parent_id）：按话题找会话，不当成没引用去猜
             return self._thread_reply(m, tags, d)
@@ -1874,6 +1880,9 @@ class Dispatcher:
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
+            if t["state"] == sm.RUNNING and (urgent := [r for r in rows if r["reason"] == OWNER_REPLY]):
+                # 7.37 第 4 件：会话在跑上一批，主人的回复不等那批回执，当轮单独送到；其余信号照旧排队
+                return self._dispatch_priority(t, urgent, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
         adopted = t["kind"] in MANAGED_KINDS
@@ -1962,6 +1971,82 @@ class Dispatcher:
                      "（压缩后重推）" if t["compacted_at"] else "")
         res.update(self._complete_delivery(t, batch_id, signals, context))
         return res
+
+    # ---------- 主人插话（7.37 第 4 件） ----------
+    def _priority_blocked(self, t) -> str:
+        """会话在跑上一批（running）时，主人插话为什么不能插队（照旧排队）；能插队返回空串。
+
+        不插队：命令行宿主（Codex / Claude 一轮是一次运行，running 就是在跑上一轮，插不进去）；会话被羊群看板判为中断 /
+        失联（照旧排队，主人那边在岗表已经通知过）；主人正在会话里（被主人占着）。failed / attention / closed 不是
+        running，不走这里。"""
+        if self.topic_host(t) != ANTIGRAVITY:
+            busy = self._busy(t)
+            return f"命令行宿主在跑上一轮（{busy}）" if busy else "命令行宿主在跑上一轮"
+        if not t["conversation_id"] or not t["pending_batch_id"]:
+            return "没有在跑的批次"
+        card = self.store.get_card(t["topic_id"])
+        if card is not None and card["run_state"] in duty.STUCK:
+            return f"羊群看板判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
+        if (card is not None and card["run_state"] == duty.OCCUPIED) or self._owner_recent(self._owner_typed_at(t, card)):
+            return "主人在会话里（被主人占着）"
+        return ""
+
+    def _dispatch_priority(self, t, urgent: list, res: dict) -> dict:
+        """当轮单独发一批「主人插话」：只放主人的回复。依据 7.34 E6：agentapi send-message 在会话忙时，会在它下一次调模型时
+        插进去（秒级）。不改会话状态、不动 pending_batch_id / dispatched_at（等的还是原来那批的回执，回执超时照原来那批算）。"""
+        why = self._priority_blocked(t)
+        if why:
+            log.info("topic %s 在跑上一批，主人插话不插队（%s），%d 条信号排队", t["topic_id"], why, res["pending"])
+            res["queued"] = why
+            return res
+        batch_id = self._new_batch_id(PRIORITY_PREFIX, t["topic_id"])
+        try:
+            quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"]))
+                      for r in urgent if "reply_to" in r.keys() and r["reply_to"]}
+            notes = self._collision_notes(t, urgent)
+            for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in urgent]):
+                notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
+            prompt = priority_prompt(self.playbook, t["topic_id"], batch_id, t["pending_batch_id"], urgent,
+                                     self._session_title(t), security=self.security, quotes=quotes,
+                                     max_lines=self.cfg.session.max_message_lines, notes=notes,
+                                     reminder=self.reminder(t))
+            # 同普通批次：先记「正在发」再发送，崩溃后由 _recover_sending 核对（7.16）
+            self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in urgent], state="sending")
+            self._send(t, prompt, batch_id)
+        except SinkError as e:
+            # 发不出去：消息留在待推里，下一轮再试（会话还在跑就再插一次，跑完了就随普通批次走）；会话状态不动
+            if self.store.get_dispatch(batch_id) is not None:
+                self.store.set_dispatch_state(batch_id, "failed", str(e))
+            self._send_failed(t, str(e))
+            log.warning("topic %s 主人插话批次 %s 发送失败: %s", t["topic_id"], batch_id, e)
+            res["error"] = str(e)
+            return res
+        self._send_ok(t, len(urgent))
+        res.update(self._complete_priority(t, batch_id, urgent))
+        log.info("topic %s 在跑 %s，主人插话 %d 条单独送到（批次 %s）", t["topic_id"], t["pending_batch_id"], len(urgent),
+                 batch_id)
+        return res
+
+    def _complete_priority(self, t, batch_id: str, urgent: list, sent_at: str | None = None) -> dict:
+        """主人插话批次送达后的记账（正常发送与崩溃恢复共用）：关闭被回答的「需要你定」、消息记成已回执（不再待推、
+        不随原来那批超时退回）、批次记终态 priority（不等回执、不算回执超时）、记路由、点确认表情。会话状态一概不动。"""
+        ids = [r["message_id"] for r in urgent]
+        for r in urgent:
+            for tag in json.loads(r["tags_json"] or "[]"):
+                if tag.startswith(ESCALATION_TAG_PREFIX):
+                    self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
+        self.store.mark_batch(ids, batch_id, t["topic_id"], "acked")
+        self.store.finish_dispatch(batch_id, PRIORITY_DISPATCH)
+        try:  # 路由事实（7.20）。出错不挡投递
+            duty.record_routes(self.store, t["topic_id"], urgent, self.cfg.duty.patterns, sent_at or now_iso())
+        except Exception as e:
+            log.warning("记路由事实出错（批次 %s）: %s", batch_id, e)
+        if self.acker is not None:
+            try:
+                self.acker.on_delivered(urgent)
+            except Exception as e:
+                log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
+        return {"priority": batch_id, "sent": len(ids), "state": self.store.get_topic(t["topic_id"])["state"]}
 
     # ---------- 连续投递失败告诉主人（第一轮报告第 6 节问题 4） ----------
     def _send_failed(self, t, error: str) -> None:
@@ -2058,8 +2143,12 @@ class Dispatcher:
             contains = getattr(sink, "transcript_contains", None) or transcript_contains
             if t is not None and t["conversation_id"] and contains(t["conversation_id"], d["batch_id"]):
                 self.store.set_dispatch_state(d["batch_id"], "sent")
-                self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
-                                        [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
+                if d["batch_id"].startswith(PRIORITY_PREFIX):
+                    # 主人插话批次：同正常发送的记账，不改会话状态
+                    self._complete_priority(t, d["batch_id"], rows, d["sent_at"])
+                else:
+                    self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
+                                            [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
                 log.info("批次 %s 发送中断，但 transcript 里已有，补记为已送达", d["batch_id"])
             else:
                 self.store.set_dispatch_state(d["batch_id"], "uncertain", "发送中断，transcript 里找不到这个批次")

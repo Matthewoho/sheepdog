@@ -1,0 +1,171 @@
+"""Antigravity 生命周期 hook（7.34 实测、7.37 第 5 件）。
+
+`sheepdog hook stop`：Antigravity 在一轮要结束时（Stop）把入参 JSON 从 stdin 给过来。这个会话是牧羊犬管的、手上那批还没交
+回执，就往 stdout 写 {"decision": "continue", "reason": "…"}：Antigravity 不让它停，reason 作为系统消息给它（7.34 E3）。
+其他情况一律什么都不输出、退出码 0。
+
+约束（7.34 实测带来的改动）：
+- 只在确定要拦时输出；任何异常（入参不是 JSON、配置坏了、账本打不开、计数文件写不了……）都兜成不输出。
+- 只在 fullyIdle 为 true 时检查：后台任务没跑完时 Stop 也会触发（E6）。
+- 账本只读打开（sqlite mode=ro：不建表、不迁移、不写一个字节）；这一批拦过几次记在状态目录下的小文件里。
+- 不导入 engine / store / cli 之外的重模块：每一轮结束都跑这条路径，要快。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from .config import ANTIGRAVITY, Config, load_config
+from .playbook import Playbook
+from . import session as sm
+
+# 以下几个值和 engine / duty 里的同名常量一致（测试核对）。这里不导入 engine：太重
+BUS_TOPIC_ID = "tp_bus"
+MANAGED_KINDS = ("adopted", "dynamic")
+OCCUPIED = "occupied"
+# 同一批最多拦几次（7.37）：拦两次还不交，就放它停，交给回执超时
+STOP_MAX_BLOCKS = 2
+# 拦过几次的计数：<状态目录>/hooks/stop/<topic>.json，{"batch": 批次号, "count": 次数}；换了批次从 0 算
+STOP_COUNT_DIR = ("hooks", "stop")
+STOP_TEMPLATE = "stop_receipt.md"
+DEFAULT_STOP_REASON = (
+    "[sheepdog] 先别结束：批次 `{{batch_id}}` 还没交回执。\n"
+    "- 处理完了：`{{receipt_command}}`\n"
+    "- 还在等别人：`{{waiting_command}}`，summary 写清等谁、等什么。\n"
+    "交完回执再结束。")
+# 连账本时最多等几秒（WAL 下读不被写挡，这只是兜底）
+DB_TIMEOUT_SECONDS = 1.0
+
+
+def _parse(ts: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat((ts or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def _connect_ro(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=DB_TIMEOUT_SECONDS)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def count_path(cfg: Config, topic_id: str) -> Path:
+    return cfg.state_dir.joinpath(*STOP_COUNT_DIR, f"{topic_id}.json")
+
+
+def _blocked_count(p: Path, batch_id: str) -> int:
+    """这一批已经拦过几次。文件不在、坏了、记的是别的批次：0。"""
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(d, dict) or d.get("batch") != batch_id:
+        return 0
+    n = d.get("count")
+    return n if isinstance(n, int) and n > 0 else 0
+
+
+def _write_count(p: Path, batch_id: str, count: int) -> None:
+    """先写临时文件再改名：Antigravity 超时杀掉进程时不会留下半个文件。写不了就抛错（调用方兜成不拦）。"""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=p.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"batch": batch_id, "count": count}, f)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _target(conn: sqlite3.Connection, conversation_id: str):
+    """conversationId 对应的、牧羊犬在投递的 Antigravity 会话（总线、名册 managed、总线新开的）；对不上或对上不止一个：None。"""
+    rows = conn.execute(
+        "SELECT * FROM topics WHERE conversation_id=? AND state != ? AND (kind IN (?, ?) OR topic_id=?)",
+        (conversation_id, sm.CLOSED, *MANAGED_KINDS, BUS_TOPIC_ID)).fetchall()
+    if len(rows) != 1:
+        return None
+    t = rows[0]
+    return t if (t["host"] or ANTIGRAVITY) == ANTIGRAVITY else None
+
+
+def _occupied(card, cfg: Config, now: datetime) -> bool:
+    """被主人占着：口径同羊群看板（卡片判为被主人占着，或主人 human_attach_minutes 分钟内在会话里亲自说过话）。"""
+    if card is None:
+        return False
+    if card["run_state"] == OCCUPIED:
+        return True
+    at = _parse(card["human_at"] or "")
+    return at is not None and now - at < timedelta(minutes=cfg.session.human_attach_minutes)
+
+
+def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None) -> dict | None:
+    """要拦就返回要写到 stdout 的 dict，不拦返回 None。出错一律当不拦（异常向外抛，由 stop_main 兜住）。
+
+    拦的条件（全部满足，7.37）：conversationId 是牧羊犬管的 Antigravity 会话；fullyIdle 为 true；会话 running、手上那批的
+    回执文件不在、账本里那批还是 sent（没收到回执）；这一批拦过的次数 < STOP_MAX_BLOCKS；会话没被主人占着。"""
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get("fullyIdle") is not True:
+        return None
+    cid = data.get("conversationId")
+    if not isinstance(cid, str) or not cid.strip():
+        return None
+    cfg = cfg or load_config()
+    now = now or datetime.now().astimezone()
+    if not cfg.db_path.is_file():
+        return None
+    conn = _connect_ro(cfg.db_path)
+    try:
+        t = _target(conn, cid.strip())
+        if t is None or t["state"] != sm.RUNNING or not t["pending_batch_id"]:
+            return None
+        tid, batch = t["topic_id"], t["pending_batch_id"]
+        if (cfg.receipts_dir / tid / f"{batch}.json").exists():
+            return None  # 回执交了，下一轮 sheepdog 收
+        d = conn.execute("SELECT state FROM dispatches WHERE batch_id=?", (batch,)).fetchone()
+        if d is None or d["state"] != "sent":
+            return None
+        card = conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (tid,)).fetchone()
+        if _occupied(card, cfg, now):
+            return None
+    finally:
+        conn.close()
+    p = count_path(cfg, tid)
+    n = _blocked_count(p, batch) + 1
+    if n > STOP_MAX_BLOCKS:
+        return None
+    _write_count(p, batch, n)  # 记不下次数就不拦：宁可放它停，也不能拦个没完
+    cli = cfg.cli_command
+    receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
+    waiting = (f"{cli} receipt --topic {tid} --batch {batch} "
+               f"--json '{{\"status\": \"waiting_external\", \"summary\": \"等谁、等什么\"}}'")
+    reason = Playbook.from_config(cfg).render_or(
+        STOP_TEMPLATE, DEFAULT_STOP_REASON, topic_id=tid, batch_id=batch, receipt_command=receipt,
+        waiting_command=waiting, blocked=str(n))
+    return {"decision": "continue", "reason": reason}
+
+
+def stop_main(stdin, stdout, cfg: Config | None = None, now: datetime | None = None) -> int:
+    """`sheepdog hook stop` 的全部逻辑：任何异常都不输出、退出码 0（Stop 出错 Antigravity 照常结束，7.34 E7；
+    但多写一个字就可能被当成要拦，所以出错时一个字也不写）。"""
+    try:
+        raw = stdin.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        out = stop_check(raw, cfg, now)
+        if out is not None:
+            stdout.write(json.dumps(out, ensure_ascii=False))
+            stdout.flush()
+    except Exception:
+        pass
+    return 0

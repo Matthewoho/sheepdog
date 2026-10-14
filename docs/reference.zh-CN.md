@@ -106,6 +106,22 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 
 `agentapi` 依赖 Antigravity App 注入的环境变量（`ANTIGRAVITY_AGENTAPI_EXE` / `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`），因此 `run` 需要在 App 托管的 sidecar 或 App 内终端中运行（Codex / Claude 会话不依赖这些变量，但总线和默认宿主的会话仍然走 agentapi）。
 
+### 你的回复插队：会话在忙也当轮送到
+
+会话手上有一批还没交回执（running）时，别的信号照旧排队等它交回执或 20 分钟超时；但你在「找主人」聊天里的回复（上面那种，`owner_reply`）不等：当轮单独发一批「主人插话」，开头写明「先回答主人这条，再继续手上的事」（playbook 的 `owner_priority.md`，可选，缺了用代码里的默认话）。agentapi 在会话忙时照样送得进去，会话下一次调模型时就看到（7.34 实测 E6）。
+
+- 不改会话状态：还是 running，等的还是原来那一批的回执，回执超时照原来那批算；插话批次不要回执，交了也不算数。
+- 不会重复：插话里的消息记成已回执（`acked`），批次记终态 `priority`；下一轮不会当待推消息再送，原来那批超时退回重投也不带它。发送中断时同普通批次一样到 transcript 里核对。
+- 不插队、照旧排队的情况：会话被羊群看板判为中断 / 失联；你正在会话里（被主人占着）；会话 failed / attention / closed；Codex / Claude 会话（一轮是一次运行，running 就是在跑上一轮）。
+
+### 收尾查回执：Antigravity 的 Stop hook
+
+`sheepdog hook stop` 挂在 Antigravity 的 Stop 时机（这一轮要结束时）。会话是 sheepdog 管的（总线、名册 managed、总线新开的，宿主是 Antigravity）、`fullyIdle` 为 true、手上那批还没交回执（回执文件不在、账本里那批还是 `sent`）、没被你占着，就输出 `{"decision":"continue","reason":"…"}`：会话不能停，reason 以系统消息出现，写明批次号和完整的 `sheepdog receipt` 命令（playbook 的 `stop_receipt.md`，可选）。同一批最多拦 2 次，计数在 `<状态目录>/hooks/stop/<topic>.json`。
+
+- 其他情况一律什么都不输出、退出码 0，包括你自己的对话和一切出错（入参不是 JSON、配置坏了、账本打不开、计数写不了）。Antigravity 对 Stop 出错照常放行，但多输出一个字就可能被当成要拦，所以出错时一个字也不写。
+- 账本只读打开（不建表、不迁移），不导入投递引擎；冷启动实测约 0.13 秒（10 次中位，最大 0.13 秒；大头是导入命令行入口）。
+- 配置：`examples/antigravity-hooks.json`（只挂 Stop，timeout 10 秒）。command 换成你本机 sheepdog 的绝对路径（`which sheepdog`）；放进正式会话所在工作区的 `.agents/hooks.json`。这个文件会影响那个工作区里的所有对话，改它要你本人授权。
+
 ## 总线只做轻活：没有合适的会话就新开
 
 总线负责分派、转交、简单确认和汇总；需要查云、读代码、跑命令、改文件、多步排查的事交给专属会话。名册里没有合适的，总线用 `sheepdog new-session` 临时新开一个（具体判断规则写在 playbook/bus.md）：
