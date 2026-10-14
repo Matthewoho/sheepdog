@@ -118,8 +118,17 @@ class EscalationConfig:
     attribution_regex: str = ""
     # 第一行 [..·名字] 里的名字 → topic_id（如 "总线" = "tp_bus"）；认不出时再和各会话标题比
     aliases: dict = field(default_factory=dict)
+    # 7.36：离到期（open_hours）还剩这么多小时还开着，提醒负责会话核实一次；0 = 不提醒；不小于 open_hours 也不提醒（免得一问就提醒）
+    remind_before_hours: float = 2
+    # 7.36：会话结案后机器人在话题里补的那句「已结案」要不要 @ 主人（话题回复默认不提醒他）。默认不 @
+    resolve_notice_at: bool = False
 
     def validate(self) -> None:
+        if (isinstance(self.remind_before_hours, bool) or not isinstance(self.remind_before_hours, (int, float))
+                or self.remind_before_hours < 0):
+            raise ConfigError("[escalation] remind_before_hours 必须是 >= 0 的数（0 = 不提醒）")
+        if not isinstance(self.resolve_notice_at, bool):
+            raise ConfigError("[escalation] resolve_notice_at 必须是 true/false")
         if not isinstance(self.chat_ids, list) or not all(isinstance(c, str) and c for c in self.chat_ids):
             raise ConfigError("escalation.chat_ids 必须是非空字符串列表")
         if isinstance(self.open_hours, bool) or not isinstance(self.open_hours, (int, float)) or self.open_hours <= 0:
