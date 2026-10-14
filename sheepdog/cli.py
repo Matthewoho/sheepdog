@@ -45,6 +45,8 @@
   sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied]
                                                          代回：发前只读检查主人有没有新发言；说过就不发（退出码 3）
   sheepdog thread --topic T (--key K | --thread omt_x)    只读：列出一个话题的全部消息
+  sheepdog hook stop                                     Antigravity 的 Stop hook：stdin 读入参；这批没交回执就输出
+                                                         {"decision":"continue",...} 不让停，其他一律不输出、退出码 0
 
 ask / report / reply 的退出码：0 发出（或同样的内容已经发过）/ 1 发送失败或超时（原样重试，防重编号保证只发一条）/
 2 参数不对 / 3 主人已经回过、没发 / 4 发前检查失败、没发。代回内容一样才算重复：同一条先回「稍等」再回结论两条都发
@@ -1627,6 +1629,11 @@ def cmd_thread(args) -> int:
     return outbound.EXIT_OK
 
 
+def cmd_hook_stop(args) -> int:
+    from . import hook  # 只读账本、不导入别的；任何异常都不输出、退出码 0
+    return hook.stop_main(sys.stdin.buffer, sys.stdout)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -1867,6 +1874,10 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--key", help="钥匙（ask / report 带这把 --key 发过）")
     g.add_argument("--thread", help="话题编号 omt_…（或开头那条的 om_）")
     sp.set_defaults(func=cmd_thread)
+
+    sp = sub.add_parser("hook", help="Antigravity 生命周期 hook（由 hooks.json 调用，不是给人敲的）")
+    hsub = sp.add_subparsers(dest="hook", required=True)
+    hsub.add_parser("stop", help="Stop：这一轮要结束时查这批交没交回执").set_defaults(func=cmd_hook_stop)
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

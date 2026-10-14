@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     state       TEXT NOT NULL,         -- sending（已记、正在发）| sent | acked | failed | missed | context
                                        -- | uncertain（发送中断、transcript 里找不到，等人工 redeliver）| redelivered
                                        -- | acked_late（判过回执超时以后回执才到，7.21；error 保留当时的超时原因）
+                                       -- | priority（主人插话批次，7.37：送到即终态，不要回执、不算超时）
     receipt     TEXT,
     error       TEXT
 );
