@@ -1,8 +1,8 @@
 """第一期「问得准、答得快」第 1–3 件（7.36）：「需要你定」的来源、可能已处理、快到期提醒、待办清单。
 
 - 来源（escalation_sources）：ask 发成功后当场记——`--about` 指定的消息（origin = about），不给就记这个会话最近一批
-  送到的消息（origin = batch，批次号同 outbound.current_batch）。老提问没记来源的，按提问时间之前送到这个会话的最近一批补
-  （origin = backfill）。sheepdog 自己生成的消息、「找主人」聊天里的消息不算来源。
+  送到的消息（origin = batch，批次号同 outbound.current_batch）。没经 sheepdog ask 发的老提问没记来源的，按提问那一分钟
+  结束前（且不晚于它入账）送到这个会话的最近一批补（origin = backfill）；经 ask 发的没记就是故意不记，不补。sheepdog 自己生成的消息、「找主人」聊天里的消息不算来源。
 - 可能已处理：提问还开着，并且（按先后取第一种）
   1. 主人本人后来在来源聊天里说过话（不是代回、不在找主人聊天）；
   2. 主人对来源消息点了表情（_check_owner_reactions 记下的，sheepdog 自己点的确认表情不算）；
@@ -100,11 +100,17 @@ def default_sources(cfg, store: Store, batch_id: str) -> tuple[list[tuple[str, s
     return (cands if n == 1 else []), n
 
 
-def backfill_batch(store: Store, topic_id: str, asked_at: str) -> str:
-    """老提问补来源：提问时间之前送到这个会话的最近一批（没送到的、不带消息的不算）。没有是空串。"""
+def backfill_batch(store: Store, topic_id: str, asked_at: str, seen_at: str = "") -> str:
+    """老提问补来源：提问时会话手上最近送到的一批（没送到的、不带消息的、主人插话批次不算）。没有是空串。
+
+    asked_at 来自飞书的 create_time，只到分钟；批次的 sent_at 到秒。会话常在收到一批的同一分钟里就提问，所以 asked_at 当成
+    「那一分钟里的某一刻」：取那一分钟结束前送到的最近一批；给了 seen_at（这条提问入账的时间，到秒）就再要求不晚于它——
+    同一轮先拉取后投递，提问入账以后才送出的那批不是它看到的。"""
     asked = _parse(asked_at)
     if asked is None:
         return ""
+    until = asked.replace(second=0, microsecond=0) + timedelta(minutes=1)   # 不含
+    seen = _parse(seen_at)
     rows = store.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC LIMIT 500",
                               (topic_id,)).fetchall()
     for d in rows:
@@ -112,9 +118,20 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str) -> str:
                 or d["batch_id"].startswith(eng.PRIORITY_PREFIX)):
             continue  # 没送到的、不带消息的（onboarding、规则推送）、主人插话批次（同 current_batch）不算一批
         sent = _parse(d["sent_at"])
-        if sent is not None and sent <= asked:
+        if sent is not None and sent < until and (seen is None or sent <= seen):
             return d["batch_id"]
     return ""
+
+
+def backfill_sources(cfg, store: Store, e) -> list[tuple[str, str]]:
+    """一条没记来源的提问该补什么（只算、不写）。经 sheepdog ask 发的（sends 里有）不补：来源在发的时候就定了，
+    没记是故意的（那一批来自多个聊天，7.38 第 2 条）；补了会绕过单聊天规则，还可能补成上一批。"""
+    s = store.send_by_message(e["message_id"])
+    if s is not None and s["kind"] == "ask":
+        return []
+    m = store.get_message(e["message_id"])
+    seen = m["first_seen"] if m is not None else ""
+    return default_sources(cfg, store, backfill_batch(store, e["topic_id"], e["asked_at"], seen))[0]
 
 
 def about_sources(cfg, store: Store, about_ids: list[str]) -> list[tuple[str, str]]:
@@ -139,7 +156,7 @@ def ensure_sources(cfg, store: Store, e) -> list:
     rows = store.escalation_sources(e["message_id"])
     if rows:
         return rows
-    srcs, _ = default_sources(cfg, store, backfill_batch(store, e["topic_id"], e["asked_at"]))
+    srcs = backfill_sources(cfg, store, e)
     if srcs:
         store.add_escalation_sources(e["message_id"], e["topic_id"], srcs, ORIGIN_BACKFILL)
         rows = store.escalation_sources(e["message_id"])
@@ -564,9 +581,8 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
     for e in opens:
         srcs = store.escalation_sources(e["message_id"])
         if not srcs:  # 只读：不写账本，按补记的规则现算
-            b = backfill_batch(store, e["topic_id"], e["asked_at"])
             srcs = [{"about_message_id": m, "about_chat_id": c, "origin": ORIGIN_BACKFILL}
-                    for m, c in default_sources(cfg, store, b)[0]]
+                    for m, c in backfill_sources(cfg, store, e)]
         if not cfg.escalation.followup:
             hit = None   # 7.40：跟进关掉时清单不写「↳」那一行（没人会去提醒，写了是假话）
         else:
