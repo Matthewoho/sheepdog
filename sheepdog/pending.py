@@ -108,8 +108,9 @@ def backfill_batch(store: Store, topic_id: str, asked_at: str) -> str:
     rows = store.conn.execute("SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC LIMIT 500",
                               (topic_id,)).fetchall()
     for d in rows:
-        if d["state"] in _UNDELIVERED or not json.loads(d["message_ids"] or "[]"):
-            continue  # 没送到的、不带消息的（onboarding、规则推送）不算一批
+        if (d["state"] in _UNDELIVERED or not json.loads(d["message_ids"] or "[]")
+                or d["batch_id"].startswith(eng.PRIORITY_PREFIX)):
+            continue  # 没送到的、不带消息的（onboarding、规则推送）、主人插话批次（同 current_batch）不算一批
         sent = _parse(d["sent_at"])
         if sent is not None and sent <= asked:
             return d["batch_id"]
@@ -408,31 +409,60 @@ def _guide(playbook, name: str, default: str, **values: str) -> str:
     return _PLACEHOLDER.sub(lambda m: vals.get(m.group(1), m.group(0)), default)
 
 
-def check_message(cfg, store: Store, playbook, e, hit: Hit) -> str:
+def follower_of(store: Store, e) -> str:
+    """谁跟进这条提问：提问的会话；它已收掉就是总线（7.38 合并第三轮，架构侧定）。总线也收掉了是空串。"""
+    if _deliverable_topic(store, e["topic_id"]):
+        return e["topic_id"]
+    return eng.BUS_TOPIC_ID if _deliverable_topic(store, eng.BUS_TOPIC_ID) else ""
+
+
+def _who_asked(store: Store, e, follower: str) -> tuple[str, str, str]:
+    """(开头的主语, 「问的」前面的主语, 原会话已收掉时补的一行)。"""
+    if follower == e["topic_id"]:
+        return "你的", "你 ", ""
+    who = session_label(store, e["topic_id"])
+    return (f"{who} 的", "它 ",
+            f"原提问会话 {who} 已经收掉，这件事由你（总线）跟进；结案用 `{{{{cli}}}} resolve --topic {follower} "
+            f"--message-id {e['message_id']} --why \"<依据>\"`（钥匙记在原会话名下，--key 用不了）。")
+
+
+def check_message(cfg, store: Store, playbook, e, hit: Hit, follower: str = "") -> str:
+    follower = follower or e["topic_id"]
     off = cfg.timezone_offset
     asked = eng.display_time(_parse(e["asked_at"]), off) if _parse(e["asked_at"]) else e["asked_at"]
     sent = store.send_by_message(e["message_id"])
     key = sent["key"] if sent is not None and sent["key"] else ""
-    lines = [f"🔎 你的「需要你定」可能已经处理了：你 {asked}问的「{ask_title(cfg, e['text'])}」"
+    whose, subj, orphan = _who_asked(store, e, follower)
+    lines = [f"🔎 {whose}「需要你定」可能已经处理了：{subj}{asked}问的「{ask_title(cfg, e['text'])}」"
              f"（message_id `{e['message_id']}`" + (f"，钥匙 {key}" if key else "") + "）。",
-             hit_line(cfg, store, hit) + "。",
-             _guide(playbook, "escalation_check.md", DEFAULT_CHECK_GUIDE, topic_id=e["topic_id"],
-                    ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"]))]
+             hit_line(cfg, store, hit) + "。"]
+    if orphan:
+        lines.append(_guide(None, "", orphan, cli=_cli(playbook)))
+    lines.append(_guide(playbook, "escalation_check.md", DEFAULT_CHECK_GUIDE, topic_id=follower,
+                        ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"])))
     return "\n".join(lines)
 
 
-def expiring_message(cfg, store: Store, playbook, e, until: datetime) -> str:
+def expiring_message(cfg, store: Store, playbook, e, until: datetime, follower: str = "") -> str:
+    follower = follower or e["topic_id"]
     off = cfg.timezone_offset
     asked = eng.display_time(_parse(e["asked_at"]), off) if _parse(e["asked_at"]) else e["asked_at"]
     left = max(0.0, (until - eng._now()).total_seconds() / 3600)
     sent = store.send_by_message(e["message_id"])
     key = sent["key"] if sent is not None and sent["key"] else ""
-    lines = [f"⏰ 你的「需要你定」快到期了：你 {asked}问的「{ask_title(cfg, e['text'])}」（message_id `{e['message_id']}`"
-             + (f"，钥匙 {key}" if key else "") + f"）还开着，约 {left:.1f} 小时后（{eng.display_time(until, off)}）自动关闭。",
-             _guide(playbook, "escalation_expiring.md", DEFAULT_EXPIRING_GUIDE, topic_id=e["topic_id"],
-                    ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"]),
-                    hours_left=f"{left:.1f}")]
+    whose, subj, orphan = _who_asked(store, e, follower)
+    lines = [f"⏰ {whose}「需要你定」快到期了：{subj}{asked}问的「{ask_title(cfg, e['text'])}」（message_id `{e['message_id']}`"
+             + (f"，钥匙 {key}" if key else "") + f"）还开着，约 {left:.1f} 小时后（{eng.display_time(until, off)}）自动关闭。"]
+    if orphan:
+        lines.append(_guide(None, "", orphan, cli=_cli(playbook)))
+    lines.append(_guide(playbook, "escalation_expiring.md", DEFAULT_EXPIRING_GUIDE, topic_id=follower,
+                        ask_message_id=e["message_id"], key=key, title=ask_title(cfg, e["text"]),
+                        hours_left=f"{left:.1f}"))
     return "\n".join(lines)
+
+
+def _cli(playbook) -> str:
+    return (getattr(playbook, "base_vars", None) or {}).get("cli") or "sheepdog"
 
 
 def resolve_notice(cfg, playbook, why: str, session: str) -> str:
@@ -463,12 +493,14 @@ def followup_round(cfg, store: Store, playbook) -> dict:
             if hit is not None and store.mark_possibly_handled(mid, hit.message_id, hit.reason):
                 out["marked"] += 1
         e = store.get_escalation(mid)
-        if not _deliverable_topic(store, e["topic_id"]):
+        follower = follower_of(store, e)   # 提问的会话收掉了就由总线跟进（topic_id 不改）
+        if not follower:
             continue
         if e["possibly_handled_at"] and not e["possibly_handled_notified_at"]:
             hit = hit_of(cfg, store, e)
             if hit is not None and store.set_escalation_mark(mid, "possibly_handled_notified_at"):
-                store.add_system_message(e["topic_id"], CHECK_REASON, check_message(cfg, store, playbook, e, hit),
+                store.add_system_message(follower, CHECK_REASON,
+                                         check_message(cfg, store, playbook, e, hit, follower),
                                          [f"escalation_check:{mid}"])
                 out["checked"] += 1
         before = esc.remind_before_hours
@@ -476,8 +508,8 @@ def followup_round(cfg, store: Store, playbook) -> dict:
         if before and before < esc.open_hours and asked is not None and not e["expiry_reminded_at"]:
             until = asked + timedelta(hours=esc.open_hours)
             if now >= until - timedelta(hours=before) and store.set_escalation_mark(mid, "expiry_reminded_at"):
-                store.add_system_message(e["topic_id"], EXPIRING_REASON,
-                                         expiring_message(cfg, store, playbook, e, until),
+                store.add_system_message(follower, EXPIRING_REASON,
+                                         expiring_message(cfg, store, playbook, e, until, follower),
                                          [f"escalation_expiring:{mid}"])
                 out["expiring"] += 1
     return out
@@ -536,6 +568,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         items[e["message_id"]] = {
             "message_id": e["message_id"], "topic_id": e["topic_id"], "session": session_label(store, e["topic_id"]),
             "session_closed": not _deliverable_topic(store, e["topic_id"]),
+            "follower": follower_of(store, e),
             "title": ask_title(cfg, e["text"]), "body": ask_body(e["text"]),
             "key": sent["key"] if sent is not None and sent["key"] else "",
             "asked_at": e["asked_at"], "asked_label": short_time(asked, off) if asked else e["asked_at"],
@@ -584,7 +617,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
     return {"generated_at": now.isoformat(timespec="seconds"), "now_label": f"{short_time(now, off)}，{eng._tz(off)[1]}",
             "decide": decide, "decide_count": len(asks_all), "possibly_handled_count": len(handled),
             "possibly_handled_notified_count": sum(1 for a in handled if a["possibly_handled"]["notified"]),
-            "possibly_handled_orphan_count": sum(1 for a in handled if a["session_closed"]),
+            "possibly_handled_orphan_count": sum(1 for a in handled if not a["follower"]),
             "possibly_handled_reasons": sorted({a["possibly_handled"]["reason"] for a in handled}),
             "waiting_owner": waiting}
 
@@ -602,13 +635,16 @@ def _ask_lines(a: dict, n: str, indent: str) -> list[str]:
     else:
         lines.append(f"{indent}来源：没记到")
     ph = a["possibly_handled"]
-    if ph and a["session_closed"]:
-        lines.append(f"{indent}↳ {ph['line']}；提问的会话已收掉，不会提醒谁核实，请你自己看一眼")
+    if ph and a["session_closed"] and not a["follower"]:
+        lines.append(f"{indent}↳ {ph['line']}；提问的会话和总线都收掉了，不会提醒谁核实，请你自己看一眼")
+    elif ph and a["session_closed"]:
+        done = "已提醒" if ph["notified"] else "下一轮会提醒"
+        lines.append(f"{indent}↳ {ph['line']}，{done}总线核实（原会话已收掉）")
     elif ph:
         done = "已提醒" if ph["notified"] else "下一轮会提醒"
         lines.append(f"{indent}↳ {ph['line']}，{done} {a['session']}核实")
     elif a["session_closed"]:
-        lines.append(f"{indent}⚠ 提问的会话已收掉，没人跟进这件事")
+        lines.append(f"{indent}⚠ 原会话已收掉，由总线跟进" if a["follower"] else f"{indent}⚠ 提问的会话已收掉，没人跟进这件事")
     return lines
 
 

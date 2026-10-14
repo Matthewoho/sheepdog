@@ -964,13 +964,14 @@ class Store:
             c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
                       (now_iso(), message_id))
 
-    def resolve_escalation(self, message_id: str, topic_id: str, note: str) -> bool:
-        """会话自己结案（7.36）：只结这个会话名下、还开着的。返回是否结了。"""
+    def resolve_escalation(self, message_id: str, topic_id: str, note: str, resolved_by: str = "") -> bool:
+        """会话结案（7.36）：只结 topic_id（提问的会话）名下、还开着的。resolved_by：谁结的，默认就是提问的会话；
+        原会话已收掉时总线替它结，记总线（7.38）。返回是否结了。"""
         ts = now_iso()
         with self.tx() as c:
             return c.execute("""UPDATE escalations SET closed_at=?, close_reason='resolved', resolved_by=?, resolve_note=?
                                 WHERE message_id=? AND topic_id=? AND closed_at IS NULL""",
-                             (ts, topic_id, note, message_id, topic_id)).rowcount > 0
+                             (ts, resolved_by or topic_id, note, message_id, topic_id)).rowcount > 0
 
     def mark_possibly_handled(self, message_id: str, trigger_message_id: str, reason: str, at: str = "") -> bool:
         """标「可能已处理」（7.36）：只标还开着、没标过的。返回是否标了。"""
@@ -1505,10 +1506,15 @@ class Store:
             args.append(norm_key)
         return self.conn.execute(sql + " ORDER BY last_at DESC, topic_id", args).fetchall()
 
-    def latest_batch_id(self, topic_id: str) -> str:
-        """这个会话最近一批的批次号（按送出时间，同一秒按记录先后）；没有就是空串。"""
-        r = self.conn.execute("SELECT batch_id FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
-                              (topic_id,)).fetchone()
+    def latest_batch_id(self, topic_id: str, skip_prefix: str = "") -> str:
+        """这个会话最近一批的批次号（按送出时间，同一秒按记录先后）；没有就是空串。
+        skip_prefix：跳过这个前缀的批次（主人插话批次 p…，7.38 第 8 条）。"""
+        sql = "SELECT batch_id FROM dispatches WHERE topic_id=?"
+        args: list = [topic_id]
+        if skip_prefix:
+            sql += " AND substr(batch_id, 1, ?) != ?"
+            args += [len(skip_prefix), skip_prefix]
+        r = self.conn.execute(sql + " ORDER BY sent_at DESC, rowid DESC LIMIT 1", args).fetchone()
         return r[0] if r is not None else ""
 
     def recent_dispatches(self, topic_id: str, limit: int = 30) -> list[sqlite3.Row]:

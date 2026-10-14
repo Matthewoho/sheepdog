@@ -583,8 +583,8 @@ class PendingListTest(PendingBase):
                          ("owner_spoke", True))
         self.assertEqual([w["key"] for w in data["waiting_owner"]], ["AGIF-9", "AGIF-1"])
 
-    def test_closed_session_ask_is_flagged_not_promised_a_reminder(self):
-        # 回放发现：tp_sammy（总线新开、已收掉）名下还开着一条，提醒发不出去，清单不能写「会提醒它」
+    def test_closed_session_ask_is_followed_by_the_bus(self):
+        # 回放发现 tp_sammy（已收掉）名下还开着一条；7.38 合并第三轮：由总线跟进，提醒发给总线，topic_id 不改
         a = self.alice_batch()
         q = self.asked("--about", a)
         q2 = self.asked(title="第二件", text="另一件事")
@@ -594,13 +594,48 @@ class PendingListTest(PendingBase):
         self.owner_says("这事我办了")
         pend.followup_round(self.cfg, self.store, self.d.playbook)   # 不走 dispatch_once：名册同步会把 tp_alpha 重新打开
         e = self.store.get_escalation(q)
-        self.assertTrue(e["possibly_handled_at"])
-        self.assertIsNone(e["possibly_handled_notified_at"])   # 收掉的会话不排提醒
+        self.assertEqual(e["topic_id"], "tp_alpha")
+        self.assertTrue(e["possibly_handled_notified_at"])
+        self.assertEqual(self.system_msgs("escalation_check", "tp_alpha"), [])
+        bus = self.system_msgs("escalation_check", BUS_TOPIC_ID)
+        self.assertEqual(len(bus), 1)
+        self.assertTrue(bus[0].startswith("🔎 tp_alpha「Alpha 需求」 的「需要你定」可能已经处理了：它 "))
+        self.assertIn("原提问会话 tp_alpha「Alpha 需求」 已经收掉，这件事由你（总线）跟进", bus[0])
+        self.assertIn(f"`sheepdog resolve --topic tp_bus --message-id {q} --why", bus[0])
+        self.assertIn(f"FX-ESC-CHECK topic=tp_bus ask={q}", bus[0])
         rc, out, _ = self.cli("pending")
-        self.assertIn("说过：「这事我办了」；提问的会话已收掉，不会提醒谁核实，请你自己看一眼", out)
-        self.assertIn("⚠ 提问的会话已收掉，没人跟进这件事", out)
+        self.assertIn("说过：「这事我办了」，已提醒总线核实（原会话已收掉）", out)
+        self.assertIn("⚠ 原会话已收掉，由总线跟进", out)
         self.assertNotIn("会提醒 tp_alpha", out)
-        self.assertIn("（其中 1 条你后来在来源聊天说过话，1 条的会话已收掉、要你自己看）", out.splitlines()[0])
+        self.assertIn("（其中 1 条你后来在来源聊天说过话，已提醒会话核实）", out.splitlines()[0])
+
+    def test_closed_session_expiring_goes_to_the_bus(self):
+        q = self.asked()
+        self.store.conn.execute("UPDATE escalations SET asked_at=? WHERE message_id=?",
+                                ((datetime.now().astimezone() - timedelta(hours=23)).isoformat(timespec="seconds"), q))
+        self.store.update_topic("tp_alpha", state="closed")
+        pend.followup_round(self.cfg, self.store, self.d.playbook)
+        self.assertEqual(self.system_msgs("escalation_expiring", "tp_alpha"), [])
+        bus = self.system_msgs("escalation_expiring", BUS_TOPIC_ID)
+        self.assertEqual(len(bus), 1)
+        self.assertIn("原提问会话 tp_alpha「Alpha 需求」 已经收掉", bus[0])
+        self.assertIn(f"FX-ESC-EXPIRING topic=tp_bus ask={q}", bus[0])
+
+    def test_bus_resolves_only_orphaned_asks(self):
+        orphan = self.asked()
+        self.store.update_topic("tp_alpha", state="closed")
+        rc, out, err = self.resolve("--message-id", orphan, "--why", "主人在私聊里定了", topic=BUS_TOPIC_ID)
+        self.assertEqual(rc, 0, err)
+        e = self.store.get_escalation(orphan)
+        self.assertEqual((e["close_reason"], e["resolved_by"], e["topic_id"]), ("resolved", BUS_TOPIC_ID, "tp_alpha"))
+        self.assertTrue(_opt(self.lark.sent("+messages-reply")[-1], "--text").startswith("✅ 已结案：主人在私聊里定了（"))
+        # 原会话还在的：总线照旧不能结
+        self.store.update_topic("tp_alpha", state="active")
+        alive = self.asked(title="别的", text="还开着的")
+        rc, _, err = self.resolve("--message-id", alive, "--why", "x", topic=BUS_TOPIC_ID)
+        self.assertEqual(rc, outbound.EXIT_INVALID)
+        self.assertIn("总线只能结原会话已收掉的", err)
+        self.assertIsNone(self.store.get_escalation(alive)["closed_at"])
 
     def test_check_line_before_reminder_is_queued(self):
         # 还没轮到提醒（只读现算出来的）：写「下一轮会提醒」，不说已提醒

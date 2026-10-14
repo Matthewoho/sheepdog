@@ -27,8 +27,8 @@ from . import pending as pend
 from . import session as sm
 from .card import build_reply_card
 from .config import Config
-from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, display_time, is_agent_reply, open_escalations, order_thread_items,
-                     root_position)
+from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, is_agent_reply, open_escalations,
+                     order_thread_items, root_position)
 from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
@@ -92,12 +92,15 @@ def _one_line(text: str) -> str:
 
 # ======================= ask / report =======================
 def current_batch(store: Store, topic_id: str) -> str:
-    """会话没传 --batch 时用的批次号：它当前在跑的批次（送出了、等回执的那批）；没有就用它最近一批；都没有是空串。
+    """会话没传 --batch 时用的批次号：它当前在跑的批次（送出了、等回执的那批）；没有就用它最近一批（跳过主人插话批次）；
+    都没有是空串。
     同一批里重跑只发一条，隔批再说同样的话不会被当成重复，会话也不用自己记批次号。"""
     t = store.get_topic(topic_id)
-    if t is not None and t["pending_batch_id"]:
+    if t is not None and t["pending_batch_id"] and not t["pending_batch_id"].startswith(PRIORITY_PREFIX):
         return t["pending_batch_id"]
-    return store.latest_batch_id(topic_id)
+    # 主人插话批次（p…，7.37）不算：它只装主人那句回复，送得又比手上那批晚；取成它，ask 的防重编号会跟着变、默认来源会
+    # 变成找主人聊天里的那句（7.38 第 8 条）
+    return store.latest_batch_id(topic_id, skip_prefix=PRIORITY_PREFIX)
 
 
 def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str) -> str:
@@ -234,7 +237,12 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
     if e is None:
         raise OutboundError(EXIT_INVALID, f"账本里没有 {message_id} 这条「需要你定」（`sheepdog escalations` 看还开着的）")
     if e["topic_id"] != topic_id:
-        raise OutboundError(EXIT_INVALID, f"{message_id} 是 {e['topic_id']} 问的，不是你的；只能结自己名下的")
+        # 7.38 合并第三轮：原提问会话已收掉的，由总线跟进，总线可以结；别的会话名下的总线照旧不能结
+        orphan = topic_id == BUS_TOPIC_ID and pend.follower_of(store, e) == BUS_TOPIC_ID
+        if not orphan:
+            raise OutboundError(EXIT_INVALID, f"{message_id} 是 {e['topic_id']} 问的，不是你的；只能结自己名下的"
+                                + ("（总线只能结原会话已收掉的）" if topic_id == BUS_TOPIC_ID else ""))
+        opens = open_escalations(store, cfg.escalation.open_hours, e["topic_id"])
     s = store.send_by_message(message_id)
     root = s["root_message_id"] if s is not None and s["root_message_id"] else ""
     return [x for x in opens if x["message_id"] == message_id], root or message_id, root
@@ -285,7 +293,9 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
                        target_message_id=notice_to, identity=ident.BOT if cfg.identity.enabled else None)
         # 主人引用这句话回复（比如「还没办完」）时送回这个会话；is_question = 0，不是新提问
         store.add_bot_outbox(mid, topic_id, False, text, now_iso())
-    closed = [e["message_id"] for e in targets if store.resolve_escalation(e["message_id"], topic_id, why)]
+    # resolved_by 记结案的会话（总线替收掉的会话结时记总线）；topic_id 不改
+    closed = [e["message_id"] for e in targets
+              if store.resolve_escalation(e["message_id"], e["topic_id"], why, resolved_by=topic_id)]
     return ResolveResult(closed, mid, notice_error=err, text=text)
 
 
