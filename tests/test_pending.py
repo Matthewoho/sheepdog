@@ -590,7 +590,7 @@ class PendingListTest(PendingBase):
         self.owner_says("下周一上")
         rc, out, _ = self.cli("pending")
         self.assertIn("，下一轮会提醒 tp_alpha「Alpha 需求」核实", out)
-        self.assertIn("已经或下一轮会提醒会话核实", out.splitlines()[0])
+        self.assertIn("（其中 1 条你后来在来源聊天说过话，下一轮会提醒会话核实）", out.splitlines()[0])
 
     def test_same_session_same_batch_asks_are_not_grouped(self):
         # 10-13 的 kc 测试库和 Leon GitHub App：总线同一批里问的两件事，来源是同一批消息，不是同一件事

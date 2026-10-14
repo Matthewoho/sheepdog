@@ -583,7 +583,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
     return {"generated_at": now.isoformat(timespec="seconds"), "now_label": f"{short_time(now, off)}，{eng._tz(off)[1]}",
             "decide": decide, "decide_count": len(asks_all), "possibly_handled_count": len(handled),
             "possibly_handled_notified_count": sum(1 for a in handled if a["possibly_handled"]["notified"]),
-            "possibly_handled_all_spoke": all(a["possibly_handled"]["reason"] == PH_SPOKE for a in handled),
+            "possibly_handled_reasons": sorted({a["possibly_handled"]["reason"] for a in handled}),
             "waiting_owner": waiting}
 
 
@@ -622,9 +622,12 @@ def render(data: dict, header: str = "") -> str:
     d, w = data["decide"], data["waiting_owner"]
     n_d, n_h = data["decide_count"], data["possibly_handled_count"]
     head = header or "待办清单"
-    what = ("你后来在来源聊天说过话" if data["possibly_handled_all_spoke"]
-            else "你后来在来源上有回应（说过话、点过表情，或同一件事的另一条已答复 / 结案）")
-    told = "已提醒会话核实" if data["possibly_handled_notified_count"] == n_h else "已经或下一轮会提醒会话核实"
+    reasons = set(data["possibly_handled_reasons"])
+    what = ("你后来在来源聊天说过话" if reasons <= {PH_SPOKE}
+            else "你后来在来源聊天说过话或点过表情" if reasons <= {PH_SPOKE, PH_REACTION}
+            else "你后来在来源上有过回应")
+    told_n = data["possibly_handled_notified_count"]
+    told = "已提醒会话核实" if told_n == n_h else "下一轮会提醒会话核实" if told_n == 0 else "已提醒或下一轮会提醒会话核实"
     extra = f"（其中 {n_h} 条{what}，{told}）" if n_h else ""
     lines = [f"{head}（{data['now_label']}）：要你定的 {n_d} 条{extra}，各会话在等你的 {len(w)} 件"]
     lines.append("")
