@@ -194,3 +194,40 @@ class PlaybookBadFileTest(Base):
             d.init()
             d.dispatch_once()
         self.assertTrue(self.sink.to("conv_test_alpha"))
+
+
+class PromptOverlayBadFileTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.f = Path(self.tmp.name) / "overlay.md"
+        self.cfg.prompt_overlay_path = str(self.f)
+
+    def test_unreadable_overlay_keeps_last_good(self):
+        self.f.write_text("第一版 overlay", encoding="utf-8")
+        self.assertEqual(self.cfg.prompt_overlay(), "第一版 overlay")
+        with self.assertLogs("sheepdog.config", "WARNING") as logs:
+            self.f.write_bytes(b"\xff\xfe")
+            self.assertEqual(self.cfg.prompt_overlay(), "第一版 overlay")       # 不是 UTF-8：沿用上一份
+            self.f.unlink()
+            self.f.mkdir()
+            self.assertEqual(self.cfg.prompt_overlay(), "第一版 overlay")       # 读不了：沿用上一份
+        self.assertTrue(all("沿用上一份" in line for line in logs.output))
+        self.f.rmdir()
+        self.assertEqual(self.cfg.prompt_overlay(), "")                         # 删掉 = 没有 overlay（原来的行为）
+        self.f.write_text("第二版", encoding="utf-8")
+        self.assertEqual(self.cfg.prompt_overlay(), "第二版")                   # 改好了下一次就用新的
+
+    def test_never_good_overlay_is_empty(self):
+        self.f.write_bytes(b"\xff")
+        with self.assertLogs("sheepdog.config", "WARNING") as logs:
+            self.assertEqual(self.cfg.prompt_overlay(), "")
+        self.assertIn("这一轮先当没有", logs.output[0])
+
+    def test_round_survives_a_broken_overlay(self):
+        # 组装 prompt 时 overlay 不是 UTF-8：这一轮照常投递（onboarding、批次），不抛出去让整轮失败
+        self.f.write_bytes(b"\xff\xfe")
+        d = self.disp()
+        with self.assertLogs("sheepdog.config", "WARNING"):
+            d.init()
+            d.dispatch_once()
+        self.assertTrue(self.sink.to("conv_test_alpha"))

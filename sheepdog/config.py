@@ -7,12 +7,18 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+log = logging.getLogger(__name__)
+# prompt_overlay 文件上一次读成功的内容（常驻进程内有效）：读不了 / 不是 UTF-8 时沿用它并 WARNING，不让投递那一轮失败
+_OVERLAY_LAST_GOOD: dict[Path, str] = {}
 
 
 class ConfigError(ValueError):
@@ -700,7 +706,17 @@ class Config:
         p = Path(self.prompt_overlay_path).expanduser()
         if not p.is_absolute():
             p = self.config_path.parent / p
-        return p.read_text(encoding="utf-8") if p.exists() else ""
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            return ""   # 不存在 = 没有 overlay（原来的行为）
+        except (OSError, UnicodeDecodeError) as e:
+            # 改坏了（读不了 / 不是 UTF-8）：沿用上一份，从没读成功过就当空，不让组装 prompt 的那一轮失败（7.40）
+            last = _OVERLAY_LAST_GOOD.get(p)
+            log.warning("prompt overlay %s 读不了，%s: %s", p, "沿用上一份" if last is not None else "这一轮先当没有", e)
+            return last or ""
+        _OVERLAY_LAST_GOOD[p] = text
+        return text
 
 
 def _apply(dc, data: dict) -> None:
