@@ -3,6 +3,7 @@
 照旧报错退出，stderr 一行带时间、文件和行号。Stop hook 遇到坏配置什么都不输出。"""
 
 import io
+import itertools
 import os
 import shutil
 from pathlib import Path
@@ -73,6 +74,17 @@ class ResidentReloadBadFilesTest(Base):
         self.assertIn(f"{self.cfg_file} 第 3 行第 9 列 TOML 语法错误", warns[0])
         self.assertIn(f"{self.cfg_file} 读不了", warns[1])
         self.assertIn(f"{self.cfg_file} 结构不对", warns[2])
+
+    def test_unexpected_error_while_reading_config_keeps_last(self):
+        # 兜底：load_config 漏网的别的异常（不是 ConfigError）也沿用上一份，这一轮照常跑
+        real = cli.load_config
+        # 第 1 次是启动时的 _build，第 2 次是第 1 轮的重读（出意外），之后都正常
+        calls = itertools.chain([real, mock.Mock(side_effect=RuntimeError("意外"))], itertools.repeat(real))
+        self.cfg_file.write_text(self.base + '[routing]\nkeywords = ["fxA"]\n', encoding="utf-8")
+        with mock.patch.object(cli, "load_config", side_effect=lambda *a: next(calls)(*a)):
+            seen, logs = self.run_rounds(lambda: None, [lambda: None])
+        self.assertEqual([r.keywords for r in seen], [["fxA"], ["fxA"]])
+        self.assertTrue(any("配置无效，沿用上一份（读配置出错 RuntimeError）" in line for line in logs))
 
     def test_roster_and_security_broken_keep_last(self):
         roster, security = self.dir / "roster.toml", self.dir / "security.toml"
