@@ -110,6 +110,7 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 
 会话手上有一批还没交回执（running）时，别的信号照旧排队等它交回执或 20 分钟超时；但你在「找主人」聊天里的回复（上面那种，`owner_reply`）不等：当轮单独发一批「主人插话」，开头写明「先回答主人这条，再继续手上的事」（playbook 的 `owner_priority.md`，可选，缺了用代码里的默认话）。agentapi 在会话忙时照样送得进去，会话下一次调模型时就看到（7.34 实测 E6）。
 
+- 一起插队的：你的回复认不出回答哪条时，sheepdog 给总线写的那条说明（未结的「需要你定」列表 / 认不出来源，正文里带着你这条回复的编号）跟着一起送；别的信号照旧排队。
 - 不改会话状态：还是 running，等的还是原来那一批的回执，回执超时照原来那批算；插话批次不要回执，交了也不算数。
 - 不会重复：插话里的消息记成已回执（`acked`），批次记终态 `priority`；下一轮不会当待推消息再送，原来那批超时退回重投也不带它。发送中断时同普通批次一样到 transcript 里核对。
 - 不插队、照旧排队的情况：会话被羊群看板判为中断 / 失联；你正在会话里（被主人占着）；会话 failed / attention / closed；Codex / Claude 会话（一轮是一次运行，running 就是在跑上一轮）。
@@ -118,9 +119,15 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 
 `sheepdog hook stop` 挂在 Antigravity 的 Stop 时机（这一轮要结束时）。会话是 sheepdog 管的（总线、名册 managed、总线新开的，宿主是 Antigravity）、`fullyIdle` 为 true、手上那批还没交回执（回执文件不在、账本里那批还是 `sent`）、没被你占着，就输出 `{"decision":"continue","reason":"…"}`：会话不能停，reason 以系统消息出现，写明批次号和完整的 `sheepdog receipt` 命令（playbook 的 `stop_receipt.md`，可选）。同一批最多拦 2 次，计数在 `<状态目录>/hooks/stop/<topic>.json`。
 
+- 你亲自在会话里说过话就不拦：正式配置 `human_attach_minutes = 0`，羊群看板永远不会判「被主人占着」，所以 hook 另外读入参里的 `transcriptPath`，只读末尾 2MB：这一批送达的那一行（带 `` `批次号` `` 的 SYSTEM_MESSAGE / USER_INPUT）之后出现过 type 为 USER_INPUT、source 为 USER_EXPLICIT 的步骤，就不拦。agentapi 送的批次（SYSTEM_MESSAGE）、hook 插的话（SYSTEM_SDK 来源的 USER_INPUT）都不算你说话。末尾那一段里找不到这一批（记录不在、送达那行早被挤出去），也不拦。
+
 - 其他情况一律什么都不输出、退出码 0，包括你自己的对话和一切出错（入参不是 JSON、配置坏了、账本打不开、计数写不了）。Antigravity 对 Stop 出错照常放行，但多输出一个字就可能被当成要拦，所以出错时一个字也不写。
 - 账本只读打开（不建表、不迁移），不导入投递引擎；冷启动实测约 0.13 秒（10 次中位，最大 0.13 秒；大头是导入命令行入口）。
 - 配置：`examples/antigravity-hooks.json`（只挂 Stop，timeout 10 秒）。command 换成你本机 sheepdog 的绝对路径（`which sheepdog`）；放进正式会话所在工作区的 `.agents/hooks.json`。这个文件会影响那个工作区里的所有对话，改它要你本人授权。
+
+### 名册会话也要交回执
+
+名册 managed 和总线新开的会话不交回执不会重投（只记一次「未回执」），但交回执之前会话一直算在做上一批（running），新消息排队，要等回执超时（`[session] receipt_timeout_minutes`，默认 20 分钟）才收得到下一批；你在「找主人」聊天里的回复除外，会插队送到。给会话的接口说明照这个写，分钟数取配置；批次末尾不再写「（可选）」。Codex / Claude 会话这一轮结束时没有回执就按未回执收尾，不等超时。
 
 ## 总线只做轻活：没有合适的会话就新开
 

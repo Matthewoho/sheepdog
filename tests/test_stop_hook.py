@@ -31,15 +31,43 @@ from test_roster import FIXTURES, ME, REPO
 BUS_CID = "8fb0aeb2-0000-4000-8000-00000000bus0"
 ALPHA_CID = "8fb0aeb2-0000-4000-8000-0000000alpha"
 BATCH = "b20261014071200"
+# 会话记录目录：HookBase.setUp 指到临时目录（入参里的 transcriptPath 指向这里）
+BRAIN = [Path("/home/test/.gemini/antigravity/brain")]
+
+
+def transcript(cid: str) -> Path:
+    return BRAIN[0] / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+
+
+def step(i: int, source: str, kind: str, content: str = "", at: str = "2026-10-13T23:12:00Z") -> dict:
+    """会话记录的一行，字段同实验室里的真实记录（step_index / source / type / status / created_at / content）。"""
+    return {"step_index": i, "source": source, "type": kind, "status": "DONE", "created_at": at, "content": content}
+
+
+def delivered(batch: str, i: int = 8) -> dict:
+    """agentapi send-message 送进去的批次：记成 SYSTEM_MESSAGE，正文里有批次开头那行。"""
+    return step(i, "SYSTEM", "SYSTEM_MESSAGE",
+                "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n<SYSTEM_MESSAGE>\n[Message] "
+                f"sender=system priority=MESSAGE_PRIORITY_HIGH content=[sheepdog] 新信号批次 `{batch}`（topic `tp_bus`，共 1 条）"
+                "\n</SYSTEM_MESSAGE>")
+
+
+def record(cid: str, *rows: dict) -> Path:
+    p = transcript(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return p
 
 
 def stop_input(cid: str = BUS_CID, fully_idle=True, execution_num: int = 0) -> str:
     """Stop 入参：字段、顺序、取值同实验室里 Antigravity 原样给的（10-14 07:08–07:17，E0 / E3 / E6），路径换成合成的。"""
-    brain = f"/home/test/.gemini/antigravity/brain/{cid}"
+    brain = f"{BRAIN[0]}/{cid}"
     return json.dumps({"artifactDirectoryPath": brain, "conversationId": cid, "error": "",
                        "executionNum": execution_num, "fullyIdle": fully_idle, "modelName": "gemini-3.8-flash-tiered",
                        "terminationReason": "NO_TOOL_CALL",
-                       "transcriptPath": f"{brain}/.system_generated/logs/transcript_full.jsonl",
+                       "transcriptPath": str(transcript(cid)),
                        "workspacePaths": ["/home/test/Code/sheepdog-hooklab"]})
 
 
@@ -66,6 +94,11 @@ class HookBase(unittest.TestCase):
         finally:
             store.close()
         self.now = datetime(2026, 10, 14, 7, 20).astimezone()
+        BRAIN[0] = self.dir / "brain"
+        # 总线的会话记录：第 0 步开场（USER_EXPLICIT），之后 sheepdog 送进去这一批，会话干了几步
+        record(BUS_CID, step(0, "USER_EXPLICIT", "USER_INPUT", "<USER_REQUEST>[sheepdog] 总线开场</USER_REQUEST>"),
+               step(7, "MODEL", "PLANNER_RESPONSE", "好的"), delivered(BATCH),
+               step(9, "MODEL", "GENERIC", "ran sheepdog inbox"), step(10, "MODEL", "PLANNER_RESPONSE", "处理完了"))
 
     def edit(self, sql: str, *args) -> None:
         """改测试账本（相当于 sheepdog 常驻进程那边写的）。"""
@@ -109,6 +142,7 @@ class BlockTest(HookBase):
                 self.edit("UPDATE topics SET kind=?, state='running', pending_batch_id=? WHERE topic_id='tp_alpha'", kind, b)
                 self.edit("INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
                           b, "tp_alpha", "[]", "2026-10-14T07:15:00+08:00", "sent")
+                record(ALPHA_CID, delivered(b))
                 d = self.check(stop_input(ALPHA_CID))
                 self.assertIn(f"batch={b}", d["reason"])
                 self.assertIn("--topic tp_alpha", d["reason"])
@@ -140,6 +174,7 @@ class BlockTest(HookBase):
         self.edit("UPDATE topics SET pending_batch_id=? WHERE topic_id='tp_bus'", nb)
         self.edit("INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
                   nb, "tp_bus", "[]", "2026-10-14T07:30:00+08:00", "sent")
+        record(BUS_CID, delivered(nb, 20))
         self.assertIn("n=1", self.check()["reason"])                   # 换了批次从头算
         self.assertEqual(json.loads(hook.count_path(self.cfg, "tp_bus").read_text()), {"batch": nb, "count": 1})
 
@@ -248,6 +283,89 @@ class PassTest(HookBase):
         self.edit("INSERT INTO duty_cards(topic_id, run_state, human_at) VALUES('tp_bus', 'working', ?)",
                   self.now.isoformat())
         self.assertEqual(json.loads(self.run_main()[1])["decision"], "continue")
+
+
+class TranscriptTest(HookBase):
+    """7.38 第 6 条：读入参的 transcriptPath。这一批送达以后主人亲自在会话里打过字（USER_INPUT、USER_EXPLICIT）不拦；
+    末尾那一段里找不到这一批也不拦。"""
+
+    def blocks(self) -> bool:
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0)
+        return bool(out) and json.loads(out)["decision"] == "continue"
+
+    def test_owner_typed_after_batch(self):
+        record(BUS_CID, step(11, "USER_EXPLICIT", "USER_INPUT", "<USER_REQUEST>先停一下，我看看</USER_REQUEST>"),
+               step(12, "MODEL", "PLANNER_RESPONSE", "好的"))
+        self.assertFalse(self.blocks())
+        self.assertFalse(hook.count_path(self.cfg, "tp_bus").exists())
+
+    def test_opening_step0_is_before_batch_and_does_not_count(self):
+        self.assertTrue(self.blocks())                                  # setUp 里第 0 步是 USER_EXPLICIT，在批次之前
+
+    def test_owner_typed_only_before_batch(self):
+        p = transcript(BUS_CID)
+        p.unlink()
+        record(BUS_CID, step(0, "USER_EXPLICIT", "USER_INPUT", "开场"), step(3, "USER_EXPLICIT", "USER_INPUT", "早先的话"),
+               delivered(BATCH), step(9, "MODEL", "PLANNER_RESPONSE", "完"))
+        self.assertTrue(self.blocks())
+
+    def test_sdk_and_system_inputs_do_not_count(self):
+        # hook 插的 userMessage 记成 SYSTEM_SDK 来源的 USER_INPUT（E2）；agentapi 送的是 SYSTEM_MESSAGE；都不是主人亲自打字
+        record(BUS_CID, step(11, "SYSTEM_SDK", "USER_INPUT", "<USER_REQUEST>插话</USER_REQUEST>"),
+               step(12, "SYSTEM", "SYSTEM_MESSAGE", "Stop hook blocked termination: 先交回执"),
+               step(13, "MODEL", "PLANNER_RESPONSE", "USER_EXPLICIT 这个词出现在回答里不算"))
+        self.assertTrue(self.blocks())
+
+    def test_batch_not_in_transcript(self):
+        p = transcript(BUS_CID)
+        p.unlink()
+        record(BUS_CID, step(0, "USER_EXPLICIT", "USER_INPUT", "开场"),
+               delivered(BATCH + "-2"),                                 # 别的批次号以它开头：不算
+               step(9, "MODEL", "PLANNER_RESPONSE", f"我在跑 sheepdog receipt --batch {BATCH}"))   # 不是送达那一行
+        self.assertFalse(self.blocks())
+
+    def test_transcript_missing_or_path_bad(self):
+        transcript(BUS_CID).unlink()
+        self.assertFalse(self.blocks())
+        for v in (None, "", 42, ["x"]):
+            with self.subTest(transcriptPath=v):
+                record(BUS_CID, delivered(BATCH))
+                raw = json.loads(stop_input())
+                raw["transcriptPath"] = v
+                self.assertEqual(self.run_main(json.dumps(raw)), (0, ""))
+        raw = json.loads(stop_input())
+        raw["transcriptPath"] = str(self.dir)                           # 是个目录
+        self.assertEqual(self.run_main(json.dumps(raw)), (0, ""))
+
+    def test_only_reads_the_tail(self):
+        # 送达那一行被挤出末尾那一段：找不到 → 不拦；主人打字在末尾那一段里 → 照样认得出
+        filler = [step(100 + i, "MODEL", "GENERIC", "x" * 200) for i in range(40)]
+        record(BUS_CID, *filler)
+        with mock.patch.object(hook, "TRANSCRIPT_TAIL_BYTES", 4096):
+            self.assertFalse(self.blocks())
+            record(BUS_CID, delivered(BATCH, 200), *filler[:5])
+            self.assertTrue(self.blocks())
+            record(BUS_CID, step(300, "USER_EXPLICIT", "USER_INPUT", "我来"))
+            self.assertFalse(self.blocks())
+
+    def test_partial_last_line_and_garbage_lines(self):
+        p = transcript(BUS_CID)
+        with p.open("a", encoding="utf-8") as f:
+            f.write("not json\n{\"type\": \"USER_INPUT\", \"source\": \"USER_EXPLICIT\"")   # 最后一行还没写完
+        self.assertTrue(self.blocks())
+
+    def test_real_lab_shape(self):
+        """实验室真实记录的样子（4031437e 那个会话）：第 0 步 USER_EXPLICIT 开场、第 3 步 SYSTEM_SDK 插话，没有主人亲自打字。"""
+        p = transcript(BUS_CID)
+        p.unlink()
+        record(BUS_CID, step(0, "USER_EXPLICIT", "USER_INPUT", "<USER_REQUEST>依次运行 echo</USER_REQUEST>"),
+               {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "created_at": "2026-10-13T23:11:44Z", "tool_calls": [{"name": "run_command"}]},
+               delivered(BATCH, 2),
+               step(3, "SYSTEM_SDK", "USER_INPUT", "<USER_REQUEST>（实验插话）主人问：现在几点？</USER_REQUEST>"),
+               step(8, "MODEL", "PLANNER_RESPONSE", "现在是 07:11"))
+        self.assertTrue(self.blocks())
 
 
 class ErrorPathTest(HookBase):

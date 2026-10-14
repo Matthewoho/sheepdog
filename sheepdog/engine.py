@@ -60,6 +60,8 @@ OWNER_VERIFIED_TAG = "owner_verified"
 OWNER_CONTEXT = "owner_context"
 # 主人在「找主人」聊天里的回复（_owner_reply）。会话在跑上一批时不排队，当轮单独发一批「主人插话」（7.37 第 4 件）
 OWNER_REPLY = "owner_reply"
+# 主人的回复认不出回答哪条时，给总线的那条系统消息（未结列表 / 认不出来源）；正文里写着那条回复的编号
+ESCALATION_LIST = "escalation_list"
 # 主人插话批次：批次号前缀（b 普通 / o onboarding / h 读前任 / r 退休通知）和发完后 dispatches 里的终态。
 # 不要回执、不改会话状态、不参与回执超时；消息直接记成已回执（acked），不会再当待推消息送一遍、也不会随超时退回重投
 PRIORITY_PREFIX = "p"
@@ -970,7 +972,7 @@ class Collector:
                 q = self.store.get_message(m.reply_to)
                 quoted = " ".join((q["content"] or "").split())[:200] if q is not None else "（原文不在账本里）"
                 self.store.add_system_message(
-                    BUS_TOPIC_ID, "escalation_list",
+                    BUS_TOPIC_ID, ESCALATION_LIST,
                     f"主人引用回复了一条认不出来源的消息（message_id `{m.reply_to}`）：{quoted}\n"
                     f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
                     + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。",
@@ -992,7 +994,7 @@ class Collector:
                   for e in opens] or ["- （无）"]
         lines.append(with_cli("判断它回答的是哪一条后，用 `sheepdog forward --topic <topic> --message-ids " + m.message_id
                               + "` 转交。", self.cfg.cli_command))
-        self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "\n".join(lines))
+        self.store.add_system_message(BUS_TOPIC_ID, ESCALATION_LIST, "\n".join(lines))
         log.info("主人的回复 %s 无法确定回答哪条（未结 %d 条），投总线", m.message_id, len(opens))
         return d
 
@@ -1101,7 +1103,7 @@ class Collector:
             else:
                 where = f"开头那条查不到（{err}）" if err else "开头那条查不到"
             self.store.add_system_message(
-                BUS_TOPIC_ID, "escalation_list",
+                BUS_TOPIC_ID, ESCALATION_LIST,
                 f"主人在一个认不出来源的话题里回复了（话题 `{m.thread_id}`）。{where}\n"
                 f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
                 + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。",
@@ -1880,7 +1882,7 @@ class Dispatcher:
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
-            if t["state"] == sm.RUNNING and (urgent := [r for r in rows if r["reason"] == OWNER_REPLY]):
+            if t["state"] == sm.RUNNING and (urgent := self._priority_rows(rows)):
                 # 7.37 第 4 件：会话在跑上一批，主人的回复不等那批回执，当轮单独送到；其余信号照旧排队
                 return self._dispatch_priority(t, urgent, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
@@ -1942,7 +1944,7 @@ class Dispatcher:
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
-                                  waiting, receipt_optional=adopted, roster_update=roster_update,
+                                  waiting, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
@@ -1973,6 +1975,17 @@ class Dispatcher:
         return res
 
     # ---------- 主人插话（7.37 第 4 件） ----------
+    @staticmethod
+    def _priority_rows(rows) -> list:
+        """插队的消息：主人在找主人聊天里的回复，加上引用了这些回复编号的 escalation_list 系统消息（回复认不出回答哪条时
+        给总线的未结列表 / 认不出来源的说明，7.38 第 5 条），保持原来的先后。没有主人回复就是空表。"""
+        ids = [r["message_id"] for r in rows if r["reason"] == OWNER_REPLY]
+        if not ids:
+            return []
+        marks = [f"`{i}`" for i in ids]
+        return [r for r in rows if r["reason"] == OWNER_REPLY
+                or (r["reason"] == ESCALATION_LIST and any(m in (r["content"] or "") for m in marks))]
+
     def _priority_blocked(self, t) -> str:
         """会话在跑上一批（running）时，主人插话为什么不能插队（照旧排队）；能插队返回空串。
 

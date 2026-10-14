@@ -7,6 +7,7 @@
 约束（7.34 实测带来的改动）：
 - 只在确定要拦时输出；任何异常（入参不是 JSON、配置坏了、账本打不开、计数文件写不了……）都兜成不输出。
 - 只在 fullyIdle 为 true 时检查：后台任务没跑完时 Stop 也会触发（E6）。
+- 主人亲自在会话里打过字（会话记录里这一批之后有 USER_EXPLICIT 的输入）不拦；只读记录末尾 2MB（7.38 第 6 条）。
 - 账本只读打开（sqlite mode=ro：不建表、不迁移、不写一个字节）；这一批拦过几次记在状态目录下的小文件里。
 - 不导入 engine / store / cli 之外的重模块：每一轮结束都跑这条路径，要快。
 """
@@ -40,6 +41,10 @@ DEFAULT_STOP_REASON = (
     "交完回执再结束。")
 # 连账本时最多等几秒（WAL 下读不被写挡，这只是兜底）
 DB_TIMEOUT_SECONDS = 1.0
+# 会话记录只读末尾这么多字节（总线的记录很大，不全读）
+TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
+# 批次送进会话的那一行：agentapi send-message 记成 SYSTEM_MESSAGE；新建会话的开场是第 0 步 USER_INPUT
+DELIVERY_TYPES = ("SYSTEM_MESSAGE", "USER_INPUT")
 
 
 def _parse(ts: str) -> datetime | None:
@@ -88,6 +93,42 @@ def _write_count(p: Path, batch_id: str, count: int) -> None:
         raise
 
 
+def _json_line(line: bytes):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TAIL_BYTES) -> bool | None:
+    """读会话记录末尾 tail 字节：这一批送达以后，主人有没有亲自在会话里打过字（type USER_INPUT、source USER_EXPLICIT；
+    agentapi 送进去的是 SYSTEM_MESSAGE，hook 插的是 SYSTEM_SDK 来源的 USER_INPUT，都不算）。
+
+    返回 True：打过；False：没打过；None：末尾这一段里找不到这一批送达的那一行（找不到就不拦）。
+    「送达的那一行」= 末尾这一段里第一条带 `批次号`（反引号括起来，sheepdog 的批次开头都这么写）的 SYSTEM_MESSAGE /
+    USER_INPUT。读不了就抛错（调用方兜成不拦）。"""
+    with path.open("rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        start = max(0, size - tail)
+        f.seek(start)
+        data = f.read(size - start)
+    lines = data.split(b"\n")
+    if start > 0:
+        lines = lines[1:]  # 第一行是从中间截开的
+    needle = f"`{batch_id}`".encode()
+    found = False
+    for line in lines:
+        if not found:
+            if needle in line and (d := _json_line(line)) is not None and d.get("type") in DELIVERY_TYPES:
+                found = True
+            continue
+        if b"USER_EXPLICIT" in line and (d := _json_line(line)) is not None \
+                and d.get("type") == "USER_INPUT" and d.get("source") == "USER_EXPLICIT":
+            return True
+    return False if found else None
+
+
 def _target(conn: sqlite3.Connection, conversation_id: str):
     """conversationId 对应的、牧羊犬在投递的 Antigravity 会话（总线、名册 managed、总线新开的）；对不上或对上不止一个：None。"""
     rows = conn.execute(
@@ -112,8 +153,9 @@ def _occupied(card, cfg: Config, now: datetime) -> bool:
 def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None) -> dict | None:
     """要拦就返回要写到 stdout 的 dict，不拦返回 None。出错一律当不拦（异常向外抛，由 stop_main 兜住）。
 
-    拦的条件（全部满足，7.37）：conversationId 是牧羊犬管的 Antigravity 会话；fullyIdle 为 true；会话 running、手上那批的
-    回执文件不在、账本里那批还是 sent（没收到回执）；这一批拦过的次数 < STOP_MAX_BLOCKS；会话没被主人占着。"""
+    拦的条件（全部满足，7.37 / 7.38 第 6 条）：conversationId 是牧羊犬管的 Antigravity 会话；fullyIdle 为 true；会话 running、
+    手上那批的回执文件不在、账本里那批还是 sent（没收到回执）；这一批拦过的次数 < STOP_MAX_BLOCKS；会话没被主人占着（羊群
+    看板的口径）；入参 transcriptPath 末尾找得到这一批，且送达以后主人没有亲自在会话里打过字。"""
     data = json.loads(raw)
     if not isinstance(data, dict) or data.get("fullyIdle") is not True:
         return None
@@ -140,6 +182,13 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None)
             return None
     finally:
         conn.close()
+    # 被主人占着的另一个口径（正式配置 human_attach_minutes = 0，上面那条永远不成立）：读会话记录，这一批送达以后主人亲自
+    # 打过字就不拦；末尾找不到这一批（记录不在、太长、送达那行早被挤出末尾这一段）也不拦
+    tp = data.get("transcriptPath")
+    if not isinstance(tp, str) or not tp.strip():
+        return None
+    if owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES) is not False:
+        return None
     p = count_path(cfg, tid)
     n = _blocked_count(p, batch) + 1
     if n > STOP_MAX_BLOCKS:

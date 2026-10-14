@@ -150,8 +150,19 @@ def with_cli(text: str, cli: str) -> str:
 
 
 # ---------- sheepdog 接口说明（软件接口文档，由代码生成） ----------
+def managed_receipt_line(cli_host: bool, receipt_timeout: int) -> str:
+    """名册 managed / 总线新开的会话不交回执会怎样（7.38 第 7 条，和 _check_receipt / _finish_run 的行为一致）：
+    不重投，只记一次「未回执」；但 Antigravity 会话在交回执或回执超时之前一直算在做上一批，新消息排队（主人在找主人
+    聊天里的回复除外，会插队送到）；命令行会话这一轮结束就按没交回执处理。"""
+    if cli_host:
+        return "要交回执：这一轮结束时没有回执，记一次「未回执」，不重投。"
+    return (f"要交回执：不交不会重投（只记一次「未回执」），但交回执之前这个会话一直算在做上一批，要等回执超时"
+            f"（约 {receipt_timeout} 分钟）才收得到下一批（主人在找主人聊天里的回复除外，会插队送到）。")
+
+
 def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: int, extra: list[str] = (),
-                      cli_host: bool = False, cli: str = "sheepdog", identity: bool = False) -> str:
+                      cli_host: bool = False, cli: str = "sheepdog", identity: bool = False,
+                      receipt_timeout: int = 20) -> str:
     lines = [
         "## sheepdog 接口说明",
         "### 回执",
@@ -161,7 +172,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         RECEIPT_SCHEMA_HINT,
         "```",
         *(["例如：", f"```{RECEIPT_FENCE}", '{"status": "handled", "summary": "..."}', "```"] if cli_host else []),
-        ("没有提交回执会被判定为处理失败并重投。" if bus else "回执可选：没回执不会重投，只记一次「未回执」。"),
+        ("没有提交回执会被判定为处理失败并重投。" if bus else managed_receipt_line(cli_host, receipt_timeout)),
         "anchors 会存进会话记录；`project:` 开头的条目在 `sheepdog sessions` 里显示为关联项目。",
         "### 等别人回复",
         f"`sheepdog watch --topic {topic_id} --person <对方 open_id> [--chat <chat_id>] [--note \"在等什么\"]`："
@@ -265,7 +276,8 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
         pb.render("bus.md", roster=roster_table(roster, dynamic), **v),
         pb.render("common.md", **v),
         overlay,
-        interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity),
+        interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity,
+                          receipt_timeout=pb.receipt_timeout),
         "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -288,7 +300,8 @@ def standing_rules_bus(pb: Playbook, plain_title: str, roster_text: str, overlay
     v = dict(session_title=plain_title, topic_id="tp_bus")
     return _join(pb.render("security.md", **v), pb.render("bus.md", roster=roster_text, **v),
                  pb.render("common.md", **v), overlay,
-                 interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity))
+                 interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity,
+                                   receipt_timeout=pb.receipt_timeout))
 
 
 def _cli_host_rules(pb: Playbook, s: RosterSession) -> str:
@@ -305,7 +318,7 @@ def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], ex
     return _join(pb.render("security.md", **v), _onboarding_body(pb, s), pb.render("common.md", **v),
                  _cli_host_rules(pb, s),
                  interface_section(s.topic_id, bus=False, remind=remind, expire=expire, cli_host=s.is_cli_host,
-                                   cli=pb.cli, identity=pb.identity))
+                                   cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout))
 
 
 def rules_update_message(rules: str, note: str = "") -> str:
@@ -346,7 +359,7 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
         _cli_host_rules(pb, s),
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=confirm, cli_host=s.is_cli_host,
-                          cli=pb.cli, identity=pb.identity),
+                          cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout),
     )
 
 
@@ -374,7 +387,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
         _cli_host_rules(pb, s),
         owner_quote_section(*owner_quote) if owner_quote else "",
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host,
-                          cli=pb.cli, identity=pb.identity),
+                          cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout),
         "" if s.predecessor_conversation_id else "现在只需回复「已就绪」，等待第一批信号。",
     )
 
@@ -512,7 +525,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
 
 
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
-                 session_title: str, waiting_note: str = "", receipt_optional: bool = False,
+                 session_title: str, waiting_note: str = "",
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
                  cli_host: bool = False, rules_note: str = "", reminder: str = "", notes: dict | None = None,
@@ -549,7 +562,7 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     if context_only:
         parts += ["", "这批只有主人本人的发言，作为背景，不需要回执。"]
     else:
-        tail = "处理完成后提交回执" + ("（可选）" if receipt_optional else "")
+        tail = "处理完成后提交回执"
         if cli_host:
             # 命令行宿主会话只给回执块这一种写法（写不了状态目录，回执命令注定失败；7.18 第三层实测）
             parts += ["", f"{tail}：在这一轮回答的最末尾附 ```{RECEIPT_FENCE} 回执块（内容同 receipt --json 的 JSON）。"

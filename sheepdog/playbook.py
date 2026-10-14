@@ -63,6 +63,8 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
 # 可选，不在 PLAYBOOK_FILES 里（缺了不算缺），doctor 单独列出哪些会话有
 REMINDERS_DIR = "reminders"
+# 同 config.SessionConfig.receipt_timeout_minutes 的默认值（测试核对）
+DEFAULT_RECEIPT_TIMEOUT = 20
 
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 # <!-- ... --> 是写给维护者看的注释（比如某个数字来自哪个版本），渲染时去掉，不发给会话和主人
@@ -83,6 +85,8 @@ class Playbook:
             "reply_suffix": cfg.session.reply_suffix or "",
             "watch_remind_minutes": "/".join(str(m) for m in w.remind_minutes),
             "watch_expire_minutes": str(w.expire_minutes),
+            # 回执超时（分钟）：接口说明里「不交回执要等多久才收得到下一批」用它（7.38 第 7 条）
+            "receipt_timeout_minutes": str(cfg.session.receipt_timeout_minutes),
             # 会话在终端里敲的 sheepdog 命令（cli_name，已加好 shell 引号）；playbook 里写 {{cli}}
             "cli": cfg.cli_command,
             # 7.26：只在开着时有这个键，关着时占位符和以前完全一样
@@ -93,6 +97,14 @@ class Playbook:
     def identity(self) -> bool:
         """[identity] 开着（7.26）：接口说明里代回那一条补一句「sheepdog 自动选身份」。关着时 base_vars 里没有这个键。"""
         return self.base_vars.get("identity_enabled") == "1"
+
+    @property
+    def receipt_timeout(self) -> int:
+        """回执超时分钟数（[session] receipt_timeout_minutes）；没给配置时用默认值 20。"""
+        try:
+            return int(self.base_vars.get("receipt_timeout_minutes") or DEFAULT_RECEIPT_TIMEOUT)
+        except ValueError:
+            return DEFAULT_RECEIPT_TIMEOUT
 
     @property
     def cli(self) -> str:

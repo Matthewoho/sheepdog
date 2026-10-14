@@ -22,6 +22,8 @@ from sheepdog.sink import SinkError
 
 from test_roster import ME, REPO, later, owner_says
 from test_threads import ESC_CHAT, ThreadsBase, now8
+from sheepdog.engine import Collector
+from sheepdog.source.lark import parse_message
 
 ALPHA_P2P = "oc_test_alpha_p2p"
 ALPHA_CID = "conv_test_alpha"
@@ -338,3 +340,77 @@ class PriorityPromptTest(PriorityBase):
         for text in (ex, de):
             self.assertIn("周五发", text)
             self.assertIn("[sheepdog] 主人插话批次 `p1`（topic `tp_alpha`，共 1 条）", text)
+
+
+class EscalationListJumpsTest(ThreadsBase):
+    """7.38 第 5 条：主人的回复认不出回答哪条时给总线的那条 escalation_list 系统消息（正文引用了这条回复的编号），
+    跟插话批次一起插队；不引用它的 escalation_list 和别的信号照旧排队。"""
+
+    def setUp(self):
+        super().setUp()
+        stranger = self.lark.add(chat_id="oc_test_stranger", sender_id="ou_test_bob", content="陌生人的私聊")
+        self.pull(stranger)
+        self.d.dispatch_once()
+        self.bus = self.store.get_topic(BUS_TOPIC_ID)
+        self.assertEqual(self.bus["state"], sm.RUNNING)
+        self.cid = self.bus["conversation_id"]
+
+    def system_rows(self, mid: str) -> list:
+        return [r for r in self.store.conn.execute(
+            "SELECT * FROM messages WHERE reason='escalation_list' AND content LIKE ?", (f"%`{mid}`%",)).fetchall()]
+
+    def test_unreferenced_reply_list_goes_along(self):
+        other = self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "主人的回复 `om_test_other` 没有引用具体问题")
+        late = self.lark.add(chat_id="oc_test_stranger", sender_id="ou_test_bob", content="陌生人追问")
+        self.pull(late)
+        mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="今天先别发版")
+        self.pull(mid)
+        (sysrow,) = self.system_rows(mid)
+        n = len(self.sink.to(self.cid))
+        res = self.d.dispatch_once()
+        (text,) = self.sink.to(self.cid)[n:]
+        pb = res["topics"][BUS_TOPIC_ID]["priority"]
+        self.assertIn("今天先别发版", text)
+        self.assertIn(f"主人的回复 `{mid}` 没有引用具体问题", text)
+        self.assertIn("共 2 条", text)
+        self.assertLess(text.index("今天先别发版"), text.index("没有引用具体问题"))     # 保持原来的先后
+        for r in (self.row(mid), self.row(sysrow["message_id"])):
+            self.assertEqual((r["dispatch_state"], r["batch_id"]), ("acked", pb))
+        # 不引用这条回复的 escalation_list、别的信号：照旧排队
+        self.assertNotIn("om_test_other", text)
+        self.assertNotIn("陌生人追问", text)
+        self.assertEqual(self.row(other)["dispatch_state"], "pending")
+        self.assertEqual(self.row(late)["dispatch_state"], "pending")
+        self.assertEqual(self.store.get_topic(BUS_TOPIC_ID)["pending_batch_id"], self.bus["pending_batch_id"])
+        # 原来那批交回执后，下一批里没有这两条
+        self.ack(BUS_TOPIC_ID)
+        n = len(self.sink.to(self.cid))
+        self.d.dispatch_once()
+        after = "\n".join(self.sink.to(self.cid)[n:])
+        self.assertIn("陌生人追问", after)
+        self.assertIn("om_test_other", after)
+        self.assertNotIn("今天先别发版", after)
+        self.assertNotIn(f"`{mid}`", after)
+
+    def test_unrecognized_quote_note_goes_along(self):
+        from dataclasses import replace
+        mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="这个不行")
+        m = replace(parse_message(self.lark.raw(mid)), reply_to="om_test_unknown_quoted")
+        Collector(self.cfg, self.store, self.source, self.roster).ingest([m])
+        self.assertEqual((self.row(mid)["topic_id"], self.row(mid)["reason"]), (BUS_TOPIC_ID, "owner_reply"))
+        (sysrow,) = self.system_rows(mid)
+        self.assertIn("认不出来源", sysrow["content"])
+        n = len(self.sink.to(self.cid))
+        self.d.dispatch_once()
+        (text,) = self.sink.to(self.cid)[n:]
+        self.assertIn("这个不行", text)
+        self.assertIn("认不出来源的消息（message_id `om_test_unknown_quoted`）", text)
+        self.assertEqual(self.row(sysrow["message_id"])["dispatch_state"], "acked")
+
+    def test_list_alone_does_not_jump(self):
+        # 只有 escalation_list、没有主人回复（比如回复已经随别的批次走了）：不插队
+        sid = self.store.add_system_message(BUS_TOPIC_ID, "escalation_list", "主人的回复 `om_test_x` 没有引用具体问题")
+        n = len(self.sink.to(self.cid))
+        self.d.dispatch_once()
+        self.assertEqual(len(self.sink.to(self.cid)), n)
+        self.assertEqual(self.row(sid)["dispatch_state"], "pending")
