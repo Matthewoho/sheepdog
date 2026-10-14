@@ -19,17 +19,20 @@ from sheepdog import cli, hook, pending as pend
 from sheepdog.config import ConfigError, load_config
 from sheepdog.engine import BUS_TOPIC_ID, PRIORITY_PREFIX, Collector
 
+from sheepdog.source.lark import parse_message
+
 from test_owner_priority import PriorityBase
 from test_pending import PendingBase, at
 from test_roster import ME
 from test_stop_hook import HookBase, stop_input
-from test_threads import ESC_CHAT, _opt
+from test_threads import ALICE, ESC_CHAT, _opt
 
 
-def reload_into(base, extra: str) -> None:
-    """改配置文件，再走一遍常驻进程每轮的重读（cli._reload_config），不重建 Collector / Dispatcher。"""
+def reload_into(base, extra: str, col: Collector | None = None) -> None:
+    """改配置文件，再走一遍常驻进程每轮的重读（cli._reload_config），不重建 Collector / Dispatcher。
+    col 给了就是常驻进程手上那个 Collector（重读后它的 cfg 跟着换）；不给就临时建一个。"""
     base.cfg_file.write_text(base.cfg_base + extra, encoding="utf-8")
-    col = Collector(base.cfg, base.store, base.source, base.roster)
+    col = col or Collector(base.cfg, base.store, base.source, base.roster)
     env = {"SHEEPDOG_CONFIG": str(base.cfg_file), "SHEEPDOG_STATE_DIR": base.tmp.name}
     with mock.patch.dict(os.environ, env):
         new = cli._reload_config(base.d.cfg, SimpleNamespace(dry_run=False), base.store, base.source, col, base.d)
@@ -81,6 +84,46 @@ class FollowupSwitchTest(PendingBase):
         self.assertEqual(self.system_msgs("escalation_check", BUS_TOPIC_ID), [])
         self.assertIsNone(self.store.get_escalation(q)["possibly_handled_at"])
 
+    def group_thread_reply(self) -> tuple[str, str]:
+        """群里的来源消息（进账本时还没有话题），ask --about 它；主人后来在它下面开话题回复。返回 (来源, 主人那条)。"""
+        src = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ALICE, content="群里：周五能上线吗？",
+                            chat_type="group", at=at(-10))
+        self.pull(src)
+        self.asked("--about", src)
+        m = self.lark.add(chat_id="oc_test_alpha_grp", sender_id=ME, content="话题里：下周一", thread_root=src, at=at(2))
+        return src, m
+
+    def mgets(self) -> list:
+        return [c for c in self.lark.calls if c[1] == "+messages-mget"]
+
+    def test_on_source_thread_learned_by_mget(self):
+        src, m = self.group_thread_reply()
+        self.pull(m)
+        self.assertEqual([_opt(c, "--message-ids") for c in self.mgets()], [src])
+
+    def test_off_no_mget_for_source_thread(self):
+        # 跟进关掉：不判可能已处理，也就不为认「在来源消息的话题里说的」去 mget
+        self.cfg.escalation.followup = False
+        src, m = self.group_thread_reply()
+        self.pull(m)
+        self.assertEqual(self.mgets(), [])
+        self.assertFalse(self.row(src)["thread_id"])
+
+    def test_hot_reload_turns_it_off_and_on_without_restart(self):
+        # 常驻进程每轮的重读：Dispatcher 不重建，改配置文件下一轮就生效
+        base = self.cfg_file.read_text(encoding="utf-8")
+        self.cfg_base = ""
+        reload_into(self, base.replace("[owner_context]", "followup = false\n[owner_context]"))
+        self.assertFalse(self.d.cfg.escalation.followup)
+        q = self.scene()
+        self.deliver()
+        self.assertIsNone(self.store.get_escalation(q)["possibly_handled_at"])
+        reload_into(self, base)
+        self.assertTrue(self.d.cfg.escalation.followup)
+        text = self.deliver()
+        self.assertTrue(self.store.get_escalation(q)["possibly_handled_at"])
+        self.assertIn("🔎 你的「需要你定」可能已经处理了", text)
+
 
 class OwnerShortcutSwitchTest(PendingBase):
     def daiban(self) -> str:
@@ -99,6 +142,23 @@ class OwnerShortcutSwitchTest(PendingBase):
         r = self.row(mid)
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", BUS_TOPIC_ID))
         self.assertEqual(self.lark.sent("+messages-reply"), [])
+
+    def test_hot_reload_reaches_the_resident_collector(self):
+        # 常驻进程手上那个 Collector 不重建：重读配置后它的 cfg 跟着换，「待办」拦不拦下一轮就变
+        col = Collector(self.cfg, self.store, self.source, self.roster)
+        base = self.cfg_file.read_text(encoding="utf-8")
+        self.cfg_base = ""
+
+        def daiban(i: int) -> str:
+            mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="待办", at=at(i))
+            col.ingest([parse_message(self.lark.raw(mid))])
+            return mid
+
+        reload_into(self, base.replace("[owner_context]", "owner_shortcut = false\n[owner_context]"), col)
+        self.assertIs(col.cfg, self.d.cfg)
+        self.assertEqual(self.row(daiban(5))["reason"], "owner_reply")
+        reload_into(self, base, col)
+        self.assertEqual(self.row(daiban(6))["reason"], "pending_query")
 
 
 class OwnerPrioritySwitchTest(PriorityBase):
