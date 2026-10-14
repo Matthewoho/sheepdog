@@ -59,6 +59,16 @@ class PendingBase(ThreadsBase):
         self.last_out = out
         return mid
 
+    def ask_earlier(self, *mids: str, minutes: int = 2) -> None:
+        """把提问时间往前挪几分钟。假飞书的时间只到分钟、结案 / 答复时间到秒：刚好跨分钟的第一秒里两者会相等，
+        「晚于提问」判不出来（10-14 连跑 75 秒复现过 22 次）。"""
+        for mid in mids:
+            e = self.store.get_escalation(mid)
+            t = datetime.fromisoformat(e["asked_at"]) - timedelta(minutes=minutes)
+            self.store.conn.execute("UPDATE escalations SET asked_at=? WHERE message_id=?",
+                                    (t.isoformat(timespec="seconds"), mid))
+        self.store.conn.commit()
+
     def owner_says(self, text: str, chat: str = ALPHA_P2P, minutes: float = 2) -> str:
         mid = self.lark.add(chat_id=chat, sender_id=ME, content=text, at=at(minutes))
         self.pull(mid)
@@ -435,6 +445,7 @@ class SourcesTest(PendingBase):
         q2 = self.asked("--about", a, topic=BUS_TOPIC_ID, title="Felix 接码（总线）")
         self.assertIn("已经在问", self.last_out)          # 重复提问：照发、提示
         self.assertIn("tp_alpha", self.last_out)
+        self.ask_earlier(q1, q2)
         # 主人引用回复 tp_alpha 那条
         ans = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="接好了", at=at(3))
         self.lark.msgs[ans]["thread_root"] = ""
@@ -455,6 +466,7 @@ class SourcesTest(PendingBase):
         a = self.alice_batch()
         q1 = self.asked("--about", a)
         q2 = self.asked("--about", a, topic=BUS_TOPIC_ID, title="同一件事")
+        self.ask_earlier(q1, q2)
         self.resolve("--message-id", q1, "--why", "主人在私聊里定了")
         with later(2):
             self.d.dispatch_once()
@@ -466,6 +478,7 @@ class SourcesTest(PendingBase):
         self.alice_batch()
         q1 = self.asked(title="第一件", text="A？")
         q2 = self.asked(title="第二件", text="B？")
+        self.ask_earlier(q1, q2)
         self.resolve("--message-id", q1, "--why", "办完了")
         with later(2):
             self.d.dispatch_once()
