@@ -10,6 +10,7 @@ from sheepdog import outbound, pending as pend
 from sheepdog.engine import PRIORITY_PREFIX, write_receipt
 
 from test_owner_priority import ALPHA_P2P, PriorityBase
+from test_roster import Base, msg
 from test_threads import _opt
 
 
@@ -40,3 +41,22 @@ class CurrentBatchSkipsPriorityTest(PriorityBase):
         self.d.dispatch_once()
         asked = (self.store.recent_dispatches("tp_alpha")[0]["sent_at"])
         self.assertEqual(pend.backfill_batch(self.store, "tp_alpha", asked), self.b1)
+
+
+class ChatLabelAfterMainMergeTest(Base):
+    """合入 main（7.41）后：第一期的提示文字（核实提醒「你几点在哪说过」、待办清单的来源聊天）里的群名也走 chat_label 的口径。"""
+
+    def add(self, mid: str, chat: str, name: str, at: str) -> None:
+        self.store.upsert_message(msg(message_id=mid, chat_id=chat, chat_name=name, create_time=at), "inbox", "group", [])
+
+    def test_group_name_from_an_earlier_message_when_the_latest_has_none(self):
+        # 机器人事件先到的那条群名是空的，且正好是最近一条：仍用账本里记过的群名
+        self.add("om_test_n1", "oc_test_named", "发布群", "2026-01-01T10:00:00+08:00")
+        self.add("om_test_n2", "oc_test_named", "", "2026-01-01T10:05:00+08:00")
+        self.assertEqual(pend.chat_label(self.cfg, self.store, "oc_test_named", "group", ""), "群「发布群」")
+
+    def test_group_name_never_known(self):
+        self.add("om_test_x1", "oc_test_noname", "", "2026-01-01T10:00:00+08:00")
+        self.assertEqual(pend.chat_label(self.cfg, self.store, "oc_test_noname", "group", ""),
+                         "群（名字没取到，oc_test_noname）")
+        self.assertEqual(pend.chat_label(self.cfg, self.store, "oc_test_noname"), "群（名字没取到，oc_test_noname）")

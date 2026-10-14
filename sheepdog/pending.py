@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 from . import duty
 from . import engine as eng
+from . import prompts
 from . import session as sm
 from .router import message_bodies
 from .store import SYSTEM_ID_PREFIX, Store, now_iso
@@ -392,7 +393,7 @@ def ask_body(text: str, limit: int = 60) -> str:
 def where(chat_type: str, chat_name: str, chat_id: str) -> str:
     if chat_type == "p2p":
         return f"私聊「{chat_name}」" if chat_name else "私聊"
-    return f"群「{chat_name or chat_id}」"
+    return prompts.chat_label(chat_type, chat_name, chat_id)   # 群「名字」；名字没取到写「群（名字没取到，oc_…）」（7.41）
 
 
 def session_label(store: Store, topic_id: str) -> str:
@@ -572,7 +573,8 @@ def chat_label(cfg, store: Store, chat_id: str, chat_type: str = "", chat_name: 
     r = store.conn.execute("SELECT chat_name, chat_type FROM messages WHERE chat_id=? ORDER BY last_seen DESC LIMIT 1",
                            (chat_id,)).fetchone()
     ctype = chat_type or (r["chat_type"] if r is not None else "") or ""
-    name = chat_name or (r["chat_name"] if r is not None else "") or ""
+    # 群名用账本里最近记过的非空的（7.41：机器人事件先到的那几条群名是空的，最近一条可能正好是它）
+    name = chat_name or (store.known_chat_name(chat_id) if ctype != "p2p" else "") or ""
     if ctype == "p2p":
         peer = store.conn.execute(
             "SELECT sender_name FROM messages WHERE chat_id=? AND sender_id != ? AND COALESCE(sender_name,'') != '' "
