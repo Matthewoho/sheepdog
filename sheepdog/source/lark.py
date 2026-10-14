@@ -204,6 +204,14 @@ class LarkCliSource:
         """机器人在哪些群（+chat-list --as bot，翻完所有页）。"""
         return self._chat_ids([], "bot")
 
+    def chat_name(self, chat_id: str, identity: str = "bot") -> str:
+        """群名（只读：lark-cli im chats get --chat-id，GET /open-apis/im/v1/chats/:chat_id，--help 标的 Risk: read，
+        user / bot 两个身份都支持，调用方要在群里）。只试一次、15 秒超时：机器人事件那条路补群名用（事件和 mget 都不带群名），
+        查不到由调用方兜底，不能挡住入账。"""
+        data = self._run_once(["im", "chats", "get", "--chat-id", chat_id], identity, timeout=15)
+        name = self._find(data, "name")
+        return name.strip() if isinstance(name, str) else ""
+
     def bot_open_id(self) -> str:
         """机器人自己的 open_id（bot/v3/info）。"""
         data = self._run(["api", "GET", "/open-apis/bot/v3/info"], "bot")

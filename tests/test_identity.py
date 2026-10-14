@@ -183,7 +183,7 @@ class DedupTest(IdentityBase):
         self.assertEqual(st["new"], 1)
         r = self.row(mid)
         self.assertEqual((r["received_by"], r["route"], r["reason"], r["topic_id"]), ("bot", DISPATCH, "keyword", "tp_alpha"))
-        # 事件先到：用 mget 取了一份，群名、序号、时间（只到分钟）和搜索一样
+        # 事件先到：用 mget 取了一份，序号、时间（只到分钟）和搜索一样；群名 mget 不带，账本里没有就用 im chats get 查（7.41）
         self.assertIn("+messages-mget", self.lark.subcommands())
         self.assertEqual(r["chat_name"], "测试私聊")
         self.assertTrue(r["message_position"])
@@ -202,7 +202,8 @@ class DedupTest(IdentityBase):
         self.lark.plan["+messages-mget"] = ["error", "error"]
         self.bot_hears(self.lark.event(mid, message_type="interactive", content=card_json))
         r = self.row(mid)
-        self.assertEqual((r["content"], r["chat_name"], r["received_by"]), (card_json, "", "bot"))
+        # mget 失败也照样补群名（7.41：im chats get 查到的）
+        self.assertEqual((r["content"], r["chat_name"], r["received_by"]), (card_json, "测试私聊", "bot"))
         self.d.dispatch_once()
         self.pull(mid)                          # 搜索的正文渲染不一样：换成它，不当编辑
         r2 = self.row(mid)
@@ -254,6 +255,114 @@ class DedupTest(IdentityBase):
         st = self.bot_hears(self.lark.event(mid))
         self.assertEqual(st, {"fetched": 0})
         self.assertIsNone(self.row(mid))
+
+
+# ======================= 7.41：机器人事件那条路补群名 =======================
+class ChatNameTest(IdentityBase):
+    """事件和 mget 都不带群名。入账前补：账本里同一个群记过的名字 → 向飞书只读查一次（im chats get，机器人身份，不行用主人
+    身份）并记下 → 都没有就留空，拼提示时写「群（名字没取到，oc_…）」。查失败不挡入账和投递。"""
+
+    NAME = "Alpha 测试群"
+
+    def setUp(self):
+        super().setUp()
+        self.lark.chat_names[GRP] = self.NAME
+
+    def chats_calls(self) -> list[list[str]]:
+        return [c for c in self.lark.calls if c[:3] == ["im", "chats", "get"]]
+
+    def test_bot_event_first_then_search_batch_has_chat_name(self):
+        """10-14 b20261014212006 的顺序：事件先到、先入账先投递，主人身份的搜索晚到。投出去的批次里要有群名。"""
+        mid = self.group_msg("周五发版吗 故障")
+        st = self.bot_hears(self.lark.event(mid))
+        self.assertEqual(st["new"], 1)
+        self.assertEqual(self.row(mid)["chat_name"], self.NAME)
+        text = self.deliver()                   # 搜索还没到，批次已经发出
+        self.assertIn(f"群「{self.NAME}」", text)
+        self.assertNotIn("群「」", text)
+        self.pull(mid)                          # 搜索晚到：合成一条 both，群名不变
+        r = self.row(mid)
+        self.assertEqual((r["received_by"], r["chat_name"]), ("both", self.NAME))
+
+    def test_name_from_ledger_without_lookup(self):
+        old = self.group_msg("早上好", at=now8() - timedelta(hours=2))
+        self.pull(old)                          # 主人身份早先搜到过这个群：账本里有群名
+        self.lark.calls.clear()
+        mid = self.group_msg("周五发版吗 故障")
+        self.bot_hears(self.lark.event(mid))
+        self.assertEqual(self.row(mid)["chat_name"], self.NAME)
+        self.assertEqual(self.chats_calls(), [])
+        self.assertIn(f"群「{self.NAME}」", self.deliver())
+
+    def test_name_looked_up_once_read_only_and_remembered(self):
+        mid = self.group_msg("周五发版吗 故障")
+        self.bot_hears(self.lark.event(mid))
+        calls = self.chats_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((_opt(calls[0], "--chat-id"), _opt(calls[0], "--as")), (GRP, "bot"))
+        self.assertEqual(self.row(mid)["chat_name"], self.NAME)
+        self.assertEqual(self.store.get_meta("chat_name:" + GRP), self.NAME)
+        # 同一个群再来一条（新的 Collector，内存清空）：不再查
+        mid2 = self.group_msg("还有一件事 故障")
+        self.bot_hears(self.lark.event(mid2))
+        self.assertEqual(len(self.chats_calls()), 1)
+        self.assertEqual(self.row(mid2)["chat_name"], self.NAME)
+        # 记下的名字在账本消息没有群名时也能用
+        self.store.conn.execute("UPDATE messages SET chat_name='' WHERE chat_id=?", (GRP,))
+        self.assertEqual(self.store.known_chat_name(GRP), self.NAME)
+
+    def test_bot_lookup_fails_falls_back_to_owner_identity(self):
+        self.lark.plan["chats"] = ["error"]
+        mid = self.group_msg("周五发版吗 故障")
+        self.bot_hears(self.lark.event(mid))
+        self.assertEqual([_opt(c, "--as") for c in self.chats_calls()], ["bot", "user"])
+        self.assertEqual(self.row(mid)["chat_name"], self.NAME)
+
+    def test_name_unavailable_still_ingested_and_delivered_with_readable_header(self):
+        self.lark.plan["chats"] = ["timeout", "error"]
+        mid = self.group_msg("周五发版吗 故障")
+        st = self.bot_hears(self.lark.event(mid))
+        self.assertEqual(st["new"], 1)
+        r = self.row(mid)
+        self.assertEqual((r["chat_name"], r["route"], r["topic_id"]), ("", DISPATCH, "tp_alpha"))
+        text = self.deliver()
+        self.assertIn(f"群（名字没取到，{GRP}）", text)
+        self.assertNotIn("群「」", text)
+        self.assertIn("周五发版吗 故障", text)
+        # 查不到的群一小时内不在每一轮都查（同一个 Collector：sheepdog run 里只建一个）
+        c = self.collector()
+        self.lark.plan["chats"] = ["error", "error"]
+        n = len(self.chats_calls())
+        mid2 = self.group_msg("还有一件事 故障")
+        self.consumer.pending.append(self.lark.event(mid2))
+        c._poll_bot_events()
+        mid3 = self.group_msg("再一件 故障")
+        self.consumer.pending.append(self.lark.event(mid3))
+        c._poll_bot_events()
+        self.assertEqual(len(self.chats_calls()) - n, 2)   # 第一条查了两个身份都失败，第二条不再查
+        self.assertEqual((self.row(mid2)["chat_name"], self.row(mid3)["chat_name"]), ("", ""))
+        # 搜索晚到：群名补上
+        self.pull(mid)
+        self.assertEqual(self.row(mid)["chat_name"], self.NAME)
+
+    def test_lookup_returns_no_name_is_not_remembered(self):
+        self.lark.chat_names[GRP] = ""
+        mid = self.group_msg("周五发版吗 故障")
+        self.bot_hears(self.lark.event(mid))
+        self.assertEqual(self.row(mid)["chat_name"], "")
+        self.assertEqual(self.store.get_meta("chat_name:" + GRP), "")
+
+    def test_p2p_not_looked_up(self):
+        mid = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="周五发版吗 故障")
+        self.bot_hears(self.lark.event(mid))
+        self.assertEqual(self.chats_calls(), [])
+
+    def test_chat_label(self):
+        from sheepdog.prompts import chat_label
+        self.assertEqual(chat_label("p2p", "", "oc_test_x"), "私聊")
+        self.assertEqual(chat_label("group", "某群", "oc_test_x"), "群「某群」")
+        self.assertEqual(chat_label("group", "  ", "oc_test_x"), "群（名字没取到，oc_test_x）")
+        self.assertEqual(chat_label("topic", "", ""), "群（名字没取到，没有 chat_id）")
 
 
 # ======================= 1：接收子进程 =======================

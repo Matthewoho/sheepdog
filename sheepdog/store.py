@@ -452,6 +452,10 @@ MIGRATIONS = {
 }
 
 
+# 向飞书查到的群名（机器人事件那条路补群名）记在 meta 里：chat_name:<chat_id> → 群名
+CHAT_NAME_META = "chat_name:"
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -565,6 +569,15 @@ class Store:
         vals.append(message_id)
         with self.tx() as c:
             c.execute(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=?", vals)
+
+    def known_chat_name(self, chat_id: str) -> str:
+        """账本里这个聊天最近一次记过的非空群名：先看消息，再看查群名时记下的（meta chat_name:<chat_id>）。没有是空串。"""
+        r = self.conn.execute("SELECT chat_name FROM messages WHERE chat_id=? AND chat_name IS NOT NULL AND chat_name != '' "
+                              "ORDER BY create_time DESC LIMIT 1", (chat_id,)).fetchone()
+        return r[0] if r is not None else self.get_meta(CHAT_NAME_META + chat_id)
+
+    def remember_chat_name(self, chat_id: str, name: str) -> None:
+        self.set_meta(CHAT_NAME_META + chat_id, name)
 
     def set_received_by(self, message_id: str, received_by: str) -> None:
         with self.tx() as c:

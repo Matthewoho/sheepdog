@@ -430,6 +430,15 @@ def security_banner(pb: Playbook, row: sqlite3.Row, security: SecurityConfig | N
     return _join(head, body)
 
 
+def chat_label(chat_type: str, chat_name: str, chat_id: str) -> str:
+    """消息头里的「在哪」：私聊写「私聊」（发送人另写）；群写「群「名字」」；名字没取到写「群（名字没取到，oc_…）」，
+    不出现空括号（10-14 总线收到过 `群「」`：机器人事件先到、群名晚到）。"""
+    if chat_type == "p2p":
+        return "私聊"
+    name = (chat_name or "").strip()
+    return f"群「{name}」" if name else f"群（名字没取到，{chat_id or '没有 chat_id'}）"
+
+
 def _person(name: str, open_id: str) -> str:
     """名字（open_id）：会话代回时要用 <at user_id="open_id">名字</at> 才能真正 @ 到人。机器人发送方同样带 id。"""
     name, open_id = (name or "").strip(), (open_id or "").strip()
@@ -471,7 +480,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         label = REASON_LABEL["owner_reply"]
     if row["chat_type"] == SYSTEM_CHAT:
         return "\n".join([f"### [{label}] sheepdog | {row['create_time']}", *(row["content"] or "").splitlines()])
-    where = "私聊" if row["chat_type"] == "p2p" else f"群「{row['chat_name']}」"
+    where = chat_label(row["chat_type"], row["chat_name"], row["chat_id"])
     lines = [f"### [{label}] {where} | {_person(row['sender_name'], row['sender_id'])} | {row['create_time']}{read}"]
     mentions = _mention_line(row["mentions_json"])
     if mentions:
