@@ -20,7 +20,7 @@ from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activ
                     scan_jsonl, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
-                      batch_prompt, bootstrap_prompt, compaction_rules_message, onboarding_prompt, with_cli,
+                      batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message, onboarding_prompt, with_cli,
                       quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message, priority_prompt)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
@@ -352,6 +352,8 @@ class Collector:
         self._dynamic: dict[str, tuple[str, bool]] = {}
         # 正在冷却的聊天（7.14）：chat_id → until
         self._cooling: dict[str, datetime] = {}
+        # 群名查不到的群：chat_id → 上次查的时间（CHAT_NAME_RETRY_MINUTES 内不再查）
+        self._chat_name_missed: dict[str, datetime] = {}
         # 机器人身份的实时接收（7.26，[identity] 开着时 sheepdog run 设）：BotEventConsumer，每轮 poll() 取事件
         self.bot_events = None
         # 机器人自己的 id（open_id、app_id），每批入账前按配置和 meta 现算；[identity] 关着是空集
@@ -644,8 +646,9 @@ class Collector:
         log.info("%s 私聊机器人（%s），已回请他直接找主人", m.sender_id, m.message_id)
 
     def _enrich_bot_events(self, msgs: list[Message]) -> list[Message]:
-        """机器人收到的新消息：先用主人身份 mget 取一份（和搜索同一套格式：群名、发送人名字、租户、序号都有，正文渲染一样），
-        取得到就用它，回复关系事件里有、mget 里没有的补上；取不到（主人不在的聊天、私聊机器人）用事件里的。只读。"""
+        """机器人收到的新消息：先用主人身份 mget 取一份（和搜索同一套格式：发送人名字、租户、序号都有，正文渲染一样；
+        但不带群名，群名由 _fill_chat_names 补），取得到就用它，回复关系、聊天号和类型事件里有、mget 里没有的补上；
+        取不到（主人不在的聊天、私聊机器人）用事件里的。只读。"""
         ids = [m.message_id for m in msgs if m.message_id and self.store.get_message(m.message_id) is None]
         if not ids:
             return msgs
@@ -669,8 +672,54 @@ class Collector:
                 x.reply_to = m.reply_to
             if not x.thread_id and m.thread_id:
                 x.thread_id = m.thread_id
+            if not x.chat_id and m.chat_id:
+                x.chat_id = m.chat_id
+            if not x.chat_type and m.chat_type:
+                x.chat_type = m.chat_type
             out.append(x)
         return out
+
+    # 查群名失败后多久内不再查同一个群（分钟）：飞书那边一时查不到，不在每一轮都打一次
+    CHAT_NAME_RETRY_MINUTES = 60
+
+    def _fill_chat_names(self, msgs: list[Message]) -> None:
+        """机器人事件那条路进来的消息没有群名（事件不带，mget 也不带；主人身份的搜索晚一两分钟才补上，那时批次可能已经
+        发出去了）。入账前补上：先用账本里这个群最近一次记过的群名；没有就向飞书只读查一次（机器人身份，不行再用主人身份），
+        查到的记进账本，同一个群下次不再查。查不到留空，不挡入账和投递（拼提示时写成「群（名字没取到，oc_…）」）。
+        私聊不补：消息头只写「私聊」。"""
+        for m in msgs:
+            if m.chat_name or not m.chat_id or m.chat_type in ("p2p", SYSTEM_CHAT):
+                continue
+            try:
+                m.chat_name = self._chat_name(m.chat_id)
+            except Exception as e:  # 账本读不了之类：留空，照常入账
+                log.warning("补群名出错（%s）: %s", m.chat_id, e)
+
+    def _chat_name(self, chat_id: str) -> str:
+        name = self.store.known_chat_name(chat_id)
+        if name:
+            return name
+        fn = getattr(self.source, "chat_name", None)
+        missed = self._chat_name_missed.get(chat_id)
+        if fn is None or (missed is not None and _now() - missed < timedelta(minutes=self.CHAT_NAME_RETRY_MINUTES)):
+            return ""
+        errors = []
+        for who in (identity.BOT, identity.USER):
+            try:
+                name = fn(chat_id, identity=who)
+            except Exception as e:
+                errors.append(f"{who}: {e}")
+                continue
+            if name:
+                self.store.remember_chat_name(chat_id, name)
+                self._chat_name_missed.pop(chat_id, None)
+                log.info("群 %s 的名字向飞书查到：%s（%s 身份）", chat_id, name, who)
+                return name
+            errors.append(f"{who}: 没返回群名")
+        self._chat_name_missed[chat_id] = _now()
+        log.warning("群 %s 的名字查不到，先留空（%d 分钟内不再查）：%s", chat_id, self.CHAT_NAME_RETRY_MINUTES,
+                    "；".join(errors))
+        return ""
 
     def _poll_bot_events(self) -> dict | None:
         """取机器人身份这期间收到的事件，入账（received_by = bot）。没开 / 没起接收返回 None。"""
@@ -684,7 +733,9 @@ class Collector:
             msgs = [m for m in msgs if m.chat_id in only]
         if not msgs:
             return {"fetched": 0}
-        return self.ingest(self._enrich_bot_events(msgs), received_by=identity.BOT)
+        msgs = self._enrich_bot_events(msgs)
+        self._fill_chat_names(msgs)
+        return self.ingest(msgs, received_by=identity.BOT)
 
     def poll_once(self) -> dict:
         started = _now()
@@ -818,7 +869,7 @@ class Collector:
         topic_id = self._owner_context_target(m.chat_id)
         if not topic_id:
             return
-        where = "私聊" if m.chat_type == "p2p" else f"群「{m.chat_name or m.chat_id}」"
+        where = chat_label(m.chat_type, m.chat_name, m.chat_id)
         if recalled:
             body = f"📝 主人撤回了他在{where}的发言（message_id `{m.message_id}`）：原文\n> {old_text}"
         else:
@@ -866,7 +917,7 @@ class Collector:
                 if not topic_id:
                     continue
                 text = " ".join((r["content"] or "").split())
-                where = "私聊" if r["chat_type"] == "p2p" else f"群「{r['chat_name'] or r['chat_id']}」"
+                where = chat_label(r["chat_type"], r["chat_name"], r["chat_id"])
                 self.store.add_system_message(
                     topic_id, OWNER_CONTEXT,
                     f"📝 主人对这条消息点了 {emoji}：{where} | {r['sender_name'] or '-'}（{r['sender_id'] or '-'}）："

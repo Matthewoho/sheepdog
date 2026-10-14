@@ -76,6 +76,8 @@ class FakeLark:
         self.positions = positions
         # 聊天 → 类型（没写的是 p2p）：机器人往群里发的消息按这里定类型
         self.chat_types: dict[str, str] = {}
+        # 群名（搜索结果和 im chats get 用；没写的是「测试私聊」）。mget 不带群名，和真的一样（lark-cli 文档的输出字段里没有）
+        self.chat_names: dict[str, str] = {}
 
     # ---------- 造数据 ----------
     def add(self, *, chat_id: str, sender_id: str, content: str, at: datetime | None = None, sender_type: str = "user",
@@ -110,7 +112,8 @@ class FakeLark:
     def raw(self, mid: str) -> dict:
         """搜索 / mget / 话题列表返回的字段（没有 parent_id、root_id）。"""
         m = self.msgs[mid]
-        out = {"chat_id": m["chat_id"], "chat_name": "测试私聊", "chat_type": m["chat_type"], "content": m["content"],
+        out = {"chat_id": m["chat_id"], "chat_name": self.chat_names.get(m["chat_id"], "测试私聊"),
+               "chat_type": m["chat_type"], "content": m["content"],
                "create_time": m["at"].strftime("%Y-%m-%d %H:%M"), "deleted": m["deleted"],
                "message_app_link": f"https://example.invalid/{mid}", "message_id": mid,
                "msg_type": "text", "sender": m["sender"], "updated": False}
@@ -145,6 +148,7 @@ class FakeLark:
         handler = {"+messages-send": self._send, "+messages-reply": self._reply, "+messages-search": self._search,
                    "+threads-messages-list": self._thread_list, "+messages-mget": self._mget,
                    "+chat-list": lambda a: {"chats": [], "has_more": False},
+                   "chats": self._chat_get,
                    "reactions": lambda a: {"reaction_id": "rc_test_1", "success_msg_reaction_details": []},
                    "+messages-read-status": lambda a: {"items": [{"message_id": i, "is_read": False}
                                                                 for i in _opt(a, "--message-ids").split(",")]},
@@ -219,14 +223,21 @@ class FakeLark:
         return {"has_more": False, "messages": [self.raw(i) for i in ids], "page_token": "", "thread_id": tid,
                 "total": len(ids)}
 
+    def _chat_get(self, args: list[str]) -> dict:
+        """im chats get（GET /open-apis/im/v1/chats/:chat_id）：只认 get，返回群信息（name 等）。"""
+        assert args[2] == "get", args
+        cid = _opt(args, "--chat-id")
+        return {"name": self.chat_names.get(cid, "测试私聊"), "chat_mode": "group", "chat_type": "private"}
+
     def _mget(self, args: list[str]) -> dict:
         out = []
         for i in _opt(args, "--message-ids").split(","):
             if i not in self.msgs:
                 continue
             r = self.raw(i)
+            r.pop("chat_name")      # 真的 mget 不带群名（搜索是另外用 chats batch_query 补的）
             if self.in_thread(i):   # 有话题的开头那条带上回复
-                r["thread_replies"] = [self.raw(x) for x in self.in_thread(i)]
+                r["thread_replies"] = [{k: v for k, v in self.raw(x).items() if k != "chat_name"} for x in self.in_thread(i)]
             out.append(r)
         return {"messages": out, "total": len(out)}
 
