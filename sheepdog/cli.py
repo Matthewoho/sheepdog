@@ -82,8 +82,9 @@ from . import lastgood
 from . import duty
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
-                     bus_quote_verifier, close_session, display_time, duty_reset_key, escalation_summary,
-                     forward_messages, open_escalations, owner_quote_verifier, unsent_notice_line, write_receipt)
+                     bus_quote_verifier, close_session, delivered_text, display_time, duty_reset_key,
+                     escalation_summary, forward_messages, open_escalations, owner_quote_verifier, unsent_notice_line,
+                     write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
 from .prompts import with_cli
@@ -978,8 +979,14 @@ def cmd_forward(args) -> int:
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
+    # 7.47 第 1 条：已经送到这个会话的不重发，逐条说明；全部跳过也算成功（退出码 0），不用重试、不用再转
+    for mid, batch, sent_at in ids.skipped:
+        print(f"`{mid}` {delivered_text(args.topic, batch, sent_at, cfg.timezone_offset)}，这次不重发")
     extra = "，附主人原话 / 总线备注" if args.quote or args.note else ""
-    print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
+    if ids or extra or not ids.skipped:
+        print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
+    else:
+        print(f"没有要转交的：{len(ids.skipped)} 条都已经送到 {args.topic}，不用再转")
     return 0
 
 

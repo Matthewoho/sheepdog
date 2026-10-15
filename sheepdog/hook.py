@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta
@@ -45,6 +46,15 @@ DB_TIMEOUT_SECONDS = 1.0
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
 # 批次送进会话的那一行：agentapi send-message 记成 SYSTEM_MESSAGE；新建会话的开场是第 0 步 USER_INPUT
 DELIVERY_TYPES = ("SYSTEM_MESSAGE", "USER_INPUT")
+# 开启一批（占用 pending_batch_id）的那条消息里一定有的字样（7.47 第 4 条）：每一项是几段必须同时出现的文字，
+# {t} = topic，{b} = 批次号。和 prompts.py 里各批次的开头一致（测试拿真的 prompt 核对）。别的消息里也会写着批次号
+# （主人插话批次的「手上那批」、压缩后重推规则、Stop hook 自己的提示……），只带批次号不算送达那一行。
+BATCH_OPENINGS = (
+    ("[sheepdog] 新信号批次 `{b}`",),                          # b：普通批次（batch_prompt）
+    ("[sheepdog] 登记通知（topic `{t}`，批次 `{b}`）",),        # o：onboarding（onboarding_prompt）
+    ("你是由 sheepdog 新建的 session：", "（topic_id: `{t}`）", " --batch {b} "),  # h：spawn 读前任（adopted_bootstrap 的开场）
+    ("[sheepdog] 退休通知（topic `{t}`，批次 `{b}`；",),        # r：退休通知（retirement_prompt；记在 retired 的 topic 上）
+)
 
 
 def _parse(ts: str) -> datetime | None:
@@ -101,13 +111,34 @@ def _json_line(line: bytes):
     return d if isinstance(d, dict) else None
 
 
-def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TAIL_BYTES) -> bool | None:
+_ANY_TOPIC = "\x00"   # 占位：不知道 topic 时，{t} 认任意 topic 编号
+
+
+def opens_batch(content, batch_id: str, topic_id: str = "") -> bool:
+    """这条消息正文是不是开启这一批的那条：BATCH_OPENINGS 里任一项的几段全都出现。不知道 topic（topic_id 为空）时，
+    {t} 认任意一个不含反引号的 topic 编号。"""
+    if not isinstance(content, str) or not batch_id:
+        return False
+    for parts in BATCH_OPENINGS:
+        if topic_id:
+            ok = all(x.format(b=batch_id, t=topic_id) in content for x in parts)
+        else:
+            ok = all(re.search(re.escape(x.format(b=batch_id, t=_ANY_TOPIC)).replace(_ANY_TOPIC, "[^`\\n]*"), content)
+                     for x in parts)
+        if ok:
+            return True
+    return False
+
+
+def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TAIL_BYTES,
+                            topic_id: str = "") -> bool | None:
     """读会话记录末尾 tail 字节：这一批送达以后，主人有没有亲自在会话里打过字（type USER_INPUT、source USER_EXPLICIT；
     agentapi 送进去的是 SYSTEM_MESSAGE，hook 插的是 SYSTEM_SDK 来源的 USER_INPUT，都不算）。
 
     返回 True：打过；False：没打过；None：末尾这一段里找不到这一批送达的那一行（找不到就不拦）。
-    「送达的那一行」= 末尾这一段里第一条带 `批次号`（反引号括起来，sheepdog 的批次开头都这么写）的 SYSTEM_MESSAGE /
-    USER_INPUT。读不了就抛错（调用方兜成不拦）。"""
+    「送达的那一行」= 末尾这一段里第一条开启这一批的 SYSTEM_MESSAGE / USER_INPUT：正文里有这一批的开头（BATCH_OPENINGS，
+    7.47 第 4 条）。只是提到批次号的（主人插话批次写着「手上那批」、压缩后重推规则、Stop hook 的提示）不算。
+    读不了就抛错（调用方兜成不拦）。"""
     with path.open("rb") as f:
         size = f.seek(0, os.SEEK_END)
         start = max(0, size - tail)
@@ -116,11 +147,12 @@ def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TA
     lines = data.split(b"\n")
     if start > 0:
         lines = lines[1:]  # 第一行是从中间截开的
-    needle = f"`{batch_id}`".encode()
+    needle = batch_id.encode()   # 先按字节粗筛（便宜），再解析 JSON、按批次开头认（7.47 第 4 条）
     found = False
     for line in lines:
         if not found:
-            if needle in line and (d := _json_line(line)) is not None and d.get("type") in DELIVERY_TYPES:
+            if needle in line and (d := _json_line(line)) is not None and d.get("type") in DELIVERY_TYPES \
+                    and opens_batch(d.get("content"), batch_id, topic_id):
                 found = True
             continue
         if b"USER_EXPLICIT" in line and (d := _json_line(line)) is not None \
@@ -189,7 +221,7 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None)
     tp = data.get("transcriptPath")
     if not isinstance(tp, str) or not tp.strip():
         return None
-    if owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES) is not False:
+    if owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES, tid) is not False:
         return None
     p = count_path(cfg, tid)
     n = _blocked_count(p, batch) + 1

@@ -26,7 +26,7 @@ from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROST
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
-from .sink import RunResult, Sink, SinkError
+from .sink import RunResult, Sink, SinkError, SinkTimeout
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
@@ -62,6 +62,8 @@ OWNER_CONTEXT = "owner_context"
 OWNER_REPLY = "owner_reply"
 # 主人的回复认不出回答哪条时，给总线的那条系统消息（未结列表 / 认不出来源）；正文里写着那条回复的编号
 ESCALATION_LIST = "escalation_list"
+# 已推送过的消息被编辑 / 撤回后回到待推的路由原因（_handle_change）
+OWNER_CORRECTIONS = ("recalled", "edited")
 # 主人插话批次：批次号前缀（b 普通 / o onboarding / h 读前任 / r 退休通知）和发完后 dispatches 里的终态。
 # 不要回执、不改会话状态、不参与回执超时；消息直接记成已回执（acked），不会再当待推消息送一遍、也不会随超时退回重投
 PRIORITY_PREFIX = "p"
@@ -229,6 +231,20 @@ def duty_notice_key(topic_id: str) -> str:
 def send_fail_key(topic_id: str) -> str:
     """meta 键：这个会话这一段连续投递失败的记录 {since, count, error, notified, covered}；发送成功就清掉。"""
     return f"send_fail:{topic_id}"
+
+
+# 7.47 第 5 条：uncertain 批次每轮接着核多久；送出后多久还核不到就私聊主人（每批一次，防重记在 meta）
+UNCERTAIN_RECHECK_HOURS = 24
+UNCERTAIN_NOTICE_MINUTES = 30
+
+
+def uncertain_notice_key(batch_id: str) -> str:
+    """uncertain 批次已经私聊过主人（7.47 第 5 条）：值是发的时间。"""
+    return f"uncertain_notice:{batch_id}"
+
+
+# 7.47 第 6 条：插话送到后等会话发消息的记录，一个插话批次一条：priority_followup:<批次号> → JSON
+PRIORITY_FOLLOWUP_PREFIX = "priority_followup:"
 
 
 def compaction_resend_key(topic_id: str) -> str:
@@ -1097,9 +1113,13 @@ class Collector:
                 self.store.upsert_message(m, d.route, d.reason, tags, BUS_TOPIC_ID)
                 q = self.store.get_message(m.reply_to)
                 quoted = " ".join((q["content"] or "").split())[:200] if q is not None else "（原文不在账本里）"
+                # 7.47 第 1 条：被引用的那条已经送到某个会话，说一句，方便总线判断（转给同一会话时 forward 也不会重发它）
+                got = delivered_to(self.store, q)
+                where = (f"被引用的这条{delivered_text(*got, self.cfg.timezone_offset)}。\n"
+                         if got is not None else "")
                 self.store.add_system_message(
                     BUS_TOPIC_ID, ESCALATION_LIST,
-                    f"主人引用回复了一条认不出来源的消息（message_id `{m.reply_to}`）：{quoted}\n"
+                    f"主人引用回复了一条认不出来源的消息（message_id `{m.reply_to}`）：{quoted}\n{where}"
                     f"主人的回复是 `{m.message_id}`。判断它属于哪个会话后用 "
                     + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交；判断不了就问主人。",
                                self.cfg.cli_command))
@@ -1562,17 +1582,25 @@ class Dispatcher:
             # dynamic 会话是为一件事开的，done 就收掉（7.10）
             if (t["kind"] == ADOPTED or t["topic_id"] == BUS_TOPIC_ID) and status == "done":
                 status = "handled"
+            summary = receipt.get("summary", t["summary"])
+            answered = ""
+            if status == "needs_decision" and (answered := self._answered_by_priority(t)):
+                # 7.47 第 3 条：回执是会话看到主人插话之前写的，主人其实已经答了、名下也没有还开着的提问：不卡在等主人
+                status = "handled"
+                summary = f"（回执说等主人拍板，但主人已在插话批次 `{answered}` 回复）{summary or ''}"
+                log.info("回执 %s/%s 说等主人拍板，但主人已在插话批次 %s 回复、名下没有开着的提问：按 handled 收",
+                         t["topic_id"], batch, answered)
             event = sm.RECEIPT_EVENTS.get(status, "receipt_handled")
             new_state = sm.transition(t["state"], event)
             self.store.finish_dispatch(batch, "acked", json.dumps(receipt, ensure_ascii=False))
             self.store.mark_batch_state(batch, "acked")
-            fields = {"state": new_state, "pending_batch_id": None, "retries": 0,
-                      "summary": receipt.get("summary", t["summary"])}
+            fields = {"state": new_state, "pending_batch_id": None, "retries": 0, "summary": summary}
             self._watches_after_receipt(t["topic_id"], batch, receipt.get("anchors") or [])
             if anchors := self._receipt_anchors(t, receipt):
                 fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
-            self._receipt_duty(t["topic_id"], batch, receipt)
+            self._receipt_duty(t["topic_id"], batch, {**receipt, "status": status, "summary": summary} if answered
+                               else receipt)
             log.info("回执 %s/%s: %s -> %s", t["topic_id"], batch, status, new_state)
             if t["kind"] == DYNAMIC and new_state == sm.CLOSED:
                 self._dynamic_closed(t["topic_id"], "回执 done")
@@ -1586,6 +1614,23 @@ class Dispatcher:
                 self._miss(t, batch)
             else:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
+
+    def _answered_by_priority(self, t) -> str:
+        """手上这一批送出以后，这个会话收到过主人插话批次（p 开头、终态 priority、送出时间晚于这一批的 dispatched_at），并且
+        名下没有还开着的「需要你定」：返回最近那个插话批次号；否则空串（7.47 第 3 条）。"""
+        since = _parse(t["dispatched_at"] or "")
+        if since is None or since.tzinfo is None:
+            return ""
+        latest, latest_at = "", None
+        for d in self.store.conn.execute(
+                "SELECT batch_id, sent_at FROM dispatches WHERE topic_id=? AND state=? AND batch_id LIKE ?",
+                (t["topic_id"], PRIORITY_DISPATCH, PRIORITY_PREFIX + "%")).fetchall():
+            at = _parse(d["sent_at"] or "")
+            if at is not None and at.tzinfo is not None and at >= since and (latest_at is None or at >= latest_at):
+                latest, latest_at = d["batch_id"], at
+        if not latest or open_escalations(self.store, self.cfg.escalation.open_hours, t["topic_id"]):
+            return ""
+        return latest
 
     @staticmethod
     def _receipt_anchors(t, receipt: dict) -> str:
@@ -2080,6 +2125,8 @@ class Dispatcher:
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
         except SinkError as e:
+            if isinstance(e, SinkTimeout) and self._left_sending(t, batch_id, e, res):
+                return res
             if batch_id and self.store.get_dispatch(batch_id) is not None:
                 self.store.set_dispatch_state(batch_id, "failed", str(e))
             self._fail(t, None, str(e), ATTN_SEND_FAILED)
@@ -2101,15 +2148,23 @@ class Dispatcher:
         return res
 
     # ---------- 主人插话（7.37 第 4 件） ----------
-    @staticmethod
-    def _priority_rows(rows) -> list:
-        """插队的消息：主人在找主人聊天里的回复，加上引用了这些回复编号的 escalation_list 系统消息（回复认不出回答哪条时
-        给总线的未结列表 / 认不出来源的说明，7.38 第 5 条），保持原来的先后。没有主人回复就是空表。"""
-        ids = [r["message_id"] for r in rows if r["reason"] == OWNER_REPLY]
-        if not ids:
+    def _owner_correction(self, r) -> bool:
+        """主人在找主人聊天里撤回 / 编辑了自己已经送出去的那条（_handle_change 改成 recalled / edited、回到待推，7.47 第 2 条）。
+        不论原来是插队送的还是随普通批次送的：主人改口是急事，同样插队。"""
+        me = self.cfg.self_open_id
+        return (r["reason"] in OWNER_CORRECTIONS and bool(me) and r["sender_id"] == me
+                and r["chat_id"] in self.cfg.owner_chat_ids)
+
+    def _priority_rows(self, rows) -> list:
+        """插队的消息：主人在找主人聊天里的回复、主人在那里撤回 / 编辑自己发过的话（7.47 第 2 条），加上引用了这些编号的
+        escalation_list 系统消息（回复认不出回答哪条时给总线的未结列表 / 认不出来源的说明，7.38 第 5 条），保持原来的先后。
+        没有主人的这两种消息就是空表。"""
+        own = [r for r in rows if r["reason"] == OWNER_REPLY or self._owner_correction(r)]
+        if not own:
             return []
-        marks = [f"`{i}`" for i in ids]
-        return [r for r in rows if r["reason"] == OWNER_REPLY
+        keep = {r["message_id"] for r in own}
+        marks = [f"`{i}`" for i in keep]
+        return [r for r in rows if r["message_id"] in keep
                 or (r["reason"] == ESCALATION_LIST and any(m in (r["content"] or "") for m in marks))]
 
     def _priority_blocked(self, t) -> str:
@@ -2153,6 +2208,8 @@ class Dispatcher:
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in urgent], state="sending")
             self._send(t, prompt, batch_id)
         except SinkError as e:
+            if isinstance(e, SinkTimeout) and self._left_sending(t, batch_id, e, res):
+                return res
             # 发不出去：消息留在待推里，下一轮再试（会话还在跑就再插一次，跑完了就随普通批次走）；会话状态不动
             if self.store.get_dispatch(batch_id) is not None:
                 self.store.set_dispatch_state(batch_id, "failed", str(e))
@@ -2166,6 +2223,19 @@ class Dispatcher:
                  batch_id)
         return res
 
+    def _left_sending(self, t, batch_id: str, e: SinkTimeout, res: dict) -> bool:
+        """7.47 第 7 条：发送超时（agentapi send-message 超时可能其实送到了）。这一批已经记了「正在发」的：留在 sending，
+        不判失败、消息不回待推（它们本来就还没标走，下一轮开头 _recover_sending 先核对，核到了补记送达，核不到标 uncertain
+        交给第 5 条接着核）；会话状态不动。返回 False = 没有「正在发」的记录（超时发生在记账之前，如 onboarding、新建总线
+        会话），调用方按普通 SinkError 处理。"""
+        d = self.store.get_dispatch(batch_id) if batch_id else None
+        if d is None or d["state"] != "sending":
+            return False
+        log.warning("topic %s 批次 %s 发送超时，可能已经送到：留在 sending，下一轮到会话记录里核对（%s）",
+                    t["topic_id"], batch_id, e)
+        res.update(timeout=batch_id, error=str(e))
+        return True
+
     def _complete_priority(self, t, batch_id: str, urgent: list, sent_at: str | None = None) -> dict:
         """主人插话批次送达后的记账（正常发送与崩溃恢复共用）：关闭被回答的「需要你定」、消息记成已回执（不再待推、
         不随原来那批超时退回）、批次记终态 priority（不等回执、不算回执超时）、记路由、点确认表情。会话状态一概不动。"""
@@ -2176,6 +2246,10 @@ class Dispatcher:
                     self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
         self.store.mark_batch(ids, batch_id, t["topic_id"], "acked")
         self.store.finish_dispatch(batch_id, PRIORITY_DISPATCH)
+        try:  # 7.47 第 6 条：开始等会话回音（正常发送与崩溃恢复都走这里）。出错不挡投递
+            self._priority_followup_start(t, batch_id, urgent, sent_at)
+        except Exception as e:
+            log.warning("记插话回音起点出错（批次 %s）: %s", batch_id, e)
         try:  # 路由事实（7.20）。出错不挡投递
             duty.record_routes(self.store, t["topic_id"], urgent, self.cfg.duty.patterns, sent_at or now_iso())
         except Exception as e:
@@ -2186,6 +2260,53 @@ class Dispatcher:
             except Exception as e:
                 log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
         return {"priority": batch_id, "sent": len(ids), "state": self.store.get_topic(t["topic_id"])["state"]}
+
+    # ---------- 插话没人回就提醒（7.47 第 6 条） ----------
+    def _priority_followup_start(self, t, batch_id: str, urgent: list, sent_at: str | None) -> None:
+        """插话批次送到：记下从什么时候起看这个会话有没有发消息（sent_at 是送出时间；due_from 是记账时间，崩溃恢复 / 晚核到
+        的批次从核到那一刻起算 N 分钟）。开关是 0 时不记。"""
+        if self.cfg.session.owner_priority_followup_minutes <= 0:
+            return
+        own = [r for r in urgent if r["reason"] == OWNER_REPLY or self._owner_correction(r)] or list(urgent)
+        first = own[0]
+        text = " ".join((first["content"] or "").split())
+        rec = {"topic": t["topic_id"], "sent_at": sent_at or now_iso(), "due_from": _now().isoformat(timespec="seconds"),
+               "said_at": first["create_time"] or "", "summary": text[:30] + ("…" if len(text) > 30 else "")}
+        self.store.set_meta(PRIORITY_FOLLOWUP_PREFIX + batch_id, json.dumps(rec, ensure_ascii=False))
+
+    def _priority_followups(self, live: set[str]) -> None:
+        """每轮：插话批次送到后 owner_priority_followup_minutes 分钟内，这个会话在 sends 表里一条都没发过（发送时间晚于插话
+        送出时间），私聊主人一次。每个插话批次最多一次；会话收掉 / 移出名册的不提醒；开关改成 0 就清掉在等的，不提醒。"""
+        minutes = self.cfg.session.owner_priority_followup_minutes
+        now = _now()
+        for key, raw in self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX):
+            bid = key.removeprefix(PRIORITY_FOLLOWUP_PREFIX)
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                rec = None
+            sent, due_from = (_parse(rec.get("sent_at") or ""), _parse(rec.get("due_from") or "")) \
+                if isinstance(rec, dict) else (None, None)
+            if minutes <= 0 or sent is None or sent.tzinfo is None or due_from is None or due_from.tzinfo is None:
+                self.store.delete_meta(key)
+                continue
+            tid = rec.get("topic") or ""
+            t = self.store.get_topic(tid)
+            if t is None or tid not in live or t["state"] == sm.CLOSED:
+                self.store.delete_meta(key)        # 会话收掉 / 移出名册：不提醒
+                continue
+            if self.store.sends_after(tid, sent):
+                self.store.delete_meta(key)        # 它发过消息了
+                continue
+            if now - due_from < timedelta(minutes=minutes):
+                continue
+            title = self._session_title(t) or tid
+            said = _parse(rec.get("said_at") or "")
+            when = f"你 {clock(said, self.cfg.timezone_offset)} 回的" if said is not None and said.tzinfo else "你回的"
+            text = (f"🐕 汇报 · 插话没回音 [{BUS_TOPIC_ID}]\n{when}「{rec.get('summary') or ''}」插话送到了「{title}」"
+                    f"（topic `{tid}`，批次 `{bid}`），{minutes} 分钟没见它发任何消息，可以去会话里看看，或者再说一次。")
+            log.info("插话批次 %s 送到 %s 后 %d 分钟没见它发消息，私聊主人", bid, tid, minutes)
+            self._notify_owner(text, "插话没回音提醒", tid, before_send=lambda k=key: self.store.delete_meta(k))
 
     # ---------- 连续投递失败告诉主人（第一轮报告第 6 节问题 4） ----------
     def _send_failed(self, t, error: str) -> None:
@@ -2271,29 +2392,84 @@ class Dispatcher:
                 log.warning("点确认表情失败（批次 %s）: %s", batch_id, e)
         return out
 
+    def _batch_in_record(self, t, batch_id: str) -> bool:
+        """会话记录里有没有这个批次号（发送中断 / 超时后核对是否已送达，7.16）。"""
+        if t is None or not t["conversation_id"]:
+            return False
+        sink = self.sinks.get(self.topic_host(t))
+        contains = getattr(sink, "transcript_contains", None) or transcript_contains
+        return contains(t["conversation_id"], batch_id)
+
+    def _found_delivered(self, t, d, rows: list) -> None:
+        """核到了：批次补记已送达，消息照正常发送的记账（插话批次走 _complete_priority，不改会话状态）。"""
+        self.store.set_dispatch_state(d["batch_id"], "sent")
+        if d["batch_id"].startswith(PRIORITY_PREFIX):
+            self._complete_priority(t, d["batch_id"], rows, d["sent_at"])
+        else:
+            self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
+                                    [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
+
     def _recover_sending(self) -> None:
-        """上一轮「正在发」就中断的批次（7.16）：到会话 transcript 里找批次号——找到就补记已送达；
-        找不到标 uncertain，消息不再自动重发，等人工 sheepdog redeliver --batch 确认。"""
+        """上一轮「正在发」就中断（或发送超时，7.47 第 7 条）的批次（7.16）：到会话 transcript 里找批次号——找到就补记
+        已送达；找不到标 uncertain，消息不再自动重发，之后每轮接着核（_recheck_uncertain），等人工 sheepdog redeliver
+        --batch 确认。"""
         for d in self.store.dispatches_in_state("sending"):
             t = self.store.get_topic(d["topic_id"])
             ids = json.loads(d["message_ids"] or "[]")
             rows = [r for r in (self.store.get_message(i) for i in ids) if r is not None]
-            sink = self.sinks.get(self.topic_host(t)) if t is not None else None
-            contains = getattr(sink, "transcript_contains", None) or transcript_contains
-            if t is not None and t["conversation_id"] and contains(t["conversation_id"], d["batch_id"]):
-                self.store.set_dispatch_state(d["batch_id"], "sent")
-                if d["batch_id"].startswith(PRIORITY_PREFIX):
-                    # 主人插话批次：同正常发送的记账，不改会话状态
-                    self._complete_priority(t, d["batch_id"], rows, d["sent_at"])
-                else:
-                    self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
-                                            [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
+            if self._batch_in_record(t, d["batch_id"]):
+                self._found_delivered(t, d, rows)
                 log.info("批次 %s 发送中断，但 transcript 里已有，补记为已送达", d["batch_id"])
             else:
                 self.store.set_dispatch_state(d["batch_id"], "uncertain", "发送中断，transcript 里找不到这个批次")
                 self.store.mark_batch(ids, d["batch_id"], d["topic_id"], "uncertain")
                 log.warning("批次 %s（%s）发送中断，不确定是否送达，不自动重发；确认后用 sheepdog redeliver --batch %s",
                             d["batch_id"], d["topic_id"], d["batch_id"])
+
+    def _recheck_uncertain(self) -> None:
+        """7.47 第 5 条：UNCERTAIN_RECHECK_HOURS 小时内的 uncertain 批次每轮再到会话记录里找一次批次号（会话忙时 agentapi
+        收下的消息要等它下一次调模型才写进记录，重启那一轮多半还找不到）：找到就补记送达（同 _recover_sending 找到的那支）；
+        从送出时间起超过 UNCERTAIN_NOTICE_MINUTES 分钟还找不到，私聊主人一次（每批一次）。仍不自动重发：送到了却核不到时
+        重发就是重复。普通批次和插话批次都管。"""
+        now = _now()
+        for d in self.store.dispatches_in_state("uncertain"):
+            sent = _parse(d["sent_at"] or "")
+            if sent is None or sent.tzinfo is None or now - sent > timedelta(hours=UNCERTAIN_RECHECK_HOURS):
+                continue
+            t = self.store.get_topic(d["topic_id"])
+            if t is None:
+                continue
+            if self._batch_in_record(t, d["batch_id"]):
+                # 只补记还挂在这一批、还是 uncertain 的消息（期间被转走 / 重发的不动）
+                rows = [r for r in (self.store.get_message(i) for i in json.loads(d["message_ids"] or "[]"))
+                        if r is not None and r["batch_id"] == d["batch_id"] and r["dispatch_state"] == "uncertain"]
+                if not rows:   # 消息期间都被转走了：只记这一批送到过，不再记账
+                    self.store.set_dispatch_state(d["batch_id"], "sent", "核到时消息已不在这一批")
+                    continue
+                self._found_delivered(t, d, rows)
+                nt = self.store.get_topic(t["topic_id"])
+                if nt is not None and nt["pending_batch_id"] == d["batch_id"]:
+                    # 普通批次这时才算会话开始做它：回执超时从现在算，不然一补记就超时（总线超时会退回重投 = 重复）
+                    self.store.update_topic(t["topic_id"], dispatched_at=now.isoformat(timespec="seconds"))
+                log.info("uncertain 批次 %s（%s）在会话记录里核到了，补记为已送达", d["batch_id"], d["topic_id"])
+                continue
+            if now - sent >= timedelta(minutes=UNCERTAIN_NOTICE_MINUTES):
+                self._uncertain_notice(t, d, sent)
+
+    def _uncertain_notice(self, t, d, sent: datetime) -> None:
+        key = uncertain_notice_key(d["batch_id"])
+        if self.store.get_meta(key):
+            return
+        tid, bid = t["topic_id"], d["batch_id"]
+        n = len(json.loads(d["message_ids"] or "[]"))
+        kind = "主人插话批次" if bid.startswith(PRIORITY_PREFIX) else "批次"
+        title = self._session_title(t) or tid
+        text = (f"🐕 汇报 · 不确定送到没有 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）的{kind} `{bid}`（{n} 条消息，"
+                f"{display_time(sent, self.cfg.timezone_offset)}送出）发送中断，{UNCERTAIN_NOTICE_MINUTES} 分钟了会话记录里"
+                f"还找不到它，不知道送到没有。sheepdog 不自动重发（送到了却核不到时会重复）。\n"
+                f"去会话里看一眼；确认没送到就重发：`sheepdog redeliver --batch {bid}`")
+        log.warning("uncertain 批次 %s（%s）%d 分钟还核不到，私聊主人", bid, tid, UNCERTAIN_NOTICE_MINUTES)
+        self._notify_owner(text, "投递不确定通知", tid, before_send=lambda: self.store.set_meta(key, now_iso()))
 
     # ---------- 命令行宿主收尾（7.18） ----------
     def collect_runs(self) -> list[RunResult]:
@@ -3379,6 +3555,10 @@ class Dispatcher:
             self._retry_owner_notices()
         except Exception as e:  # 重试出错不能挡住投递
             log.warning("重试给主人的通知出错: %s", e)
+        try:  # 7.47 第 5 条：先核以前标了 uncertain 的（这一轮刚标的下一轮再核）。出错不挡投递
+            self._recheck_uncertain()
+        except Exception as e:
+            log.warning("核对 uncertain 批次出错: %s", e)
         self._recover_sending()
         self.collect_runs()
         self.sync_roster()
@@ -3396,6 +3576,10 @@ class Dispatcher:
             self._check_receipt(self.store.get_topic(tid))
         self._check_handovers()
         self._tick_watches(set(tids))
+        try:  # 7.47 第 6 条：插话送到后会话没回音就告诉主人。出错不挡投递
+            self._priority_followups(set(tids))
+        except Exception as e:
+            log.warning("插话回音检查出错: %s", e)
         self._expire_escalations()
         try:  # 7.36：开着的「需要你定」补来源、判可能已处理、排核实 / 快到期提醒。出错不挡投递
             from . import pending as pend
@@ -3825,9 +4009,38 @@ def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
     return verify
 
 
+# 已经送到某个会话的消息（7.47 第 1 条）：forward 到同一会话时不重发
+DELIVERED_STATES = ("delivered", "acked")
+
+
+def delivered_to(store: Store, row) -> tuple[str, str, str] | None:
+    """这条消息已经随哪一批送到了哪个会话：(topic_id, 批次号, 送出时间 sent_at)；没送到（待推 / uncertain / missed /
+    failed / context）或认不出批次返回 None。"""
+    if row is None or not row["batch_id"] or not row["topic_id"] or row["dispatch_state"] not in DELIVERED_STATES:
+        return None
+    d = store.get_dispatch(row["batch_id"])
+    return row["topic_id"], row["batch_id"], (d["sent_at"] if d is not None else "")
+
+
+def delivered_text(topic_id: str, batch_id: str, sent_at: str, offset: str = "+08:00") -> str:
+    """「已在 HH:MM 随批次 `…` 送到 topic `X`」（时间按配置的时区；不知道送出时间就不写）。"""
+    at = _parse(sent_at or "")
+    when = f"已在 {clock(at, offset)} " if at is not None and at.tzinfo is not None else "已"
+    return f"{when}随批次 `{batch_id}` 送到 topic `{topic_id}`"
+
+
+class ForwardResult(list):
+    """forward_messages 的返回：本身是这次真正转交（回到待推）的消息编号列表；skipped 是已经送到目标会话、这次不重发的
+    [(message_id, 批次号, 送出时间 sent_at)]（7.47 第 1 条）。"""
+
+    def __init__(self, ids=(), skipped=()):
+        super().__init__(ids)
+        self.skipped: list[tuple[str, str, str]] = list(skipped)
+
+
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
                      verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24,
-                     key_patterns: list | None = None) -> list[str]:
+                     key_patterns: list | None = None) -> ForwardResult:
     """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
     下一轮完成，因此同样受人类接管、onboarding 约束。
 
@@ -3836,6 +4049,8 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     - 被安全规则 hold 的消息只能带已核对的 quote 转交。
     - 目标是总线、known、已移除或不存在时抛 ValueError。
     - 在岗表（7.20）：转出去的消息记成转出方名下「已转交」的活（钥匙按 [duty] key_patterns 从正文认）。
+    - 已经随批次送到目标会话的（topic 就是目标、有批次号、delivered / acked，7.47 第 1 条）跳过：不改回待推、不关「需要
+      你定」、不记看板转交，记进返回值的 skipped；uncertain / missed / failed / context 照旧可以转。quote / note 不受影响。
     """
     _check_target(store, topic_id, "转交")
     ids = list(dict.fromkeys(i.strip() for i in message_ids if i.strip()))
@@ -3846,6 +4061,11 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     missing = [i for i, r in rows.items() if r is None]
     if missing:
         raise ValueError(f"账本里没有这些消息: {missing}")
+    skipped = []
+    for i in list(rows):
+        if (got := delivered_to(store, rows[i])) is not None and got[0] == topic_id:
+            skipped.append((i, got[1], got[2]))
+            del rows[i]
     held = [i for i, r in rows.items() if r["security_action"] == HOLD]
     if held and not quote:
         raise ValueError(f"消息 {held} 被安全规则拦截，只能凭已核对的主人原话转交：加 --quote \"<主人原话>\"")
@@ -3876,11 +4096,16 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
                 duty.forward_work(store, src, topic_id, rs, pats)
             except Exception as e:  # 在岗表出错不挡转交
                 log.warning("转交记进羊群看板出错: %s", e)
+    done = [i for i, _, _ in skipped]
+    ids = [i for i in ids if i in rows]
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
+        if done:
+            extra += f"（已经送到过你这里、这次不重发：{', '.join(done)}）"
         store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))
-    log.info("转交 %d 条消息%s -> %s", len(ids), "（含转达）" if quote or note else "", topic_id)
-    return ids
+    log.info("转交 %d 条消息%s -> %s%s", len(ids), "（含转达）" if quote or note else "", topic_id,
+             f"；{len(done)} 条已送到过、不重发" if done else "")
+    return ForwardResult(ids, skipped)
 
 
 def close_session(store: Store, topic_id: str) -> None:

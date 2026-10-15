@@ -100,10 +100,16 @@ class SessionConfig:
     # 7.40 开关（热加载）：会话在跑上一批时，主人在找主人聊天里的回复当轮单独插队送到（7.37 第 4 件）。
     # 关掉后回到原来的排队：等手上那批交回执（或回执超时）再随下一批送
     owner_priority: bool = True
+    # 7.47 第 6 条（热加载）：主人插话批次送到后这么多分钟内，那个会话经 sheepdog 一条消息都没发（ask / report / reply），
+    # 私聊主人一次。0 = 关
+    owner_priority_followup_minutes: int = 10
 
     def validate(self) -> None:
         if not isinstance(self.owner_priority, bool):
             raise ConfigError("[session] owner_priority 必须是 true/false")
+        m = self.owner_priority_followup_minutes
+        if isinstance(m, bool) or not isinstance(m, int) or m < 0:
+            raise ConfigError("[session] owner_priority_followup_minutes 必须是不小于 0 的整数（0 = 关）")
         if self.reply_card_width not in ("compact", "default", "fill"):
             raise ConfigError("session.reply_card_width 只能是 compact / default / fill")
         if not isinstance(self.reply_suffix, str):

@@ -59,6 +59,9 @@ reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill
 # 关掉（false）：回到原来的排队，你的回复要等那个会话交了手上那批的回执（或回执超时，见 receipt_timeout_minutes）才随下一批送到；
 # 省掉的是插队那一批（每次插话多送一次、会话多读一段）。改完常驻进程下一轮生效，不用重启
 owner_priority = true
+# 插话送到后这么多分钟内，那个会话经 sheepdog 一条消息都没发（ask / report / reply），私聊你一次（每个插话批次最多一次；
+# 会话收掉 / 移出名册的不提醒）。0 = 关。改完常驻进程下一轮生效，不用重启
+owner_priority_followup_minutes = 10
 # 旧的代回前缀：playbook 里的 {{reply_prefix}}，保留兼容
 reply_prefix = "🐕 [Agent 代回] "
 

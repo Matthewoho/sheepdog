@@ -125,11 +125,13 @@ class PriorityDeliveryTest(PriorityBase):
         self.d.dispatch_once()
         self.assertEqual((self.topic()["state"], self.topic()["pending_batch_id"]), (sm.RUNNING, self.b1))
         self.assertEqual(self.store.get_dispatch(pb)["state"], PRIORITY_DISPATCH)
-        # 原来那批的回执晚一点到：照常收
+        # 原来那批的回执晚一点到：照常收。回执说等主人拍板，但主人已经在插话里答了、名下没有开着的提问：按 handled 收
+        # （7.47 第 3 条；名下还有开着的提问照旧等主人，见 test_review_priority.NeedsDecisionScopeTest）
         write_receipt(self.cfg, "tp_alpha", self.b1, {"status": "needs_decision", "summary": "等主人"})
         self.d.dispatch_once()
         t = self.topic()
-        self.assertEqual((t["state"], t["pending_batch_id"], t["summary"]), (sm.WAITING_HUMAN, None, "等主人"))
+        self.assertEqual((t["state"], t["pending_batch_id"], t["summary"]),
+                         (sm.ACTIVE, None, f"（回执说等主人拍板，但主人已在插话批次 `{pb}` 回复）等主人"))
         self.assertEqual(self.store.get_dispatch(self.b1)["state"], "acked")
         self.assertEqual(self.row(self.alice)["dispatch_state"], "acked")
 

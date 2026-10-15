@@ -544,6 +544,29 @@ class Store:
         with self.tx() as c:
             c.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
+    def meta_items(self, prefix: str) -> list[tuple[str, str]]:
+        """key 以 prefix 开头的 meta（按 key 排）。prefix 里的 % _ 按字面算。"""
+        esc = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self.conn.execute("SELECT key, value FROM meta WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+                                 (esc + "%",)).fetchall()
+        return [(r["key"], r["value"]) for r in rows]
+
+    def delete_meta(self, key: str) -> None:
+        with self.tx() as c:
+            c.execute("DELETE FROM meta WHERE key=?", (key,))
+
+    def sends_after(self, topic_id: str, after: datetime) -> int:
+        """这个会话在 after 之后经 sheepdog 发出去的消息（sends 表：ask / report / reply 等）有几条。"""
+        n = 0
+        for r in self.conn.execute("SELECT sent_at FROM sends WHERE topic_id=?", (topic_id,)).fetchall():
+            try:
+                at = datetime.fromisoformat(r["sent_at"] or "")
+            except ValueError:
+                continue
+            if at.tzinfo is not None and at > after:
+                n += 1
+        return n
+
     # ---------- messages ----------
     def get_message(self, message_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()

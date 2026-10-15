@@ -15,6 +15,12 @@ class SinkError(RuntimeError):
     pass
 
 
+class SinkTimeout(SinkError):
+    """调用宿主超时（7.47 第 7 条）：agentapi send-message 超时时消息可能其实已经送到了。有「正在发」记录的投递路径
+    （普通批次、插话批次）遇到它不判失败：批次留在 sending，下一轮由 _recover_sending 到会话记录里核对；其他调用按普通
+    SinkError 处理。"""
+
+
 class Sink(Protocol):
     name: str
 

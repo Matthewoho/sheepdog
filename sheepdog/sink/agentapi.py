@@ -15,7 +15,10 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import SinkError
+from . import SinkError, SinkTimeout
+
+# agentapi 一次调用最多等多少秒
+AGENTAPI_TIMEOUT = 60
 
 _REQUIRED_ENV = ("ANTIGRAVITY_AGENTAPI_EXE", "ANTIGRAVITY_LS_ADDRESS", "ANTIGRAVITY_CSRF_TOKEN")
 
@@ -57,7 +60,11 @@ class AgentApiSink:
         if not ok:
             raise SinkError(why)
         exe = os.environ["ANTIGRAVITY_AGENTAPI_EXE"]
-        proc = subprocess.run([exe, "agentapi", *args], capture_output=True, text=True, timeout=60)
+        try:
+            proc = subprocess.run([exe, "agentapi", *args], capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            # 7.47 第 7 条：不再冲出 dispatch_once 中断整轮。send-message 超时可能其实送到了，由调用方按 SinkTimeout 处理
+            raise SinkTimeout(f"agentapi {args[0] if args else ''} 超过 {AGENTAPI_TIMEOUT} 秒没返回（可能已经送到）") from e
         # language_server 会往 stderr 打启动日志，只解析 stdout 里的 JSON
         out = proc.stdout.strip()
         start = out.find("{")
