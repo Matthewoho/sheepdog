@@ -10,7 +10,8 @@ from unittest import mock
 
 from sheepdog import cli, hook, lastgood
 
-from test_stop_hook import stop_input
+from test_roster import ME
+from test_stop_hook import HookBase, stop_input
 from test_threads import ThreadsBase
 
 BROKEN = "[routing\nkeywords = [\"x\"]\n"
@@ -154,3 +155,25 @@ class LastGoodTest(ThreadsBase):
             with self.assertRaises(KeyboardInterrupt):
                 cli.main(["run"])
         self.assertEqual((self.dir / lastgood.DIR_NAME / lastgood.CONFIG).read_text(encoding="utf-8"), b)
+
+
+class HookStopIgnoresLastGoodTest(HookBase):
+    def test_hook_stop_with_a_broken_config_outputs_nothing_even_with_a_saved_copy(self):
+        # 正常配置下这一批会被拦；配置写坏后，即使有最后好用的那份，sheepdog hook stop 也什么都不输出（不拿旧配置去拦）
+        cfg_file = self.dir / "config.toml"
+        env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": str(self.cfg.state_dir),
+               "XDG_CONFIG_HOME": str(self.dir / "xdg")}
+        cfg_file.write_text(f'self_open_id = "{ME}"\n', encoding="utf-8")
+
+        def call() -> str:
+            out = io.StringIO()
+            stdin = mock.Mock(buffer=io.BytesIO(stop_input().encode("utf-8")))
+            with mock.patch.dict(os.environ, env), mock.patch("sys.stdin", stdin), redirect_stdout(out):
+                self.assertEqual(cli.main(["hook", "stop"]), 0)
+            return out.getvalue()
+
+        self.assertEqual(json.loads(call())["decision"], "continue")
+        with mock.patch.dict(os.environ, env):
+            lastgood.save(cli.load_config())
+        cfg_file.write_text(BROKEN, encoding="utf-8")
+        self.assertEqual(call(), "")
