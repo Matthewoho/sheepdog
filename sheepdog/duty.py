@@ -236,6 +236,35 @@ def close_auto_work(store: Store, source: str, is_closed: Callable[[str], str | 
             record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
 
 
+def release_owner_waits(store: Store, basis: Callable[[object], tuple[str, datetime] | None]) -> list[int]:
+    """会话自报过「等主人」的活（declared，同一把钥匙上自动补的那部分已经被会话的申报接管），它等的那条「需要你定」已经关了
+    （主人已答 / 会话已结案 / 过期），并且会话是在关闭之前申报的：这件活不再算等主人，改成进行中（不替会话结束它——会话自报的
+    活由会话自己 done），履历记一笔。关闭以后会话又申报了「等主人」的，以新申报为准，不动。
+    basis(w) 返回 (关闭说明, 关闭时间)；它等的提问还开着、或者找不到它等的是哪条提问，返回 None。返回改了哪些活。"""
+    changed: list[int] = []
+    for w in store.conn.execute("SELECT * FROM work_items WHERE closed_at IS NULL AND declared=1 AND state=? ORDER BY id",
+                                (WAITING_OWNER,)).fetchall():
+        b = basis(w)
+        if b is None:
+            continue
+        why, closed_at = b
+        declared_at = _parse_ts(w["declared_at"] or w["updated_at"] or "")
+        if declared_at is not None and closed_at is not None and declared_at > closed_at:
+            continue
+        store.update_work(w["id"], state=DOING, waiting_on=None)
+        store.add_history(w["topic_id"], "work", f"{w['key']} 不再算等主人：{why}（会话自报的活没结束，改成进行中）")
+        changed.append(w["id"])
+    return changed
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(ts) if ts else None
+    except ValueError:
+        return None
+    return dt if dt is not None and dt.tzinfo is not None else None
+
+
 def key_for(text: str, patterns: Iterable[re.Pattern], fallback: str) -> str:
     keys = extract_keys(text, patterns)
     return keys[0] if keys else fallback

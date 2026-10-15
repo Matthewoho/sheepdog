@@ -3242,18 +3242,49 @@ class Dispatcher:
                    duty.key_for(e["text"] or "", pats, f"ask-{e['message_id'][-8:]}"))
             duty.auto_work(self.store, e["topic_id"], key, f"escalation:{e['message_id']}", duty.SRC_ESCALATION,
                            duty.WAITING_OWNER, title=escalation_summary(e, 40), waiting_on=duty.OWNER_NAME_FIELD)
-        live = {e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)}
+        hours = self.cfg.escalation.open_hours
+        live = {e["message_id"] for e in open_escalations(self.store, hours)}
+
+        def close_text(e) -> str:
+            """提问是怎么关的：主人已答 / 会话已结案：依据 / 已过期（N 小时没人答）。"""
+            if e is None:
+                return "「需要你定」记录已清理"
+            if e["close_reason"] == "resolved":
+                return f"会话已结案：{duty.short(e['resolve_note'] or '', 40)}"
+            if e["close_reason"] == "answered" or e["answered_at"]:
+                return "主人已答"
+            return f"已过期（{hours:g} 小时没人答）"
 
         def escalation_closed(ref: str) -> str | None:
             mid = ref.removeprefix("escalation:")
-            if mid in live:
-                return None
-            e = self.store.get_escalation(mid)
-            if e is not None and e["close_reason"] == "resolved":
-                return f"会话已结案：{duty.short(e['resolve_note'] or '', 40)}"
-            return "主人已答" if e is not None and e["answered_at"] else "「需要你定」已过期"
+            return None if mid in live else close_text(self.store.get_escalation(mid))
 
+        # 自动补的（会话没申报过）：提问一关就收掉，三条路都走这里
         duty.close_auto_work(self.store, duty.SRC_ESCALATION, escalation_closed)
+
+        def waited_on(w):
+            """会话自报「等主人」的活等的是哪几条提问：自动补出来的那条（source_ref），加上同一会话里带同一把钥匙发的
+            （sheepdog ask --key）。还有开着的返回 None；都关了返回最晚关的那条的 (说明, 关闭时间)。"""
+            mids = set()
+            if (w["source_ref"] or "").startswith("escalation:"):
+                mids.add(w["source_ref"].removeprefix("escalation:"))
+            mids |= {r[0] for r in self.store.conn.execute(
+                "SELECT message_id FROM sends WHERE kind='ask' AND topic_id=? AND norm_key=?", (w["topic_id"], w["norm_key"]))}
+            if not mids or mids & live:
+                return None
+            latest = None
+            for mid in mids:
+                e = self.store.get_escalation(mid)
+                if e is None:
+                    continue
+                at = _parse(e["closed_at"] or "") or ((_parse(e["asked_at"] or "") or _now()) + timedelta(hours=hours))
+                if latest is None or at > latest[1]:
+                    latest = (close_text(e), at)
+            return latest
+
+        # 会话自报过的：活不替会话结束，但它等的提问都关了、又是关之前报的，就不再算等主人（改成进行中）
+        for wid in duty.release_owner_waits(self.store, waited_on):
+            log.info("羊群看板：活 #%d 等的「需要你定」已关，不再算等主人", wid)
 
     def _receipt_duty(self, topic_id: str, batch_id: str, receipt: dict) -> None:
         """回执进在岗表：work 字段同 work set；回执摘要记进履历。"""
