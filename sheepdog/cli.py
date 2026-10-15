@@ -77,7 +77,8 @@ from . import __version__
 from . import actions
 from .ack import Acker
 from .card import build_reply_card
-from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, load_config
+from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, default_config_path, load_config
+from . import lastgood
 from . import duty
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
@@ -120,9 +121,76 @@ SINK_CLASSES = {"codex": CodexSink, "claude": ClaudeSink}
 HOST_RESTART_KEYS = ("enabled", "command", "workdir", "settings", "profile")
 
 
+# 会话侧命令（receipt、ask、report…，每次都是新进程）读配置失败时可以用常驻进程存下的「最后好用的那份」（lastgood）。
+# run / init / doctor / hook stop 不用：常驻进程有自己的「上一份」，启动时坏了要报出来；hook 出错一律不输出。main 里按命令设。
+_FALLBACK = False
+_FALLBACK_NOTED: set[str] = set()
+
+
+def _fallback_note(what: str, err: Exception, saved: "lastgood.Saved", name: str) -> None:
+    if name in _FALLBACK_NOTED:
+        return
+    _FALLBACK_NOTED.add(name)
+    print(f"{what}无效（{err}），这次沿用 {saved.label(name)} 最后好用的那份（{saved.directory / name}）", file=sys.stderr)
+
+
+def _load_cfg():
+    """读配置；会话侧命令读失败、又有最后好用的那份时用它（stderr 写一行）。没有那份照旧抛 ConfigError。"""
+    try:
+        return load_config()
+    except ConfigError as e:
+        if not _FALLBACK:
+            raise
+        path = default_config_path()
+        saved = lastgood.find(path)
+        if saved is None:
+            raise
+        try:
+            cfg = lastgood.load_saved_config(saved, path)
+        except ConfigError:
+            raise e
+        _fallback_note("配置", e, saved, lastgood.CONFIG)
+        return cfg
+
+
+def _load_roster(cfg) -> Roster:
+    try:
+        return load_roster(cfg.roster_file, cfg.roster_required)
+    except RosterError as e:
+        saved = lastgood.find_for(cfg) if _FALLBACK else None
+        p = saved.path(lastgood.ROSTER) if saved is not None else None
+        if p is None:
+            raise
+        roster = load_roster(p, True)
+        _fallback_note("名册", e, saved, lastgood.ROSTER)
+        return roster
+
+
+def _load_security(cfg) -> SecurityConfig:
+    try:
+        return load_security(cfg.security_file)
+    except SecurityError as e:
+        saved = lastgood.find_for(cfg) if _FALLBACK else None
+        p = saved.path(lastgood.SECURITY) if saved is not None else None
+        if p is None:
+            raise
+        sec = load_security(p)
+        _fallback_note("安全规则", e, saved, lastgood.SECURITY)
+        return sec
+
+
+def _save_last_good(cfg, which=(lastgood.CONFIG, lastgood.ROSTER, lastgood.SECURITY)) -> None:
+    """常驻进程加载成功后存「最后好用的那份」。存不了只记日志，不挡这一轮。"""
+    try:
+        if changed := lastgood.save(cfg, which):
+            logging.info("最后好用的配置已更新：%s（%s）", "、".join(changed), cfg.state_dir / lastgood.DIR_NAME)
+    except Exception as e:
+        logging.warning("存最后好用的配置出错: %s", e)
+
+
 def load_checked_roster(cfg) -> Roster:
     """读名册并检查 managed 会话引用的宿主都已启用（7.18）。"""
-    roster = load_roster(cfg.roster_file, cfg.roster_required)
+    roster = _load_roster(cfg)
     check_hosts(roster, cfg.host_enabled)
     return roster
 
@@ -139,14 +207,14 @@ def _roster(cfg) -> Roster:
 def _security(cfg) -> SecurityConfig:
     """安全规则格式错误直接报错退出（同名册）；文件不存在 = 没有规则。"""
     try:
-        return load_security(cfg.security_file)
+        return _load_security(cfg)
     except SecurityError as e:
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR 安全规则无效: {e}", file=sys.stderr)
         raise _Abort() from e
 
 
 def _build(args):
-    cfg = load_config()
+    cfg = _load_cfg()
     roster = _roster(cfg)
     security = _security(cfg)
     dry = getattr(args, "dry_run", False)
@@ -222,15 +290,40 @@ def _collect_warning(store: Store) -> str:
     return ""
 
 
+def _last_good_report(cfg) -> str:
+    """doctor：会话侧命令读不了当前配置时能用的那份（常驻进程存的）。"""
+    saved = lastgood.find_for(cfg)
+    names = [(lastgood.CONFIG, "配置"), (lastgood.ROSTER, "名册"), (lastgood.SECURITY, "安全规则")]
+    have = [f"{label} {saved.label(n)}" for n, label in names if saved is not None and saved.path(n) is not None]
+    if not have:
+        return f"最后好用的那份: 还没有（常驻进程加载成功后才存到 {cfg.state_dir / lastgood.DIR_NAME}）"
+    return f"最后好用的那份: {saved.directory}（{'，'.join(have)}）"
+
+
 def cmd_doctor(args) -> int:
-    cfg = load_config()
     ok = True
+    try:
+        cfg = load_config()
+        bad_cfg = ""
+    except ConfigError as e:
+        saved = lastgood.find(default_config_path())
+        if saved is None:
+            print(f"配置文件: ✗ 无效：{e}\n  没有最后好用的那份：会话命令（receipt / ask / report …）也会失败")
+            return 2
+        cfg = lastgood.load_saved_config(saved, default_config_path())
+        bad_cfg = (f"配置文件: ✗ 当前无效：{e}\n  会话命令在用 {saved.label(lastgood.CONFIG)} 最后好用的那份"
+                   f"（{saved.directory / lastgood.CONFIG}）；常驻进程沿用它上一份；下面按那份检查")
+        ok = False
     print(f"sheepdog {__version__}")
+    if bad_cfg:
+        print(bad_cfg)
     # 开头先说有没有给主人的通知没发出去（还在重试的、放弃了没人处理的），直到人工处理
     if warn := unsent_notice_line(Store(cfg.db_path), cfg.cli_command):
         print(warn)
-    print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
+    if not bad_cfg:
+        print(f"配置文件: {cfg.config_path} {'✓' if cfg.config_path.exists() else '✗ 不存在（使用默认值）'}")
     print(f"状态目录: {cfg.state_dir}")
+    print(_last_good_report(cfg))
     print(cli_name_report(cfg))
     print(notify_report(cfg))
     print(f"self_open_id: {'✓ 已配置' if cfg.self_open_id else '✗ 未配置（@我/回复我 判定会失效）'}")
@@ -254,7 +347,10 @@ def cmd_doctor(args) -> int:
         print(f"名册: {cfg.roster_file} " + (f"✓ {len(r.managed)} managed / {len(r.sessions) - len(r.managed)} known"
                                             if exists else "（不存在，所有信号进总线）"))
     except RosterError as e:
-        print(f"名册: ✗ {e}")
+        saved = lastgood.find_for(cfg)
+        p_ = saved.path(lastgood.ROSTER) if saved is not None else None
+        print(f"名册: ✗ {e}\n  " + (f"会话命令在用 {saved.label(lastgood.ROSTER)} 最后好用的那份（{p_}）" if p_
+                                       else "没有最后好用的那份：会话命令也会失败"))
         ok = False
     try:
         sec = load_security(cfg.security_file)
@@ -266,7 +362,10 @@ def cmd_doctor(args) -> int:
         print(f"own_tenant_keys: {'✓ ' + str(len(sec.own_tenant_keys)) + ' 个' if sec.own_tenant_keys else '⚠ 未配置（所有发送方都按外部人处理）'}"
               f"  quote 回看 {sec.quote_max_age_hours:g} 小时")
     except SecurityError as e:
-        print(f"安全规则: ✗ {e}")
+        saved = lastgood.find_for(cfg)
+        p_ = saved.path(lastgood.SECURITY) if saved is not None else None
+        print(f"安全规则: ✗ {e}\n  " + (f"会话命令在用 {saved.label(lastgood.SECURITY)} 最后好用的那份（{p_}）" if p_
+                                         else "没有最后好用的那份：会话命令也会失败"))
         ok = False
     if warn := _collect_warning(Store(cfg.db_path)):
         print(warn)
@@ -585,6 +684,7 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
         if sink is not None and hasattr(sink, "update_config"):
             sink.update_config(new.hosts[h])
     collector.cfg = dispatcher.cfg = new
+    _save_last_good(new, (lastgood.CONFIG,))   # 重读成功：存一份给会话侧命令兜底（内容没变不重写）
     dispatcher.playbook = Playbook.from_config(new)  # 代回前缀、等待分钟数等占位符跟着新配置
     if hasattr(source, "max_pages"):
         source.max_pages = new.max_pages
@@ -600,6 +700,7 @@ def cmd_run(args) -> int:
     # 本进程是常驻进程：只有它能跨项目调 agentapi，会话里发起的动作由它执行
     actions.mark_resident()
     cfg, store, source, sink, roster, security = _build(args)
+    _save_last_good(cfg)   # 启动时三样都加载成功了：存一份给会话侧命令兜底
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
     dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args))
@@ -636,11 +737,13 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
             # 每轮重读名册：改名册不必重启；改坏了沿用上一份有效名册并报错，常驻进程不退出
             try:
                 collector.roster = dispatcher.roster = load_checked_roster(cfg)
+                _save_last_good(cfg, (lastgood.ROSTER,))
             except RosterError as e:
                 logging.error("名册无效，沿用上一份: %s", e)
             # 安全规则同样每轮现读，改坏了沿用上一份有效规则
             try:
                 collector.security = dispatcher.security = load_security(cfg.security_file)
+                _save_last_good(cfg, (lastgood.SECURITY,))
             except SecurityError as e:
                 logging.error("安全规则无效，沿用上一份: %s", e)
             # 先执行会话发起的动作（spawn / new-session / push-rules / init / retire），再拉取和投递
@@ -664,7 +767,7 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
 
 
 def cmd_inbox(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     if args.chat:
         rows = store.inbox_messages(args.chat, args.limit)
@@ -686,7 +789,7 @@ def cmd_inbox(args) -> int:
 
 
 def cmd_inbox_clear(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     if not args.all and not args.chat:
         print("请指定 --chat <群名> 或 --all")
@@ -753,7 +856,7 @@ _MODE = {"adopted": "managed", "known": "known", "bus": "bus", "dynamic": "dynam
 
 
 def cmd_sessions(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     try:
         roster = load_roster(cfg.roster_file, cfg.roster_required)
@@ -853,7 +956,7 @@ def attention_report(cfg, store: Store) -> list[str]:
 
 
 def cmd_receipt(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     try:
         receipt = json.loads(args.json)
         p = write_receipt(cfg, args.topic, args.batch, receipt)
@@ -865,7 +968,7 @@ def cmd_receipt(args) -> int:
 
 
 def cmd_forward(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     security = _security(cfg)
     store = Store(cfg.db_path)
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
@@ -881,7 +984,7 @@ def cmd_forward(args) -> int:
 
 
 def cmd_watch(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     try:
         wid = add_watch(store, args.topic, args.person, args.chat, args.note)
@@ -896,7 +999,7 @@ def cmd_watch(args) -> int:
 
 
 def cmd_watches(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     rows = store.list_watches(include_closed=args.all)
     if not rows:
@@ -918,7 +1021,7 @@ def cmd_watches(args) -> int:
 
 def cmd_watch_done(args) -> int:
     """会话确认真正等到了对方的回复（7.16）。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     w = store.get_watch(args.id)
     if not w:
@@ -933,7 +1036,7 @@ def cmd_watch_done(args) -> int:
 
 
 def cmd_unwatch(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     w = store.get_watch(args.id)
     if not w:
@@ -956,7 +1059,7 @@ def _parse_since(text: str) -> timedelta:
 
 
 def cmd_security_log(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     try:
         since = datetime.now().astimezone() - _parse_since(args.since)
@@ -978,7 +1081,7 @@ def cmd_security_log(args) -> int:
 
 
 def cmd_escalations(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     tid = _topic_arg(args.topic) if getattr(args, "topic", "") else ""
     open_ids = {e["message_id"] for e in open_escalations(store, cfg.escalation.open_hours, tid or None)}
@@ -1007,7 +1110,7 @@ def cmd_escalations(args) -> int:
 
 
 def cmd_acks(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     rows = store.list_acks(open_only=args.open)
     if not rows:
@@ -1130,7 +1233,7 @@ def cmd_retire(args) -> int:
 
 
 def cmd_actions(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     rows = store.list_actions(include_done=args.all)
     if not rows:
@@ -1152,7 +1255,7 @@ def cmd_actions(args) -> int:
 
 
 def cmd_loops(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     if args.clear:
         n = store.clear_loop(args.clear)
@@ -1178,7 +1281,7 @@ def cmd_loops(args) -> int:
 
 
 def cmd_redeliver(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     d = store.get_dispatch(args.batch)
     if d is None:
@@ -1198,7 +1301,7 @@ def cmd_reply_card(args) -> int:
     """打印代回卡片（Card 2.0）JSON（7.17），用法：
     lark-cli im +messages-send --as user --chat-id oc_x --msg-type interactive --content "$(sheepdog reply-card --text ...)"
     """
-    cfg = load_config()
+    cfg = _load_cfg()
     if args.text_file:
         text = sys.stdin.read() if args.text_file == "-" else Path(args.text_file).expanduser().read_text(encoding="utf-8")
     else:
@@ -1242,7 +1345,7 @@ def _show_topic(cfg, store: Store, topic_id: str, limit: int) -> int:
 
 def cmd_show(args) -> int:
     """打印账本里一条消息的完整正文（送进会话的长消息会截断，7.16）；--topic 打印会话最近几轮问答（7.18）。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     if args.topic:
         return _show_topic(cfg, store, args.topic, args.limit)
@@ -1265,7 +1368,7 @@ INJECT_ID_PREFIX = "om_test_inject_"
 
 def cmd_inject(args) -> int:
     """测试环境（7.18）：不拉 IM 时，把一条合成消息当作刚收到的 IM 消息入账，走正常的路由和归属。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     if cfg.source.enabled:
         print("inject 被拒绝: 只在 [source] enabled = false（测试环境，不拉 IM）时可用", file=sys.stderr)
         return 2
@@ -1284,7 +1387,7 @@ def cmd_inject(args) -> int:
 
 
 def cmd_close_session(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     try:
         close_session(store, args.topic)
@@ -1296,7 +1399,7 @@ def cmd_close_session(args) -> int:
 
 
 def cmd_session_reset(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     t = store.get_topic(args.topic)
     if not t:
@@ -1334,7 +1437,7 @@ def _topic_arg(x: str) -> str:
 
 
 def cmd_work(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     tid = _topic_arg(args.topic)
     if not _duty_target_ok(store)(tid):
@@ -1362,7 +1465,7 @@ def cmd_work(args) -> int:
 
 
 def cmd_tell(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     security = _security(cfg)
     store = Store(cfg.db_path)
     verify = owner_quote_verifier(store, security.quote_max_age_hours, cfg.self_open_id) if args.quote else None
@@ -1377,7 +1480,7 @@ def cmd_tell(args) -> int:
 
 
 def cmd_board(args) -> int:
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     cards = duty.board_cards(store, cfg, topic=args.topic, history=bool(args.topic))
     if args.topic and not cards:
@@ -1430,7 +1533,7 @@ def _notice_line(cfg, r) -> str:
 def cmd_notices(args) -> int:
     """给主人的通知账本：默认列没发出去、没人处理的（还在重试的、放弃了的）。--retry 让它们回到待发、2 小时重新算
     （常驻进程下一轮重发，防重编号不变）；--ack 确认已处理（不再提示、不再重发）；--show 打印正文原样。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     if args.show is not None:
         r = store.get_owner_notice(args.show)
@@ -1491,7 +1594,7 @@ def _test_env_write(cfg, what: str, text: str) -> int:
 
 def cmd_ask(args) -> int:
     """sheepdog ask / report：经机器人找主人。带 --key：同一把钥匙第一次起新话题，之后回到这个话题里。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     kind = args.cmd
     tid = _topic_arg(args.topic)
@@ -1535,7 +1638,7 @@ def cmd_ask(args) -> int:
 
 def cmd_resolve(args) -> int:
     """sheepdog resolve（7.36）：会话结案自己名下还开着的「需要你定」，机器人在那条提问的话题里补一句「已结案」。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     tid = _topic_arg(args.topic)
     source = _source(cfg) if cfg.source.enabled else None
@@ -1563,7 +1666,7 @@ def cmd_resolve(args) -> int:
 def cmd_pending(args) -> int:
     """sheepdog pending（7.36）：只读列出要主人定的、可能已处理的、各会话在等主人的。不写账本。"""
     from . import pending as pend
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     data = pend.build(cfg, store)
     if args.json:
@@ -1575,7 +1678,7 @@ def cmd_pending(args) -> int:
 
 def cmd_reply(args) -> int:
     """sheepdog reply：代回。发前只读检查主人有没有新发言；说过就不发（退出码 3），把他的话打印出来。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     tid = _topic_arg(args.topic)
     try:
@@ -1622,7 +1725,7 @@ def cmd_reply(args) -> int:
 
 def cmd_thread(args) -> int:
     """sheepdog thread：只读列出一个话题的全部消息（开头那条从账本 / sends / mget 取，回复从账本和话题列表取）。"""
-    cfg = load_config()
+    cfg = _load_cfg()
     store = Store(cfg.db_path)
     source = _source(cfg)
     try:
@@ -1886,6 +1989,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
+    global _FALLBACK
+    _FALLBACK = args.func not in (cmd_run, cmd_init, cmd_doctor, cmd_hook_stop)
+    _FALLBACK_NOTED.clear()
     try:
         return args.func(args)
     except _Abort:
