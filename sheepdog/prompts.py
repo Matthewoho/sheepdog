@@ -1,6 +1,7 @@
 """Prompt 组装（7.6、7.7）：这里只放机制——消息格式、名册表、「sheepdog 接口说明」和各段的拼装顺序。
 
-拼装顺序：所有开场最前面是 security.md，然后才是各自的说明和 common.md；
+拼装顺序：所有开场最前面是 security.md（开启一个批次的开场，最前面还有一行批次头：登记通知、接手开场），然后才是各自
+的说明和 common.md；普通批次的批次头永远是第一行，规则更新跟在它后面；
 每批末尾先 security_footer.md 再 batch_footer.md；被安全规则标记的消息正文前插 security_banner.md。
 
 业务规则（职责、工作方式、代回前缀、找主人、等回复、项目归属、退休/接手说明、提醒文字）一律来自 playbook 目录的
@@ -355,8 +356,8 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
     confirm = ["### 确认登记",
                *receipt_lines(s.is_cli_host, s.topic_id, batch_id, '{"status":"handled","summary":"..."}')]
     return _join(
+        onboarding_header(s.topic_id, batch_id),   # 头一行（7.47 第 4 条返工）：在 security.md 前面，截断后还在
         pb.render("security.md", session_title=s.display_title, topic_id=s.topic_id),
-        f"[sheepdog] 登记通知（topic `{s.topic_id}`，批次 `{batch_id}`）",
         _onboarding_body(pb, s),
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
         _cli_host_rules(pb, s),
@@ -379,6 +380,8 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
             "前任的交接回执到达后，sheepdog 会以「前任交接回执」原样转给你。",
         ]
     return _join(
+        # 有前任时开场本身就是一个批次（读完前任回执）：头一行写批次号，截断后 Stop hook 还认得出（7.47 第 4 条返工）
+        successor_header(s.topic_id, read_batch_id) if s.predecessor_conversation_id and read_batch_id else "",
         pb.render("security.md", **v),
         f"你是由 sheepdog 新建的 session：**{title}**（topic_id: `{s.topic_id}`）。",
         _onboarding_body(pb, s),
@@ -535,6 +538,21 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     return "\n".join(lines)
 
 
+def batch_header(topic_id: str, batch_id: str, count: int) -> str:
+    """普通批次的头一行（hook.BATCH_OPENINGS 认它）。"""
+    return f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {count} 条）"
+
+
+def onboarding_header(topic_id: str, batch_id: str) -> str:
+    """登记通知的头一行（hook.BATCH_OPENINGS 认它）。"""
+    return f"[sheepdog] 登记通知（topic `{topic_id}`，批次 `{batch_id}`）"
+
+
+def successor_header(topic_id: str, batch_id: str) -> str:
+    """spawn 接手会话（读前任）开场的头一行（hook.BATCH_OPENINGS 认它）。"""
+    return f"[sheepdog] 接手开场（topic `{topic_id}`，批次 `{batch_id}`）"
+
+
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "",
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
@@ -544,14 +562,15 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     """rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
     7.19 K1），附在整批最末尾。notes：附在某条消息上的撞车提醒（message_id → 几行，7.20）；
     digest：总线批次附的在岗表摘要（7.20）。"""
-    parts = []
+    # 批次头永远是第一行（7.47 第 4 条返工）：Antigravity 写会话记录时长消息只留首尾各约 2KB，规则排在前面会把批次头
+    # 截掉，Stop hook 就认不出这一批送达的那一行
+    parts = [batch_header(topic_id, batch_id, len(rows)), ""]
     if rules_update:
-        # 规则变了：完整现行规则放在这批最前面（7.11）；压缩后重推时头一行之后先说一句为什么又发
+        # 规则变了：完整现行规则紧跟批次头，放在消息前面（7.11）；压缩后重推时规则头之后先说一句为什么又发
         parts += [f"{RULES_UPDATE_HEADER}", ""]
         if rules_note:
             parts += [rules_note.strip(), ""]
         parts += [rules_update.strip(), "", "---", ""]
-    parts += [f"[sheepdog] 新信号批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
     quotes = quotes or {}

@@ -298,6 +298,11 @@ class SecurityPromptTest(unittest.TestCase):
         openings["successor"] = adopted_bootstrap(self.pb, handover, "[managed] Alpha", "h1", [15, 30], 60,
                                                   "/tmp/sheepdog_test_t.jsonl", "/tmp/sheepdog_test_dir")
         for name, text in openings.items():
+            if name in ("onboarding", "successor"):
+                # 开启批次的开场：第一行是批次头（7.47 第 4 条返工：会话记录截断后 Stop hook 还认得出），紧接着就是 security.md
+                head, _, text = text.partition("\n\n")
+                self.assertTrue(head.startswith("[sheepdog] "), name)
+                self.assertNotIn("\n", head, name)
             self.assertTrue(text.startswith("FX-SECURITY title="), name)
             self.assertLess(text.index("FX-SECURITY"), text.index("FX-COMMON"), name)
 

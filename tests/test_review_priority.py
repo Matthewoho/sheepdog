@@ -284,59 +284,143 @@ class NeedsDecisionScopeTest(PriorityBase):
         self.assertEqual(t["summary"], f"（回执说等主人拍板，但主人已在插话批次 `{pb}` 回复）等主人定发版时间")
 
 
+# Antigravity 写会话记录的格式（10-16 架构侧和实现侧只读核过正式记录；以下全是合成的数据）
+AG_SYSTEM_WRAP = ("The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as "
+                  "important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-16T01:02:03Z "
+                  "sender=system priority=MESSAGE_PRIORITY_HIGH content={body}\n</SYSTEM_MESSAGE>")
+AG_USER_WRAP = ("<USER_REQUEST>\n{body}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: "
+                "2026-10-16T09:02:03+08:00.\n</ADDITIONAL_METADATA>")
+AG_KEEP_BYTES = 2048
+LONG = "规则正文，规则正文，规则正文。\n" * 700          # 约 30KB
+
+
+def ag_truncate(content: str) -> tuple[str, bool]:
+    """照 Antigravity 的截法：太长就留开头约 2048 字节、结尾约 2048 字节，中间换成 `\n<truncated N bytes>\n`（截在字符边界上）。"""
+    raw = content.encode("utf-8")
+    if len(raw) <= 2 * AG_KEEP_BYTES:
+        return content, False
+    head = raw[:AG_KEEP_BYTES].decode("utf-8", errors="ignore")
+    tail = raw[-AG_KEEP_BYTES:].decode("utf-8", errors="ignore")
+    cut = len(raw) - len(head.encode()) - len(tail.encode())
+    return f"{head}\n<truncated {cut} bytes>\n{tail}", True
+
+
+def ag_record(body: str, kind: str = "SYSTEM_MESSAGE") -> tuple[dict, bool]:
+    """sheepdog 发的正文在会话记录里的样子（一行 JSON）：套包装、按需截断。"""
+    wrap = AG_USER_WRAP if kind == "USER_INPUT" else AG_SYSTEM_WRAP
+    content, cut = ag_truncate(wrap.format(body=body))
+    row = {"step_index": 0 if kind == "USER_INPUT" else 9, "source": "USER_EXPLICIT" if kind == "USER_INPUT" else "SYSTEM",
+           "type": kind, "status": "DONE", "created_at": "2026-10-16T01:02:03Z", "content": content}
+    if cut:
+        row["truncated_fields"] = ["content"]
+    return row, cut
+
+
 class BatchOpeningTest(unittest.TestCase):
-    """第 4 条：Stop hook 只认真正开启一批（占用 pending_batch_id）的那条消息。开头的清单拿真的 prompt 核对。"""
+    """第 4 条：Stop hook 只认真正开启一批（占用 pending_batch_id）的那条消息。开头的清单拿真的 prompt 核对；返工后按真记录的
+    截断格式核（长消息只留首尾各约 2KB），批次头必须在正文第一行。"""
 
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.pb = Playbook(REPO / "examples" / "playbook")
+        # 正式的 security.md 比示例长得多：拷一份示例 playbook，把它垫到 30KB，开场一定会被截断
+        d = Path(self.tmp.name) / "playbook"
+        import shutil
+        shutil.copytree(REPO / "examples" / "playbook", d)
+        (d / "security.md").write_text((d / "security.md").read_text(encoding="utf-8") + LONG, encoding="utf-8")
+        (d / "retire.md").write_text((d / "retire.md").read_text(encoding="utf-8") + LONG, encoding="utf-8")
+        self.long_pb = Playbook(d)
         roster = parse_roster(roster_data())
         self.s = roster.by_topic("tp_alpha")
 
-    def openings(self) -> dict[str, tuple[str, str, str]]:
-        """各种占用 pending_batch_id 的批次：种类 → (开场正文, 批次号, 记在哪个 topic)。"""
-        s, pb = self.s, self.pb
+    def openings(self, pb=None) -> dict[str, tuple[str, str, str, str]]:
+        """各种占用 pending_batch_id 的批次：种类 → (开场正文, 批次号, 记在哪个 topic, 会话记录里的类型)。"""
+        s, pb = self.s, pb or self.pb
         heir = replace(s, predecessor_conversation_id="conv_test_prev")
         b, o, h, r = ("b20261016010101-alpha", "o20261016010101-alpha", "h20261016010101-alpha",
                       "r20261016010101-alpha~prev")
         return {
-            "b": (batch_prompt(pb, "tp_alpha", b, [], [], "Alpha"), b, "tp_alpha"),
-            "o": (onboarding_prompt(pb, s, o, [15, 30], 60), o, "tp_alpha"),
-            "h": (adopted_bootstrap(pb, heir, "🐕 Alpha", h, [15, 30], 60), h, "tp_alpha"),
-            "r": (retirement_prompt(pb, "tp_alpha~prev", "Alpha（前任）", r, "🐕 Alpha", "tp_alpha"), r, "tp_alpha~prev"),
+            "b": (batch_prompt(pb, "tp_alpha", b, [], [], "Alpha"), b, "tp_alpha", "SYSTEM_MESSAGE"),
+            "b+规则": (batch_prompt(pb, "tp_alpha", b, [], [], "Alpha", rules_update=LONG), b, "tp_alpha",
+                       "SYSTEM_MESSAGE"),
+            "b+长红线": (batch_prompt(pb, "tp_alpha", b, [], [], "Alpha", reminder=LONG), b, "tp_alpha", "SYSTEM_MESSAGE"),
+            "o": (onboarding_prompt(pb, s, o, [15, 30], 60), o, "tp_alpha", "SYSTEM_MESSAGE"),
+            "h": (adopted_bootstrap(pb, heir, "🐕 Alpha", h, [15, 30], 60), h, "tp_alpha", "USER_INPUT"),
+            "r": (retirement_prompt(pb, "tp_alpha~prev", "Alpha（前任）", r, "🐕 Alpha", "tp_alpha"), r, "tp_alpha~prev",
+                  "SYSTEM_MESSAGE"),
+        }
+
+    def mentions(self, pb=None) -> dict[str, tuple[str, str]]:
+        """提到批次号、但不是开启那一批的消息：名字 → (正文, 会话记录里的类型)。"""
+        pb = pb or self.pb
+        b1 = "b20261016010101-alpha"
+        stop = (Playbook(REPO / "examples" / "playbook").render("stop_receipt.md", topic_id="tp_alpha", batch_id=b1,
+                receipt_command=f"sheepdog receipt --topic tp_alpha --batch {b1} --json '{{}}'",
+                waiting_command=f"sheepdog receipt --topic tp_alpha --batch {b1} --json '{{}}'", blocked="1")
+                or DEFAULT_STOP_REASON.replace("{{batch_id}}", b1))
+        return {
+            "插话": (priority_prompt(pb, "tp_alpha", "p20261016010202-alpha", b1, [], "Alpha", reminder=LONG),
+                     "SYSTEM_MESSAGE"),
+            "压缩后补发": (compaction_rules_message(LONG, "压缩说明", b1), "SYSTEM_MESSAGE"),
+            "规则更新": (rules_update_message(LONG + f"\n手上的批次 `{b1}`"), "SYSTEM_MESSAGE"),
+            "Stop hook 提示": ("Stop hook blocked termination: " + stop, "SYSTEM_MESSAGE"),
+            "Stop hook 提示（短）": ("Stop hook blocked termination: " + DEFAULT_STOP_REASON.replace("{{batch_id}}", b1)
+                                    .replace("{{receipt_command}}", f"sheepdog receipt --topic tp_alpha --batch {b1}"),
+                                    "SYSTEM_MESSAGE"),
         }
 
     def test_every_batch_kind_opening_is_recognized(self):
         ops = self.openings()
-        self.assertEqual(len(ops), len(BATCH_OPENINGS))           # 占用 pending_batch_id 的批次：b / o / h / r
-        for kind, (text, bid, tid) in ops.items():
+        self.assertEqual({k[0] for k in ops}, {"b", "o", "h", "r"})
+        self.assertEqual(len(BATCH_OPENINGS), 4)                  # 占用 pending_batch_id 的批次：b / o / h / r
+        for kind, (text, bid, tid, _) in ops.items():
             self.assertTrue(opens_batch(text, bid, tid), kind)
             self.assertTrue(opens_batch(text, bid), kind)         # 不知道 topic 也认
             self.assertFalse(opens_batch(text, bid[:-1] + "9", tid), kind)
-            if kind != "b":                                       # 普通批次的开头只认批次号（批次号里本来就带 topic）
+            if not kind.startswith("b"):                          # 普通批次的开头只认批次号（批次号里本来就带 topic）
                 self.assertFalse(opens_batch(text, bid, "tp_other"), kind)
+
+    def test_truncated_openings_still_recognized(self):
+        """真记录的截断格式：包装 + 截断以后，b（带规则 / 不带规则）、o、h、r 都还认得出。"""
+        for pb in (self.pb, self.long_pb):
+            for kind, (text, bid, tid, rtype) in self.openings(pb).items():
+                row, cut = ag_record(text, rtype)
+                if kind in ("b+规则", "b+长红线") or (pb is self.long_pb and kind != "b"):
+                    self.assertTrue(cut, kind)                    # 确实被截断了
+                    self.assertIn("<truncated ", row["content"])
+                self.assertTrue(opens_batch(row["content"], bid, tid), f"{kind} 截断={cut}")
+                self.assertTrue(opens_batch(row["content"], bid), f"{kind} 截断={cut}")
+
+    def test_truncated_b_with_rules_found_in_record(self):
+        tp = Path(self.tmp.name) / "t.jsonl"
+        text, bid, tid, rtype = self.openings()["b+规则"]
+        row, cut = ag_record(text, rtype)
+        self.assertTrue(cut)
+        lines = [row, {"type": "PLANNER_RESPONSE", "content": "继续"},
+                 {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "主人亲自打字"}]
+        tp.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        self.assertIs(owner_typed_after_batch(tp, bid, 1 << 20, tid), True)
+        tp.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines[:2]) + "\n", encoding="utf-8")
+        self.assertIs(owner_typed_after_batch(tp, bid, 1 << 20, tid), False)
 
     def test_mentions_of_batch_are_not_openings(self):
         b1 = "b20261016010101-alpha"
-        rows = []
-        mentions = {
-            "插话": priority_prompt(self.pb, "tp_alpha", "p20261016010202-alpha", b1, rows, "Alpha"),
-            "压缩后重推": compaction_rules_message("规则全文", "压缩说明", b1),
-            "规则更新": rules_update_message("规则全文") + f"\n手上的批次 `{b1}`",
-            "Stop hook 提示": "Stop hook blocked termination: " + DEFAULT_STOP_REASON.replace("{{batch_id}}", b1),
-        }
-        for name, text in mentions.items():
+        for name, (text, rtype) in self.mentions().items():
             self.assertIn(b1, text, name)
-            self.assertFalse(opens_batch(text, b1, "tp_alpha"), name)
-            self.assertFalse(opens_batch(text, b1), name)
+            row, _ = ag_record(text, rtype)
+            for content in (text, row["content"]):              # 截断前、套包装截断后都不算
+                self.assertFalse(opens_batch(content, b1, "tp_alpha"), name)
+                self.assertFalse(opens_batch(content, b1), name)
 
     def test_onboarding_opening_found_in_record(self):
-        tp = Path(tempfile.mkdtemp()) / "t.jsonl"
-        bid = "o20261016010101-alpha"
-        text = onboarding_prompt(self.pb, self.s, bid, [15, 30], 60)
-        lines = [{"type": "SYSTEM_MESSAGE", "content": text},
-                 {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "主人亲自打字"}]
+        tp = Path(self.tmp.name) / "o.jsonl"
+        text, bid, tid, rtype = self.openings(self.long_pb)["o"]
+        row, cut = ag_record(text, rtype)
+        self.assertTrue(cut)
+        lines = [row, {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "主人亲自打字"}]
         tp.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
-        self.assertIs(owner_typed_after_batch(tp, bid, 1 << 20, "tp_alpha"), True)
+        self.assertIs(owner_typed_after_batch(tp, bid, 1 << 20, tid), True)
 
 
 class UncertainRecheckTest(PriorityBase):

@@ -20,6 +20,12 @@ from sheepdog.prompts import RULES_UPDATE_HEADER
 
 from duty_sim import START, World
 
+
+def rules_up_front(text: str) -> bool:
+    """批次带了完整规则：头一行是批次头（7.47 第 4 条返工：批次头永远第一行，截断后 Stop hook 还认得出），紧接着是规则。"""
+    first, _, rest = text.partition("\n\n")
+    return first.startswith("[sheepdog] 新信号批次") and rest.startswith(RULES_UPDATE_HEADER)
+
 KEY1, KEY2, KEY3 = "202610100035", "PR #123", "ABC-123"
 
 
@@ -851,7 +857,7 @@ class S12RulesPush(Scenario):
             w.message(tid.removeprefix("tp_"), "规则改之前")
         self.to(1)
         for tid in (BUS_TOPIC_ID, "tp_alpha", "tp_beta"):
-            self.assertFalse(self.texts(tid)[-1].startswith(RULES_UPDATE_HEADER), tid)
+            self.assertFalse(rules_up_front(self.texts(tid)[-1]), tid)
             w[tid].act("Handle")
             w[tid].receipt()
         common = w.root / "config" / "playbook" / "common.md"
@@ -863,10 +869,10 @@ class S12RulesPush(Scenario):
             for tid in (BUS_TOPIC_ID, "tp_alpha", "tp_beta"):
                 text = self.texts(tid)[-1]
                 if round_ == 0:
-                    self.assertTrue(text.startswith(RULES_UPDATE_HEADER), tid)
+                    self.assertTrue(rules_up_front(text), tid)
                     self.assertIn("FX-RULE-V2", text)
                 else:
-                    self.assertFalse(text.startswith(RULES_UPDATE_HEADER), tid)
+                    self.assertFalse(rules_up_front(text), tid)
                 w[tid].act("Handle")
                 w[tid].receipt()
         self.assertEqual(self.notes(), [])
@@ -886,14 +892,14 @@ class S13Compaction(Scenario):
         mid = w.message("alpha", "压缩以后的第一条")
         self.to(4)
         text = self.texts("tp_alpha")[-1]
-        self.assertTrue(text.startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(text))
         self.assertIn("FX-COMPACTED title=会话alpha", text)
         self.assertIn(mid, text)
         a.act("Handle")
         a.receipt()
         w.message("alpha", "第二条")
         self.to(5)
-        self.assertFalse(self.texts("tp_alpha")[-1].startswith(RULES_UPDATE_HEADER))
+        self.assertFalse(rules_up_front(self.texts("tp_alpha")[-1]))
         a.act("Handle")
         a.receipt()
         # 超过 compacted_recent_minutes（60）不再标

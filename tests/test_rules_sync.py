@@ -16,6 +16,12 @@ from sheepdog.prompts import RULES_UPDATE_HEADER
 from test_roster import FIXTURES, ME, Base, msg
 
 
+def rules_up_front(text: str) -> bool:
+    """批次带了完整规则：头一行是批次头（7.47 第 4 条返工：批次头永远第一行，截断后 Stop hook 还认得出），紧接着是规则。"""
+    first, _, rest = text.partition("\n\n")
+    return first.startswith("[sheepdog] 新信号批次") and rest.startswith(RULES_UPDATE_HEADER)
+
+
 class RulesSyncTest(Base):
     def setUp(self):
         super().setUp()
@@ -54,10 +60,10 @@ class RulesSyncTest(Base):
         self.edit("common.md", "FX-COMMON-V2 title={{session_title}}")
         self.assertIn("待更新", self.d.rules_status(self.store.get_topic("tp_alpha")))
         text = self.deliver_to("tp_alpha", "om_test_c1")
-        self.assertTrue(text.startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(text))
         self.assertIn("FX-COMMON-V2 title=Alpha 需求", text)
-        # 完整现行规则：security + onboarding + common + 接口说明，都在批次头之前
-        head = text.index("[sheepdog] 新信号批次")
+        # 完整现行规则：security + onboarding + common + 接口说明，都在消息之前（批次头在第一行）
+        head = text.index("om_test_c1")
         for part in ("FX-SECURITY", "FX-ONBOARDING", "FX-COMMON-V2", "## sheepdog 接口说明"):
             self.assertLess(text.index(part), head, part)
         self.assertEqual(self.d.rules_status(self.store.get_topic("tp_alpha")), "最新")
@@ -66,7 +72,7 @@ class RulesSyncTest(Base):
     def test_missing_hash_treated_as_changed(self):
         self.store.update_topic("tp_alpha", rules_hash=None)
         self.assertIn("未记录", self.d.rules_status(self.store.get_topic("tp_alpha")))
-        self.assertTrue(self.deliver_to("tp_alpha", "om_test_m1").startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(self.deliver_to("tp_alpha", "om_test_m1")))
 
     def test_bus_too_but_not_on_roster_change(self):
         self.d.new_session("deploy", "发布排查", "FX 职责", [("oc_test_dall", True)])  # 名册变化
@@ -75,7 +81,7 @@ class RulesSyncTest(Base):
         self.assertIn("名册更新", text)
         self.edit("bus.md", "FX-BUS-V2\n{{roster}}")
         text = self.deliver_to(BUS_TOPIC_ID, "om_test_b2")
-        self.assertTrue(text.startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(text))
         self.assertIn("FX-BUS-V2", text)
         self.assertIn("tp_deploy", text)  # 发出去的完整规则里名册是真实的
 

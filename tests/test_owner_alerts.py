@@ -31,7 +31,7 @@ from sheepdog.source.lark import LarkCliSource
 from sheepdog.store import now_iso
 
 from duty_sim import World
-from test_guardrails import CliSink, GuardBase
+from test_guardrails import CliSink, GuardBase, rules_up_front
 
 ALERT = "会话跑了危险命令"
 GREP = 'grep -rn "builds approve" ~/notes/fx-release.md'
@@ -436,7 +436,7 @@ class F5RulesAfterCompaction(OwnerAlertBase):
         self.w.run(2)
         batches = [d for d in self.w.sink.to(self.bus.cid) if d["batch"]]
         self.assertEqual(len(batches), 2)
-        self.assertFalse(batches[-1]["content"].startswith(RULES_UPDATE_HEADER))
+        self.assertFalse(rules_up_front(batches[-1]["content"]))
         self.assertEqual(len(self.rules_messages()), 1)
         # 回执超时也照旧按 bid 算：bid 交了回执，是 acked
         self.assertEqual(self.w.store.get_dispatch(bid)["state"], "acked")
@@ -468,7 +468,7 @@ class F5RulesAfterCompaction(OwnerAlertBase):
         self.w.message("bus", "故障：SIM 服务报错")
         self.w.round()
         [batch] = [d for d in self.w.sink.to(self.bus.cid) if d["batch"]]
-        self.assertTrue(batch["content"].startswith(RULES_UPDATE_HEADER))  # 照旧随下一批带上
+        self.assertTrue(rules_up_front(batch["content"]))  # 照旧随下一批带上
 
     def test_unfinished_batch_after_receipt_timeout_also_gets_rules(self):
         """总线连续三次回执超时进了 attention，不再重投：它手上那一批还没交差（它其实在跑，只是没交回执），
@@ -547,7 +547,7 @@ class F5RulesAfterCompaction(OwnerAlertBase):
         self.w.run(2)
         batches = [d for d in self.w.sink.to(a.cid) if d["batch"]]
         self.assertEqual(len(batches), 2)
-        self.assertTrue(batches[-1]["content"].startswith(RULES_UPDATE_HEADER))  # 照旧随下一批带上
+        self.assertTrue(rules_up_front(batches[-1]["content"]))  # 照旧随下一批带上
 
 
 class F5CodexKeepsNextBatch(GuardBase):

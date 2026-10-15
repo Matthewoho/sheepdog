@@ -126,7 +126,7 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 
 `sheepdog hook stop` 挂在 Antigravity 的 Stop 时机（这一轮要结束时）。会话是 sheepdog 管的（总线、名册 managed、总线新开的，宿主是 Antigravity）、`fullyIdle` 为 true、手上那批还没交回执（回执文件不在、账本里那批还是 `sent`）、没被你占着，就输出 `{"decision":"continue","reason":"…"}`：会话不能停，reason 以系统消息出现，写明批次号和完整的 `sheepdog receipt` 命令（playbook 的 `stop_receipt.md`，可选）。同一批最多拦 2 次，计数在 `<状态目录>/hooks/stop/<topic>.json`。
 
-- 你亲自在会话里说过话就不拦：正式配置 `human_attach_minutes = 0`，羊群看板永远不会判「被主人占着」，所以 hook 另外读入参里的 `transcriptPath`，只读末尾 2MB：这一批送达的那一行（开启这一批的 SYSTEM_MESSAGE / USER_INPUT：普通批次「新信号批次 `` `批次号` ``」、登记通知、接手会话的开场、退休通知；只是提到批次号的，比如插话批次里写的「手上那批」、压缩后重推规则、Stop hook 自己的提示，不算）之后出现过 type 为 USER_INPUT、source 为 USER_EXPLICIT 的步骤，就不拦。agentapi 送的批次（SYSTEM_MESSAGE）、hook 插的话（SYSTEM_SDK 来源的 USER_INPUT）都不算你说话。末尾那一段里找不到这一批（记录不在、送达那行早被挤出去），也不拦。
+- 你亲自在会话里说过话就不拦：正式配置 `human_attach_minutes = 0`，羊群看板永远不会判「被主人占着」，所以 hook 另外读入参里的 `transcriptPath`，只读末尾 2MB：这一批送达的那一行（开启这一批的 SYSTEM_MESSAGE / USER_INPUT：去掉 Antigravity 的包装后，sheepdog 正文第一行是这一批的批次头——「[sheepdog] 新信号批次 `` `批次号` ``」「登记通知」「接手开场」「退休通知」。批次头永远排在第一行、在规则和开场说明前面，因为会话记录会把长消息掐掉中间、只留首尾各约 2KB。只是提到批次号的，比如插话批次里写的「手上那批」、压缩后重推规则、Stop hook 自己的提示，不算）之后出现过 type 为 USER_INPUT、source 为 USER_EXPLICIT 的步骤，就不拦。agentapi 送的批次（SYSTEM_MESSAGE）、hook 插的话（SYSTEM_SDK 来源的 USER_INPUT）都不算你说话。末尾那一段里找不到这一批（记录不在、送达那行早被挤出去），也不拦。
 
 - 其他情况一律什么都不输出、退出码 0，包括你自己的对话和一切出错（入参不是 JSON、配置坏了、账本打不开、计数写不了）。Antigravity 对 Stop 出错照常放行，但多输出一个字就可能被当成要拦，所以出错时一个字也不写。
 - 账本只读打开（不建表、不迁移），不导入投递引擎；冷启动实测约 0.13 秒（10 次中位，最大 0.13 秒；大头是导入命令行入口）。
@@ -452,7 +452,7 @@ playbook 的常驻规则原本只在会话建立时发一次。现在每个会�
 - 指纹覆盖的内容：总线 = security.md + bus.md + common.md + overlay + 接口说明；专属会话（名册 managed、总线新开的）= security.md + onboarding.md + common.md + 接口说明。successor.md 这类一次性指令不算。
 - 总线算指纹时 `{{roster}}` 用固定占位：名册变化照旧走「名册更新」，不会触发整份规则重发；真正发出去的规则里名册是现行的。
 - 建会话、onboarding、spawn、new-session 时记下当时的指纹。
-- 每次给会话投批次前重新渲染比对：不同就在这批最前面加「📌 规则已更新（以下为现行完整规则，取代之前的版本）」和完整规则，并更新指纹；没有待投消息时不单独发，下次有消息再一起带。
+- 每次给会话投批次前重新渲染比对：不同就在这批的批次头（第一行）后面、消息前面加「📌 规则已更新（以下为现行完整规则，取代之前的版本）」和完整规则，并更新指纹；没有待投消息时不单独发，下次有消息再一起带。
 - 没有指纹（老账本第一次上线新代码）视为不同，所以上线后每个会话的下一批都会带上现行规则。
 - 接口说明（命令用法）也在指纹里：代码升级加了新命令时，已有会话同样会收到一次。
 - `sheepdog sessions` 显示每个会话的规则是「最新」「待更新」还是「未记录」；`sheepdog push-rules [--topic tp_x] [--dry-run]` 不等新消息立即发（对总线也可以；known、已关闭、还没 onboarding 的跳过）。
@@ -527,7 +527,7 @@ sheepdog doctor                                         # 列出缺哪些文件�
 | `successor.md` | 接手会话开场附加 | `{{predecessor_id}}` `{{predecessor_transcript}}` `{{predecessor_dir}}` |
 | `nudge_remind.md` / `nudge_expire.md` | 等待提醒 / 到期 | `{{note}}` `{{person}}` `{{minutes}}` |
 | `batch_footer.md` | 每批信号末尾 | — |
-| `security.md` | 所有开场的最前面（在 common.md 之前） | — |
+| `security.md` | 所有开场的最前面（在 common.md 之前；开启批次的开场——登记通知、接手开场——前面还有一行批次头） | — |
 | `security_banner.md` | 被安全规则标记的消息正文前的警示 | `{{tags}}` `{{notes}}` `{{action}}` |
 | `security_footer.md` | 每批信号末尾，batch_footer 之前 | — |
 | `cli_host.md` | 只发给 Codex / Claude 会话（common.md 之后）：回执块怎么写、发不了 IM 时怎么办 | `{{host}}` |

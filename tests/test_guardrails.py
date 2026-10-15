@@ -22,6 +22,12 @@ from sheepdog.sink.agentapi import transcript_path
 
 from test_roster import FIXTURES, ME, REPO, Base, FakeSink, msg
 
+
+def rules_up_front(text: str) -> bool:
+    """批次带了完整规则：头一行是批次头（7.47 第 4 条返工：批次头永远第一行，截断后 Stop hook 还认得出），紧接着是规则。"""
+    first, _, rest = text.partition("\n\n")
+    return first.startswith("[sheepdog] 新信号批次") and rest.startswith(RULES_UPDATE_HEADER)
+
 CHECKPOINT = {"step_index": 5635, "source": "SYSTEM", "type": "CHECKPOINT", "status": "DONE",
               "created_at": "2026-10-10T15:59:00Z",
               "content": "# Resuming from a compaction\n\nYou are continuing work on a task ..."}
@@ -101,17 +107,17 @@ class CompactionTest(GuardBase):
         with self.assertLogs("sheepdog", "INFO") as logs:
             text = self.deliver_to(BUS_TOPIC_ID, "om_test_k1")
         self.assertTrue(any("检测到压缩" in m for m in logs.output))
-        self.assertTrue(text.startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(text))
         note = text.index("FX-COMPACTED title=Lark 信号·总线")
         self.assertLess(note, text.index("FX-SECURITY"))           # 那句话在规则前面
-        self.assertLess(text.index("FX-BUS"), text.index("[sheepdog] 新信号批次"))
+        self.assertLess(text.index("FX-BUS"), text.index("om_test_k1"))
         t = self.store.get_topic(BUS_TOPIC_ID)
         self.assertIsNone(t["compacted_at"])
         self.assertEqual(self.d.rules_status(t), "最新")
         self.assertNotIn(RULES_UPDATE_HEADER, self.deliver_to(BUS_TOPIC_ID, "om_test_k2"))  # 只带一次
         # 再压缩一次，又带一次
         self.append("conv_test_bus", dict(CHECKPOINT, step_index=6000))
-        self.assertTrue(self.deliver_to(BUS_TOPIC_ID, "om_test_k3").startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(self.deliver_to(BUS_TOPIC_ID, "om_test_k3")))
 
     def test_status_shows_compaction_until_delivered(self):
         self.append("conv_test_bus", CHECKPOINT)
@@ -138,7 +144,7 @@ class CompactionTest(GuardBase):
         self.assertNotIn(RULES_UPDATE_HEADER, self.deliver_to("tp_alpha", "om_test_k6"))
         self.append("conv_test_alpha", dict(CHECKPOINT, step_index=9))
         text = self.deliver_to("tp_alpha", "om_test_k7")
-        self.assertTrue(text.startswith(RULES_UPDATE_HEADER))
+        self.assertTrue(rules_up_front(text))
         self.assertIn("FX-COMPACTED title=Alpha 需求", text)
         self.assertIn("FX-ONBOARDING", text)
 

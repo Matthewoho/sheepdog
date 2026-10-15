@@ -46,15 +46,21 @@ DB_TIMEOUT_SECONDS = 1.0
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
 # 批次送进会话的那一行：agentapi send-message 记成 SYSTEM_MESSAGE；新建会话的开场是第 0 步 USER_INPUT
 DELIVERY_TYPES = ("SYSTEM_MESSAGE", "USER_INPUT")
-# 开启一批（占用 pending_batch_id）的那条消息里一定有的字样（7.47 第 4 条）：每一项是几段必须同时出现的文字，
-# {t} = topic，{b} = 批次号。和 prompts.py 里各批次的开头一致（测试拿真的 prompt 核对）。别的消息里也会写着批次号
-# （主人插话批次的「手上那批」、压缩后重推规则、Stop hook 自己的提示……），只带批次号不算送达那一行。
+# 开启一批（占用 pending_batch_id）的那条消息，sheepdog 正文的头一行（7.47 第 4 条；返工后都挪到了第一行）：
+# {t} = topic，{b} = 批次号。和 prompts.py 的 batch_header / onboarding_header / successor_header / retirement_prompt 一致
+# （测试拿真的 prompt 核对）。只认正文开头：Antigravity 写会话记录时长消息只留首尾各约 2KB、中间换成
+# `<truncated N bytes>`，开头一定还在；别的消息里也会写着批次号（主人插话批次的「手上那批」、压缩后补发规则、
+# Stop hook 自己的提示……），但都不在正文开头，不算。
 BATCH_OPENINGS = (
-    ("[sheepdog] 新信号批次 `{b}`",),                          # b：普通批次（batch_prompt）
-    ("[sheepdog] 登记通知（topic `{t}`，批次 `{b}`）",),        # o：onboarding（onboarding_prompt）
-    ("你是由 sheepdog 新建的 session：", "（topic_id: `{t}`）", " --batch {b} "),  # h：spawn 读前任（adopted_bootstrap 的开场）
-    ("[sheepdog] 退休通知（topic `{t}`，批次 `{b}`；",),        # r：退休通知（retirement_prompt；记在 retired 的 topic 上）
+    "[sheepdog] 新信号批次 `{b}`",                      # b：普通批次（带不带完整规则都是第一行）
+    "[sheepdog] 登记通知（topic `{t}`，批次 `{b}`）",   # o：onboarding
+    "[sheepdog] 接手开场（topic `{t}`，批次 `{b}`）",   # h：spawn 接手会话、读前任（新建会话的第 0 步 USER_INPUT）
+    "[sheepdog] 退休通知（topic `{t}`，批次 `{b}`；",   # r：退休通知（记在 retired 的 topic 上）
 )
+# 会话记录里 sheepdog 正文前面的包装：agentapi send-message 送的是 SYSTEM_MESSAGE，正文在「[Message] … content=」之后；
+# 新建会话的开场是 USER_INPUT，正文在「<USER_REQUEST>\n」之后（10-16 只读核过正式会话记录的格式）
+_SYSTEM_BODY_RE = re.compile(r"^\[Message\] [^\n]*?\bcontent=", re.M)
+_USER_REQUEST = "<USER_REQUEST>\n"
 
 
 def _parse(ts: str) -> datetime | None:
@@ -111,21 +117,26 @@ def _json_line(line: bytes):
     return d if isinstance(d, dict) else None
 
 
-_ANY_TOPIC = "\x00"   # 占位：不知道 topic 时，{t} 认任意 topic 编号
+def message_body(content: str) -> str:
+    """会话记录一行的 content 去掉 Antigravity 的包装，剩下 sheepdog 发的正文（没有包装就是原样）。"""
+    if content.startswith(_USER_REQUEST):
+        return content[len(_USER_REQUEST):]
+    if content.startswith("The following is a <SYSTEM_MESSAGE>") and (m := _SYSTEM_BODY_RE.search(content, 0, 2048)):
+        return content[m.end():]
+    return content
 
 
 def opens_batch(content, batch_id: str, topic_id: str = "") -> bool:
-    """这条消息正文是不是开启这一批的那条：BATCH_OPENINGS 里任一项的几段全都出现。不知道 topic（topic_id 为空）时，
+    """这条消息是不是开启这一批的那条：sheepdog 正文以 BATCH_OPENINGS 里的某一行开头。不知道 topic（topic_id 为空）时，
     {t} 认任意一个不含反引号的 topic 编号。"""
     if not isinstance(content, str) or not batch_id:
         return False
-    for parts in BATCH_OPENINGS:
-        if topic_id:
-            ok = all(x.format(b=batch_id, t=topic_id) in content for x in parts)
-        else:
-            ok = all(re.search(re.escape(x.format(b=batch_id, t=_ANY_TOPIC)).replace(_ANY_TOPIC, "[^`\\n]*"), content)
-                     for x in parts)
-        if ok:
+    body = message_body(content)
+    for mark in BATCH_OPENINGS:
+        if topic_id or "{t}" not in mark:
+            if body.startswith(mark.format(b=batch_id, t=topic_id)):
+                return True
+        elif re.match(re.escape(mark.format(b=batch_id, t="\x00")).replace("\x00", "[^`\n]*"), body):
             return True
     return False
 
