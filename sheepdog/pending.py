@@ -991,7 +991,7 @@ def _grey(text: str) -> str:
 
 def owner_card(v: dict) -> dict:
     """卡片版（Card 2.0）：header「📋 待办」+ 副标题；要你定的多于 0 条橙色，否则绿色；栏标题加粗，空栏不显示；
-    每一条：加粗的「序号. 标题」（能拿到原提问链接就跟「[打开](链接)」）、灰色一行会话和时间、摘录、灰色来源；条与条之间分隔线。"""
+    每一条：加粗的「序号. 标题」、灰色一行会话和时间、摘录、灰色来源；条与条之间分隔线。"""
     els: list[dict] = []
 
     def section(title: str, rows: list[dict], decide: bool) -> None:
@@ -999,7 +999,8 @@ def owner_card(v: dict) -> dict:
         for i, r in enumerate(rows):
             if i:
                 els.append({"tag": "hr"})
-            head = f"**{r['n']}. {r['title']}**" + (f" [打开]({r['link']})" if decide and r.get("link") else "")
+            # 不给「[打开]」（10-17 02:0x 真飞书核过）：「待办」就在私聊里回，原提问的话题链接打不开，打开私聊也没用
+            head = f"**{r['n']}. {r['title']}**"
             lines = [head, _grey(r["meta"])]
             if decide and r["excerpt"]:
                 lines.append(r["excerpt"])

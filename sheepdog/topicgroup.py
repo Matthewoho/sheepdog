@@ -299,33 +299,13 @@ def _link_host(store: Store) -> str:
     return m.group(1)
 
 
-def thread_link(store: Store, chat_id: str, thread_id: str, root_message_id: str = "") -> str:
-    """话题的链接：账本里开头那条的 message_app_link 是话题链接（client/thread/open）就用它；否则按聊天和话题编号拼
-    （同一个格式：open_chat_id + open_thread_id，10-16 正式账本核过）；话题编号还不知道就是空串。"""
-    if root_message_id:
-        row = store.get_message(root_message_id)
-        if row is not None and "/client/thread/open" in (row["link"] or ""):
-            return row["link"]
-    if not (chat_id and thread_id):
+def chat_link(store: Store, chat_id: str) -> str:
+    """打开一个聊天的链接：client/chat/open?openChatId=<oc_>。10-17 02:0x Matthew 在真飞书上逐个点过：话题链接
+    （client/thread/open，搜索给的原样、只带两个参数的都一样）打不开，卡片按钮也打不开；chat/open 能打开整个群，
+    带 position 也定位不到那一条。所以只在「从一个聊天跳到另一个聊天」时给链接，跳不进具体话题。"""
+    if not chat_id:
         return ""
-    return (f"{_link_host(store)}/client/thread/open?open_chat_id={chat_id}&open_thread_id={thread_id}"
-            f"&openchatid={chat_id}&openthreadid={thread_id}")
-
-
-def item_link(store: Store, item) -> str:
-    return thread_link(store, item["chat_id"] or "", item["thread_id"] or "", item["root_message_id"] or "")
-
-
-def dm_thread_link(store: Store, dm_root: str) -> str:
-    if not dm_root:
-        return ""
-    thr = store.thread_by_root(dm_root)
-    row = store.get_message(dm_root)
-    chat = row["chat_id"] if row is not None else ""
-    link = thread_link(store, chat, (thr["thread_id"] if thr is not None else "") or
-                       (row["thread_id"] if row is not None else "") or "", dm_root)
-    # 话题编号还不知道：退一步用那条消息自己的链接（打开私聊、定位到那条）
-    return link or ((row["link"] or "") if row is not None else "")
+    return f"{_link_host(store)}/client/chat/open?openChatId={chat_id}"
 
 
 # ======================= 进群：发送这一侧 =======================
@@ -371,7 +351,7 @@ TITLE_FOOTER = "在这里回复就是回给负责的会话；整句回「办完�
 INDEX_TITLE = "📌 话题群索引"
 INDEX_EMPTY = "现在没有在跟的事"
 INDEX_FOOTER = "在话题里回复就是回给负责的会话；整句回「办完了」表示办完，「移出群」退回私聊"
-SUGGEST_HOW = "在私聊那件事的话题里整句回「放群里」"
+SUGGEST_HOW = "在私聊那件事的话题里整句回「放群里」（在私聊里搜钥匙就能找到那个话题）"
 
 
 def _grey(text: str) -> str:
@@ -402,9 +382,8 @@ def title_view(cfg, store: Store, item, opener: str = "", key: str = "") -> dict
     sub = [f"钥匙 {key}" if key else "", opener or opener_phrase(cfg, store, item), when]
     related = ""
     if item["related_item"]:
-        old = store.get_item(item["related_item"])
-        link = item_link(store, old) if old is not None else ""
-        related = f"可能相关：{label(item['related_item'])}" + (f" [打开]({link})" if link else "") + "，那件已经归档"
+        # 同一个群里的另一件事：跳不进话题（见 chat_link），写编号，主人在群里搜编号
+        related = f"可能相关：{label(item['related_item'])}，那件已经归档"
     return {"title": f"🗂 {no} · {item['title']}", "subtitle": " · ".join(x for x in sub if x), "related": related,
             "footer": TITLE_FOOTER}
 
@@ -656,14 +635,17 @@ def build_index(cfg, store: Store, now: datetime | None = None) -> dict:
         else:   # 进行中、等别人、沉睡
             when = f"最近动静 {ago(last)}前" if last else ""
         sections[st].append({"item_no": it["item_no"], "label": label(it["item_no"]), "title": it["title"],
-                             "owner": _name(cfg, store, owner) if owner else "-", "link": item_link(store, it),
+                             "owner": _name(cfg, store, owner) if owner else "-",
                              "when": when, "last": it["last_activity_at"] or it["opened_at"] or ""})
     for k in sections:
         sections[k].sort(key=lambda x: x["last"], reverse=True)
     sugg = suggestions(cfg, store, now)
     for x in sugg:
         x["name"] = _name(cfg, store, x["topic_id"])
-        x["link"] = dm_thread_link(store, x["root_message_id"])
+        # 私聊话题跳不进去（见 chat_link）：打开私聊（找主人聊天），主人在私聊里搜钥匙
+        root = store.get_message(x["root_message_id"])
+        x["link"] = chat_link(store, (root["chat_id"] if root is not None else "") or
+                              (cfg.owner_chat_ids[0] if cfg.owner_chat_ids else ""))
         x["ago"] = ago(_parse(x["last_at"]))
     return {"generated_at": now.isoformat(timespec="seconds"), "sections": sections, "suggest": sugg,
             "per_session": {_name(cfg, store, k): v for k, v in sorted(per_session.items(), key=lambda kv: -kv[1])}}
@@ -681,7 +663,7 @@ def index_view(cfg, data: dict, rows: int = INDEX_ROWS) -> dict:
         items = data["sections"][st]
         if not items:
             continue
-        shown = [{"head": f"{x['label']} · {_excerpt(x['title'], 40)}", "link": x["link"],
+        shown = [{"head": f"{x['label']} · {_excerpt(x['title'], 40)}", "link": "",   # 索引卡就在群里：不给链接，带编号
                   "meta": " · ".join(y for y in (x["owner"], x["when"]) if y)} for x in items[:rows]]
         secs.append({"label": f"{STATUS_LABEL[st]} · {len(items)} 件", "items": shown, "more": len(items) - len(shown)})
     sugg = data["suggest"]
@@ -724,7 +706,8 @@ def index_text(v: dict) -> str:
 
 def index_card(v: dict) -> dict:
     """索引卡（Card 2.0），排版同「待办」卡片：header「📌 话题群索引」+ 副标题（几点更新 · 跟踪几件 · 等你定几件），
-    等你定多于 0 件橙色，否则蓝色；只列非空的栏，栏标题加粗；每件两行：加粗的「T-1 · 标题」跟「[打开](链接)」，灰色小字
+    等你定多于 0 件橙色，否则蓝色；只列非空的栏，栏标题加粗；每件两行：加粗的「T-1 · 标题」（不给链接：卡片就在群里，
+    话题链接打不开；「建议放进群」那几件跟「[打开](私聊的 chat/open 链接)」），灰色小字
     「会话显示名 · 时间」；件与件、栏与栏之间分隔线。全空只写一行「现在没有在跟的事」。「建议放进群」有内容才出现，
     第一行灰色小字说怎么放。末尾灰色小字说怎么回。"""
     els: list[dict] = []
@@ -1035,5 +1018,5 @@ def list_lines(cfg, store: Store, include_all: bool = False) -> list[str]:
         keys = item_keys(store, it["item_no"])
         out.append(f"{label(it['item_no'])} [{STATUS_LABEL.get(st, '已移出')}] {it['title']} · 负责 {it['owner_topic'] or '-'}"
                    + (f" · 钥匙 {'、'.join(keys)}" if keys else "") + f" · {ORIGIN_LABEL.get(it['origin'], it['origin'])}"
-                   + (f" · {item_link(store, it)}" if item_link(store, it) else ""))
+                   )
     return out

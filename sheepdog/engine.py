@@ -1534,9 +1534,8 @@ class Collector:
             # 群里发「待办」：回一句「看置顶的索引卡」，不另开清单
             d = RouteDecision(DROP, "pending_query", tags)
             self.store.upsert_message(m, d.route, d.reason, tags)
-            info = tg.index_info(self.store)
-            link = tg.thread_link(self.store, m.chat_id, info.get("thread_id", ""), info.get("message_id", ""))
-            self._tg_note(m, "📋 待办看置顶的索引卡" + (f"：[打开]({link})" if link else "（群顶上那张）"))
+            # 索引卡就在这个群里：不给链接（话题链接打不开，见 topicgroup.chat_link）
+            self._tg_note(m, "📋 待办看置顶的索引卡（群顶上那张）")
             return d
         item = self._tg_find_item(m)
         if item is not None and item["root_message_id"] == m.message_id:
@@ -1810,9 +1809,9 @@ class Collector:
             return d
         old = tg.find_by_key(self.store, key) if key else self.store.item_by_dm_root(dm_root)
         if old is not None and old["state"] in (tg.ACTIVE, tg.DONE):
-            link = tg.item_link(self.store, old)
-            self._bot_note(m.message_id, f"这件事已经在话题群里了：{tg.label(old['item_no'])}" + (f"（[打开]({link})）" if link else ""),
-                           "tg_note", in_thread=bool(m.thread_id))
+            link = tg.chat_link(self.store, self.cfg.topic_group.chat_id)   # 从私聊跳到话题群（只能打开整个群）
+            self._bot_note(m.message_id, f"这件事已经在话题群里了：{tg.label(old['item_no'])}" + (f"（[打开话题群]({link})，"
+                           f"搜 {tg.label(old['item_no'])}）" if link else ""), "tg_note", in_thread=bool(m.thread_id))
             return d
         title = re.sub(r"^🐕\s*(需要你定|汇报)\s*·\s*", "", title).strip() or key or "（无标题）"
         item = tg.open_item(self.store, title, topic, "owner", tg.ORIGIN_MOVE, self.cfg.topic_group.chat_id, key=key,
@@ -1830,8 +1829,8 @@ class Collector:
                                in_thread=bool(m.thread_id))
                 return d
         no = tg.label(item["item_no"])
-        link = tg.item_link(self.store, item)
-        self._bot_note(dm_root, f"📌 这件事已经放进话题群：{no}" + (f"（[打开]({link})）" if link else "")
+        link = tg.chat_link(self.store, self.cfg.topic_group.chat_id)   # 从私聊跳到话题群（只能打开整个群，搜编号找话题）
+        self._bot_note(dm_root, f"📌 这件事已经放进话题群：{no}" + (f"（[打开话题群]({link})，搜 {no}）" if link else "")
                        + "。之后同一把钥匙的消息都发进群里那个话题；这里的回复照旧送给会话。", "tg_moved", in_thread=True)
         how = (f"之后 `--key {key}` 的 ask / report 会发进群里那个话题（命令不用改）" if key
                else f"之后找主人用 `--key {no}`，会发进群里那个话题")

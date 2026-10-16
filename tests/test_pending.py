@@ -812,9 +812,11 @@ class OwnerPendingTest(PendingBase):
         text, card = self.view()
         item = next(e for e in self.els(card) if e.startswith("**1. "))
         lines = item.split("\n")
-        link = self.store.get_message(q)["link"]
-        self.assertTrue(link)
-        self.assertEqual(lines[0], f"**1. 卡片测试** [打开]({link})")
+        self.assertTrue(self.store.get_message(q)["link"])
+        # 10-17 02:0x 真飞书核过：话题链接打不开，「待办」在私聊里回、打开私聊也没用 → 标题后不再跟「[打开]」
+        self.assertEqual(lines[0], "**1. 卡片测试**")
+        self.assertNotIn("[打开]", json.dumps(card, ensure_ascii=False))
+        self.assertNotIn("client/thread/open", json.dumps(card, ensure_ascii=False) + text)
         meta = lines[1]
         self.assertEqual(meta, "<font color='grey'>Alpha 需求 · 15:00 问 · 已等 5 分钟 · 钥匙 T748</font>")
         self.assertNotIn("[managed]", meta)

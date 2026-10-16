@@ -248,7 +248,8 @@ class EntryTest(TGBase):
         # 私聊旧话题里贴上链接（kind = tg_moved，读回丢弃）
         note = [c for c in self.lark.sent("+messages-reply") if _opt(c, "--message-id") == root][-1]
         self.assertIn("这件事已经放进话题群：T-1", sent_text(note))
-        self.assertIn(f"open_chat_id={TG}", sent_text(note))
+        self.assertIn(f"[打开话题群](https://applink.larksuite.com/client/chat/open?openChatId={TG})，搜 T-1", sent_text(note))
+        self.assertNotIn("client/thread/open", sent_text(note))
         # 告诉负责会话
         self.assertEqual(len(self.sys_rows("tp_alpha", "topic_group")), 1)
         self.assertIn("命令不用改", self.sys_rows("tp_alpha", "topic_group")[0]["content"])
@@ -542,7 +543,9 @@ class IndexTest(TGBase):
         self.assertEqual(_opt(sent[0], "--msg-type"), "interactive")
         text = sent_text(sent[0])
         self.assertIn("**等你定 · 1 件**", text)
-        self.assertIn("**T-1 · 要你定的** [打开](https://applink.larksuite.com/client/thread/open?open_chat_id=" + TG, text)
+        self.assertIn("**T-1 · 要你定的**\n", text)                       # 卡片就在群里：不给链接
+        self.assertNotIn("client/thread/open", _opt(sent[0], "--content"))
+        self.assertNotIn("[打开]", _opt(sent[0], "--content"))
         # 内容没变：不改卡（同一时刻再对账一次；「已等多久」这类时间变了才算变）
         fixed = datetime.now().astimezone()
         with mock.patch("sheepdog.engine._now", return_value=fixed):
@@ -1135,7 +1138,8 @@ class CardLookTest(TGBase):
         self.assertEqual(md[0], "**等你定 · 1 件**")
         row = md[1].split("\n")
         self.assertEqual(len(row), 2)
-        self.assertTrue(row[0].startswith("**T-1 · 要你定的事** [打开](https://"), row[0])
+        self.assertEqual(row[0], "**T-1 · 要你定的事**")
+        self.assertNotIn("client/thread/open", json.dumps(card, ensure_ascii=False) + text)
         self.assertRegex(row[1], r"^<font color='grey'>Alpha 需求 · \d\d:\d\d 问 · 已等 \d+ 分钟</font>$")
         bus_row = next(x for x in md if x.startswith("**T-2"))
         self.assertIn("<font color='grey'>Lark 信号·总线 · 最近动静 ", bus_row)          # 会话显示名去掉 [managed]
@@ -1173,8 +1177,11 @@ class CardLookTest(TGBase):
         md = [e["content"] for e in card["body"]["elements"] if e["tag"] == "markdown"]
         self.assertEqual(md[0], "现在没有在跟的事")
         self.assertEqual(md[1], f"**建议放进群 · 1 件**\n<font color='grey'>{tg.SUGGEST_HOW}</font>")
-        self.assertRegex(md[2], r"^\*\*发版时间\*\* \[打开\]\(https://[^)]+\)\n<font color='grey'>Alpha 需求 · 钥匙 SG-1 · "
-                                r"你回过 2 次 · 最近动静 \d+ 分钟前</font>$")
+        self.assertIn("（在私聊里搜钥匙就能找到那个话题）", md[1])
+        # 建议栏的链接打开私聊（找主人聊天），chat/open 的写法；话题链接打不开，不用
+        self.assertRegex(md[2], r"^\*\*发版时间\*\* \[打开\]\(https://applink\.larksuite\.com/client/chat/open\?openChatId="
+                                + ESC_CHAT + r"\)\n<font color='grey'>Alpha 需求 · 钥匙 SG-1 · 你回过 2 次 · 最近动静 \d+ 分钟前</font>$")
+        self.assertNotIn("client/thread/open", json.dumps(card, ensure_ascii=False) + text)
 
     def test_title_card_header_and_one_grey_line(self):
         self.store.update_topic(BUS_TOPIC_ID, title="[managed] Lark 信号·总线")
@@ -1199,7 +1206,7 @@ class CardLookTest(TGBase):
                                "--content"))
         els = card["body"]["elements"]
         self.assertEqual(len(els), 2)
-        self.assertTrue(els[0]["content"].startswith("可能相关：T-1 [打开](https://"), els[0]["content"])
+        self.assertEqual(els[0]["content"], "可能相关：T-1，那件已经归档")
         self.assertEqual(els[1]["content"], f"<font color='grey'>{tg.TITLE_FOOTER}</font>")
         # owner_card 关着：标题卡发纯文本
         self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + "[notify]\nowner_card = false\n", encoding="utf-8")
@@ -1303,3 +1310,54 @@ class P1CFixTest(TGBase):
         self.d.dispatch_once()
         texts = [sent_text(c) for c in self.lark.tg_sent() if _opt(c, "--message-id") == mid]
         self.assertEqual(texts[-1], "➡️ 已交给「Beta 发版」")
+
+
+# ======================= 链接（10-17 02:0x Matthew 在真飞书上逐个点过：话题链接打不开，只能打开整个聊天） =======================
+class LinkTest(TGBase):
+    def all_cards_and_texts(self) -> str:
+        out = []
+        for c in self.lark.calls:
+            if c[1:2] in (["+messages-send"], ["+messages-reply"]):
+                out.append(_opt(c, "--content") or _opt(c, "--text"))
+        out += [json.dumps(x, ensure_ascii=False) for v in self.lark.patched.values() for x in v]
+        return "\n".join(out)
+
+    def test_no_thread_links_anywhere_and_chat_links_where_jumping(self):
+        # 私聊里问 → 放群里（私聊旧话题里那一句：打开话题群）
+        self.ask("--key", "LN-1", text="?")
+        self.poll()
+        root = self.store.thread_by_key("tp_alpha", "LN-1")["root_message_id"]
+        self.owner_dm_thread(root, "放群里")
+        self.poll()
+        moved = self.store.conn.execute("SELECT text FROM sends WHERE kind='tg_moved'").fetchone()[0]
+        self.assertIn(f"/client/chat/open?openChatId={TG})", moved)
+        again = self.owner_dm_thread(root, "放群里")              # 已经在群里了：同样给打开话题群的链接
+        self.poll()
+        note = self.store.conn.execute("SELECT text FROM sends WHERE kind='tg_note' AND target_message_id=?",
+                                       (again,)).fetchone()[0]
+        self.assertIn(f"/client/chat/open?openChatId={TG})", note)
+        # 群里新开话题、发「待办」、--track 的事项、归档 14 天后的「可能相关」、建议放进群
+        self.owner_tg("看一下磁盘")
+        self.owner_tg("待办")
+        self.ask("--key", "LN-2", "--track", title="要你定", text="?")
+        it = self.item("LN-2")
+        tg.close(self.store, it, "tp_alpha", "好了")
+        self.store.update_item(it["item_no"], state="archived",
+                               archived_at=(datetime.now().astimezone() - timedelta(days=15)).isoformat(timespec="seconds"))
+        self.ask("--key", "LN-2", "--track", title="又一轮", text="?")
+        self.ask("--key", "LN-3", text="?")
+        self.poll()
+        r3 = self.store.thread_by_key("tp_alpha", "LN-3")["root_message_id"]
+        self.owner_dm_thread(r3, "a")
+        self.owner_dm_thread(r3, "b")
+        self.poll()
+        self.d.dispatch_once()
+        everything = self.all_cards_and_texts()
+        self.assertNotIn("client/thread/open", everything)
+        self.assertNotIn("open_thread_id", everything)
+        idx = json.dumps(self.lark.patched.get(tg.index_info(self.store)["message_id"], [None])[-1]
+                         or json.loads(_opt([c for c in self.lark.tg_sent() if "📌" in sent_text(c)][-1], "--content")),
+                         ensure_ascii=False)
+        self.assertIn(f"client/chat/open?openChatId={ESC_CHAT}", idx)          # 建议栏：打开私聊
+        self.assertNotIn(f"openChatId={TG}", idx)                               # 索引卡在群里：不给打开同一个群
+        self.assertEqual(tg.list_lines(self.cfg, self.store, include_all=True)[0].count("http"), 0)
