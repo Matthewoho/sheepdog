@@ -1603,6 +1603,9 @@ class Store:
                             (kind, topic_id or None, body, idem_key, ts, ts, ts, reply_to or None, int(bool(in_thread))))
             return int(cur.lastrowid)
 
+    def owner_notice_by_key(self, idem_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM owner_notices WHERE idem_key=?", (idem_key,)).fetchone()
+
     def get_owner_notice(self, notice_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM owner_notices WHERE id=?", (notice_id,)).fetchone()
 

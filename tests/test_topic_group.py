@@ -1386,3 +1386,66 @@ class EchoInTopicGroupTest(TGBase):
         (c,) = [x for x in dm.calls if x["text"].startswith("✅ ")]
         self.assertEqual((c["reply_to"], c["in_thread"]), (mid, True))
         self.assertIn("今晚 22 点发", c["text"])
+
+    def _bus_batch_with(self, *mids):
+        """这几句主人的话都在同一批送到总线，总线交回执；返回带回的卡片（FakeDM 的调用）。"""
+        from test_owner_echo import FakeDM
+        from sheepdog.engine import write_receipt
+        if not isinstance(self.d.notifier, FakeDM):
+            self.d.notifier = FakeDM()
+        dm = self.d.notifier
+        n = len(dm.calls)
+        self.poll()
+        self.d.dispatch_once()
+        t = self.store.get_topic(BUS_TOPIC_ID)
+        batch = t["pending_batch_id"]
+        for mid in mids:
+            self.assertEqual((self.row(mid)["topic_id"], self.row(mid)["batch_id"]), (BUS_TOPIC_ID, batch))
+        write_receipt(self.cfg, BUS_TOPIC_ID, batch, {"status": "handled", "summary": "总线处理了"})
+        self.d.dispatch_once()
+        return [x for x in dm.calls[n:] if x["text"].startswith("✅ ")]
+
+    def _idle_bus_with_item(self) -> tuple[str, str]:
+        """主人在话题群新开一个话题（事项归总线），总线收完这一批、空闲下来。返回 (事项开头那条, 事项编号)。"""
+        from sheepdog.engine import write_receipt
+        from test_owner_echo import FakeDM
+        self.d.notifier = FakeDM()                                   # E0 自己的带回发在这里，不算进后面那一批
+        root = self.owner_tg("E0 新开一件事")
+        self.poll()
+        self.d.dispatch_once()
+        t = self.store.get_topic(BUS_TOPIC_ID)
+        write_receipt(self.cfg, BUS_TOPIC_ID, t["pending_batch_id"], {"status": "handled", "summary": "记下了"})
+        self.d.dispatch_once()
+        item = next(t for t in json.loads(self.row(root)["tags_json"]) if t.startswith("item:"))
+        return root, item
+
+    def test_relay_one_card_per_destination_in_the_same_batch(self):
+        """回归 7.52：一批里一句来自找主人聊天、一句来自话题群事项话题，带回被合成一张卡片、都发进了话题群（P1C 10-17 03:59）。"""
+        root, item = self._idle_bus_with_item()
+        e1 = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="E1 测试：帮我看看测试磁盘")   # 没引用 → 总线
+        e2 = self.owner_tg("E2 测试", root=root)                                                # 事项话题 → 总线
+        cards = self._bus_batch_with(e1, e2)
+        self.assertEqual(len(cards), 2, cards)
+        by_anchor = {c["reply_to"]: c for c in cards}
+        self.assertEqual(set(by_anchor), {e1, e2})
+        self.assertFalse(by_anchor[e1]["in_thread"])                          # 找主人聊天：引用 E1
+        self.assertIn("E1 测试", by_anchor[e1]["text"])
+        self.assertNotIn("E2 测试", by_anchor[e1]["text"])
+        self.assertTrue(by_anchor[e2]["in_thread"])                           # 话题群：回到那件事的话题
+        self.assertIn("E2 测试", by_anchor[e2]["text"])
+        self.assertNotIn("E1 测试", by_anchor[e2]["text"])
+        batch = self.row(e1)["batch_id"]
+        self.assertTrue(self.store.get_meta(f"owner_relay:{batch}:main:{ESC_CHAT}"))
+        self.assertTrue(self.store.get_meta(f"owner_relay:{batch}:{item}"))
+        before = len(self.d.notifier.calls)
+        self.d.dispatch_once()
+        self.assertEqual(len(self.d.notifier.calls), before)                 # 每批、每个去处一次
+
+    def test_relay_same_destination_two_sentences_one_card(self):
+        """回归 7.52：同一个去处的几句主人的话合成一张卡片，不拆开。"""
+        a = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="第一句")
+        b = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="第二句")
+        (card,) = self._bus_batch_with(a, b)
+        self.assertIn("「第一句」", card["text"])
+        self.assertIn("「第二句」", card["text"])
+        self.assertEqual((card["reply_to"], card["in_thread"]), (b, False))   # 引用最近那一句

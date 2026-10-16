@@ -3162,15 +3162,37 @@ class Dispatcher:
                 self.store.echo_update(e["message_id"], relay_batch=batch_id, relay_at=now, relay_status=status,
                                        relay_summary=summary)
 
+    def _echo_destination(self, e) -> tuple[str, bool]:
+        """这句主人的话，回音该回到哪：(去处键, 是否回到话题里)。
+        - 话题群里的：那件事的话题（item:T-n；认不出事项就按话题编号）；
+        - 找主人聊天里、在某个话题里的：那个话题（thread:<话题编号>）；
+        - 找主人聊天里、不在话题里的：找主人聊天的主时间线（main:<聊天>，卡片引用其中最近的一句）；
+        - 群里 @ 机器人的指令、撤回了的：找主人聊天里新起一条（new）。"""
+        tgid = self.cfg.topic_group.chat_id
+        chat = e["chat_id"] or ""
+        r = self.store.get_message(e["message_id"])
+        if r is None or e["kind"] == "recalled" or not (chat in self.cfg.owner_chat_ids or (tgid and chat == tgid)):
+            return "new", False
+        m = row_to_message(r)
+        if tgid and chat == tgid:
+            item = next((t for t in json.loads(r["tags_json"] or "[]") if t.startswith("item:")), "")
+            return item or f"thread:{r['thread_id'] or m.root_id or r['message_id']}", True
+        if is_thread_reply(m):
+            return f"thread:{r['thread_id']}", True
+        return f"main:{chat}", False
+
     def _echo_relays(self) -> None:
-        """回执带回第二步：等着带回、还没还上的，到了 max(回执收到, 送到 + owner_relay_after_minutes) 就发一张卡片（同一会话
-        同一次回执的几句合成一张）。每批最多一次（meta owner_relay:<批次>）。发到哪：主人那句在找主人聊天的话题里 → 回到话题里；
-        不在话题里 → 回复主人那一条（带引用）；只有群里 @ 机器人的指令 → 找主人聊天里新起一条，不发进那个群。"""
+        """回执带回第二步：等着带回、还没还上的，到了 max(回执收到, 送到 + owner_relay_after_minutes) 就发卡片。
+        按「去处」分组（_echo_destination）：一个会话一次回执里的几句，回到哪就各发一张，同一个去处的几句合成一张（P1C
+        10-17 03:59：找主人聊天的一句和话题群 T-3 的一句被合成一张、都发进了 T-3 话题）。每批、每个去处最多一次
+        （meta owner_relay:<批次>:<去处>；给主人的通知账本里的防重编号也按批次 + 去处定）。发到哪：话题里的回到话题里；
+        找主人聊天主时间线的引用其中最近的一句；群里 @ 机器人的指令在找主人聊天里新起一条，不发进那个群。"""
         sc = self.cfg.session
         if not sc.owner_receipt_relay:
             return
         now = _now()
         groups: dict[tuple, list] = {}
+        dests: dict[str, bool] = {}
         for e in self.store.echo_open():
             if e["stage"] != ECHO_DELIVERED or not e["relay_batch"]:
                 continue
@@ -3178,9 +3200,12 @@ class Dispatcher:
             since = _parse(e["stage_at"] or "")
             due = max(x for x in (at, since + timedelta(minutes=sc.owner_relay_after_minutes) if since else None) if x)
             if now >= due:
-                groups.setdefault((e["topic_id"], e["relay_batch"]), []).append(e)
-        for (tid, batch_id), rows in groups.items():
-            key = ECHO_RELAY_PREFIX + batch_id
+                dest, in_thread = self._echo_destination(e)
+                dests[dest] = in_thread
+                groups.setdefault((e["topic_id"], e["relay_batch"], dest), []).append(e)
+        from .outbound import idem_key
+        for (tid, batch_id, dest), rows in groups.items():
+            key = f"{ECHO_RELAY_PREFIX}{batch_id}:{dest}"
             if self.store.get_meta(key):
                 continue
             last = rows[-1]
@@ -3188,16 +3213,8 @@ class Dispatcher:
             lines += [f"{self._echo_said(e)}「{self._echo_excerpt(e)}」" for e in rows]
             lines += [last["relay_summary"] or "（回执没写说明）",
                       f"状态：{RELAY_STATUS_LABEL.get(last['relay_status'], last['relay_status'] or '已处理')}"]
-            anchor, in_thread = "", False
-            tgid = self.cfg.topic_group.chat_id   # 7.51 话题群也是主人和机器人说话的地方：回到那件事的话题里
-            owner_chat = [e for e in rows if (e["chat_id"] in self.cfg.owner_chat_ids or (tgid and e["chat_id"] == tgid))
-                          and e["kind"] != "recalled"]
-            if owner_chat:
-                r = self.store.get_message(owner_chat[-1]["message_id"])
-                if r is not None:
-                    anchor = r["message_id"]
-                    # 话题群里一律回到那件事的话题里（主人新开的顶层话题，它自己就是开头）
-                    in_thread = is_thread_reply(row_to_message(r)) or bool(tgid and r["chat_id"] == tgid)
+            anchor = "" if dest == "new" else rows[-1]["message_id"]
+            in_thread = dests[dest] and bool(anchor)
             ids = [e["message_id"] for e in rows]
 
             def settle(ids=ids, key=key) -> None:
@@ -3205,8 +3222,8 @@ class Dispatcher:
                 self.store.set_meta(key, now_iso())
 
             if self._notify_owner("\n".join(lines), "回执带回", tid, before_send=settle, reply_to=anchor,
-                                  in_thread=in_thread):
-                log.info("回执带回 %s/%s：%d 句主人的话，%s", tid, batch_id, len(ids),
+                                  in_thread=in_thread, idem_key=idem_key("relay", tid, batch_id, dest)):
+                log.info("回执带回 %s/%s → %s：%d 句主人的话，%s", tid, batch_id, dest, len(ids),
                          f"回复 {anchor}" + ("（话题里）" if in_thread else "") if anchor else "找主人聊天新起一条")
 
     # ---------- 连续投递失败告诉主人（第一轮报告第 6 节问题 4） ----------
@@ -3495,7 +3512,7 @@ class Dispatcher:
                                       f"（{r.error_kind}）：{r.error[-300:]}", about=r.topic_id)
 
     def _notify_owner(self, text: str, what: str, topic_id: str = "", before_send=None, reply_to: str = "",
-                      in_thread: bool = False) -> bool:
+                      in_thread: bool = False, idem_key: str = "") -> bool:
         """给主人的通知（危险命令报警、在岗表中断 / 失联 / 已恢复、attention / 恢复、投递不出去 / 已恢复、写锁提醒、
         登录提醒）。没有发送渠道时只记日志，返回 False。
 
@@ -3508,7 +3525,9 @@ class Dispatcher:
         记账放在发送之前，进程在「发出去了、还没记账」之间没了，重启以后不会把同一件事再拼一条新通知（那条会带新的
         防重编号，飞书去不了重）；落了账本的那条由重试接着发、靠防重编号去重。
         topic_id：说的是哪个会话（登录提醒说的是宿主，留空）。
-        reply_to / in_thread（7.52 回执带回）：回复主人的哪一条、是否回到它的话题里；渠道不支持回复（写文件、打印）时照常发。"""
+        reply_to / in_thread（7.52 回执带回）：回复主人的哪一条、是否回到它的话题里；渠道不支持回复（写文件、打印）时照常发。
+        idem_key（7.52）：调用方定的防重编号（不给就新起一个）；账本里已经有这个编号的通知 = 这件事已经落过账，不再落、
+        照常做 before_send 的记账，返回 True。"""
         if self.notifier is None:
             return False
         text = with_cli(text, self.cfg.cli_command)
@@ -3521,7 +3540,11 @@ class Dispatcher:
             if before_send is not None:
                 before_send()
             return True
-        nid = self.store.add_owner_notice(what, topic_id, text.encode("utf-8"), new_idempotency_key(), reply_to,
+        if idem_key and self.store.owner_notice_by_key(idem_key) is not None:
+            if before_send is not None:
+                before_send()
+            return True
+        nid = self.store.add_owner_notice(what, topic_id, text.encode("utf-8"), idem_key or new_idempotency_key(), reply_to,
                                           in_thread)
         if before_send is not None:
             before_send()

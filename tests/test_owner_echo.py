@@ -95,7 +95,7 @@ class RelayTest(EchoBase):
         self.assertEqual(lines[-1], "状态：已处理")
         self.assertEqual((c["reply_to"], c["in_thread"]), (a, False))          # 回复主人那一条（带引用）
         self.assertEqual((self.echo(a)["stage"], self.echo(a)["settled_by"]), ("settled", "relay"))
-        self.assertTrue(self.store.get_meta("owner_relay:" + batch))
+        self.assertTrue(self.store.get_meta(f"owner_relay:{batch}:main:{ESC_CHAT}"))   # 每批、每个去处一次
         with later(30):
             self.d.dispatch_once()
         self.assertEqual(len(self.relays()), 1)                               # 每批一次，之后也不再报没回音
