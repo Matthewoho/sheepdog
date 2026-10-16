@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
+from . import media
 from .models import Mention, Message
 
 SCHEMA = """
@@ -1831,9 +1832,10 @@ class Store:
     ITEM_PURGE_DAYS = 30
 
     def prune(self, retention_days: int, receipts_dir: Path | None = None,
-              runs_dir: Path | None = None, history_days: int | None = None) -> dict[str, int]:
+              runs_dir: Path | None = None, history_days: int | None = None,
+              media_dir: Path | None = None) -> dict[str, int]:
         """清理超过 retention_days 的记录与回执文件、超过 history_days（默认同 retention_days）的在岗表履历；
-        返回每类删了多少。"""
+        media_dir（7.54）：送进会话的图片，消息已经清出账本、目录又超过保留期的整个删。返回每类删了多少。"""
         now = datetime.now().astimezone()
         cutoff = (now - timedelta(days=retention_days)).isoformat(timespec="seconds")
         hcut = (now - timedelta(days=history_days if history_days is not None else retention_days)
@@ -1875,6 +1877,9 @@ class Store:
                     f.unlink()
                     n += 1
             out["run_files"] = n
+        if media_dir is not None:
+            keep = {r[0] for r in self.conn.execute("SELECT message_id FROM messages")}
+            out["media_dirs"] = media.prune(media_dir, keep, (now - timedelta(days=retention_days)).timestamp())
         return out
 
 

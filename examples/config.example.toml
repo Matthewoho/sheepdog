@@ -309,3 +309,12 @@ stop = true
 # 机器人实时事件到了就处理（7.45，要开 [identity]）：两轮之间不再死睡 poll_interval_seconds，事件一到（攒 2 秒）就做一次
 # 只入账 + 投递的小轮次，不跑搜索。关掉（false）：照旧每轮睡满间隔。热加载
 wake_on_bot_event = true
+
+[media]
+# 消息里的图片送进会话前先下载（7.54）：用 lark-cli（用户身份）下到 <状态目录>/media/<message_id>/<钥匙>.<扩展名>，
+# 正文里那把飞书图片钥匙（![Image](img_…)、[Image: img_…]、卡片里的 (img_key:img_…)）换成本机绝对路径，同一张只下一次。
+# 下载失败不挡投递：原文照留，正文后面写原因和会话自己去取的命令。跟着 retention_days 一起清理。热加载
+images = true
+max_image_mb = 20             # 单张上限，下完超过就删掉、当没下载下来
+max_images_per_batch = 10     # 一批里最多真去下载几张（已经下过的不算）
+image_timeout_seconds = 30    # 每张的超时

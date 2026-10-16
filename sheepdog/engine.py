@@ -16,6 +16,7 @@ from . import session as sm
 from .config import ANTIGRAVITY, Config, DutyConfig
 from .models import Message
 from . import duty
+from . import media
 from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
                     human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
@@ -2108,6 +2109,34 @@ class Dispatcher:
         self.playbook = Playbook.from_config(cfg)
         # 这一轮里各会话的记录文件（护栏用，每轮清空）
         self._record_cache: dict[tuple[str, str], Path | None] = {}
+        # 消息里的图片送进会话前先下载（7.54）：下载用的 lark-cli。空 = 这个进程不下载（试运行、只组装 prompt 的命令），
+        # 正文后面写明原因和会话自己去取的命令；常驻进程和 poll 由 cli 设上
+        self.image_binary = ""
+        self.image_off_reason = "这个进程不下载图片"
+
+    def _images(self, rows) -> dict[str, dict]:
+        """这一批里每条消息的图片下载结果（7.54）：message_id → {钥匙: media.ImageResult}。[media] 每批现读（热加载）。
+        下载失败不挡投递：结果里带原因，渲染时原文照留、写明会话自己去取的命令。"""
+        mc = self.cfg.media
+        fetcher = None
+        reason = self.image_off_reason
+        if not mc.images:
+            reason = "配置里关了图片下载（[media] images = false）"
+        elif self.image_binary:
+            fetcher = media.ImageFetcher(self.cfg.media_dir, self.image_binary, int(mc.max_image_mb * 1024 * 1024),
+                                         mc.image_timeout_seconds)
+        try:
+            out = media.resolve(rows, fetcher, mc.max_images_per_batch, reason)
+        except Exception as e:  # 兜底：图片出什么错都不能挡投递，当都没下载下来
+            log.warning("下载图片出错，这一批的图片都按没下载处理: %s: %s", type(e).__name__, e)
+            out = media.resolve(rows, None, mc.max_images_per_batch, f"下载图片出错：{type(e).__name__}: {e}")
+        for mid, res in out.items():
+            for r in res.values():
+                if r.ok and not r.cached:
+                    log.info("消息 %s 的图片 %s 已下载到 %s", mid, r.key, r.path)
+                elif not r.ok and fetcher is not None:
+                    log.warning("消息 %s 的图片 %s 没下载下来：%s", mid, r.key, r.error)
+        return out
 
     @property
     def sink(self) -> Sink:
@@ -2821,13 +2850,14 @@ class Dispatcher:
             for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in rows]):
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
+            images = self._images(rows)   # 7.54：图片先下到本机，正文里换成路径
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
                                   rules_note=self._compaction_note(t) if rules_update else "",
-                                  reminder=self.reminder(t), notes=notes, digest=digest)
+                                  reminder=self.reminder(t), notes=notes, digest=digest, images=images)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -2911,7 +2941,7 @@ class Dispatcher:
             prompt = priority_prompt(self.playbook, t["topic_id"], batch_id, t["pending_batch_id"], urgent,
                                      self._session_title(t), security=self.security, quotes=quotes,
                                      max_lines=self.cfg.session.max_message_lines, notes=notes,
-                                     reminder=self.reminder(t))
+                                     reminder=self.reminder(t), images=self._images(urgent))
             # 同普通批次：先记「正在发」再发送，崩溃后由 _recover_sending 核对（7.16）
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in urgent], state="sending")
             self._send(t, prompt, batch_id)
