@@ -490,18 +490,27 @@ def learn_thread_id(store: Store, source, item_no: int, root: str) -> str:
 
 # ======================= 状态（按证据现算） =======================
 def item_asks(store: Store, item) -> list:
-    """这件事话题里会话发过的「需要你定」（escalations 行），按提问时间倒序。"""
-    root = item["root_message_id"]
-    if not root:
-        return []
+    """这件事名下会话发过的「需要你定」（escalations 行），按提问时间倒序：群里这个话题里的，加上「放群里」搬进来的事项
+    私聊原话题（dm_root_message_id）里的——私聊里那条提问还开着，这件事就是在等主人定（10-17 01:57 P1C：DEMO-G7 搬进
+    群以后状态算成进行中，主人在群里回的话也认不出是在答它）。"""
     out = []
-    for n, s in enumerate(store.sends_in_thread(root)):
-        if s["kind"] != "ask":
+    seen: set[str] = set()
+    n = 0
+    for root in (item["dm_root_message_id"], item["root_message_id"]):
+        if not root:
             continue
-        e = store.get_escalation(s["message_id"])
-        if e is not None:
-            out.append((e["asked_at"] or "", n, e))
-    # 提问时间只到分钟（搜索结果的 create_time）：同一分钟里按发出先后（sends 的顺序）
+        mids = [s["message_id"] for s in store.sends_in_thread(root) if s["kind"] == "ask"]
+        if root == item["dm_root_message_id"] and root not in mids:
+            mids.insert(0, root)   # 私聊原话题开头那条本身就是提问（不是经 sheepdog ask 发的、sends 里没有）
+        for mid in mids:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            e = store.get_escalation(mid)
+            if e is not None:
+                out.append((e["asked_at"] or "", n, e))
+            n += 1
+    # 提问时间只到分钟（搜索结果的 create_time）：同一分钟里按发出先后（私聊在前、群里在后，各自按 sends 的顺序）
     out.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return [e for _, _, e in out]
 

@@ -1743,6 +1743,8 @@ class Collector:
             f"`sheepdog forward --topic <会话> --message-ids {m.message_id}` 转交：{no} 会跟着带过去，那个会话之后用 "
             f"`--key {no}` 发 ask / report 就回到群里这个话题，话题里会自动说一句「已交给 …」。你自己处理就用 "
             f"`sheepdog report --topic tp_bus --key {no}` 回主人。", self.cfg.cli_command))
+        # 当轮在这个话题里回一行（kind = tg_note，读回丢弃），主人在话题里就看得到编号；之后转交照旧补「➡️ 已交给 …」
+        self._tg_note(m, f"🗂 记成事项 {no}，交给「{tg._name(self.cfg, self.store, BUS_TOPIC_ID)}」")
         log.info("主人在话题群新开话题 %s，记成事项 %s，交给总线", m.message_id, no)
         return RouteDecision(DISPATCH, OWNER_REPLY, tags)
 

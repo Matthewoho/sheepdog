@@ -1239,3 +1239,67 @@ class ChangeLineFinalStateTest(TGBase):
         self.poll()
         self.d.dispatch_once()
         self.assertEqual(self.decide_lines(), ["🟠 等你定：G5：只问抄送会话"])
+
+
+# ======================= 10-17 01:57 P1C 查出的两处 =======================
+class P1CFixTest(TGBase):
+    def test_moved_item_counts_open_ask_in_dm_thread(self):
+        """DEMO-G7：总线在私聊话题里问了一条（还开着），主人在那个话题里整句回「放群里」开出 T-n。T-n 应当是等你定；
+        主人在群话题里不引用地回一句，送给提问的会话、带 escalation 标签，送到以后私聊那条标成已答，状态回到进行中。"""
+        self.ask("--key", "DEMO-G7", topic=BUS_TOPIC_ID, title="DEMO-G7 要不要续费", text="A 续 / B 不续？")
+        self.poll()
+        root = self.store.thread_by_key(BUS_TOPIC_ID, "DEMO-G7")["root_message_id"]
+        esc = self.store.get_escalation(root)
+        self.assertIsNotNone(esc)
+        self.assertIsNone(esc["closed_at"])
+        self.owner_dm_thread(root, "放群里")
+        self.poll()
+        it = self.item("DEMO-G7")
+        self.assertEqual((it["origin"], it["dm_root_message_id"]), (tg.ORIGIN_MOVE, root))
+        self.assertEqual([e["message_id"] for e in tg.open_asks(self.cfg, self.store, it)], [root])
+        self.assertEqual(tg.status(self.cfg, self.store, it), tg.S_DECIDE)
+        data = tg.build_index(self.cfg, self.store)
+        self.assertEqual([x["label"] for x in data["sections"][tg.S_DECIDE]], [tg.label(it["item_no"])])
+        self.d.dispatch_once()
+        lines = [r[0] for r in self.store.conn.execute("SELECT text FROM sends WHERE kind='tg_change'")]
+        self.assertEqual(lines, ["🟠 等你定：DEMO-G7 要不要续费"])
+        self.assertEqual(self.store.get_item(it["item_no"])["status"], tg.S_DECIDE)
+        # 主人在群话题里不引用地回一句：送给提问的会话（总线），带 escalation 标签
+        it = self.store.get_item(it["item_no"])
+        reply = self.owner_tg("续一年", root=it["root_message_id"])
+        self.poll()
+        r = self.row(reply)
+        self.assertEqual((r["reason"], r["topic_id"]), ("owner_reply", BUS_TOPIC_ID))
+        self.assertIn("escalation:" + root, json.loads(r["tags_json"]))
+        self.d.dispatch_once()
+        e = self.store.get_escalation(root)
+        self.assertEqual((e["close_reason"], e["answer_message_id"]), ("answered", reply))
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_item(it["item_no"])["status"], tg.S_DOING)
+
+    def test_owner_new_topic_gets_a_line_right_away(self):
+        self.store.update_topic(BUS_TOPIC_ID, title="[managed] Lark 信号·总线")
+        mid = self.owner_tg("G6 帮我看看测试环境的磁盘")
+        self.poll()
+        no = tg.label(self.store.item_by_root(mid)["item_no"])
+        notes = [c for c in self.lark.tg_sent() if _opt(c, "--message-id") == mid]
+        self.assertEqual(len(notes), 1)                                    # 开事项的同一轮就回一行
+        self.assertIn("--reply-in-thread", notes[0])
+        self.assertEqual(sent_text(notes[0]), f"🗂 记成事项 {no}，交给「Lark 信号·总线」")
+        note_mid = self.lark.idem[_opt(notes[0], "--idempotency-key")]
+        self.assertEqual(self.store.send_by_message(note_mid)["kind"], "tg_note")
+        self.poll()                                                        # 读回：丢弃，不登记成任何东西
+        r = self.row(note_mid)
+        self.assertEqual((r["route"], r["reason"]), ("drop", "sheepdog_tg_note"))
+        self.assertIsNone(self.store.get_bot_outbox(note_mid))
+        self.assertIsNone(self.store.get_escalation(note_mid))
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM tracked_items").fetchone()[0], 1)
+        # 再 poll 一次不重复回
+        self.poll()
+        self.assertEqual(len([c for c in self.lark.tg_sent() if _opt(c, "--message-id") == mid]), 1)
+        # 转交以后照旧补「已交给 …」
+        from sheepdog.engine import forward_messages
+        forward_messages(self.store, "tp_beta", [mid], self_open_id=ME)
+        self.d.dispatch_once()
+        texts = [sent_text(c) for c in self.lark.tg_sent() if _opt(c, "--message-id") == mid]
+        self.assertEqual(texts[-1], "➡️ 已交给「Beta 发版」")
