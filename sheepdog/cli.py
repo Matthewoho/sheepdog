@@ -77,7 +77,7 @@ from . import __version__
 from . import actions
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text
-from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, default_config_path, load_config
+from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
 from . import lastgood
 from . import duty
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
@@ -401,6 +401,8 @@ def cmd_doctor(args) -> int:
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     print(owner_chats_report(cfg))
     print(topic_group_report(cfg, store))
+    for line in _test_group_warnings(cfg, store):   # 7.56：建了测试群忘了登记进 ignore，下一次 doctor 就看见
+        print(line)
     print(media_report(cfg))
     for line in switches_report(cfg):
         print(line)
@@ -421,6 +423,28 @@ def cmd_doctor(args) -> int:
         print(line)
     print(duty_report(cfg, store))
     return 0 if ok else 1
+
+
+TEST_GROUP_MARK = "🧪"
+
+
+def _test_group_warnings(cfg, store: Store) -> list[str]:
+    """doctor（7.56）：账本里出现过、群名以「🧪」开头、却不在 [routing] ignore_chat_ids 里的群，逐个列出 chat_id 和群名。
+    测试群和正式共用主人的飞书身份，正式牧羊犬照样拉得到；不在 ignore 里，里面的消息会被当真（当背景、当指令送总线）。
+    找主人那一侧（找主人聊天、话题群）本来就不走普通路由，不报。群名按账本里最近的那条。只警告，不改退出码。"""
+    latest: dict[str, str] = {}
+    for r in store.conn.execute("SELECT chat_id, chat_name FROM messages WHERE chat_name LIKE ? "
+                                "ORDER BY create_time", (f"%{TEST_GROUP_MARK}%",)):
+        if r["chat_id"]:
+            latest[r["chat_id"]] = r["chat_name"] or ""
+    bad = [(cid, name.strip()) for cid, name in latest.items()
+           if name.strip().startswith(TEST_GROUP_MARK) and cfg.chat_scope(cid) == NORMAL]
+    if not bad:
+        return []
+    out = [f"测试群: ⚠ {len(bad)} 个「{TEST_GROUP_MARK}」开头的群不在 [routing] ignore_chat_ids 里，"
+           "里面的消息会被正式牧羊犬当真（当背景、当指令送总线）："]
+    out += [f"  ⚠ {cid}  {name}" for cid, name in sorted(bad, key=lambda x: x[1])]
+    return out
 
 
 def media_report(cfg) -> str:
