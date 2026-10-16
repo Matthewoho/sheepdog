@@ -28,10 +28,12 @@ class FakeLark:
     def __init__(self):
         self.sent: list[tuple[str, str, str]] = []
         self.keys: list[str] = []
+        self.cards: list[dict | None] = []   # 7.48：每次发的卡片（纯文本是 None）
 
-    def send_text(self, to, text, identity, idempotency_key=""):
+    def send_text(self, to, text, identity, idempotency_key="", card=None):
         self.sent.append((to, text, identity))
         self.keys.append(idempotency_key)
+        self.cards.append(card)
 
 
 class NotifyConfigTest(unittest.TestCase):
@@ -60,6 +62,7 @@ class NotifyConfigTest(unittest.TestCase):
         self.assertNotIsInstance(n, FileNotifier)
         n("hi")
         self.assertEqual(lark.sent, [(ME, "hi", "bot")])  # 照旧经机器人私聊主人
+        self.assertIsNotNone(lark.cards[-1])               # 7.48：[notify] owner_card 默认开，发成卡片
         # 走通知账本时带防重编号发（lark-cli --idempotency-key）
         self.assertIsInstance(n, OwnerDM)
         self.assertTrue(getattr(n, "ledger", True))

@@ -8,6 +8,9 @@ Matthew 原话（10-13 19:5x）：「他在话题里补充回复 我看不到 �
 - 口径（写死）：防重编号、sends.text、bot_outbox.text 都按不含 @ 那一行的 compose 结果；只有发给飞书的那一份带 @。
 - 牧羊犬自己再拉到这条（正文渲染出 @主人、mentions 里有主人）：照旧认作机器人的提问 / 汇报，不当 at_me 派给会话。
   7.26 打开时机器人身份先收到事件的那条路也一样。
+
+7.48 起发给主人的默认是卡片（@ 是卡片里另起的一个 markdown 元素，见 test_owner_card）。这里的用例跑在
+[notify] owner_card = false 上：开关关掉回到纯文本时，7.29 的写法一字不变。
 """
 
 import re
@@ -33,7 +36,17 @@ def rendered(lark, mid: str) -> dict:
     return raw
 
 
+def plain_mode(case) -> None:
+    """[notify] owner_card = false（纯文本）：常驻进程用的 cfg 和命令行现读的配置文件都关掉。"""
+    case.cfg.notify.owner_card = False
+    case.cfg_file.write_text(case.cfg_file.read_text(encoding="utf-8") + "[notify]\nowner_card = false\n", encoding="utf-8")
+
+
 class ThreadAtOwnerTest(ThreadsBase):
+    def setUp(self):
+        super().setUp()
+        plain_mode(self)
+
     def sends(self):
         return [c for c in self.lark.sent()]
 
@@ -124,6 +137,10 @@ class ThreadAtOwnerTest(ThreadsBase):
 
 
 class ThreadAtOwnerWithIdentityTest(IdentityBase):
+    def setUp(self):
+        super().setUp()
+        plain_mode(self)
+
     def test_bot_event_first_is_still_bot_question(self):
         self.assertTrue(self.cfg.identity.enabled)
         self.ask("--key", "PR #9")

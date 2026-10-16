@@ -290,35 +290,46 @@ class LarkCliSource:
     # 飞书消息的防重编号最长 50 个字符；同一个编号 1 小时内只发出一条（lark-cli im +messages-send --idempotency-key）
     IDEMPOTENCY_KEY_MAX = 50
 
-    def send_text(self, user_id: str, text: str, identity: str = "bot", idempotency_key: str = "") -> None:
+    @staticmethod
+    def _body_args(text: str, card: dict | None) -> list[str]:
+        """消息内容：card 不为空发卡片（--msg-type interactive --content <卡片 JSON>，同 reply_to），否则纯文本。"""
+        if card is not None:
+            return ["--msg-type", "interactive", "--content", json.dumps(card, ensure_ascii=False)]
+        return ["--text", text]
+
+    def _idem_args(self, key: str) -> list[str]:
+        if not key:
+            return []
+        if len(key) > self.IDEMPOTENCY_KEY_MAX:
+            raise SourceError(f"防重编号超过 {self.IDEMPOTENCY_KEY_MAX} 个字符: {key!r}")
+        return ["--idempotency-key", key]
+
+    def send_text(self, user_id: str, text: str, identity: str = "bot", idempotency_key: str = "",
+                  card: dict | None = None) -> None:
         """经机器人给一个人发一条私聊（给主人的通知）。只试一次：失败由调用方（给主人的通知账本）按退避重试，
-        重试时带同一个 idempotency_key，飞书按它去重。"""
-        args = ["im", "+messages-send", "--user-id", user_id, "--text", text]
-        if idempotency_key:
-            if len(idempotency_key) > self.IDEMPOTENCY_KEY_MAX:
-                raise SourceError(f"防重编号超过 {self.IDEMPOTENCY_KEY_MAX} 个字符: {idempotency_key!r}")
-            args += ["--idempotency-key", idempotency_key]
+        重试时带同一个 idempotency_key，飞书按它去重。card 不为空发卡片（7.48），否则纯文本。"""
+        args = ["im", "+messages-send", "--user-id", user_id, *self._body_args(text, card)]
+        args += self._idem_args(idempotency_key)
         self._run_once(args, identity)
 
     # ---------- 写：替会话发消息（7.22）。只试一次：重试由调用方带同一个防重编号重来，飞书只发一条 ----------
-    def send_to_user(self, user_id: str, text: str, idem_key: str, identity: str = "bot") -> dict:
-        """私聊一个人（ask / report 经机器人找主人）。返回 {message_id, chat_id, thread_id}。"""
-        return self._sent(self._run_once(["im", "+messages-send", "--user-id", user_id, "--text", text,
-                                          "--idempotency-key", idem_key], identity))
+    def send_to_user(self, user_id: str, text: str, idem_key: str, identity: str = "bot",
+                     card: dict | None = None) -> dict:
+        """私聊一个人（ask / report 经机器人找主人）。返回 {message_id, chat_id, thread_id}。card 不为空发卡片（7.48）。"""
+        return self._sent(self._run_once(["im", "+messages-send", "--user-id", user_id, *self._body_args(text, card),
+                                          *self._idem_args(idem_key)], identity))
 
-    def send_to_chat(self, chat_id: str, text: str, idem_key: str, identity: str = "bot") -> dict:
-        """发进一个群（[threads] owner_chat_id，真实飞书测试用）。返回 {message_id, chat_id, thread_id}。"""
-        return self._sent(self._run_once(["im", "+messages-send", "--chat-id", chat_id, "--text", text,
-                                          "--idempotency-key", idem_key], identity))
+    def send_to_chat(self, chat_id: str, text: str, idem_key: str, identity: str = "bot",
+                     card: dict | None = None) -> dict:
+        """发进一个群（[threads] owner_chat_id，真实飞书测试用）。返回 {message_id, chat_id, thread_id}。
+        card 不为空发卡片（7.48）。"""
+        return self._sent(self._run_once(["im", "+messages-send", "--chat-id", chat_id, *self._body_args(text, card),
+                                          *self._idem_args(idem_key)], identity))
 
     def reply_to(self, message_id: str, *, identity: str, idem_key: str, text: str = "", card: dict | None = None,
                  in_thread: bool = False) -> dict:
         """回复一条消息：in_thread = 回到它的话题里（不出现在主聊天）；card = 卡片（interactive），否则纯文本。"""
-        args = ["im", "+messages-reply", "--message-id", message_id]
-        if card is not None:
-            args += ["--msg-type", "interactive", "--content", json.dumps(card, ensure_ascii=False)]
-        else:
-            args += ["--text", text]
+        args = ["im", "+messages-reply", "--message-id", message_id, *self._body_args(text, card)]
         if in_thread:
             args.append("--reply-in-thread")
         args += ["--idempotency-key", idem_key]

@@ -958,6 +958,12 @@ class Store:
         with self.tx() as c:
             c.execute("UPDATE dispatches SET state=?, receipt=?, error=? WHERE batch_id=?", (state, receipt, error, batch_id))
 
+    def set_reason(self, message_id: str, route: str, reason: str, tags: list[str]) -> None:
+        """改一条已入账消息的去向（7.48：找主人聊天里机器人身份先收到的卡片，主人身份搜到正文后重新认出来）。不碰投递状态。"""
+        with self.tx() as c:
+            c.execute("UPDATE messages SET route=?, reason=?, tags_json=? WHERE message_id=?",
+                      (route, reason, json.dumps(tags, ensure_ascii=False), message_id))
+
     def set_note(self, message_id: str, note: str) -> None:
         with self.tx() as c:
             c.execute("UPDATE messages SET note=? WHERE message_id=?", (note, message_id))

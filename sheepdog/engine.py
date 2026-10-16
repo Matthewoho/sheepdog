@@ -15,6 +15,7 @@ from . import session as sm
 from .config import ANTIGRAVITY, Config, DutyConfig
 from .models import Message
 from . import duty
+from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
                     human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
                     scan_jsonl, tool_actions, user_turn)
@@ -176,7 +177,8 @@ def order_thread_items(items: list[dict], last_id: str = "") -> list[dict]:
 
 
 def first_line(content: str) -> str:
-    bodies = message_bodies(content)
+    """第一行。读回的卡片（7.48）按「标题\n正文」算：有 header 时第一行是标题。"""
+    bodies = message_bodies(plain_text(content))
     text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
     return text.splitlines()[0] if text else ""
 
@@ -627,10 +629,29 @@ class Collector:
         if prev != identity.BOT:
             return False
         self.store.merge_identity_copy(m.message_id, m, received_by, fill_content=True)
+        self._reconsider_bot_owner_message(existing, m)
         if m.deleted and not existing["deleted"]:
             ctx = RouteContext(self.cfg.self_open_id, self._muted(), self._is_my_message, self.bot_ids)
             self._handle_change(self.store.get_message(m.message_id), m, ctx)
         return True
+
+    def _reconsider_bot_owner_message(self, existing, m: Message) -> None:
+        """7.48：找主人聊天里机器人发的卡片，要是机器人身份先收到（事件里卡片只有「[interactive card]」，认不出来，记成
+        escalation_chat_other），主人身份搜到正文以后按搜到的正文再认一次，认出来就照常登记。
+        10-16 核过正式账本：7.26 上线以来机器人自己发的 690 条全是主人身份搜到的，机器人事件收不到自己发的消息；这里是兜底。"""
+        if (m.chat_id not in self.cfg.owner_chat_ids or m.sender_type not in ("app", "bot")
+                or existing["reason"] != "escalation_chat_other" or m.deleted):
+            return
+        own = self.store.send_by_message(m.message_id)
+        if own is not None and own["kind"] in ("resolve", "pending"):
+            return   # 牧羊犬自己的话（结案那一句、待办清单）照旧不登记
+        hit = self._recognize_bot_owner_message(m)
+        if hit is None:
+            return
+        d, topic, question, text = hit
+        self.store.set_reason(m.message_id, d.route, d.reason, d.tags)
+        self._register_bot_owner_message(m, topic, question, text)
+        log.info("找主人聊天里机器人的消息 %s 搜到正文后认出来了：%s -> %s", m.message_id, d.reason, topic)
 
     def _is_bot_dm(self, m: Message) -> bool:
         """别人私聊机器人（7.26）：机器人身份收到的私聊，不是「找主人」聊天，不是主人本人、不是机器人自己发的。
@@ -955,7 +976,6 @@ class Collector:
     # ---------- 「找主人」聊天（7.8） ----------
     def _escalation_message(self, m: Message) -> RouteDecision:
         """先于普通路由，不受 ignore_chat_ids 影响。三种结果：登记提问 / 主人的回复 / 其他一律 drop。"""
-        esc = self.cfg.escalation
         me = self.cfg.self_open_id
         if me and m.sender_id == me:
             if m.chat_id == self.cfg.threads.owner_chat_id and is_agent_reply(m.content, self.cfg.owner_context):
@@ -986,32 +1006,47 @@ class Collector:
                 d = RouteDecision(DROP, f"sheepdog_{own['kind']}")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
-            question = ""
-            if esc.pattern is not None:
-                question = next((mt.group("topic") for b in message_bodies(m.content)
-                                 if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
-            topic = question or self._attribute(m)
-            if topic:
-                ok = self._escalation_target_ok(topic)
-                d = RouteDecision(DROP, "escalation_asked" if question else "escalation_bot_message")
-                self.store.upsert_message(m, d.route, d.reason, [f"escalation_topic:{topic}"])
-                if ok:
-                    # 7.15：机器人发给主人的每条消息都记来源，主人引用回复它时按这里送回
-                    self.store.add_bot_outbox(m.message_id, topic, bool(question), m.content, m.create_time or now_iso())
-                if question and ok:
-                    self.store.add_escalation(m.message_id, topic, m.chat_id, m.content, m.create_time or now_iso())
-                    log.info("登记「需要你定」%s -> %s", m.message_id, topic)
-                    try:  # 7.36：ask 当场记过来源就连上；没记过（老版本、别的途径发的）按提问时间补
-                        from . import pending as pend
-                        pend.ensure_sources(self.cfg, self.store, self.store.get_escalation(m.message_id))
-                    except Exception as e:
-                        log.warning("补「需要你定」%s 的来源出错: %s", m.message_id, e)
-                elif not ok:
-                    log.warning("机器人消息 %s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
+            hit = self._recognize_bot_owner_message(m)
+            if hit is not None:
+                d, topic, question, text = hit
+                self.store.upsert_message(m, d.route, d.reason, d.tags)
+                self._register_bot_owner_message(m, topic, question, text)
                 return d
         d = RouteDecision(DROP, "escalation_chat_other")
         self.store.upsert_message(m, d.route, d.reason, [])
         return d
+
+    def _recognize_bot_owner_message(self, m: Message):
+        """找主人聊天里机器人发的消息：是「需要你定」（header_regex）、还是哪个会话发的（attribution_regex、aliases、标题）。
+        7.48：发给主人的卡片读回来是 <card title="第一行">…</card>，还原成「第一行\n正文」再认；纯文本原样，认法一字不变。
+        认出来返回 (去向, topic, 是不是提问, 记账用的正文)；认不出返回 None。"""
+        esc = self.cfg.escalation
+        text = plain_text(m.content)
+        question = ""
+        if esc.pattern is not None:
+            question = next((mt.group("topic") for b in message_bodies(text)
+                             if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
+        topic = question or self._attribute(m)
+        if not topic:
+            return None
+        d = RouteDecision(DROP, "escalation_asked" if question else "escalation_bot_message", [f"escalation_topic:{topic}"])
+        return d, topic, question, text
+
+    def _register_bot_owner_message(self, m: Message, topic: str, question: str, text: str) -> None:
+        ok = self._escalation_target_ok(topic)
+        if ok:
+            # 7.15：机器人发给主人的每条消息都记来源，主人引用回复它时按这里送回（记还原后的纯文本，7.48）
+            self.store.add_bot_outbox(m.message_id, topic, bool(question), text, m.create_time or now_iso())
+        if question and ok:
+            self.store.add_escalation(m.message_id, topic, m.chat_id, text, m.create_time or now_iso())
+            log.info("登记「需要你定」%s -> %s", m.message_id, topic)
+            try:  # 7.36：ask 当场记过来源就连上；没记过（老版本、别的途径发的）按提问时间补
+                from . import pending as pend
+                pend.ensure_sources(self.cfg, self.store, self.store.get_escalation(m.message_id))
+            except Exception as e:
+                log.warning("补「需要你定」%s 的来源出错: %s", m.message_id, e)
+        elif not ok:
+            log.warning("机器人消息 %s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
 
     def _pending_reply(self, m: Message) -> None:
         """「待办」快捷问法（7.36）：机器人回复主人那条，正文是 sheepdog pending 的清单。只读账本拼清单；
@@ -1028,8 +1063,11 @@ class Collector:
         ik = identity.short_key(pend.SEND_PENDING, pend.SEND_PENDING, m.message_id)
         if self.store.get_send(ik) is not None:
             return
+        from .outbound import owner_content, send_owner
+        plain, card = owner_content(self.cfg, text)   # 7.48：发成卡片（[notify] owner_card），sends 照旧记纯文本
         try:
-            res = fn(m.message_id, identity=identity.BOT, idem_key=ik, text=text)
+            res = send_owner(lambda t, c: fn(m.message_id, identity=identity.BOT, idem_key=ik, text=t,
+                                             **({"card": c} if c is not None else {})), plain, card)
         except Exception as e:
             log.warning("回主人的「待办」%s 失败: %s", m.message_id, e)
             return
@@ -1047,8 +1085,9 @@ class Collector:
     _BRACKET = re.compile(r"\[([^\[\]]+)\]")
 
     def _attribute(self, m: Message) -> str | None:
-        """机器人发给主人的消息来自哪个 topic：第一行先用 attribution_regex，认不出再用 aliases 和会话标题；唯一命中才算。"""
-        bodies = message_bodies(m.content)
+        """机器人发给主人的消息来自哪个 topic：第一行先用 attribution_regex，认不出再用 aliases 和会话标题；唯一命中才算。
+        卡片（7.48）按还原后的「标题\n正文」认，第一行就是 header 标题。"""
+        bodies = message_bodies(plain_text(m.content))
         text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
         first = text.splitlines()[0] if text else ""
         if not first:
@@ -1184,7 +1223,7 @@ class Collector:
             esc = self.cfg.escalation
             topic = ""
             if esc.pattern is not None:
-                topic = next((mt.group("topic") for b in message_bodies(root.content)
+                topic = next((mt.group("topic") for b in message_bodies(plain_text(root.content))
                               if (mt := esc.pattern.search(b)) and mt.group("topic")), "")
             topic = topic or self._attribute(root) or ""
             if topic and self._escalation_target_ok(topic):
@@ -1245,7 +1284,7 @@ class Collector:
             # 都认不出：同 7.15「认不出来源」，交给总线
             self.store.upsert_message(m, d.route, d.reason, [*tags, f"thread:{m.thread_id}"], BUS_TOPIC_ID)
             if root is not None:
-                where = f"开头那条（message_id `{root.message_id}`）：{duty.short(root.content, 200)}"
+                where = f"开头那条（message_id `{root.message_id}`）：{duty.short(plain_text(root.content), 200)}"
             else:
                 where = f"开头那条查不到（{err}）" if err else "开头那条查不到"
             self.store.add_system_message(
@@ -1287,11 +1326,12 @@ class Collector:
         def who_of(sender_id: str, sender_type: str) -> str:
             return "主人" if me and sender_id == me else "机器人" if sender_type in ("app", "bot") else "-"
 
+        # 机器人发的卡片（7.48）按还原后的「标题\n正文」给会话看，不带 <card …> 外壳
         for r in self.store.thread_messages_in_ledger(thr["thread_id"] or m.thread_id, root):
-            add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), r["content"],
+            add(r["message_id"], r["create_time"], who_of(r["sender_id"], r["sender_type"]), plain_text(r["content"] or ""),
                 r["thread_position"], r["message_position"])
         for x in extra:
-            add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), x.content, x.thread_position,
+            add(x.message_id, x.create_time, who_of(x.sender_id, x.sender_type), plain_text(x.content), x.thread_position,
                 x.message_position)
         for s in self.store.sends_in_thread(root):
             add(s["message_id"], s["sent_at"], "机器人", s["text"])

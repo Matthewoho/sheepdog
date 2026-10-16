@@ -14,7 +14,8 @@ attention 和恢复、危险命令报警、写锁提醒、登录失效）只记�
 read_notices() 按这个格式读回来。
 
 文件模式不走「给主人的通知账本」（owner_notices，不重试）：写文件是本机操作，失败了记日志就是。
-正式环境经机器人私聊用 OwnerDM：带防重编号发，发不出去由 Dispatcher 的通知账本按退避重试。
+正式环境经机器人私聊用 OwnerDM：带防重编号发，发不出去由 Dispatcher 的通知账本按退避重试；7.48 起发成卡片
+（[notify] owner_card），测试环境（[threads] owner_chat_id）发进测试群。
 """
 
 from __future__ import annotations
@@ -81,21 +82,45 @@ def read_notices(path: Path) -> list[dict]:
 
 
 class OwnerDM:
-    """经机器人私聊主人（没设 [notify] file 时）。send(text, idempotency_key)：发一次，失败抛异常，由 Dispatcher 的
-    通知账本按退避重试；每次重试带同一个防重编号（飞书 1 小时内同一个编号只发出一条）。"""
+    """经机器人发给主人（没设 [notify] file 时）。send(text, idempotency_key)：发一次，失败抛异常，由 Dispatcher 的
+    通知账本按退避重试；每次重试带同一个防重编号（飞书 1 小时内同一个编号只发出一条）。
 
-    def __init__(self, source, open_id: str):
+    7.48：
+    - cfg 的 [notify] owner_card 开着就发成卡片（第一行进 header，其余 markdown 原样渲染），关着照旧纯文本；
+      通知账本里存的正文仍是纯文本，每次发送现拼卡片。卡片太大、飞书拒了卡片，同一个编号改发纯文本（outbound.send_owner）。
+    - 测试环境（设了 [threads] owner_chat_id）发进那个测试群，不私聊主人（和 ask / report 的测试做法一致），
+      免得测试牧羊犬的通知进了主人和机器人的真私聊、被正式牧羊犬读到。
+    配置热加载：常驻进程每轮按新配置重建 OwnerDM（cli._reload_config）。"""
+
+    def __init__(self, source, open_id: str, cfg=None):
         self.source = source
         self.open_id = open_id
+        self.cfg = cfg
+
+    @property
+    def chat_id(self) -> str:
+        return (self.cfg.threads.owner_chat_id or "") if self.cfg is not None else ""
 
     def send(self, text: str, idempotency_key: str = "") -> None:
-        if idempotency_key:
-            self.source.send_text(self.open_id, text, "bot", idempotency_key=idempotency_key)
+        from .outbound import owner_content, send_owner
+        if self.cfg is not None:
+            plain, card = owner_content(self.cfg, text)
         else:
-            self.source.send_text(self.open_id, text, "bot")
+            plain, card = text, None
+        chat = self.chat_id
+
+        def one(t: str, c: dict | None):
+            kw = {"card": c} if c is not None else {}
+            if chat:
+                return self.source.send_to_chat(chat, t, idempotency_key, "bot", **kw)
+            if idempotency_key:
+                return self.source.send_text(self.open_id, t, "bot", idempotency_key=idempotency_key, **kw)
+            return self.source.send_text(self.open_id, t, "bot", **kw)
+
+        send_owner(one, plain, card)
 
     def __call__(self, text: str) -> None:
         self.send(text)
 
     def __repr__(self) -> str:
-        return "OwnerDM(经机器人私聊主人)"
+        return f"OwnerDM(经机器人发进测试群 {self.chat_id})" if self.chat_id else "OwnerDM(经机器人私聊主人)"

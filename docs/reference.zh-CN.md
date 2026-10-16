@@ -168,6 +168,18 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 - **给你的通知不会丢（通知账本）**：经机器人私聊你的每一条通知（危险命令报警、羊群看板判中断 / 失联和已恢复、attention 和恢复、投递不出去 / 已恢复、写锁提醒、登录提醒）都先落账本（`owner_notices` 表：通知类型、会话、正文原样字节、防重编号、待发 / 已发 / 放弃、尝试次数、最近一次错误、时间），再发。发送带 `lark-cli im +messages-send --idempotency-key`（防重编号在落账本时定好，`sd-` 加 32 位十六进制，35 个字符），每次重试都用同一个编号、同一份正文字节，飞书 1 小时内同一个编号只发出一条。发不出去（比如飞书限流 429）留在待发，每一轮按退避重试（1、2、4、8 分钟，之后每 10 分钟一次），重启以后接着试；从落账本起 2 小时还没发出去就标放弃、记 ERROR 日志，`sheepdog doctor` 和 `sheepdog board` 的开头一直显示「⚠ 有 N 条给主人的通知没发出去」，直到你 `sheepdog notices --retry` 重发或 `--ack` 确认。进程在「发出去了、还没记成已发」之间没了：重启后 50 分钟以内用同一个编号补发（飞书去重）；更久了不敢补发，标放弃等你看。调用方「这件事已经通知过」的记账在发送之前做，重启以后不会为同一件事再拼一条新通知。`[notify] file` 模式照旧直接写文件，不落账本、不重试。
 - **给你的通知写到文件（测试环境）**：不拉 IM 时没有私聊你的渠道，原来给你的通知（羊群看板判中断 / 失联、attention 和自动恢复、危险命令报警、写锁提醒、登录失效）只记日志。配置里设 `[notify] file = "路径"`（相对路径相对配置文件所在目录），这些通知一律追加写进这个文件，不发飞书；每条一段，头一行是 `### 2026-10-12 14:03:05（北京时间）· 羊群看板通知` 这样的时间和通知类型，下面是原文。通知类型：`羊群看板通知`、`attention 通知`、`恢复通知`、`投递失败通知`、`投递恢复通知`、`危险命令报警`、`写锁提醒`、`登录提醒`。`sheepdog.notify.read_notices()` 能把文件读回成列表。没设时行为不变。拉着飞书又设了它，写文件优先、不发飞书，`sheepdog doctor` 会提示「主人通知写到文件，不发飞书」，免得正式配置误设。`--dry-run` 只打印，不写文件。改了下一轮生效。
 
+## 发给你的消息也是卡片
+
+普通文本消息不渲染 markdown，会话又爱写 markdown，所以 sheepdog 发给你的四类消息默认都发成卡片（Card 2.0，`[notify] owner_card = true`，热加载）：会话的 `sheepdog ask / report`（新起一条，或回到同一把钥匙的话题里）、给你的系统通知（羊群看板、attention、投递失败、危险命令等）、「待办」清单、结案那一句。
+
+- 第一行（`🐕 需要你定 · 标题 [tp_xxx]`、`🐕 汇报 · …`、`📋 待办清单…`）放卡片标题（「需要你定」橙色，其余蓝色），其余原样放一个 markdown 元素；只有一行的（结案那一句）不放标题。
+- 话题里的 ask / report 末尾另起一个 markdown 元素 `<at id=ou_xxx></at>` 提醒你（同 7.29）；结案那一句看 `[escalation] resolve_notice_at`。
+- 读回：主人身份搜到的卡片是 `<card title="第一行">` 加正文、最后一行 `</card>`。sheepdog 先还原成「第一行\n正文」再用 `[escalation] header_regex` / `attribution_regex` 认「需要你定」和会话，纯文本照旧；`sheepdog doctor` 会用 ask 的开头一行按卡片读回的样子自检一遍。
+- 太大（按请求体估算超过约 28 KB；飞书的卡片上限是 30 KB）或飞书拒了卡片（230025 / 230099），同一条、同一个防重编号改发纯文本；超时不改（不知道发出去没有，原样重试）。
+- 记账（`sends`、`bot_outbox`、给你的通知账本）的正文都是纯文本，防重编号和发纯文本时一样。
+- 测试环境（设了 `[threads] owner_chat_id`、没设 `[notify] file`）：系统通知也发进那个测试群，不私聊你。
+- `owner_card = false`：回到纯文本（话题里的 @ 用文本消息的 `<at user_id="ou_xxx"></at>`）。
+
 ## 代回用卡片
 
 会话以你的身份对外回复时发一张卡片：正文 + 右下角灰色小字标记（`session.reply_suffix`，默认 `[🐕Sheepdog Reply]`），别人一眼能看出是 Agent 代回。回复某条消息一律用 `sheepdog reply`（见上文「发前再看一眼」），它内部就用这里的卡片；只有先发起一段新的聊天时，才用 `reply-card` 加 lark-cli：
@@ -372,7 +384,7 @@ owner_chat_id = "oc_测试群"       # ask / report 发进这个群（+messages-
 ```
 
 - `only_chat_ids`：拉到的消息只保留这些聊天的；其他聊天的消息直接扔掉、**不入账本**（不是入账本再丢），所以也不会点表情、查已读。没设时行为不变。
-- `owner_chat_id`：ask / report 发进这个群，往话题里回照旧用 `+messages-reply --reply-in-thread`；这个群同时当成「找主人」聊天（等同于加进 `[escalation] chat_ids`），你在群里的回复、话题回复都按 owner_reply 送回会话。「你」仍按 `self_open_id` 认；机器人发的、带代回标记的会话代回，都不算你的发言。没设时照旧私聊 `self_open_id`。
+- `owner_chat_id`：ask / report 发进这个群，往话题里回照旧用 `+messages-reply --reply-in-thread`；这个群同时当成「找主人」聊天（等同于加进 `[escalation] chat_ids`），你在群里的回复、话题回复都按 owner_reply 送回会话。「你」仍按 `self_open_id` 认；机器人发的、带代回标记的会话代回，都不算你的发言。没设时照旧私聊 `self_open_id`。经机器人发给你的系统通知（没设 `[notify] file` 时）也发进这个群（7.48），免得测试牧羊犬的通知进了你的真私聊、被正式牧羊犬读到。
 - 校验：设了 `only_chat_ids`，`owner_chat_id` 就必须在里面；设了 `owner_chat_id`，`[escalation] header_regex` 不能为空。不满足就报配置错误。
 - `sheepdog doctor` 设了就提示「⚠ 只拉这些聊天：…（测试用）」「⚠ 找主人改发到群 …（测试用）」。
 - **正式环境不要设这两个开关。**

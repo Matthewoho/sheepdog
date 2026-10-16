@@ -3,7 +3,7 @@
 规则优先级（自上而下，先命中先返回）：
  1. 自己发的            → self（仅入账，供「回复我」判定）
  1a. 机器人自己发的（7.26，[identity] 开着）→ self（self_bot）：不分派、不算主人发言
- 1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环）
+ 1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环；卡片按 header 标题 + 正文比）
  2. 强制忽略的会话       → drop
  3. 私聊：人 → dispatch；bot → inbox(bot_p2p)，关键词命中则 dispatch
  4. 群 @我、@机器人、回复我（或机器人）的消息 → dispatch（同级，都在免打扰之前，7.16 / 7.26）
@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .card import plain_text
 from .config import RoutingConfig
 from .models import Message
 
@@ -78,10 +79,10 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     if ctx.bot_ids and msg.sender_id in ctx.bot_ids:
         return RouteDecision(SELF, "self_bot")
 
-    # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响
+    # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响。卡片（7.48 发给主人的）按还原后的「标题\n正文」比开头
     prefixes = [p for p in cfg.drop_bot_message_prefixes if p]
     if prefixes and msg.sender_type in ("app", "bot"):
-        if any(b.startswith(p) for b in message_bodies(msg.content) for p in prefixes):
+        if any(b.startswith(p) for b in message_bodies(plain_text(msg.content)) for p in prefixes):
             return RouteDecision(DROP, "self_escalation")
 
     # 2. 强制忽略

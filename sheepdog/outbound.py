@@ -9,6 +9,9 @@
   新发言。检查只用搜索接口（不会把消息标成已读），不写账本里的消息、不动拉取进度、不点表情；
   主人说过就不发，把他的话原样打印给会话，记一个「发送前已看到」。
 - thread：只读列出一个话题的全部消息。
+- 7.48：发给主人的（ask / report、结案那一句，以及 engine 里的「待办」清单、notify 里的系统通知）[notify] owner_card 开着时
+  发成卡片（owner_content / send_owner），正文的 markdown 原样渲染；卡片太大、或者飞书说卡片内容不行，同一条改发纯文本。
+  防重编号、sends、bot_outbox 记的都是纯文本正文（compose 的结果），和发不发卡片无关。
 
 每次发送都带防重编号（--idempotency-key，最长 50 个字符）：由会话、钥匙或批次、正文指纹（代回：批次 + 被回复的
 消息号 + 正文指纹）算出来，固定不变；内容一样才算重复。发成功的记进 sends 表，重试时先查它，发过的不再调飞书；超时的带同一个编号重试，飞书只发一条。
@@ -17,6 +20,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,7 +30,7 @@ from . import duty
 from . import identity as ident
 from . import pending as pend
 from . import session as sm
-from .card import build_reply_card
+from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes
 from .config import Config
 from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, is_agent_reply, open_escalations,
                      order_thread_items, root_position)
@@ -33,6 +38,8 @@ from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
 from .store import Store, now_iso
+
+log = logging.getLogger("sheepdog")
 
 ASK, REPORT, REPLY = "ask", "report", "reply"
 
@@ -145,16 +152,19 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
                          batch_chats=n_chats)
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
     root = store.thread_by_key(topic_id, nk) if nk else None
+    # 7.29：话题里的回复不提醒主人，末尾 @ 他（第一行不变，照旧认得出「需要你定」和会话）；7.48：发成卡片
+    plain, card = owner_content(cfg, text, at=root is not None)
     try:
         if root is not None:
-            # 7.29：话题里的回复不提醒主人，末尾另起一行 @ 他（第一行不变，照旧认得出「需要你定」和会话）
-            res = source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=with_owner_at(cfg, text),
-                                  in_thread=True)
+            res = send_owner(lambda t, c: source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=t,
+                                                          card=c, in_thread=True), plain, card)
         elif cfg.threads.owner_chat_id:
             # 真实飞书测试用：发进测试群，不私聊主人
-            res = source.send_to_chat(cfg.threads.owner_chat_id, text, ik, "bot")
+            res = send_owner(lambda t, c: source.send_to_chat(cfg.threads.owner_chat_id, t, ik, "bot", **_card_kw(c)),
+                             plain, card)
         else:
-            res = source.send_to_user(cfg.self_open_id, text, ik, "bot")
+            res = send_owner(lambda t, c: source.send_to_user(cfg.self_open_id, t, ik, "bot", **_card_kw(c)),
+                             plain, card)
     except LarkTimeout as e:
         raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
     except SourceError as e:
@@ -272,7 +282,7 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
             return ResolveResult([], prev["message_id"], already=True, text=text)
         raise OutboundError(EXIT_INVALID, "没有还开着的「需要你定」可结（已答、已结或已过期的不用再结）"
                             + (f"：钥匙 {key} 的话题里没有开着的" if key else ""))
-    shown = with_owner_at(cfg, text) if cfg.escalation.resolve_notice_at else text
+    shown, card = owner_content(cfg, text, at=cfg.escalation.resolve_notice_at)
     mid, err = "", ""
     if source is None:
         err = "测试环境（[source] enabled = false），没发飞书"
@@ -280,7 +290,8 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
         mid = prev["message_id"]
     else:
         try:
-            res = source.reply_to(notice_to, identity="bot", idem_key=ik, text=shown, in_thread=True)
+            res = send_owner(lambda t, c: source.reply_to(notice_to, identity="bot", idem_key=ik, text=t, card=c,
+                                                          in_thread=True), shown, card)
         except LarkTimeout as e:
             raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话发送超时，不确定发出去没有（{e}），还没结案：用同样的参数重试，"
                                                   "防重编号保证只发一条")
@@ -314,6 +325,56 @@ def with_owner_at(cfg: Config, text: str) -> str:
     if not cfg.self_open_id:
         return text
     return text.rstrip("\n") + "\n" + owner_at(cfg.self_open_id)
+
+
+# ======================= 发给主人的卡片（7.48） =======================
+# 飞书说卡片内容不行时的错误码（发送消息接口）：230025 消息内容超过长度上限；230099 卡片内容创建失败（卡片 JSON 不合法、
+# 组件不支持等）。碰到这两个，同一条（同一个防重编号）改发纯文本。错误码出自飞书开放平台文档，实际报法要真飞书核实。
+CARD_REJECT_CODES = ("230025", "230099")
+_CARD_REJECT = re.compile(r"(?<!\d)(" + "|".join(CARD_REJECT_CODES) + r")(?!\d)")
+
+
+def owner_content(cfg: Config, text: str, at: bool = False) -> tuple[str, dict | None]:
+    """发给主人的这一条：(纯文本那一份, 卡片或 None)。text 是记账用的纯文本正文（第一行是「🐕 …」那一行时进卡片 header）。
+    at = 末尾提醒主人（话题里的 ask / report，7.29；结案那一句看 [escalation] resolve_notice_at）：纯文本加
+    `<at user_id=…>` 一行，卡片另起一个 markdown 元素 `<at id=…>`；不知道主人是谁（没配 self_open_id）就都不加。
+    [notify] owner_card 关着、正文为空、卡片估算超过上限（card.OWNER_CARD_MAX_BYTES），都不发卡片（返回 None）。"""
+    plain = with_owner_at(cfg, text) if at else text
+    if not cfg.notify.owner_card:
+        return plain, None
+    try:
+        card = build_owner_card(text, cfg.self_open_id if at else "")
+    except ValueError:
+        return plain, None
+    if not card_fits(card):
+        log.warning("发给主人的这条卡片估算 %d 字节，超过上限，改发纯文本：%s", card_request_bytes(card),
+                    _one_line(text)[:80])
+        return plain, None
+    return plain, card
+
+
+def card_rejected(err: Exception) -> bool:
+    """飞书拒了这张卡片（内容不行、太长）：错误信息里有 CARD_REJECT_CODES 之一。超时不算（不知道发出去没有）。"""
+    return not isinstance(err, LarkTimeout) and bool(_CARD_REJECT.search(str(err)))
+
+
+def send_owner(send, plain: str, card: dict | None):
+    """发一条给主人：send(正文, 卡片或 None) 调一次飞书。有卡片先发卡片；飞书拒了卡片（card_rejected）就用同一个防重编号
+    改发纯文本（卡片没发出去，编号还没用掉）。其他失败、超时原样抛给调用方。"""
+    if card is None:
+        return send(plain, None)
+    try:
+        return send(plain, card)
+    except SourceError as e:
+        if not card_rejected(e):
+            raise
+        log.warning("飞书拒了发给主人的卡片（%s），同一条改发纯文本", " ".join(str(e).split())[:200])
+        return send(plain, None)
+
+
+def _card_kw(card: dict | None) -> dict:
+    """只有发卡片时才带 card 参数（纯文本照旧的调用方式）。"""
+    return {"card": card} if card is not None else {}
 
 
 def learn_thread_id(store: Store, source, root_mid: str) -> str:

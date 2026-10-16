@@ -22,7 +22,8 @@ from sheepdog.source.lark import parse_message
 from sheepdog.store import Store
 
 from test_roster import ME, REPO, later
-from test_threads import ALICE, ALPHA_P2P, BOT, ESC_CHAT, MARK, FakeLark, ThreadsBase, _opt, now8
+from test_threads import ALICE, ALPHA_P2P, BOT, ESC_CHAT, MARK, FakeLark, ThreadsBase, _opt, now8, sent_text
+from sheepdog.card import plain_text
 
 # 正式配置里 header_regex 的写法（10-14 只读核对）：结案那句、待办清单的第一行都不能被它认成「需要你定」
 PROD_HEADER_RX = r"^🐕 (?=.*需要你定).*?\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]"
@@ -82,7 +83,8 @@ class PendingBase(ThreadsBase):
         return self.cli("resolve", "--topic", topic, *argv)
 
     def bot_msgs_in_thread(self, root: str) -> list[str]:
-        return [self.lark.msgs[m]["content"] for m in self.lark.in_thread(root)]
+        # 7.48：发给主人的是卡片，按还原后的「标题\n正文」比
+        return [plain_text(self.lark.msgs[m]["content"]) for m in self.lark.in_thread(root)]
 
 
 # ======================= A：账本迁移 =======================
@@ -131,7 +133,8 @@ class ResolveTest(PendingBase):
         call = self.lark.sent("+messages-reply")[-1]
         self.assertEqual((_opt(call, "--message-id"), _opt(call, "--as")), (q, "bot"))
         self.assertIn("--reply-in-thread", call)
-        text = _opt(call, "--text")
+        text = sent_text(call)
+        self.assertEqual(_opt(call, "--msg-type"), "interactive")
         self.assertEqual(text, "✅ 已结案：主人 02:10 在 Alpha 私聊说下周一（Alpha 需求）")
         self.assertNotIn("<at", text)
         s = self.store.send_by_message(out.split("message_id ")[-1].split("）")[0])
@@ -143,7 +146,7 @@ class ResolveTest(PendingBase):
             "[owner_context]", "resolve_notice_at = true\n[owner_context]"), encoding="utf-8")
         q = self.asked()
         self.assertEqual(self.resolve("--message-id", q, "--why", "办完了")[0], 0)
-        self.assertTrue(_opt(self.lark.sent("+messages-reply")[-1], "--text").endswith(f'<at user_id="{ME}"></at>'))
+        self.assertTrue(sent_text(self.lark.sent("+messages-reply")[-1]).endswith(f'<at id={ME}></at>'))   # 卡片的 @ 写法
 
     def test_resolve_by_key_closes_all_open_in_the_thread(self):
         q1 = self.asked("--key", "VPN-1", text="给 Ivan 开 VPN 吗？")
@@ -638,7 +641,7 @@ class PendingListTest(PendingBase):
         self.assertEqual(rc, 0, err)
         e = self.store.get_escalation(orphan)
         self.assertEqual((e["close_reason"], e["resolved_by"], e["topic_id"]), ("resolved", BUS_TOPIC_ID, "tp_alpha"))
-        self.assertTrue(_opt(self.lark.sent("+messages-reply")[-1], "--text").startswith("✅ 已结案：主人在私聊里定了（"))
+        self.assertTrue(sent_text(self.lark.sent("+messages-reply")[-1]).startswith("✅ 已结案：主人在私聊里定了（"))
         # 原会话还在的：总线照旧不能结
         self.store.update_topic("tp_alpha", state="active")
         alive = self.asked(title="别的", text="还开着的")
@@ -689,12 +692,12 @@ class PendingListTest(PendingBase):
         call = self.lark.sent("+messages-reply")[-1]
         self.assertEqual((_opt(call, "--message-id"), _opt(call, "--as")), (q, "bot"))
         self.assertNotIn("--reply-in-thread", call)
-        text = _opt(call, "--text")
+        text = sent_text(call)
         self.assertTrue(text.startswith("📋 待办清单（"))
         self.assertIn("Felix 接码", text)
         self.assertIsNone(self.cfg.escalation.pattern.search(text.splitlines()[0]))
         # 清单拉回来：不登记「需要你定」、不投给任何会话；「待办」本身也没回答哪条提问
-        reply = [m for m in self.lark.msgs if self.lark.msgs[m]["content"] == text][0]
+        reply = [m for m in self.lark.msgs if plain_text(self.lark.msgs[m]["content"]) == text][0]
         self.pull(reply)
         self.assertEqual((self.row(reply)["route"], self.row(reply)["reason"]), ("drop", "sheepdog_pending"))
         self.assertIsNone(self.store.get_escalation(reply))

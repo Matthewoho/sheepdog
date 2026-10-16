@@ -76,7 +76,7 @@ from pathlib import Path
 from . import __version__
 from . import actions
 from .ack import Acker
-from .card import build_reply_card
+from .card import build_reply_card, owner_title, plain_text
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, default_config_path, load_config
 from . import lastgood
 from . import duty
@@ -245,6 +245,7 @@ def _notifier(cfg, source, args):
 
     - 配了 [notify] file：一律追加写进那个文件（带时间和通知类型），不发飞书（测试环境用；拉不拉 IM 都一样），不重试；
     - 否则经机器人私聊主人（OwnerDM，带防重编号）；先落给主人的通知账本再发，发不出去按退避重试；
+      7.48：[notify] owner_card 开着发成卡片；设了 [threads] owner_chat_id（测试环境）发进那个测试群；
       不拉 IM、没有 self_open_id 时没有渠道（只记日志）。
     dry-run 一律只打印，不写文件、不发飞书。"""
     path = cfg.notify_path
@@ -256,8 +257,10 @@ def _notifier(cfg, source, args):
     if not cfg.self_open_id or not hasattr(source, "send_text"):
         return None
     if dry:
-        return lambda text: print(f"[dryrun] 给主人发私聊：\n{text}\n")
-    return OwnerDM(source, cfg.self_open_id)
+        where = f"发进测试群 {cfg.threads.owner_chat_id}" if cfg.threads.owner_chat_id else "发私聊"
+        how = "卡片" if cfg.notify.owner_card else "纯文本"
+        return lambda text: print(f"[dryrun] 给主人{where}（{how}）：\n{text}\n")
+    return OwnerDM(source, cfg.self_open_id, cfg)
 
 
 def notify_report(cfg) -> str:
@@ -489,6 +492,15 @@ def threads_report(cfg) -> list[str]:
                 m = ax.search(line)
                 if not (m and m.group("topic") == sample):
                     out.append(f"  ⚠ {name} 开头一行认不出 topic（attribution_regex），主人引用回复它时靠发送时记的来源")
+    out.append("  发给主人的消息（7.48）: " + ("卡片（[notify] owner_card = true）" if cfg.notify.owner_card
+                                            else "纯文本（[notify] owner_card = false）"))
+    if cfg.owner_chat_ids and cfg.notify.owner_card and esc.pattern is not None:
+        # 卡片读回来是 <card title="开头一行">…</card>：按还原后的文字再认一遍，和纯文本的认法一致才算对
+        back = plain_text(f'<card title="{owner_title(ask)}">\n示例正文\n</card>')
+        hit = esc.pattern.search(back)
+        if not (hit and hit.group("topic") == sample):
+            out.append(f"  ✗ ask 发成卡片后读回「{back.splitlines()[0]}」认不出来：「需要你定」登记不上，"
+                       "先把 [notify] owner_card 关掉（改回纯文本）再查")
     return out
 
 

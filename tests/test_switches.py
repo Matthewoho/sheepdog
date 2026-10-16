@@ -25,7 +25,7 @@ from test_owner_priority import PriorityBase
 from test_pending import PendingBase, at
 from test_roster import ME
 from test_stop_hook import HookBase, stop_input
-from test_threads import ALICE, ESC_CHAT, _opt
+from test_threads import ALICE, ESC_CHAT, _opt, sent_text
 
 
 def reload_into(base, extra: str, col: Collector | None = None) -> None:
@@ -134,7 +134,7 @@ class OwnerShortcutSwitchTest(PendingBase):
     def test_on_bot_replies_list(self):
         mid = self.daiban()
         self.assertEqual(self.row(mid)["reason"], "pending_query")
-        self.assertTrue(_opt(self.lark.sent("+messages-reply")[-1], "--text").startswith("📋 待办清单"))
+        self.assertTrue(sent_text(self.lark.sent("+messages-reply")[-1]).startswith("📋 待办清单"))
 
     def test_off_is_a_normal_owner_reply(self):
         self.cfg.escalation.owner_shortcut = False

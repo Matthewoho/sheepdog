@@ -248,6 +248,7 @@ class ThreadsConfig:
     root_chars: int = 300
     reply_chars: int = 120
     # 只给真实飞书测试用，正式环境不要设：ask / report 发进这个群（+messages-send --chat-id），不再私聊主人；
+    # 系统通知（没设 [notify] file 时经机器人发的那些，7.48 第 7 条）也发进这个群；
     # 这个群同时当成「找主人」聊天（等同于加进 [escalation] chat_ids）。空 = 照旧私聊 self_open_id
     owner_chat_id: str = ""
 
@@ -532,12 +533,19 @@ class NotifyConfig:
 
     file 留空（默认）= 经机器人私聊主人（要拉飞书、配了 self_open_id），行为不变。
     file 设了 = 一律追加写进这个文件（带时间和通知类型），不发飞书；测试环境（[source] enabled = false）用。
-    相对路径相对本配置文件所在目录。下一轮生效。"""
+    相对路径相对本配置文件所在目录。下一轮生效。
+
+    owner_card（7.48，默认开，热加载：常驻进程下一轮生效，ask / report / resolve 每次现读）：牧羊犬发给主人的消息
+    （ask / report、系统通知、「待办」清单、结案那一句）发成卡片，正文的 markdown 原样渲染；关掉 = 照旧发纯文本。
+    不管开没开，记账（sends、bot_outbox、给主人的通知账本）的正文都是纯文本。"""
     file: str = ""
+    owner_card: bool = True
 
     def validate(self) -> None:
         if not isinstance(self.file, str):
             raise ConfigError("[notify] file 必须是字符串（文件路径）；留空 = 经机器人私聊主人")
+        if not isinstance(self.owner_card, bool):
+            raise ConfigError("[notify] owner_card 必须是 true/false（true = 发给主人的消息发成卡片）")
 
 
 @dataclass

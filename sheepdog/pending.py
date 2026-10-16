@@ -28,6 +28,7 @@ from . import duty
 from . import engine as eng
 from . import prompts
 from . import session as sm
+from .card import plain_text
 from .router import message_bodies
 from .store import SYSTEM_ID_PREFIX, Store, now_iso
 
@@ -372,8 +373,8 @@ _ASK_TITLE = re.compile(r"^🐕\s*需要你定\s*·\s*(?P<title>.*?)\s*\[[^\[\]]
 
 
 def ask_title(cfg, text: str) -> str:
-    """提问的短标题：sheepdog ask 加的开头一行里 · 和 [..] 之间那段；认不出就是第一行前 40 字。"""
-    bodies = message_bodies(text or "")
+    """提问的短标题：sheepdog ask 加的开头一行里 · 和 [..] 之间那段；认不出就是第一行前 40 字。卡片（7.48）按还原后的算。"""
+    bodies = message_bodies(plain_text(text or ""))
     body = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
     first = body.splitlines()[0].strip() if body else ""
     m = _ASK_TITLE.match(first)
@@ -383,8 +384,8 @@ def ask_title(cfg, text: str) -> str:
 
 
 def ask_body(text: str, limit: int = 60) -> str:
-    """提问正文（去掉开头一行）的前几十个字。"""
-    bodies = message_bodies(text or "")
+    """提问正文（去掉开头一行）的前几十个字。卡片（7.48）按还原后的算。"""
+    bodies = message_bodies(plain_text(text or ""))
     body = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
     lines = body.splitlines()
     return _short(" ".join(lines[1:]) if len(lines) > 1 else "", limit)

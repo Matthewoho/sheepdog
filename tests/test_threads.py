@@ -18,6 +18,7 @@ C 发前再看一眼：检查跑多少次账本、已读状态、拉取进度都
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from contextlib import redirect_stdout
@@ -42,6 +43,7 @@ MARK = "[🐕Sheepdog Reply]"
 HEADER_RX = r"^🐕 需要你定 · [^\n]*\[(?P<topic>tp_[a-z0-9_.-]+)\]"
 ATTR_RX = r"\[(?P<topic>tp_[a-z0-9_.-]+)\]"
 WRITE_CMDS = ("+messages-send", "+messages-reply")
+_NAMES = {ME: "主人"}
 
 
 def now8() -> datetime:
@@ -52,14 +54,32 @@ def _opt(args: list[str], name: str, default: str = "") -> str:
     return args[args.index(name) + 1] if name in args else default
 
 
+def sent_text(call: list[str]) -> str:
+    """一次发送的正文（7.48 起发给主人的是卡片）：纯文本就是 --text；卡片是 header 标题 + 各 markdown 元素，换行连起来，
+    @ 主人保留卡片写法 <at id=…></at>。"""
+    if "--content" not in call:
+        return _opt(call, "--text")
+    card = json.loads(_opt(call, "--content"))
+    title = ((card.get("header") or {}).get("title") or {}).get("content", "")
+    parts = [el.get("content", "") for el in card["body"]["elements"]]
+    return "\n".join(([title] if title else []) + parts)
+
+
 def _card_text(content: str) -> str:
-    """卡片拉回来时的样子：<card>\\n正文\\n标记\\n</card>（同 test_reply_card）。"""
+    """卡片拉回来时的样子（7.48，10-16 只读核过正式账本里机器人发的代回卡片和别的机器人的告警卡片）：
+    有 header 是 <card title="标题">（带副标题是 <card title="…" subtitle="…">），没有 header 是 <card>；
+    各 markdown 元素之间换行分开；<at id=ou_x></at> 变成 @名字(ou_x)；<font …> 标签去掉；最后一行 </card>。"""
     card = json.loads(content)
+    head = (card.get("header") or {})
+    title = (head.get("title") or {}).get("content", "")
+    sub = (head.get("subtitle") or {}).get("content", "")
     parts = []
     for el in card["body"]["elements"]:
         text = el.get("content", "")
-        parts.append(text.replace("<font color='grey'>", "").replace("</font>", ""))
-    return "<card>\n" + "\n".join(parts) + "\n</card>"
+        text = re.sub(r"<at id=([\w-]+)></at>", lambda m: f"@{_NAMES.get(m.group(1), '某人')}({m.group(1)})", text)
+        parts.append(re.sub(r"</?font[^>]*>", "", text))
+    first = (f'<card title="{title}" subtitle="{sub}">' if sub else f'<card title="{title}">') if title else "<card>"
+    return first + "\n" + "\n".join(parts) + "\n</card>"
 
 
 class FakeLark:
@@ -69,7 +89,8 @@ class FakeLark:
         self.calls: list[list[str]] = []
         self.msgs: dict[str, dict] = {}
         self.idem: dict[str, str] = {}
-        # 子命令 → 依次使用的模式：error（报错，什么都没发）/ timeout（超时，什么都没发）/ lost（发出去了但响应超时）
+        # 子命令 → 依次使用的模式：error（报错，什么都没发）/ timeout（超时，什么都没发）/ lost（发出去了但响应超时）/
+        # card_reject（飞书拒了卡片，什么都没发，7.48）
         self.plan: dict[str, list[str]] = {}
         self.n = 0
         # 搜索结果带不带 message_position（消息在这个聊天里的序号，按发送先后，同一分钟里也分先后）
@@ -81,14 +102,14 @@ class FakeLark:
 
     # ---------- 造数据 ----------
     def add(self, *, chat_id: str, sender_id: str, content: str, at: datetime | None = None, sender_type: str = "user",
-            chat_type: str = "p2p", thread_root: str = "", message_id: str = "") -> str:
+            chat_type: str = "p2p", thread_root: str = "", message_id: str = "", msg_type: str = "text") -> str:
         self.n += 1
         mid = message_id or f"om_test_fk{self.n:04d}"
         m = {"message_id": mid, "chat_id": chat_id, "chat_type": chat_type, "content": content,
              "at": (at or now8()).astimezone(TZ8).replace(second=0, microsecond=0),
              "sender": {"id": sender_id, "sender_type": sender_type,
                         "name": "主人" if sender_id == ME else "机器人" if sender_type == "app" else "Alice"},
-             "thread_root": "", "thread_id": "", "pos": None, "deleted": False, "seq": self.n}
+             "thread_root": "", "thread_id": "", "pos": None, "deleted": False, "seq": self.n, "msg_type": msg_type}
         base = 0 if chat_type == "topic" else -1   # 开头那条的序号：话题群 "0"，普通聊天 "-1"
         if thread_root:
             root = self.msgs[thread_root]
@@ -116,7 +137,7 @@ class FakeLark:
                "chat_type": m["chat_type"], "content": m["content"],
                "create_time": m["at"].strftime("%Y-%m-%d %H:%M"), "deleted": m["deleted"],
                "message_app_link": f"https://example.invalid/{mid}", "message_id": mid,
-               "msg_type": "text", "sender": m["sender"], "updated": False}
+               "msg_type": m["msg_type"], "sender": m["sender"], "updated": False}
         if self.positions:
             # 聊天里的序号：同一聊天按（时间、发送先后）排，所以同一分钟里谁先谁后也分得清
             out["message_position"] = str(1 + sum(1 for x in self.msgs.values() if x["chat_id"] == m["chat_id"]
@@ -145,6 +166,10 @@ class FakeLark:
             raise subprocess.TimeoutExpired(argv, timeout or 60)
         if mode == "error":
             return self._out({"ok": False, "error": {"type": "api", "subtype": "server_error", "message": "假的失败"}}, 1)
+        if mode == "card_reject":
+            # 7.48：飞书拒了卡片（卡片内容创建失败），什么都没发
+            return self._out({"ok": False, "error": {"type": "api", "code": 230099,
+                                                     "message": "Failed to create card content"}}, 1)
         handler = {"+messages-send": self._send, "+messages-reply": self._reply, "+messages-search": self._search,
                    "+threads-messages-list": self._thread_list, "+messages-mget": self._mget,
                    "+chat-list": lambda a: {"chats": [], "has_more": False},
@@ -167,6 +192,14 @@ class FakeLark:
             return _card_text(_opt(args, "--content"))
         return _opt(args, "--text")
 
+    @staticmethod
+    def _msg_type(args: list[str]) -> str:
+        return "interactive" if "--content" in args else "text"
+
+    def sent_body(self, call: list[str]) -> str:
+        """一次发送的内容，按主人身份搜索读回的样子（卡片是 <card …> 那种，纯文本原样）。"""
+        return self._content(call)
+
     def _created(self, mid: str) -> dict:
         m = self.msgs[mid]
         out = {"message_id": mid, "chat_id": m["chat_id"], "create_time": str(int(m["at"].timestamp()))}
@@ -180,7 +213,7 @@ class FakeLark:
         chat = ESC_CHAT if _opt(args, "--user-id") and ident == "bot" else _opt(args, "--chat-id")
         mid = self.add(chat_id=chat, sender_id=BOT if ident == "bot" else ME,
                        sender_type="app" if ident == "bot" else "user", content=self._content(args),
-                       chat_type=self.chat_types.get(chat, "p2p"))
+                       chat_type=self.chat_types.get(chat, "p2p"), msg_type=self._msg_type(args))
         if key:
             self.idem[key] = mid
         return self._created(mid)
@@ -193,7 +226,7 @@ class FakeLark:
         ident = _opt(args, "--as")
         mid = self.add(chat_id=target["chat_id"], sender_id=BOT if ident == "bot" else ME,
                        sender_type="app" if ident == "bot" else "user", content=self._content(args),
-                       chat_type=target["chat_type"],
+                       chat_type=target["chat_type"], msg_type=self._msg_type(args),
                        thread_root=target["message_id"] if "--reply-in-thread" in args else "")
         if key:
             self.idem[key] = mid
@@ -317,13 +350,14 @@ class AskTest(ThreadsBase):
         send, r1, r2 = self.lark.sent()
         self.assertEqual(send[1], "+messages-send")
         self.assertEqual((_opt(send, "--as"), _opt(send, "--user-id")), ("bot", ME))
-        self.assertTrue(_opt(send, "--text").startswith("🐕 需要你定 · 发版时间 [tp_alpha]\n周五还是下周一？"))
+        self.assertEqual(_opt(send, "--msg-type"), "interactive")   # 7.48：发给主人的一律是卡片
+        self.assertTrue(sent_text(send).startswith("🐕 需要你定 · 发版时间 [tp_alpha]\n周五还是下周一？"))
         root = self.store.thread_by_key("tp_alpha", "PR#12")["root_message_id"]
         for r in (r1, r2):
             self.assertEqual(r[1], "+messages-reply")
             self.assertEqual((_opt(r, "--message-id"), _opt(r, "--as")), (root, "bot"))
             self.assertIn("--reply-in-thread", r)
-        self.assertTrue(_opt(r2, "--text").startswith("🐕 汇报 · 进度 [tp_alpha]"))
+        self.assertTrue(sent_text(r2).startswith("🐕 汇报 · 进度 [tp_alpha]"))
         for c in (send, r1, r2):
             k = _opt(c, "--idempotency-key")
             self.assertTrue(k and len(k) <= 50, k)
