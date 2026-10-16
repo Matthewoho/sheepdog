@@ -1056,15 +1056,16 @@ class Collector:
         if fn is None:
             return
         try:
-            text = pend.render(pend.build(self.cfg, self.store), header="📋 待办清单")
+            # 7.48：给主人的「待办」卡片和纯文本版（[notify] owner_card 关着或卡片太大时卡片是 None），sends 记纯文本版
+            plain, card = pend.owner_list(self.cfg, self.store)
         except Exception as e:
             log.warning("拼待办清单出错: %s", e)
             return
+        text = plain
         ik = identity.short_key(pend.SEND_PENDING, pend.SEND_PENDING, m.message_id)
         if self.store.get_send(ik) is not None:
             return
-        from .outbound import owner_content, send_owner
-        plain, card = owner_content(self.cfg, text)   # 7.48：发成卡片（[notify] owner_card），sends 照旧记纯文本
+        from .outbound import send_owner
         try:
             res = send_owner(lambda t, c: fn(m.message_id, identity=identity.BOT, idem_key=ik, text=t,
                                              **({"card": c} if c is not None else {})), plain, card)

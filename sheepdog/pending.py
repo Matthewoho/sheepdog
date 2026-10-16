@@ -11,7 +11,8 @@
   3. 同来源的另一条提问被主人答复或被会话结案（两条提问不在同一个会话，或都是 --about 指定的来源）。
   标上以后给负责会话排一条系统消息请它核实，每条只提醒一次。不替会话结案：误判会把没办的事当成办完。
 - 快到期：离 open_hours 还剩 [escalation] remind_before_hours 小时还开着，提醒负责会话核实一次；到期照旧关闭。
-- 待办清单（sheepdog pending / 主人在找主人聊天里发「待办」）：只读，从账本拼。
+- 待办清单（sheepdog pending / 主人在找主人聊天里发「待办」）：只读，从账本拼。sheepdog pending 打印 render() 那份；
+  主人发「待办」时机器人回 owner_list()：卡片（owner_card）和清爽的纯文本版（发卡片被拒、开关关着时用，sends 记它）。
 
 对会话、对人的说明放 playbook（escalation_check.md、escalation_expiring.md、resolve_notice.md，可选；缺了用这里的默认话），
 这里只拼事实。
@@ -28,7 +29,7 @@ from . import duty
 from . import engine as eng
 from . import prompts
 from . import session as sm
-from .card import plain_text
+from .card import card_fits, plain_text
 from .router import message_bodies
 from .store import SYSTEM_ID_PREFIX, Store, now_iso
 
@@ -621,6 +622,14 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
                 **hit.as_dict(), "line": hit_line(cfg, store, hit, "你", short=True),
                 "marked": bool(e["possibly_handled_at"]), "notified": bool(e["possibly_handled_notified_at"])},
         }
+        # 给主人看的清单（owner_list）用：会话显示名、原提问链接、来源时间、整段正文（摘录用）
+        msg = store.get_message(e["message_id"])
+        items[e["message_id"]].update({
+            "session_name": session_name(cfg, store, e["topic_id"]),
+            "link": (msg["link"] or "") if msg is not None else "",
+            "body_full": _body_after_header(e["text"]),
+            "sources": _source_marks(cfg, store, srcs),
+        })
         about_of[e["message_id"]] = (e["topic_id"], srcs)
     # 同一件事合成一组（same_matter：共用来源消息、不在同一个会话，或同一个会话都 --about 指定了它）
     groups: list[list[str]] = []
@@ -651,6 +660,7 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         upd = _parse(w["declared_at"] if w["declared"] and w["declared_at"] else w["updated_at"])
         stale = bool(w["declared"]) and upd is not None and now - upd >= timedelta(hours=stale_h)
         waiting.append({"topic_id": w["topic_id"], "session": session_label(store, w["topic_id"]), "key": w["key"],
+                        "session_name": session_name(cfg, store, w["topic_id"]),
                         "title": w["title"] or "", "source": duty.source_text(w), "declared": bool(w["declared"]),
                         "updated_at": upd.isoformat(timespec="seconds") if upd else "",
                         "updated_minutes": _minutes(upd, now), "stale": stale,
@@ -738,6 +748,257 @@ def render(data: dict, header: str = "") -> str:
     if not w:
         lines.append("（无）")
     return "\n".join(lines)
+
+
+# ======================= 给主人看的「待办」（主人发「待办」时机器人回的，10-16 19:0x「待办卡片有点丑」） =======================
+PENDING_TITLE = "📋 待办"
+PENDING_FOOTER = "直接回原提问那条就能答；私聊发「待办」随时刷新"
+PENDING_EMPTY = "现在没有要你定、也没有在等你的事"
+EXCERPT_CHARS = 60
+_LEADING_TAG = re.compile(r"^\s*\[[^\[\]]*\]\s*")
+
+
+def session_name(cfg, store: Store, topic_id: str) -> str:
+    """会话的显示名：名册 / 动态会话的标题去掉 [managed] 这类前缀；没有标题就用 topic 去掉 tp_。"""
+    t = store.get_topic(topic_id)
+    title = ((t["title"] or "") if t is not None else "").strip()
+    prefix = cfg.session.title_prefix or ""
+    if prefix and title.startswith(prefix):
+        title = title[len(prefix):].strip()
+    title = _LEADING_TAG.sub("", title).strip()
+    return title or topic_id.removeprefix("tp_")
+
+
+def _body_after_header(text: str) -> str:
+    """提问去掉 sheepdog 加的开头一行以后的正文（卡片按还原后的算）。"""
+    bodies = message_bodies(plain_text(text or ""))
+    body = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
+    return body.partition("\n")[2].strip()
+
+
+def _source_marks(cfg, store: Store, srcs) -> list[dict]:
+    """来源：(聊天名, 来源消息的时间)，同一个聊天只列一次。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for s in srcs:
+        chat = s["about_chat_id"]
+        if not chat or chat in seen:
+            continue
+        seen.add(chat)
+        m = store.get_message(s["about_message_id"]) if s["about_message_id"] else None
+        out.append({"label": chat_label(cfg, store, chat), "at": (m["create_time"] or "") if m is not None else ""})
+    return out
+
+
+_MD_FENCE = re.compile(r"^\s*(```|~~~).*$", re.M)
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+_MD_QUOTE = re.compile(r"^\s*>\s?", re.M)
+_MD_LIST = re.compile(r"^\s*(?:[-*+•]|\d+[.)、])\s+", re.M)
+_MD_HR = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", re.M)
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_TAG = re.compile(r"</?[A-Za-z][^<>]*>")
+_MD_EMPH = re.compile(r"(\*\*|__|~~|\*|`)")
+# 内联的标题、列表、引用（读回时换行被吃掉、和上一行连在一起的，比如「…如下：### 选项- 第一项」）
+_MD_INLINE_HEADING = re.compile(r"(?<=\S)\s*#{2,6}\s+")
+_MD_INLINE_LIST = re.compile(r"(?:(?<=\s)|(?<=[\u4e00-\u9fff。：:）)」]))(?:[-*•]|\d+[.)、])\s+")
+_SENTENCE_END = "。！？；!?;"
+_SOFT_END = "，、,：:）)」"
+
+
+def strip_markdown(text: str) -> str:
+    """去掉 markdown 符号，只留文字：标题、列表、引用、分隔线、加粗斜体删除线、行内代码和代码块标记、HTML 标签；
+    链接和图片只留文字。换行合成一个空格。不会留下反引号。"""
+    t = text or ""
+    t = _MD_FENCE.sub("", t)
+    t = _MD_HR.sub("", t)
+    t = _MD_HEADING.sub("", t)
+    t = _MD_QUOTE.sub("", t)
+    t = _MD_LIST.sub("", t)
+    t = _MD_IMAGE.sub(r"\1", t)
+    t = _MD_LINK.sub(r"\1", t)
+    t = _MD_TAG.sub("", t)
+    t = _MD_INLINE_HEADING.sub(" ", t)
+    t = _MD_INLINE_LIST.sub(" ", t)
+    t = _MD_EMPH.sub("", t)
+    return " ".join(t.split())
+
+
+def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
+    """摘录：去 markdown，合成一行，超过 limit 个字在句子边界截断（找不到就在逗号这类地方，再不行硬截），后面加「…」。"""
+    t = strip_markdown(text)
+    if len(t) <= limit:
+        return t
+    head = t[:limit]
+    for marks in (_SENTENCE_END, _SOFT_END):
+        cut = max(head.rfind(c) for c in marks)
+        if cut >= limit // 2:
+            keep = cut + 1 if head[cut] in _SENTENCE_END + "）)」" else cut   # 逗号、冒号这类不留在「…」前面
+            return head[:keep].rstrip() + "…"
+    return head.rstrip() + "…"
+
+
+def _clean_title(text: str) -> str:
+    return strip_markdown(text) or "（没有标题）"
+
+
+def _hm(iso: str, now: datetime, offset: str) -> str:
+    """北京时间（配置的时区）时:分；和现在不是同一天时带月-日。"""
+    dt = _parse(iso)
+    if dt is None:
+        return ""
+    tz = eng._tz(offset)[0]
+    local, today = dt.astimezone(tz), now.astimezone(tz)
+    return local.strftime("%H:%M") if local.date() == today.date() else local.strftime("%m-%d %H:%M")
+
+
+def _ph_phrase(cfg, store: Store, ph: dict, now: datetime) -> str:
+    """可能已处理：几点在哪说过 / 点过表情 / 同来源那条已答复或已结案。"""
+    at = _hm(ph.get("at") or "", now, cfg.timezone_offset)
+    where_ = chat_label(cfg, store, ph.get("chat_id") or "", ph.get("chat_type") or "", ph.get("chat_name") or "") \
+        if ph.get("chat_id") else ""
+    r = ph.get("reason")
+    if r == PH_SPOKE:
+        return f"{at} 你在{where_}里说过"
+    if r == PH_REACTION:
+        return f"{at} 你在{where_}里点了{ph.get('emoji') or '表情'}"
+    if r == PH_SIBLING_ANSWERED:
+        return f"{at} 同来源的另一条你已答复"
+    if r == PH_SIBLING_RESOLVED:
+        return f"{at} 同来源的另一条已结案"
+    return "标了可能已处理"
+
+
+def _closed_note(a: dict) -> str:
+    if not a["session_closed"]:
+        return ""
+    if a["follower"]:
+        return "原会话已收掉，由总线跟进"
+    return "原会话已收掉，没人跟进，请你自己看一眼"
+
+
+def _owner_asks(cfg, store: Store, data: dict, now: datetime) -> list[dict]:
+    """要你定的每一条（同一件事的几条编成 2a、2b）：{title, link, meta, excerpt, source}。"""
+    out = []
+    for i, g in enumerate(data["decide"], 1):
+        same = g["same_source"]
+        for j, a in enumerate(g["asks"]):
+            n = f"{i}{chr(ord('a') + j)}" if same else str(i)
+            meta = [a.get("session_name") or a["topic_id"].removeprefix("tp_")]
+            if (t := _hm(a["asked_at"], now, cfg.timezone_offset)):
+                meta.append(f"{t} 问")
+            if a["waited_minutes"] is not None:
+                meta.append(f"已等 {waited(a['waited_minutes'])}")
+            if a["key"]:
+                meta.append(f"钥匙 {a['key']}")
+            if same:
+                meta.append(f"同一件事 {len(g['asks'])} 个提问")
+            if (c := _closed_note(a)):
+                meta.append(f"⚠ {c}")
+            if a["possibly_handled"]:
+                meta.append(f"⚠ 可能已处理（{_ph_phrase(cfg, store, a['possibly_handled'], now)}）")
+            srcs = a.get("sources") or []
+            src = "、".join(" ".join(x for x in (s["label"], _hm(s["at"], now, cfg.timezone_offset)) if x)
+                           for s in srcs[:3]) + (f" 等 {len(srcs)} 个聊天" if len(srcs) > 3 else "")
+            out.append({"n": n, "title": _clean_title(a["title"]), "link": a.get("link") or "",
+                        "meta": " · ".join(meta), "excerpt": excerpt(a.get("body_full") or a.get("body") or ""),
+                        "source": f"来源：{src}" if srcs else ""})
+    return out
+
+
+def _owner_waits(cfg, data: dict) -> list[dict]:
+    out = []
+    for i, x in enumerate(data["waiting_owner"], 1):
+        meta = [x.get("session_name") or x["topic_id"].removeprefix("tp_")]
+        if x["key"]:
+            meta.append(f"钥匙 {x['key']}")
+        meta.append(x["source"])
+        if x["updated_minutes"] is not None:
+            meta.append(f"{waited(x['updated_minutes'])}前更新")
+        if x["stale"]:
+            meta.append(f"⚠ {x['stale_label']}")
+        out.append({"n": str(i), "title": _clean_title(x["title"] or x["key"]), "meta": " · ".join(meta)})
+    return out
+
+
+def owner_view(cfg, store: Store, data: dict, now: datetime | None = None) -> dict:
+    """给主人看的清单，卡片和纯文本共用：{subtitle, decide, waiting, n_decide, n_waiting}。"""
+    now = now or _parse(data["generated_at"]) or eng._now()
+    nd, nw = data["decide_count"], len(data["waiting_owner"])
+    return {"subtitle": f"{_hm(data['generated_at'], now, cfg.timezone_offset)} · 要你定 {nd} · 在等你 {nw}",
+            "decide": _owner_asks(cfg, store, data, now), "waiting": _owner_waits(cfg, data),
+            "n_decide": nd, "n_waiting": nw}
+
+
+def owner_text(v: dict) -> str:
+    """纯文本版：发卡片被拒、[notify] owner_card 关着时发它；sends 也记它。"""
+    lines = [f"{PENDING_TITLE} · {v['subtitle']}"]
+    if not v["decide"] and not v["waiting"]:
+        lines += ["", PENDING_EMPTY]
+    if v["decide"]:
+        lines += ["", f"要你定 · {v['n_decide']} 条"]
+        for i, a in enumerate(v["decide"]):
+            if i:
+                lines.append("")
+            lines.append(f"{a['n']}. {a['title']}")
+            lines += [f"   {x}" for x in (a["meta"], a["excerpt"], a["source"]) if x]
+    if v["waiting"]:
+        lines += ["", f"会话在等你 · {v['n_waiting']} 件"]
+        for i, w in enumerate(v["waiting"]):
+            if i:
+                lines.append("")
+            lines += [f"{w['n']}. {w['title']}", f"   {w['meta']}"]
+    lines += ["", PENDING_FOOTER]
+    return "\n".join(lines)
+
+
+def _grey(text: str) -> str:
+    return f"<font color='grey'>{text}</font>"
+
+
+def owner_card(v: dict) -> dict:
+    """卡片版（Card 2.0）：header「📋 待办」+ 副标题；要你定的多于 0 条橙色，否则绿色；栏标题加粗，空栏不显示；
+    每一条：加粗的「序号. 标题」（能拿到原提问链接就跟「[打开](链接)」）、灰色一行会话和时间、摘录、灰色来源；条与条之间分隔线。"""
+    els: list[dict] = []
+
+    def section(title: str, rows: list[dict], decide: bool) -> None:
+        els.append({"tag": "markdown", "content": f"**{title}**"})
+        for i, r in enumerate(rows):
+            if i:
+                els.append({"tag": "hr"})
+            head = f"**{r['n']}. {r['title']}**" + (f" [打开]({r['link']})" if decide and r.get("link") else "")
+            lines = [head, _grey(r["meta"])]
+            if decide and r["excerpt"]:
+                lines.append(r["excerpt"])
+            if decide and r["source"]:
+                lines.append(_grey(r["source"]))
+            els.append({"tag": "markdown", "content": "\n".join(lines)})
+
+    if not v["decide"] and not v["waiting"]:
+        els.append({"tag": "markdown", "content": PENDING_EMPTY})
+    if v["decide"]:
+        section(f"要你定 · {v['n_decide']} 条", v["decide"], True)
+    if v["waiting"]:
+        if v["decide"]:
+            els.append({"tag": "hr"})
+        section(f"会话在等你 · {v['n_waiting']} 件", v["waiting"], False)
+    els.append({"tag": "markdown", "content": _grey(PENDING_FOOTER), "text_size": "notation"})
+    return {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": PENDING_TITLE},
+                       "subtitle": {"tag": "plain_text", "content": v["subtitle"]},
+                       "template": "orange" if v["n_decide"] > 0 else "green"},
+            "body": {"elements": els}}
+
+
+def owner_list(cfg, store: Store, now: datetime | None = None) -> tuple[str, dict | None]:
+    """主人发「待办」时机器人回的：(纯文本版, 卡片或 None)。[notify] owner_card 关着、卡片太大时卡片是 None。只读。"""
+    data = build(cfg, store, now)
+    v = owner_view(cfg, store, data, now)
+    text = owner_text(v)
+    if not cfg.notify.owner_card:
+        return text, None
+    card = owner_card(v)
+    return text, (card if card_fits(card) else None)
 
 
 def is_pending_query(content: str) -> bool:

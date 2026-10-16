@@ -209,11 +209,9 @@ class FourPathsTest(OwnerCardBase):
         self.assertEqual((_opt(call, "--message-id"), _opt(call, "--msg-type")), (q, "interactive"))
         self.assertNotIn("--reply-in-thread", call)
         c = card_of(call)
-        self.assertTrue(c["header"]["title"]["content"].startswith("📋 待办清单"))
+        self.assertEqual(c["header"]["title"]["content"], "📋 待办")
         s = self.store.conn.execute("SELECT text, message_id FROM sends WHERE kind='pending'").fetchone()
-        self.assertTrue(s[0].startswith("📋 待办清单"))
-        head, _, rest = s[0].partition("\n")
-        self.assertEqual(sent_text(call), head + "\n" + rest.strip("\n"))   # 正文开头的空行不进卡片
+        self.assertTrue(s[0].startswith("📋 待办 · "))                    # sends 记纯文本版
         # 清单拉回来：认得出是牧羊犬自己的话
         self.pull(s[1])
         self.assertEqual(self.row(s[1])["reason"], "sheepdog_pending")

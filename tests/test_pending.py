@@ -693,11 +693,11 @@ class PendingListTest(PendingBase):
         self.assertEqual((_opt(call, "--message-id"), _opt(call, "--as")), (q, "bot"))
         self.assertNotIn("--reply-in-thread", call)
         text = sent_text(call)
-        self.assertTrue(text.startswith("📋 待办清单（"))
+        self.assertEqual(text.split("\n")[0], "📋 待办")                 # 卡片 header 标题
         self.assertIn("Felix 接码", text)
         self.assertIsNone(self.cfg.escalation.pattern.search(text.splitlines()[0]))
         # 清单拉回来：不登记「需要你定」、不投给任何会话；「待办」本身也没回答哪条提问
-        reply = [m for m in self.lark.msgs if plain_text(self.lark.msgs[m]["content"]) == text][0]
+        reply = self.store.conn.execute("SELECT message_id FROM sends WHERE kind='pending'").fetchone()[0]
         self.pull(reply)
         self.assertEqual((self.row(reply)["route"], self.row(reply)["reason"]), ("drop", "sheepdog_pending"))
         self.assertIsNone(self.store.get_escalation(reply))
@@ -731,3 +731,143 @@ class PendingListTest(PendingBase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.count("（无）"), 2)
         self.assertIn("要你定的 0 条，各会话在等你的 0 件", out)
+
+
+# ======================= 给主人看的「待办」卡片（10-16 19:0x Matthew：「待办卡片有点丑」） =======================
+class OwnerPendingTest(PendingBase):
+    scene = PendingListTest.scene     # 同一套场景：4 条要你定（含同来源 2 条、可能已处理 1 条）、2 件在等你
+
+    def view(self):
+        return pend.owner_list(self.cfg, self.store)
+
+    def els(self, card) -> list[str]:
+        return [e.get("content", "<hr>") if e["tag"] != "hr" else "<hr>" for e in card["body"]["elements"]]
+
+    def test_header_title_subtitle_and_color(self):
+        self.scene()
+        text, card = self.view()
+        h = card["header"]
+        self.assertEqual(h["title"], {"tag": "plain_text", "content": "📋 待办"})
+        self.assertRegex(h["subtitle"]["content"], r"^\d\d:\d\d · 要你定 4 · 在等你 2$")
+        self.assertEqual(h["template"], "orange")
+        self.assertTrue(text.startswith("📋 待办 · " + h["subtitle"]["content"] + "\n"))
+        els = self.els(card)
+        self.assertEqual(els[0], "**要你定 · 4 条**")
+        self.assertIn("**会话在等你 · 2 件**", els)
+        self.assertIn("<hr>", els)                                   # 条与条之间分隔线
+        self.assertEqual(card["body"]["elements"][-1]["content"],
+                         "<font color='grey'>直接回原提问那条就能答；私聊发「待办」随时刷新</font>")
+        self.assertNotIn("（无）", text + json.dumps(card, ensure_ascii=False))
+
+    def test_both_empty_one_line_green(self):
+        text, card = self.view()
+        self.assertEqual(card["header"]["template"], "green")
+        self.assertRegex(card["header"]["subtitle"]["content"], r"要你定 0 · 在等你 0$")
+        self.assertEqual(self.els(card)[:-1], ["现在没有要你定、也没有在等你的事"])
+        self.assertEqual(text.split("\n")[1:], ["", "现在没有要你定、也没有在等你的事", "",
+                                                "直接回原提问那条就能答；私聊发「待办」随时刷新"])
+
+    def test_empty_column_hidden(self):
+        self.cli("work", "set", "--topic", "tp_alpha", "--key", "AGIF-9", "--title", "等主人看方案", "--state", "等主人")
+        text, card = self.view()
+        self.assertEqual(card["header"]["template"], "green")       # 要你定 0 条：绿色
+        joined = "\n".join(self.els(card))
+        self.assertNotIn("要你定 ·", joined)
+        self.assertIn("**会话在等你 · 1 件**", joined)
+        self.assertNotIn("要你定 ·", text.split("\n", 1)[1])
+        self.store.conn.execute("UPDATE work_items SET closed_at='x'")
+        self.store.conn.commit()
+        self.asked()
+        text, card = self.view()
+        self.assertNotIn("会话在等你", "\n".join(self.els(card)) + text)
+        self.assertEqual(card["header"]["template"], "orange")
+
+    def test_item_lines_meta_excerpt_source_link(self):
+        a = self.alice_batch()
+        q = self.asked("--about", a, "--key", "T748", title="**卡片**测试",
+                       text="这是 7.48 卡片测试（S1），不用真的回答。\n### 要你看的\n- 加粗**能不能**显示\n- 行内代码：`sheepdog ask` 和 [链接](https://x.invalid)\n```\nkubectl get pods\n```")
+        text, card = self.view()
+        item = next(e for e in self.els(card) if e.startswith("**1. "))
+        lines = item.split("\n")
+        link = self.store.get_message(q)["link"]
+        self.assertTrue(link)
+        self.assertEqual(lines[0], f"**1. 卡片测试** [打开]({link})")
+        meta = lines[1]
+        self.assertRegex(meta, r"^<font color='grey'>Alpha 需求 · \d\d:\d\d 问 · 已等 \d+ 分钟 · 钥匙 T748</font>$")
+        self.assertNotIn("[managed]", meta)
+        self.assertNotIn("tp_alpha", meta)
+        ex = lines[2]
+        for bad in ("###", "**", "`", "](", "- "):
+            self.assertNotIn(bad, ex)
+        self.assertTrue(ex.startswith("这是 7.48 卡片测试（S1），不用真的回答。 要你看的 加粗能不能显示"))
+        self.assertRegex(lines[3], r"^<font color='grey'>来源：和 .+ 的私聊 \d\d:\d\d</font>$")
+        # 纯文本版：同样的顺序，一条分几行
+        i = text.index("1. 卡片测试")
+        block = text[i:].split("\n\n")[0].split("\n")
+        self.assertEqual(block[0], "1. 卡片测试")
+        self.assertEqual(block[1], "   " + meta.removeprefix("<font color='grey'>").removesuffix("</font>"))
+        self.assertEqual(block[2], "   " + ex)
+        self.assertTrue(block[3].startswith("   来源："))
+
+    def test_no_source_no_source_line(self):
+        self.asked(title="随口", text="随便问问")
+        text, card = self.view()
+        self.assertNotIn("来源", text)
+        self.assertNotIn("来源", json.dumps(card, ensure_ascii=False))
+        self.assertNotIn("没记到", text)
+
+    def test_possibly_handled_on_meta_line(self):
+        self.scene()
+        text, card = self.view()
+        item = next(e for e in self.els(card) if "Leon GitHub App" in e)
+        meta = item.split("\n")[1]
+        self.assertRegex(meta, r" · ⚠ 可能已处理（\d\d:\d\d 你在.+里说过）</font>$")
+
+    def test_session_name(self):
+        self.assertEqual(pend.session_name(self.cfg, self.store, "tp_alpha"), "Alpha 需求")
+        self.assertEqual(pend.session_name(self.cfg, self.store, BUS_TOPIC_ID), self.cfg.session.bus_title)
+        self.store.update_topic("tp_alpha", title="[managed] Lark 信号·总线")
+        self.assertEqual(pend.session_name(self.cfg, self.store, "tp_alpha"), "Lark 信号·总线")
+        self.store.update_topic("tp_alpha", title="[dynamic] 发版 bot")
+        self.assertEqual(pend.session_name(self.cfg, self.store, "tp_alpha"), "发版 bot")
+        self.store.update_topic("tp_alpha", title="")
+        self.assertEqual(pend.session_name(self.cfg, self.store, "tp_alpha"), "alpha")
+        self.assertEqual(pend.session_name(self.cfg, self.store, "tp_nobody-here"), "nobody-here")
+
+    def test_excerpt(self):
+        self.assertEqual(pend.excerpt("**粗** `代码` [字](https://x) ### 标题"), "粗 代码 字 标题")
+        long = "第一句话说清楚是什么事情。" * 3 + "后面还有很多很多很多很多字" * 5
+        ex = pend.excerpt(long)
+        self.assertTrue(ex.endswith("。…"), ex)
+        self.assertLessEqual(len(ex), 61)
+        # 原文里半截的反引号（之前清单截在半截的样子）也不留
+        self.assertNotIn("`", pend.excerpt("行内代码：`sheepd" + "x" * 80))
+        self.assertNotIn("`", pend.excerpt("```json\n{\"a\": 1}\n```\n后话"))
+        self.assertEqual(pend.excerpt("没有句号的一长串" * 10)[-1], "…")
+
+    def test_plain_text_when_switch_off_and_sends_record_it(self):
+        self.scene()
+        self.cfg.notify.owner_card = False
+        text, card = self.view()
+        self.assertIsNone(card)
+        q = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="待办", at=at(5))
+        self.pull(q)
+        call = self.lark.sent("+messages-reply")[-1]
+        self.assertNotIn("--content", call)
+        sent = _opt(call, "--text")
+        self.assertTrue(sent.startswith("📋 待办 · "))
+        self.assertIn("\n\n要你定 · 4 条\n1a. Felix 接码（总线）\n   Lark 信号·总线 · ", sent)   # 同一件事编成 1a、1b
+        self.assertIn("\n\n会话在等你 · 2 件\n", sent)
+        self.assertTrue(sent.endswith("\n\n直接回原提问那条就能答；私聊发「待办」随时刷新"))
+        self.assertEqual(self.store.conn.execute("SELECT text FROM sends WHERE kind='pending'").fetchone()[0], sent)
+
+    def test_card_reply_records_plain_text(self):
+        self.scene()
+        q = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="待办", at=at(5))
+        self.pull(q)
+        call = self.lark.sent("+messages-reply")[-1]
+        card = json.loads(_opt(call, "--content"))
+        self.assertEqual(card["header"]["title"]["content"], "📋 待办")
+        rec = self.store.conn.execute("SELECT text FROM sends WHERE kind='pending'").fetchone()[0]
+        self.assertTrue(rec.startswith("📋 待办 · "))
+        self.assertIn("要你定 · 4 条", rec)

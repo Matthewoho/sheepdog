@@ -134,7 +134,7 @@ class OwnerShortcutSwitchTest(PendingBase):
     def test_on_bot_replies_list(self):
         mid = self.daiban()
         self.assertEqual(self.row(mid)["reason"], "pending_query")
-        self.assertTrue(sent_text(self.lark.sent("+messages-reply")[-1]).startswith("📋 待办清单"))
+        self.assertTrue(sent_text(self.lark.sent("+messages-reply")[-1]).startswith("📋 待办\n"))
 
     def test_off_is_a_normal_owner_reply(self):
         self.cfg.escalation.owner_shortcut = False
