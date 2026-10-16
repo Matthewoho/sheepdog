@@ -375,6 +375,40 @@ class DeferredRelayBindingTest(EchoBase):
         self.assertEqual(len(self.relays()), 1)
         self.assertEqual(self.dm.texts("没回音"), [])
 
+    def test_regression_752_late_receipt_of_an_earlier_batch_does_not_take_it(self):
+        """回归 7.52：这句随 b1 送到，b1 还在跑，之前判过超时的 b0 晚到的回执先到了：那份说的是 b0 的事，不绑这句，
+        等 b1 自己的回执（只认送它进去那一批，不认「送到后的第一份」）。"""
+        q = self.asked()
+        busy = self.say(ALPHA_P2P, sender=ALICE, content="Alice 的需求")
+        self.pull(busy)
+        self.d.dispatch_once()
+        b0 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        with later(25):
+            self.d.dispatch_once()                                          # b0 回执超时（adopted：记未回执，不重投）
+        self.assertEqual(self.store.get_dispatch(b0)["state"], "missed")
+        a = self.owner("周五发", quote=q)
+        with later(26):
+            self.d.dispatch_once()
+        b1 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        self.assertNotEqual(b1, b0)
+        self.assertEqual((self.echo(a)["stage"], self.echo(a)["batch_id"]), ("delivered", b1))
+        self.store.update_topic("tp_alpha", dispatched_at=(now8() + timedelta(minutes=26)).isoformat(timespec="seconds"))
+        write_receipt(self.cfg, "tp_alpha", b0, {"status": "handled", "summary": "Alice 的需求办了"})
+        with later(27):
+            self.d.dispatch_once()                                          # b0 的回执晚到
+        self.assertEqual(self.store.get_dispatch(b0)["state"], "acked_late")
+        self.assertIsNone(self.echo(a)["relay_batch"])
+        with later(37):
+            self.d.dispatch_once()                                          # 送到后 10 分钟：绑错了就拿 b0 的发了
+        self.assertEqual(self.relays(), [])
+        self.receipt(summary="已按周五排期")
+        with later(38):
+            self.d.dispatch_once()
+        self.assertEqual(self.echo(a)["relay_batch"], b1)
+        (c,) = self.relays()
+        self.assertIn("已按周五排期", c["text"])
+        self.assertNotIn("Alice 的需求办了", c["text"])
+
     def test_regression_752_session_reported_during_deferral_no_card(self):
         """回归 7.52：推迟期间来了不相干的回执，会话也自己 report 了 → 算还上，不发卡片（原有行为）。"""
         a = self.owner("可以跟 sammy 说一声")
