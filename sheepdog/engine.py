@@ -33,7 +33,7 @@ from .sink import RunResult, Sink, SinkError, SinkTimeout
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
-from .store import SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
+from .store import ECHO_RELAY_FIELDS, SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
 from .source.lark import LarkTimeout, parse_event, parse_message as parse_thread_reply
 from . import identity
 
@@ -301,6 +301,7 @@ ECHO_REPLY = "reply"                                  # 报过「送到了、没
 ECHO_DELIVERED_STATES = ("delivered", "acked", "missed")
 ECHO_REQUEST_REASONS = ("owner_reply", "owner_instruction", "recalled", "edited")
 ECHO_RELAY_PREFIX = "owner_relay:"                    # 这一批已经带回过：meta owner_relay:<批次号>
+ECHO_UNBOUND = dict.fromkeys(ECHO_RELAY_FIELDS)       # 这句重新送了一次：绑过的回执作废（_echo_sync）
 ECHO_EXCERPT_CHARS = 60
 RELAY_STATUS_LABEL = {"handled": "已处理", "done": "已完成", "needs_decision": "等你定", "waiting_external": "在等别人"}
 
@@ -3066,7 +3067,8 @@ class Dispatcher:
     def _echo_sync(self) -> None:
         """按账本里消息的现状推进欠账：待推 → queued（跟着转交换会话）；送到了（delivered / acked / missed）→ delivered，
         记批次的送出时间；送到以后会话发过 ask / report → 还上（report）；会话收掉 / 移出名册 → 结掉（topic_closed，
-        同 7.47 第 6 条：不提醒）。没送进会话的（undelivered）不动。"""
+        同 7.47 第 6 条：不提醒）。没送进会话的（undelivered）不动。
+        这句重新送了一次（转交换了会话、退回待推、换了批次）：绑过的回执作废（ECHO_UNBOUND），那份回执说的是上一次。"""
         live = set(self._live_tids())
         now = _now().isoformat(timespec="seconds")
         for e in self.store.echo_open():
@@ -3080,16 +3082,17 @@ class Dispatcher:
             if r["route"] != DISPATCH or not tid:
                 continue
             if tid != e["topic_id"]:
-                # 转交了：换会话，报过的清零（对新会话重新起算）
-                self.store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now)
+                # 转交了：换会话，报过的清零（对新会话重新起算）；绑过的是原来那个会话的回执，作废
+                self.store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now, **ECHO_UNBOUND)
             if st == "pending" and (e["stage"] != ECHO_QUEUED or tid != e["topic_id"]):
                 self.store.echo_update(e["message_id"], stage=ECHO_QUEUED, stage_at=now, batch_id=None,
-                                       delivered_at=None)
+                                       delivered_at=None, **ECHO_UNBOUND)
             elif st in ECHO_DELIVERED_STATES and (e["stage"] != ECHO_DELIVERED or e["batch_id"] != r["batch_id"]):
                 d = self.store.get_dispatch(r["batch_id"]) if r["batch_id"] else None
                 self.store.echo_update(e["message_id"], stage=ECHO_DELIVERED, stage_at=now, batch_id=r["batch_id"],
                                        delivered_at=(d["sent_at"] if d is not None and d["sent_at"] else now),
-                                       priority=int(bool(r["batch_id"]) and r["batch_id"].startswith(PRIORITY_PREFIX)))
+                                       priority=int(bool(r["batch_id"]) and r["batch_id"].startswith(PRIORITY_PREFIX)),
+                                       **(ECHO_UNBOUND if e["batch_id"] != r["batch_id"] else {}))
         for e in self.store.echo_open():
             if e["stage"] != ECHO_DELIVERED:
                 continue
@@ -3179,9 +3182,13 @@ class Dispatcher:
         self._echo_alerts()
 
     def _echo_relay(self, t, batch_id: str, receipt: dict, status: str = "", summary: str | None = None) -> None:
-        """回执带回（7.52 第 1 条）第一步：会话交了回执，把它送到过、还欠着回音的主人的话（这一批的、之前插话送到的）记上
-        「等着带回」和这次回执的状态、summary；真正发在这一轮的回音账本里（_echo_relays，可按 owner_relay_after_minutes 推迟）。
-        同一会话后来又交了回执、还没带回的，换成最新那次回执。开关关着不记。"""
+        """回执带回（7.52 第 1 条）第一步：会话交了回执，把这份回执（状态、summary）绑到该由它带回的主人的话上；真正发在
+        这一轮的回音账本里（_echo_relays，可按 owner_relay_after_minutes 推迟），发的就是绑上的这一份。绑哪几句：
+        - 这一批送进去的（账上的批次就是这份回执的批次）；
+        - 插话批次（p 开头，没有自己的回执）送进去的：送到以后的第一份回执。
+        每句只绑一次，绑上了后来的回执改不了（store.echo_bind_relay 只写还空着的）；别的普通批次送进去、还在等自己那份
+        回执的不碰（10-17 04:59：推迟期间总线又交了两份回执，每份都把 04:48 那句改记到最新那份上，卡片正文成了另一件事）。
+        这句被重新送了一次（转交、退回重投），_echo_sync 把绑过的作废，再按新的那一批绑。开关关着不绑。"""
         if not self.cfg.session.owner_receipt_relay or not batch_id:
             return
         self._echo_sync()
@@ -3191,9 +3198,11 @@ class Dispatcher:
         summary = " ".join(str(summary or "").split())
         now = _now().isoformat(timespec="seconds")
         for e in self.store.echo_open():
-            if e["stage"] == ECHO_DELIVERED and e["topic_id"] == t["topic_id"]:
-                self.store.echo_update(e["message_id"], relay_batch=batch_id, relay_at=now, relay_status=status,
-                                       relay_summary=summary)
+            if e["stage"] != ECHO_DELIVERED or e["topic_id"] != t["topic_id"] or e["relay_batch"]:
+                continue
+            via = e["batch_id"] or ""
+            if via == batch_id or via.startswith(PRIORITY_PREFIX):
+                self.store.echo_bind_relay(e["message_id"], batch_id, now, status, summary)
 
     def _echo_destination(self, e) -> tuple[str, bool]:
         """这句主人的话，回音该回到哪：(去处键, 是否回到话题里)。
@@ -3216,7 +3225,8 @@ class Dispatcher:
         return f"main:{chat}", False
 
     def _echo_relays(self) -> None:
-        """回执带回第二步：等着带回、还没还上的，到了 max(回执收到, 送到 + owner_relay_after_minutes) 就发卡片。
+        """回执带回第二步：等着带回、还没还上的，到了 max(回执收到, 送到 + owner_relay_after_minutes) 就发卡片。卡片里的
+        状态和说明就是 _echo_relay 绑上的那份回执的，不看后来的回执。
         按「去处」分组（_echo_destination）：一个会话一次回执里的几句，回到哪就各发一张，同一个去处的几句合成一张（P1C
         10-17 03:59：找主人聊天的一句和话题群 T-3 的一句被合成一张、都发进了 T-3 话题）。每批、每个去处最多一次
         （meta owner_relay:<批次>:<去处>；给主人的通知账本里的防重编号也按批次 + 去处定）。发到哪：话题里的回到话题里；

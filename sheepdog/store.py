@@ -552,6 +552,9 @@ CREATE TABLE IF NOT EXISTS tracked_keys (
 SYSTEM_CHAT = "sheepdog"
 SYSTEM_ID_PREFIX = "sd_"
 
+# 回音账本里「等着带回」的那份回执（7.52）：只经 echo_bind_relay 写一次；echo_update 只许把它们清空（这句被重新送了一次）
+ECHO_RELAY_FIELDS = ("relay_batch", "relay_at", "relay_status", "relay_summary")
+
 
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
@@ -1308,11 +1311,23 @@ class Store:
                                  ).fetchall()
 
     def echo_update(self, message_id: str, **fields) -> None:
+        """改一笔欠账。等着带回的那份回执（ECHO_RELAY_FIELDS）这里只能清空，绑定走 echo_bind_relay。"""
         if not fields:
             return
+        if bound := [k for k in ECHO_RELAY_FIELDS if fields.get(k) is not None]:
+            raise ValueError(f"回执带回只能经 echo_bind_relay 绑一次，echo_update 不能写 {', '.join(bound)}")
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.tx() as c:
             c.execute(f"UPDATE owner_echoes SET {cols} WHERE message_id=?", (*fields.values(), message_id))
+
+    def echo_bind_relay(self, message_id: str, batch_id: str, at: str, status: str, summary: str) -> bool:
+        """把一份回执绑到这笔欠账上，等着带回（7.52）。只写还没绑、还没还上的：绑上了，后来的回执改不了它
+        （10-17 04:59：推迟期间每来一份回执都改记一次，卡片正文成了另一件事）。返回这次绑上了没有。"""
+        with self.tx() as c:
+            return c.execute(
+                """UPDATE owner_echoes SET relay_batch=?, relay_at=?, relay_status=?, relay_summary=?
+                   WHERE message_id=? AND settled_at IS NULL AND relay_batch IS NULL""",
+                (batch_id, at, status, summary, message_id)).rowcount == 1
 
     def echo_settle(self, message_ids: list[str], by: str) -> None:
         ts = now_iso()

@@ -7,6 +7,8 @@
 1 回执带回：交回执、从送到起没 ask / report → 一张卡片；自己 report 过 → 不带回；插话那几句跟下一次回执带回；
   needs_decision / waiting_external 写状态；发到哪（话题里、引用主人那句、群里 @ 的指令 → 找主人聊天新起一条）；
   每批一次；开关关掉不带回；晚到的回执也带回；带回卡片拉回来认得出会话、不登记「需要你定」。
+1b 推迟带回（owner_relay_after_minutes）：每句只绑送它进去那一批的回执（插话：送到后的第一份），推迟期间后来的回执不改它；
+  推迟期间会话 report 了就不发；转交以后绑过的作废、按新会话那一批重绑。
 2 回音账本：入账记欠账；没送进会话当场报、排队超时报、送到没回音报，各一次、不重复；牧羊犬自己处理的「待办」不记账；
   转交以后跟着换会话。
 """
@@ -254,6 +256,139 @@ class RelayTest(EchoBase):
         self.assertEqual((kw["identity"], kw["idem_key"], kw["in_thread"]), ("bot", "sdr-key", True))
         self.assertEqual(kw["card"]["header"]["title"]["content"], "✅ Alpha 需求 处理了你的话 [tp_alpha]")
         src.send_text.assert_not_called()
+
+
+# ======================= 1b 推迟带回：每句只绑送它进去那一批的回执 =======================
+class DeferredRelayBindingTest(EchoBase):
+    """10-17 04:59 正式环境：推迟 10 分钟带回，期间总线又交了 2 份回执，卡片引用 04:48 那句、正文却是 04:57 那份回执的
+    summary。一句话的带回只绑送它进去那一批的回执（插话批次：送到后的第一份），绑上了后来的回执不改。"""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.session.owner_relay_after_minutes = 10
+
+    def unrelated_bus_batch(self, at: float, summary: str, status="handled") -> str:
+        """一句和主人无关的话进总线、送成一批，总线交回执（at 分钟后送、at+1 分钟后收）。返回批次号。"""
+        u = self.say(OPS, sender=ALICE, content=f"无关的事 {at}", mentions=[ME])
+        self.pull(u)
+        with later(at):
+            self.d.dispatch_once()
+        self.assertEqual(self.row(u)["topic_id"], BUS_TOPIC_ID)
+        batch = self.receipt(BUS_TOPIC_ID, status=status, summary=summary)
+        self.assertEqual(self.row(u)["batch_id"], batch)
+        with later(at + 1):
+            self.d.dispatch_once()
+        return batch
+
+    def test_regression_752_deferred_relay_keeps_its_own_batch_receipt(self):
+        """回归 7.52：推迟带回的 10 分钟里，同一会话又交了 2 份不相干的回执，卡片里仍是送这句进去那一批的 summary 和状态。"""
+        a = self.owner("可以跟 sammy 说一声，热修发布了")                      # 没引用 → 指令进总线（7.53）
+        self.assertEqual((self.echo(a)["topic_id"], self.echo(a)["kind"]), (BUS_TOPIC_ID, "owner_instruction"))
+        self.d.dispatch_once()
+        b1 = self.store.get_topic(BUS_TOPIC_ID)["pending_batch_id"]
+        self.assertEqual((self.echo(a)["stage"], self.echo(a)["batch_id"]), ("delivered", b1))
+        self.receipt(BUS_TOPIC_ID, status="waiting_external", summary="已跟 Sammy 私聊说了，等他回")
+        self.d.dispatch_once()
+        self.assertEqual(self.relays(), [])                                  # 推迟：还没到送到后 10 分钟
+        b2 = self.unrelated_bus_batch(3, "群绑定好了")
+        b3 = self.unrelated_bus_batch(6, "收到别的会话的留言回执")
+        self.assertEqual(len({b1, b2, b3}), 3)
+        e = self.echo(a)
+        self.assertEqual((e["relay_batch"], e["relay_status"], e["relay_summary"]),
+                         (b1, "waiting_external", "已跟 Sammy 私聊说了，等他回"))   # 后来两份回执没改它
+        with later(11):
+            self.d.dispatch_once()
+        (c,) = self.relays()
+        self.assertIn("「可以跟 sammy 说一声，热修发布了」", c["text"])
+        self.assertIn("已跟 Sammy 私聊说了，等他回", c["text"])
+        self.assertTrue(c["text"].endswith("状态：在等别人"), c["text"])
+        self.assertNotIn("群绑定好了", c["text"])
+        self.assertNotIn("留言回执", c["text"])
+        self.assertEqual(c["reply_to"], a)
+        self.assertTrue(self.store.get_meta(f"owner_relay:{b1}:main:{ESC_CHAT}"))
+        self.assertEqual(self.echo(a)["settled_by"], "relay")
+        with later(30):
+            self.d.dispatch_once()
+        self.assertEqual(len(self.relays()), 1)
+
+    def test_regression_752_priority_binds_first_receipt_after_delivery_only(self):
+        """回归 7.52：插话批次没有自己的回执，送到后的第一份回执绑上它；推迟期间同一会话后来的回执不覆盖。"""
+        q = self.asked()
+        busy = self.say(ALPHA_P2P, sender=ALICE, content="Alice 的需求")
+        self.pull(busy)
+        self.d.dispatch_once()
+        b1 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        a = self.owner("插一句：先别发", quote=q)
+        self.d.dispatch_once()
+        self.assertTrue(self.echo(a)["batch_id"].startswith("p"))
+        self.assertEqual(self.echo(a)["relay_batch"], None)                   # 插话送到时还没有回执可绑
+        self.receipt(status="waiting_external", summary="先暂停发版，等运维确认窗口")   # 原来那批：送到后的第一份
+        self.d.dispatch_once()
+        self.assertEqual(self.echo(a)["relay_batch"], b1)
+        self.assertEqual(self.relays(), [])
+        later_q = self.say(ALPHA_P2P, sender=ALICE, content="Alice 的第二件事")
+        self.pull(later_q)
+        with later(3):
+            self.d.dispatch_once()
+        b2 = self.receipt(summary="Alice 的第二件事办了")
+        self.assertNotEqual(b2, b1)
+        with later(4):
+            self.d.dispatch_once()
+        e = self.echo(a)
+        self.assertEqual((e["relay_batch"], e["relay_status"], e["relay_summary"]),
+                         (b1, "waiting_external", "先暂停发版，等运维确认窗口"))
+        with later(11):
+            self.d.dispatch_once()
+        (c,) = self.relays()
+        self.assertIn("「插一句：先别发」", c["text"])
+        self.assertIn("先暂停发版，等运维确认窗口", c["text"])
+        self.assertTrue(c["text"].endswith("状态：在等别人"), c["text"])
+        self.assertNotIn("Alice 的第二件事办了", c["text"])
+
+    def test_regression_752_session_reported_during_deferral_no_card(self):
+        """回归 7.52：推迟期间来了不相干的回执，会话也自己 report 了 → 算还上，不发卡片（原有行为）。"""
+        a = self.owner("可以跟 sammy 说一声")
+        self.d.dispatch_once()
+        b1 = self.receipt(BUS_TOPIC_ID, summary="已跟 Sammy 说了")
+        self.d.dispatch_once()
+        self.unrelated_bus_batch(3, "群绑定好了")
+        self.assertEqual(self.echo(a)["relay_batch"], b1)
+        self.store.add_send("k_test_rep_752", "report", BUS_TOPIC_ID, "om_test_rep_752", "跟 Sammy 说过了")
+        self.store.conn.execute("UPDATE sends SET sent_at=? WHERE idem_key='k_test_rep_752'",
+                                ((now8() + timedelta(minutes=5)).isoformat(timespec="seconds"),))
+        self.store.conn.commit()
+        with later(11):
+            self.d.dispatch_once()
+        self.assertEqual(self.relays(), [])
+        self.assertEqual(self.echo(a)["settled_by"], "report")
+
+    def test_regression_752_forward_after_binding_drops_the_old_receipt(self):
+        """回归 7.52：已经绑上总线回执、还在推迟的那句，后来被转给 alpha：总线那份回执不再算它的，
+        改绑 alpha 送它进去那一批的回执（绑上不改，只在重新送一次时作废）。"""
+        a = self.owner("这句没引用")
+        self.d.dispatch_once()
+        b1 = self.receipt(BUS_TOPIC_ID, summary="先记下了")
+        self.d.dispatch_once()
+        self.assertEqual(self.echo(a)["relay_batch"], b1)
+        forward_messages(self.store, "tp_alpha", [a], self_open_id=ME)          # 总线下一批里决定转给 alpha
+        with later(2):
+            self.d.dispatch_once()
+        e = self.echo(a)
+        self.assertEqual((e["topic_id"], e["stage"], e["relay_batch"], e["relay_summary"]),
+                         ("tp_alpha", "delivered", None, None))
+        with later(11):
+            self.d.dispatch_once()
+        self.assertEqual(self.relays(), [])                                  # alpha 还没交回执：不拿总线那份发
+        a1 = self.receipt("tp_alpha", summary="alpha 办完了")
+        with later(12):
+            self.d.dispatch_once()
+        self.assertEqual(self.echo(a)["relay_batch"], a1)
+        with later(13):
+            self.d.dispatch_once()
+        (c,) = self.relays()
+        self.assertTrue(c["text"].startswith("✅ Alpha 需求 处理了你的话 [tp_alpha]"), c["text"])
+        self.assertIn("alpha 办完了", c["text"])
+        self.assertNotIn("先记下了", c["text"])
 
 
 # ======================= 2 回音账本 =======================
