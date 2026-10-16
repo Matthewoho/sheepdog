@@ -3229,26 +3229,33 @@ class Dispatcher:
         状态和说明就是 _echo_relay 绑上的那份回执的，不看后来的回执。
         按「去处」分组（_echo_destination）：一个会话一次回执里的几句，回到哪就各发一张，同一个去处的几句合成一张（P1C
         10-17 03:59：找主人聊天的一句和话题群 T-3 的一句被合成一张、都发进了 T-3 话题）。每批、每个去处最多一次
-        （meta owner_relay:<批次>:<去处>；给主人的通知账本里的防重编号也按批次 + 去处定）。发到哪：话题里的回到话题里；
-        找主人聊天主时间线的引用其中最近的一句；群里 @ 机器人的指令在找主人聊天里新起一条，不发进那个群。"""
+        （meta owner_relay:<批次>:<去处>；给主人的通知账本里的防重编号也按批次 + 去处定），所以一张卡片里有一句到点了，
+        就带上同一份回执、同一个去处的全部几句一起发：只发到点的那几句，后到点的就再也带不回、还会被报「没回音」。
+        发到哪：话题里的回到话题里；找主人聊天主时间线的引用其中最近的一句；群里 @ 机器人的指令在找主人聊天里新起一条，
+        不发进那个群。"""
         sc = self.cfg.session
         if not sc.owner_receipt_relay:
             return
         now = _now()
         groups: dict[tuple, list] = {}
         dests: dict[str, bool] = {}
+        ready: set[tuple] = set()
         for e in self.store.echo_open():
             if e["stage"] != ECHO_DELIVERED or not e["relay_batch"]:
                 continue
             at = _parse(e["relay_at"] or "")
             since = _parse(e["stage_at"] or "")
             due = max(x for x in (at, since + timedelta(minutes=sc.owner_relay_after_minutes) if since else None) if x)
+            dest, in_thread = self._echo_destination(e)
+            dests[dest] = in_thread
+            group = (e["topic_id"], e["relay_batch"], dest)
+            groups.setdefault(group, []).append(e)
             if now >= due:
-                dest, in_thread = self._echo_destination(e)
-                dests[dest] = in_thread
-                groups.setdefault((e["topic_id"], e["relay_batch"], dest), []).append(e)
+                ready.add(group)
         from .outbound import idem_key
         for (tid, batch_id, dest), rows in groups.items():
+            if (tid, batch_id, dest) not in ready:
+                continue
             key = f"{ECHO_RELAY_PREFIX}{batch_id}:{dest}"
             if self.store.get_meta(key):
                 continue

@@ -8,7 +8,7 @@
   needs_decision / waiting_external 写状态；发到哪（话题里、引用主人那句、群里 @ 的指令 → 找主人聊天新起一条）；
   每批一次；开关关掉不带回；晚到的回执也带回；带回卡片拉回来认得出会话、不登记「需要你定」。
 1b 推迟带回（owner_relay_after_minutes）：每句只绑送它进去那一批的回执（插话：送到后的第一份），推迟期间后来的回执不改它；
-  推迟期间会话 report 了就不发；转交以后绑过的作废、按新会话那一批重绑。
+  推迟期间会话 report 了就不发；转交以后绑过的作废、按新会话那一批重绑；同一份回执、同一个去处有一句到点就一张卡片全带上。
 2 回音账本：入账记欠账；没送进会话当场报、排队超时报、送到没回音报，各一次、不重复；牧羊犬自己处理的「待办」不记账；
   转交以后跟着换会话。
 """
@@ -344,6 +344,36 @@ class DeferredRelayBindingTest(EchoBase):
         self.assertIn("先暂停发版，等运维确认窗口", c["text"])
         self.assertTrue(c["text"].endswith("状态：在等别人"), c["text"])
         self.assertNotIn("Alice 的第二件事办了", c["text"])
+
+    def test_regression_752_same_receipt_same_place_sent_together_when_first_is_due(self):
+        """回归 7.52：同一份回执绑上的两句、回到同一个地方，到点时间不同（一句随这一批送到，一句是之后的插话）：先到点的
+        那张卡片占了「每批、每个去处一次」，后到点的那句再也带不回，还被报「插话没回音」。要一张卡片带上两句。"""
+        q = self.asked()
+        a = self.owner("周五发", quote=q)
+        self.d.dispatch_once()
+        b1 = self.store.get_topic("tp_alpha")["pending_batch_id"]
+        q2 = self.asked(key="PR #2", title="灰度比例", text="5% 还是 10%？")
+        b = self.owner("10%", quote=q2)
+        with later(4):
+            self.d.dispatch_once()                                          # 插话：送到比 a 晚 4 分钟
+        self.assertTrue(self.echo(b)["batch_id"].startswith("p"))
+        self.receipt(summary="周五发、灰度 10%")
+        with later(5):
+            self.d.dispatch_once()
+        self.assertEqual((self.echo(a)["relay_batch"], self.echo(b)["relay_batch"]), (b1, b1))
+        with later(11):
+            self.d.dispatch_once()                                          # a 到点，b 要到 14 分钟
+        (c,) = self.relays()
+        self.assertIn("「周五发」", c["text"])
+        self.assertIn("「10%」", c["text"])
+        self.assertIn("周五发、灰度 10%", c["text"])
+        self.assertEqual(c["reply_to"], b)                                    # 同一个去处：引用最近的一句
+        self.assertEqual((self.echo(a)["settled_by"], self.echo(b)["settled_by"]), ("relay", "relay"))
+        for m in (15, 20, 40):
+            with later(m):
+                self.d.dispatch_once()
+        self.assertEqual(len(self.relays()), 1)
+        self.assertEqual(self.dm.texts("没回音"), [])
 
     def test_regression_752_session_reported_during_deferral_no_card(self):
         """回归 7.52：推迟期间来了不相干的回执，会话也自己 report 了 → 算还上，不发卡片（原有行为）。"""
