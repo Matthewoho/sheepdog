@@ -229,7 +229,7 @@ def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool 
         if reg["ok"]:
             print(f"  回归登记 ✓ {reg['rows']} 行、{reg['tests']} 个测试都在")
         else:
-            print(f"  回归登记 ✗ {reg.get('error') or ''}")
+            print(f"  回归登记 ✗ {reg.get('error') or str(len(reg['missing'])) + ' 个登记的测试不在或被跳过'}")
             for t, why in sorted(reg["missing"].items()):
                 print(f"      缺测试：{t}（{why}）")
         for g in reg.get("no_guard", []):
@@ -309,6 +309,8 @@ def check(repo: Path, commit: str, runs: int = RUNS) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)   # 上线脚本常接 tee：每跑完一次就看得见，不等 8 分钟后一起出来
     ap = argparse.ArgumentParser(description="sheepdog 上线测试闸门（7.55）")
     ap.add_argument("commit", nargs="?", help="要上线的提交号（跑闸门）")
     ap.add_argument("--check", metavar="COMMIT", help="只核闸门记录（上线脚本第一步）")

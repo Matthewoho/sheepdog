@@ -131,6 +131,7 @@ class FlakyTest(unittest.TestCase):
         rc, out = self.run_gate(sha)
         self.assertEqual(rc, 1)
         self.assertIn("缺测试：test_ok.OkTest.test_gone", out)
+        self.assertIn("回归登记 ✗ 1 个登记的测试不在或被跳过", out)
         self.assertFalse(gate.record_path(sha).exists())
 
     def test_skipped_regression_test_is_red(self):
