@@ -627,7 +627,8 @@ def build(cfg, store: Store, now: datetime | None = None) -> dict:
         items[e["message_id"]].update({
             "session_name": session_name(cfg, store, e["topic_id"]),
             "link": (msg["link"] or "") if msg is not None else "",
-            "body_full": _body_after_header(e["text"]),
+            # 摘录优先用 sheepdog ask 发出时记的原文（换行都在）；读回的那份标题、列表常和下一行连在一起
+            "body_full": _body_after_header(sent["text"] if sent is not None and sent["text"] else e["text"]),
             "sources": _source_marks(cfg, store, srcs),
         })
         about_of[e["message_id"]] = (e["topic_id"], srcs)
@@ -791,37 +792,69 @@ def _source_marks(cfg, store: Store, srcs) -> list[dict]:
 
 
 _MD_FENCE = re.compile(r"^\s*(```|~~~).*$", re.M)
-_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
 _MD_QUOTE = re.compile(r"^\s*>\s?", re.M)
-_MD_LIST = re.compile(r"^\s*(?:[-*+•]|\d+[.)、])\s+", re.M)
 _MD_HR = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", re.M)
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _MD_TAG = re.compile(r"</?[A-Za-z][^<>]*>")
 _MD_EMPH = re.compile(r"(\*\*|__|~~|\*|`)")
-# 内联的标题、列表、引用（读回时换行被吃掉、和上一行连在一起的，比如「…如下：### 选项- 第一项」）
-_MD_INLINE_HEADING = re.compile(r"(?<=\S)\s*#{2,6}\s+")
-_MD_INLINE_LIST = re.compile(r"(?:(?<=\s)|(?<=[\u4e00-\u9fff。：:）)」]))(?:[-*•]|\d+[.)、])\s+")
 _SENTENCE_END = "。！？；!?;"
 _SOFT_END = "，、,：:）)」"
 
 
-def strip_markdown(text: str) -> str:
-    """去掉 markdown 符号，只留文字：标题、列表、引用、分隔线、加粗斜体删除线、行内代码和代码块标记、HTML 标签；
-    链接和图片只留文字。换行合成一个空格。不会留下反引号。"""
-    t = text or ""
-    t = _MD_FENCE.sub("", t)
-    t = _MD_HR.sub("", t)
-    t = _MD_HEADING.sub("", t)
-    t = _MD_QUOTE.sub("", t)
-    t = _MD_LIST.sub("", t)
+_HEAD_LINE = re.compile(r"^\s{0,3}#{1,6}\s*(.*)$")
+_LIST_LINE = re.compile(r"^\s*(?:[-*+•]|\d+[.)、])\s+(.*)$")
+# 读回时连到行中间的标题、列表：先拆回单独一行再处理
+_SPLIT_HEADING = re.compile(r"(?<=\S)[ \t]*(?=#{2,6}\s)")
+_SPLIT_LIST = re.compile(r"(?:(?<=\s)|(?<=[\u4e00-\u9fff。：:；;）)」]))[ \t]*(?=(?:[-*•]|\d+[.)、])\s+\S)")
+_ENDS_WITH_PUNCT = "。！？；：，、.!?;:,)）」】…"
+HEADING_JOIN = "："      # 标题后面还有正文：标题后加「：」（标题已经以标点结尾就只加空格）
+LIST_JOIN = "；"         # 列表项之间
+
+
+def _inline(t: str) -> str:
     t = _MD_IMAGE.sub(r"\1", t)
     t = _MD_LINK.sub(r"\1", t)
     t = _MD_TAG.sub("", t)
-    t = _MD_INLINE_HEADING.sub(" ", t)
-    t = _MD_INLINE_LIST.sub(" ", t)
     t = _MD_EMPH.sub("", t)
     return " ".join(t.split())
+
+
+def strip_markdown(text: str) -> str:
+    """去掉 markdown 符号，只留文字：标题、列表、引用、分隔线、加粗斜体删除线、行内代码和代码块标记、HTML 标签；
+    链接和图片只留文字。合成一行，不会留下反引号。按行合并：标题后面还有正文就加「：」（标题已经以标点结尾只加空格），
+    相邻的列表项之间加「；」，其他换行变成一个空格。读回时连到行中间的标题（「…。### 事情」）、列表（「…的- 第一项」）
+    先拆回单独一行。标题和后面的正文在读回时连成一个字（「### 事情Sammy」）的，分不出标题在哪结束，只能去掉符号。"""
+    t = text or ""
+    t = _MD_FENCE.sub("", t)
+    t = _MD_HR.sub("", t)
+    t = _SPLIT_HEADING.sub("\n", t)
+    t = _SPLIT_LIST.sub("\n", t)
+    parts: list[tuple[str, str]] = []           # (种类, 文字)：head | item | text
+    for line in t.split("\n"):
+        line = _MD_QUOTE.sub("", line, count=1) if line.lstrip().startswith(">") else line
+        if (m := _HEAD_LINE.match(line)) and line.lstrip().startswith("#"):
+            kind, body = "head", m.group(1)
+        elif (m := _LIST_LINE.match(line)):
+            kind, body = "item", m.group(1)
+        else:
+            kind, body = "text", line
+        body = _inline(body)
+        if body:
+            parts.append((kind, body))
+    out = ""
+    for i, (kind, body) in enumerate(parts):
+        if i:
+            pk, prev = parts[i - 1]
+            ends = prev[-1] in _ENDS_WITH_PUNCT
+            if pk == "head":
+                out += " " if ends else HEADING_JOIN
+            elif pk == "item" and kind == "item":
+                out += " " if ends else LIST_JOIN
+            else:
+                out += " "
+        out += body
+    return out
 
 
 def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
@@ -833,7 +866,7 @@ def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
     for marks in (_SENTENCE_END, _SOFT_END):
         cut = max(head.rfind(c) for c in marks)
         if cut >= limit // 2:
-            keep = cut + 1 if head[cut] in _SENTENCE_END + "）)」" else cut   # 逗号、冒号这类不留在「…」前面
+            keep = cut + 1 if head[cut] in "。！？!?）)」" else cut   # 分号、逗号、冒号这类不留在「…」前面
             return head[:keep].rstrip() + "…"
     return head.rstrip() + "…"
 

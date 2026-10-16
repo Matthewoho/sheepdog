@@ -799,7 +799,7 @@ class OwnerPendingTest(PendingBase):
         ex = lines[2]
         for bad in ("###", "**", "`", "](", "- "):
             self.assertNotIn(bad, ex)
-        self.assertTrue(ex.startswith("这是 7.48 卡片测试（S1），不用真的回答。 要你看的 加粗能不能显示"))
+        self.assertTrue(ex.startswith("这是 7.48 卡片测试（S1），不用真的回答。 要你看的：加粗能不能显示"), ex)
         self.assertRegex(lines[3], r"^<font color='grey'>来源：和 .+ 的私聊 \d\d:\d\d</font>$")
         # 纯文本版：同样的顺序，一条分几行
         i = text.index("1. 卡片测试")
@@ -871,3 +871,42 @@ class OwnerPendingTest(PendingBase):
         rec = self.store.conn.execute("SELECT text FROM sends WHERE kind='pending'").fetchone()[0]
         self.assertTrue(rec.startswith("📋 待办 · "))
         self.assertIn("要你定 · 4 条", rec)
+
+
+# ======================= 摘录：标题、列表合并时不粘在一起（10-16 19:2x 真卡片「事情Sammy 要一条…」） =======================
+SAMMY = ("### 事情\nSammy 要一条独享的干净线路，用来跑 **海外模型** 的测试（`gpt-sol`）。\n\n"
+         "- 方案一：新开一台 VPS\n- 方案二：复用现有节点\n\n选哪个？")
+
+
+class ExcerptJoinTest(PendingBase):
+    def test_heading_gets_colon_and_list_items_semicolon(self):
+        self.assertEqual(pend.strip_markdown(SAMMY),
+                         "事情：Sammy 要一条独享的干净线路，用来跑 海外模型 的测试（gpt-sol）。 "
+                         "方案一：新开一台 VPS；方案二：复用现有节点 选哪个？")
+        ex = pend.excerpt(SAMMY)
+        self.assertTrue(ex.startswith("事情：Sammy 要一条独享的干净线路"), ex)
+        self.assertNotIn("`", ex)
+        self.assertTrue(ex.endswith("…"))
+
+    def test_heading_already_ending_with_punctuation_gets_a_space(self):
+        self.assertEqual(pend.strip_markdown("## 结论。\n正文"), "结论。 正文")
+        self.assertEqual(pend.strip_markdown("## 只有标题"), "只有标题")
+        self.assertEqual(pend.strip_markdown("- 第一项。\n- 第二项"), "第一项。 第二项")
+
+    def test_joined_inline_heading_and_list_from_readback(self):
+        # 读回时连在行中间的标题、列表（卡片读回会吃掉换行）：拆回单独一行再合并
+        self.assertEqual(pend.strip_markdown("前面一句。### 事情\nSammy 要线路。- 方案一：新开- 方案二：复用\n选哪个？"),
+                         "前面一句。 事情：Sammy 要线路。 方案一：新开；方案二：复用 选哪个？")
+        self.assertEqual(pend.strip_markdown("不用真的回答。### 要你看的- 加粗**能不能**显示 - 行内代码：`ask`"),
+                         "不用真的回答。 要你看的：加粗能不能显示；行内代码：ask")
+
+    def test_list_uses_sent_text_not_glued_readback(self):
+        # 读回登记的「需要你定」里标题和下一行连成了「### 事情Sammy」：清单摘录用 ask 发出时记的原文
+        self.asked(title="Sammy 线路", text=SAMMY)
+        e = self.store.conn.execute("SELECT message_id, text FROM escalations").fetchone()
+        glued = e["text"].replace("### 事情\n", "### 事情")
+        self.store.conn.execute("UPDATE escalations SET text=? WHERE message_id=?", (glued, e["message_id"]))
+        self.store.conn.commit()
+        text, card = pend.owner_list(self.cfg, self.store)
+        self.assertIn("\n   事情：Sammy 要一条独享的干净线路", text)
+        self.assertIn("\n事情：Sammy 要一条独享的干净线路", "\n".join(el.get("content", "") for el in card["body"]["elements"]))
