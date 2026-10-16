@@ -71,6 +71,7 @@ def parse_message(raw: dict, tz: str = "+08:00") -> Message:
         sender_tenant_key=sender.get("tenant_key") or "",
         message_position=str(raw.get("message_position") or ""),
         thread_position="" if raw.get("thread_message_position") is None else str(raw.get("thread_message_position")),
+        root_id=raw.get("root_id") or "",
         raw=raw,
     )
 
@@ -93,7 +94,9 @@ def _event_time(ms: str, tz: str) -> str:
 def parse_event(raw: dict, tz: str = "+08:00") -> Message:
     """机器人身份实时接收的一条消息（lark-cli event consume im.message.receive_v1，7.26）。
     事件是拍平的：没有群名、发送人名字、租户、序号；正文是渲染好的文字（卡片是原始 JSON）；
-    机器人发的 sender_type 是 bot（搜索结果里是 app）。"""
+    机器人发的 sender_type 是 bot（搜索结果里是 app）。
+    回复关系（7.45 按 lark-cli 的事件定义核实）：reply_to = 直接回复的那条（parent），root_id = 回复链 / 话题开头那条。
+    话题里的回复两样都有（在话题里没点「回复」某条时 reply_to 就是开头那条）；搜索结果里话题回复两样都没有。"""
     mentions = []
     for m in raw.get("mentions") or []:
         mid = m.get("id") or ""
@@ -117,6 +120,7 @@ def parse_event(raw: dict, tz: str = "+08:00") -> Message:
         mentions=mentions,
         reply_to=raw.get("reply_to") or "",
         thread_id=raw.get("thread_id") or "",
+        root_id=raw.get("root_id") or "",
         raw=raw,
     )
 

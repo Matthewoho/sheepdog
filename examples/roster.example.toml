@@ -28,6 +28,12 @@ chat_id = "oc_test_demo_group"
 name = "示例需求群"
 all_messages = false                         # 只推 dispatch 级消息（@我、回复我、关键词等）
 
+# 只负责某个群里的一个话题（7.45，PR #1 的格式）：这个话题里的回复一律送本会话，覆盖自动归属、不过期；同一个群的其他消息不受影响
+# [[session.chats]]
+# chat_id = "oc_test_demo_ops_group"
+# name = "运维群·某个话题"
+# thread_id = "omt_test_demo_thread"
+
 [[session]]
 key = "demo_ops"
 mode = "known"

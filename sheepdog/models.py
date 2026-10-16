@@ -42,6 +42,9 @@ class Message:
     # 消息在话题里的序号（lark thread_message_position，7.22）：普通聊天（p2p、group）开头那条是 "-1"、回复从 "0" 起；
     # 话题群（topic）开头那条是 "0"。空 = 不在话题里或不知道
     thread_position: str = ""
+    # 话题 / 回复链的开头那条（lark-cli event consume 拍平后的 root_id，7.45 核实）：只有机器人实时事件带；搜索、mget 不带。
+    # 在话题里回复时就是话题开头那条；空 = 不知道
+    root_id: str = ""
     raw: dict = field(default_factory=dict)
 
     @property

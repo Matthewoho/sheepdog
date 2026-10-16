@@ -2,7 +2,8 @@
 
 假的飞书（FakeLark）替换 lark-cli 的子进程调用，按架构侧 10-12 22:5x 在真实飞书上核实的格式造数据：
 - 搜索 / mget / 话题列表里的消息没有 parent_id、root_id；
-- 普通聊天（p2p、group）话题开头那条 thread_message_position 是 "-1"、回复从 "0" 起；话题群（topic）开头那条是 "0"；
+- 话题开头那条 thread_message_position 是 "-1"、回复从 "0" 起：普通聊天（p2p、group）和话题群（topic）都一样（7.45 用正式
+  账本核实；7.22 当时以为话题群开头是 "0"，不对）；
 - 话题列表只有回复、不含开头那条；mget 有话题的开头那条带 thread_id 和 thread_replies；
 - --reply-in-thread 的返回只有 chat_id、create_time、message_id，没有 thread_id；
 - 同一个防重编号再发：ok，返回第一次那条的 message_id，不多发。
@@ -110,7 +111,7 @@ class FakeLark:
              "sender": {"id": sender_id, "sender_type": sender_type,
                         "name": "主人" if sender_id == ME else "机器人" if sender_type == "app" else "Alice"},
              "thread_root": "", "thread_id": "", "pos": None, "deleted": False, "seq": self.n, "msg_type": msg_type}
-        base = 0 if chat_type == "topic" else -1   # 开头那条的序号：话题群 "0"，普通聊天 "-1"
+        base = -1   # 开头那条的序号：普通聊天和话题群都是 "-1"（7.45 正式账本核实）
         if thread_root:
             root = self.msgs[thread_root]
             if root["thread_root"]:
@@ -118,7 +119,7 @@ class FakeLark:
                 root = self.msgs[thread_root]
             if not root["thread_id"]:
                 root["thread_id"] = "omt_test_" + thread_root.removeprefix("om_test_")
-                root["pos"] = 0 if root["chat_type"] == "topic" else -1
+                root["pos"] = -1
             m["chat_type"] = root["chat_type"]
             m["thread_root"] = thread_root
             m["thread_id"] = root["thread_id"]
@@ -599,22 +600,22 @@ class ThreadReplyTest(ThreadsBase):
         self.assertEqual(self.store.thread_by_root(old)["source"], "recognized")
         self.assertNotIn("+messages-mget", self.lark.subcommands())
 
-    def test_topic_group_root_is_zero(self):
-        # 话题群（chat_type = topic）：开头那条序号是 "0"，回复从 "1" 起
+    def test_topic_group_root_is_minus_one(self):
+        # 话题群（chat_type = topic）：开头那条序号同样是 "-1"，回复从 "0" 起（7.45 正式账本：5 个话题群 54 个话题都是这样）
         topic_chat = "oc_test_esc_topic"
         self.cfg.escalation.chat_ids = [ESC_CHAT, topic_chat]
         old = self.lark.add(chat_id=topic_chat, chat_type="topic", sender_id=BOT, sender_type="app",
                             content="🐕 需要你定 · 话题群里问的 [tp_alpha]\n选哪个？")
         self.poll()
-        self.assertEqual(self.row(old)["thread_position"], "0")
+        self.assertEqual(self.row(old)["thread_position"], "-1")
         mid = self.owner_in_thread(old, "选 B")
-        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "1")
+        self.assertEqual(self.lark.raw(mid)["thread_message_position"], "0")
         self.poll()
         r = self.row(mid)
         self.assertEqual(r["topic_id"], "tp_alpha")
         self.assertIn("🧵", r["note"])
         self.assertIn("选哪个？", r["note"])
-        # 主人在话题群里新发一条（它自己就是开头，序号 "0"）：不当成话题回复
+        # 主人在话题群里新发一条（它自己就是开头，序号 "-1"）：不当成话题回复
         own = self.lark.add(chat_id=topic_chat, chat_type="topic", sender_id=ME, content="另起一件事")
         self.poll()
         self.assertNotIn("🧵", self.row(own)["note"] or "")

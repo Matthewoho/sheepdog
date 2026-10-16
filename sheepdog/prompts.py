@@ -43,6 +43,8 @@ REASON_LABEL = {
     "bus_relay": "总线转达",
     "owner_reply": "主人在 IM 的回复",
     "owner_context": "主人本人的发言",
+    "owner_instruction": "主人在群里 @ 你",
+    "thread_owner": "话题归属",
     "loop_guard": "疑似循环",
     "collect_partial": "采集不完整",
     "escalation_list": "未结的「需要你定」",
@@ -76,6 +78,9 @@ AGENT_SENDER_LABEL_FILE = "agent_sender_label.md"
 OWNER_CONTEXT_LABEL = "📝 主人本人在该聊天的发言（发给对方的，不是给你的指令）"
 # 主人在「找主人」聊天里的回复（7.8）：发送人已由 IM 账号核实
 OWNER_REPLY_LABEL = "✅ 主人在飞书的回复（已核对：发送人是主人本人账号）"
+# 主人本人账号在群里 @ 机器人（7.45 A 类）：给助理的指令，不是背景
+OWNER_INSTRUCTION_LABEL = "🗣 主人在群里 @ 了你：这是主人的指令（已核对：发送人是主人本人账号）"
+OWNER_INSTRUCTION_TAG = "owner_instruction"
 
 
 # 牧羊犬发给会话的每一条（批次、登记通知、退休通知、规则更新）都有一行以它开头的头（7.18 第 7 条靠它认）
@@ -94,9 +99,15 @@ def _join(*parts: str) -> str:
 
 
 # ---------- 名册数据渲染 ----------
+def _chat_scope(c) -> str:
+    """名册里一个聊天条目负责的范围：整个聊天的写「全部消息 / 仅 dispatch 级」；绑定到话题的（7.45）写话题编号。"""
+    if getattr(c, "thread_id", ""):
+        return f"只负责话题 `{c.thread_id}`"
+    return "全部消息" if c.all_messages else "仅 dispatch 级消息"
+
+
 def chats_text(s: RosterSession) -> str:
-    return "\n".join(f"- {c.name or c.chat_id}（`{c.chat_id}`，{'全部消息' if c.all_messages else '仅 dispatch 级消息'}）"
-                     for c in s.chats) or "- （无）"
+    return "\n".join(f"- {c.name or c.chat_id}（`{c.chat_id}`，{_chat_scope(c)}）" for c in s.chats) or "- （无）"
 
 
 def _anchor_chat(a: str) -> tuple[str, bool]:
@@ -118,7 +129,8 @@ def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
             lines.append(f"  职责：{s.duty}")
         if s.mode == MANAGED and s.chats:
             lines.append("  负责的聊天：" + "、".join(
-                f"{c.name or c.chat_id}（{'全部消息' if c.all_messages else '仅 dispatch 级'}）" for c in s.chats))
+                f"{c.name or c.chat_id}（{_chat_scope(c).replace('仅 dispatch 级消息', '仅 dispatch 级')}）"
+                for c in s.chats))
     for t in dynamic or []:
         lines.append(f"- 「{t['title']}」 topic `{t['topic_id']}` | conversation `{t['conversation_id'] or '-'}` | "
                      f"dynamic（总线新开，{t['created_at']}）")
@@ -497,7 +509,11 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
-    if "owner_verified" in tags:
+    instruction = OWNER_INSTRUCTION_TAG in tags
+    if instruction:
+        # 7.45 A 类：按标记认（被总线 forward 转交以后 reason 不变，标记也还在）
+        label = REASON_LABEL["owner_instruction"]
+    elif "owner_verified" in tags:
         # 主人回复按标记认，不按 reason 值认：已上线账本里的旧行用的是改名前的 reason
         label = REASON_LABEL["owner_reply"]
     if row["chat_type"] == SYSTEM_CHAT:
@@ -509,7 +525,9 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         lines.append(mentions)
     if quote:
         lines.append(quote)
-    if "owner_verified" in tags:
+    if instruction:
+        lines.append(OWNER_INSTRUCTION_LABEL)
+    elif "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
     if row["reason"] == "owner_context":
         lines.append(OWNER_CONTEXT_LABEL)

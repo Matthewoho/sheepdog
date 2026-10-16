@@ -61,6 +61,23 @@ OWNER_VERIFIED_TAG = "owner_verified"
 OWNER_CONTEXT = "owner_context"
 # 主人在「找主人」聊天里的回复（_owner_reply）。会话在跑上一批时不排队，当轮单独发一批「主人插话」（7.37 第 4 件）
 OWNER_REPLY = "owner_reply"
+# 7.45 A 类：主人本人账号在群里 @ 机器人 = 给助理的指令。和 owner_reply 一样会插队、机器人身份点确认表情，但不当成回答
+# 哪条「需要你定」。tags 里带 owner_instruction（被 forward 以后也认得出）和 owner_at:<去向依据>
+OWNER_INSTRUCTION = "owner_instruction"
+OWNER_AT_TAG_PREFIX = "owner_at:"
+# 7.45 C 类：别人在群里的话题回复按话题归属直达。路由器本来判 inbox / drop 的改成这个原因；本来就 dispatch 的（@主人等）
+# 原因不变。tags 里带 group_thread:<依据>
+THREAD_OWNER = "thread_owner"
+GROUP_THREAD_TAG_PREFIX = "group_thread:"
+# 归属依据（给人看的说法）
+GROUP_SOURCE_LABEL = {
+    "roster": "名册绑定了这个话题", "recorded": "之前认出过这个话题", "delivered": "开头那条送到过你",
+    "forwarded": "开头那条（或话题里的消息）转交给了你", "sent": "开头那条是你经 sheepdog 发的",
+    "quote_delivered": "引用的那条送到过你", "quote_forwarded": "引用的那条转交给了你",
+    "quote_sent": "引用的那条是你经 sheepdog 发的", "quote_thread": "引用的那条所在的话题归你",
+}
+# 找群话题开头那条时一次 mget 最多看几条候选（7.45 第二节第 3 条）
+GROUP_ROOT_MGET = 50
 # 主人的回复认不出回答哪条时，给总线的那条系统消息（未结列表 / 认不出来源）；正文里写着那条回复的编号
 ESCALATION_LIST = "escalation_list"
 # 已推送过的消息被编辑 / 撤回后回到待推的路由原因（_handle_change）
@@ -140,9 +157,10 @@ def is_agent_reply(content: str, oc) -> bool:
     return any(mk in b for b in [content or "", *bodies] for mk in oc.agent_markers)
 
 
-# 话题里开头那条的序号（thread_message_position，7.22，10-12 22:5x 真实飞书核实）：普通聊天（p2p、group）开头那条
-# 是 "-1"、回复从 "0" 起；话题群（chat_type = topic）开头那条是 "0"
-THREAD_ROOT_POSITION = {"topic": "0"}
+# 话题里开头那条的序号（thread_message_position）：开头那条 "-1"、回复从 "0" 起。7.22 时（10-12 22:5x）按一个样本以为
+# 话题群（chat_type = topic）开头那条是 "0"；7.45 用正式账本只读核实（10-13 19:50～10-16 16:13：5 个话题群 195 个话题，
+# 54 个同时有 "-1" 和 "0" 的话题里 "-1" 都是最早那条），话题群同样是 "-1"。表留着，按聊天类型取
+THREAD_ROOT_POSITION: dict[str, str] = {}
 DEFAULT_THREAD_ROOT_POSITION = "-1"
 
 
@@ -154,6 +172,17 @@ def is_thread_root(m: Message) -> bool:
     """话题开头那条（序号是这个聊天类型的开头序号）：它自己不是「在话题里回复」。没有序号的不算开头。"""
     pos = (m.thread_position or "").strip()
     return bool(pos) and pos == root_position(m.chat_type)
+
+
+def is_thread_reply(m: Message) -> bool:
+    """在话题里回复（不是开头那条，7.45）：有话题编号，序号不是开头序号；没有序号时（机器人事件、mget 没补上）看事件带的
+    root_id 是不是另一条。"""
+    if not m.thread_id:
+        return False
+    pos = (m.thread_position or "").strip()
+    if pos:
+        return pos != root_position(m.chat_type)
+    return bool(m.root_id) and m.root_id != m.message_id
 
 
 def _seq(value) -> int | None:
@@ -376,6 +405,8 @@ class Collector:
         self.bot_events = None
         # 机器人自己的 id（open_id、app_id），每批入账前按配置和 meta 现算；[identity] 关着是空集
         self.bot_ids: frozenset[str] = frozenset()
+        # 7.45：路由时算好、入账后要写进 note 的说明（话题归属的「这是你处理过的 … 下面的话题回复」）：message_id → 文字
+        self._notes: dict[str, str] = {}
 
     def _decide(self, m: Message, ctx: RouteContext):
         """路由 → 名册归属 → 等待归属 → 防循环。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
@@ -475,6 +506,18 @@ class Collector:
         if d.route == SELF or d.reason == "self_escalation" or m.chat_id in self.cfg.routing.ignore_chat_ids:
             return d, topic_id, None
         w = self.store.match_watch(m.sender_id, m.chat_id)
+        g = self._group_reply_owner(m)
+        if g is not None:
+            # 7.45 C 类：别人在群里的话题回复，话题有归属 → 直达归属会话（覆盖整群归属、Inbox、免打扰）。
+            # 不抢：登记的 watch 只认归属会话自己的；别的会话的（含整群范围的）watch 不抢走这条
+            tags = [*d.tags, GROUP_THREAD_TAG_PREFIX + g["source"]]
+            reason = d.reason if d.route == DISPATCH else THREAD_OWNER
+            self._notes[m.message_id] = self._group_note(g, m, "话题回复")
+            if w is not None and w["topic_id"] == g["topic"]:
+                return RouteDecision(DISPATCH, reason, [*tags, f"watch:{w['id']}"]), g["topic"], w
+            if w is not None:
+                log.info("消息 %s 在 %s 的话题里，等待 #%s（%s）不抢", m.message_id, g["topic"], w["id"], w["topic_id"])
+            return RouteDecision(DISPATCH, reason, tags), g["topic"], None
         if w:
             return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"], w
         return d, topic_id, None
@@ -594,11 +637,13 @@ class Collector:
             elif existing is None:
                 d, topic_id, w = self._decide(m, ctx)
                 self.store.upsert_message(m, d.route, d.reason, d.tags, topic_id, rb)
+                self._write_note(m.message_id)
                 if d.route == DISPATCH:
                     self._close_watch(w, m.message_id, self._secure(m.message_id))
                 elif d.route == SELF and me and m.sender_id == me:
                     self._loop_check(m)
-                    self._owner_context(m)
+                    if not self._owner_instruction(m):   # 7.45 A 类：@ 机器人 = 指令；否则照旧当背景（B 类）
+                        self._owner_context(m)
                     self._learn_source_thread(m)
                 elif d.route == SELF and d.reason == "self_bot":
                     # 7.26：机器人自己发的（会话以机器人身份代回的）：撤下它回应了的确认表情、算进防循环；不算主人发言
@@ -606,6 +651,8 @@ class Collector:
                     self._loop_check(m)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
+                if m.thread_id:
+                    self.store.touch_group_thread(m.thread_id, m.create_time)   # 7.45：话题最近活动（过期按它）
             else:
                 if m.chat_id in esc_chats:
                     self._learn_thread(m)  # 7.22：老消息后来有了话题（开头那条再被拉到时带上 thread_id）
@@ -709,6 +756,8 @@ class Collector:
                 x.reply_to = m.reply_to
             if not x.thread_id and m.thread_id:
                 x.thread_id = m.thread_id
+            if not x.root_id and m.root_id:
+                x.root_id = m.root_id   # 7.45：话题开头那条只有事件里有
             if not x.chat_id and m.chat_id:
                 x.chat_id = m.chat_id
             if not x.chat_type and m.chat_type:
@@ -773,6 +822,11 @@ class Collector:
         msgs = self._enrich_bot_events(msgs)
         self._fill_chat_names(msgs)
         return self.ingest(msgs, received_by=identity.BOT)
+
+    def poll_bot_only(self) -> dict | None:
+        """7.45 第三节：机器人实时事件到了的小轮次：只把这期间收到的事件入账（路由、归属、安全闸），不跑主人身份的搜索、
+        不查已读和表情、不动水位线。没开 / 没起接收返回 None。"""
+        return self._poll_bot_events()
 
     def poll_once(self) -> dict:
         started = _now()
@@ -840,8 +894,14 @@ class Collector:
         # 会话以主人身份代回的（带代回前缀）不送
         return not is_agent_reply(m.content, oc)
 
-    def _owner_context_target(self, chat_id: str) -> str | None:
-        """去向：名册 / 总线新开的聊天归属 → 它；否则 follow_hours 内最近处理过该聊天的会话（含总线）；都没有 → 不送。"""
+    def _owner_context_target(self, m: Message, exclude: str = "") -> str | None:
+        """去向（7.45 B 类）：①话题 / 引用归属（[threads] group_owner 开着）②名册 / 总线新开的聊天归属 ③follow_hours 内最近
+        处理过该聊天的会话（含总线）④都没有 → 不送。①命中时把「在谁的话题里」写进 _notes。"""
+        chat_id = m.chat_id
+        g = self._group_owner(m, exclude or m.message_id)
+        if g is not None:
+            self._notes[m.message_id] = self._group_note(g, m, "话题里主人的发言")
+            return g["topic"]
         owner = self.roster.owner_of(chat_id) if self.roster else None
         if owner is not None:
             return owner[0].topic_id
@@ -859,12 +919,224 @@ class Collector:
     def _owner_context(self, m: Message) -> None:
         if not self._owner_context_wanted(m):
             return
-        topic_id = self._owner_context_target(m.chat_id)
+        topic_id = self._owner_context_target(m)
+        note = self._notes.pop(m.message_id, "")
         if not topic_id:
             return
         # 回复的是哪条由投递时统一附的「↪ 回复的是」说明（7.15）
-        self.store.route_owner_context(m.message_id, topic_id, "")
-        log.info("主人的发言 %s 作为背景送给 %s", m.message_id, topic_id)
+        self.store.route_owner_context(m.message_id, topic_id, note)
+        log.info("主人的发言 %s 作为背景送给 %s%s", m.message_id, topic_id, "（话题 / 引用归属）" if note else "")
+
+    # ---------- 主人在群里 @ 机器人 = 指令（7.45 A 类） ----------
+    def _owner_instruction_wanted(self, m: Message) -> bool:
+        """发送人是主人本人账号（调用方已判）、群聊、@ 名单里有机器人（open_id 或 app_id）、不带代回标记、不在找主人聊天、
+        不在 ignore 聊天。开关 [routing] owner_at_assistant；[identity] 关着时不知道机器人是谁，一律不算。"""
+        if not self.cfg.routing.owner_at_assistant or not self.bot_ids or not self._group_chat(m):
+            return False
+        if not any(x.id in self.bot_ids for x in m.mentions if x.id):
+            return False
+        return not self._agent_reply_text(m.content)
+
+    def _owner_instruction(self, m: Message) -> bool:
+        """主人在群里 @ 机器人：去向 ①话题 / 引用归属 ②名册（或总线新开的会话）负责这个群的会话 ③总线。
+        改成 dispatch / owner_instruction / 待推；会话在跑时由 Dispatcher 插队。返回是否按指令处理了。"""
+        if not self._owner_instruction_wanted(m):
+            return False
+        g = self._group_owner(m, m.message_id)
+        note = ""
+        if g is not None:
+            topic_id, how = g["topic"], g["source"]
+            note = self._group_note(g, m, "主人的指令")
+        elif self.roster is not None and (owner := self.roster.owner_of(m.chat_id)) is not None:
+            topic_id, how = owner[0].topic_id, "roster_chat"
+        elif m.chat_id in self._dynamic:
+            topic_id, how = self._dynamic[m.chat_id][0], "dynamic_chat"
+        else:
+            topic_id, how = BUS_TOPIC_ID, "bus"
+            note = with_cli("📮 名册里没有会话负责这个群，这条也不在哪个会话处理过的话题里、没引用哪个会话处理过的消息。"
+                            f"判断该谁做以后用 `sheepdog forward --topic <会话> --message-ids {m.message_id}` 转过去"
+                            "（没有合适的就新开）；主人明说让总线自己做才自己做。", self.cfg.cli_command)
+        self.store.route_owner_instruction(m.message_id, topic_id,
+                                           [OWNER_INSTRUCTION, OWNER_AT_TAG_PREFIX + how], note)
+        log.info("主人在群里 @ 机器人 %s：当成指令送给 %s（%s）", m.message_id, topic_id, how)
+        return True
+
+    # ---------- 群话题 / 引用归属（7.45 第二节，思路来自 PR #1 @Jerry030-1，issue #2） ----------
+    def _group_chat(self, m: Message) -> bool:
+        """群（普通群、话题群），不是找主人聊天、不在 ignore 名单。"""
+        return (m.chat_type not in ("p2p", SYSTEM_CHAT, "") and m.chat_id not in self.cfg.owner_chat_ids
+                and m.chat_id not in self.cfg.routing.ignore_chat_ids)
+
+    def _write_note(self, message_id: str) -> None:
+        note = self._notes.pop(message_id, "")
+        if note:
+            self.store.set_note(message_id, note)
+
+    def _live_topic(self, topic_id: str) -> bool:
+        """还能投的会话：总线，或没关的 managed / 总线新开的会话（口径同 dispatch_once）。"""
+        if not topic_id:
+            return False
+        if topic_id == BUS_TOPIC_ID:
+            return True
+        t = self.store.get_topic(topic_id)
+        return t is not None and t["state"] != sm.CLOSED and t["kind"] in MANAGED_KINDS
+
+    def _expired(self, last: str, m: Message) -> bool:
+        """话题最近一次活动（last）离这条消息超过 group_owner_hours：不再自动归属。"""
+        at, now = _parse(last), _parse(m.create_time) or _now()
+        if at is None or at.tzinfo is None or now.tzinfo is None:
+            return False
+        return now - at > timedelta(hours=self.cfg.threads.group_owner_hours)
+
+    def _message_owner(self, row) -> tuple[str, str] | None:
+        """一条消息（话题开头那条 / 被引用的那条）归哪个会话：送到过某个会话（后来转交了就是接手的那个，账本里的 topic_id
+        跟着 forward 改）→ 它；sheepdog 替某个会话发的（ask / report / reply，sends 表）→ 那个会话。主人的背景不算。
+        返回 (topic_id, delivered | forwarded | sent)；认不出或会话已经不能投返回 None。"""
+        if row is None:
+            return None
+        if (row["route"] == DISPATCH and row["dispatch_state"] in DELIVERED_STATES and row["reason"] != OWNER_CONTEXT
+                and row["topic_id"] and self._live_topic(row["topic_id"])):
+            tags = json.loads(row["tags_json"] or "[]")
+            return row["topic_id"], ("forwarded" if any(t.startswith("forwarded_from:") for t in tags) else "delivered")
+        s = self.store.send_by_message(row["message_id"])
+        if s is not None and s["topic_id"] and self._live_topic(s["topic_id"]):
+            return s["topic_id"], "sent"
+        return None
+
+    def _group_root(self, m: Message, thread_id: str):
+        """群话题开头那条（账本里的行），返回 (行或 None, 怎么找到的)。依次：
+        1. 账本里同一话题、开头序号的那条；
+        2. 机器人事件带的 root_id，或 reply_to 指向一条账本里还没记话题的消息（开头那条入账时还没有话题）；
+        3. mget 这个群里投出去过、还没记话题编号的消息（一次最多 GROUP_ROOT_MGET 条），对上 thread_id 的就是；
+           mget 过、当时没有话题的记下来，这个话题已经有回复以后核过的不再核。"""
+        for r in self.store.thread_messages_in_ledger(thread_id):
+            if (r["thread_position"] or "") == root_position(r["chat_type"]):
+                return r, "ledger"
+        for ref in (m.root_id, m.reply_to):
+            if not ref or ref == m.message_id:
+                continue
+            r = self.store.get_message(ref)
+            if r is None or r["chat_id"] != m.chat_id:
+                continue
+            if ref == m.root_id or not r["thread_id"]:
+                self.store.fill_thread_fields(ref, thread_id, root_position(r["chat_type"]))
+                return self.store.get_message(ref), "event"
+        since = self.store.thread_first_seen(thread_id) or now_iso()
+        cands = self.store.group_root_candidates(m.chat_id, m.create_time or now_iso(), since, GROUP_ROOT_MGET)
+        if not cands:
+            return None, ""
+        got, err = self._mget(cands)
+        if got is None:
+            log.warning("话题 %s：mget 开头那条的候选失败: %s", thread_id, err)
+            return None, ""
+        found = ""
+        with_thread = set()
+        for x in got:
+            if x.thread_id:
+                with_thread.add(x.message_id)
+                self.store.fill_thread_fields(x.message_id, x.thread_id, x.thread_position)
+                if x.thread_id == thread_id:
+                    found = x.message_id
+        self.store.mark_root_checked([c for c in cands if c not in with_thread])
+        log.info("话题 %s：mget %d 条候选，%s", thread_id, len(cands), f"开头那条是 {found}" if found else "没对上")
+        return (self.store.get_message(found), "mget") if found else (None, "")
+
+    def _group_thread_owner(self, m: Message, thread_id: str, exclude: str) -> dict | None:
+        """群话题归谁（7.45 第二节）：1 名册显式绑定 (chat_id, thread_id) → 2 已记下的话题归属 → 3 自动（开头那条送到过 /
+        转交给 / 是谁代发的）。2、3 过期（话题最近一次活动超过 group_owner_hours）不算；认出来的记进 group_threads。"""
+        if self.roster is not None and (hit := self.roster.thread_owner(m.chat_id, thread_id)) is not None:
+            return {"topic": hit[0].topic_id, "source": "roster", "thread": thread_id, "root": "", "summary": ""}
+        rec = self.store.group_thread(thread_id)
+        last = max(rec["last_activity_at"] if rec is not None else "", self.store.thread_last_activity(thread_id, exclude))
+        if rec is not None:
+            if self._expired(last, m):
+                log.info("话题 %s 最近活动 %s，超过 %g 小时，不再自动归属", thread_id, last, self.cfg.threads.group_owner_hours)
+                return None
+            if not self._live_topic(rec["topic_id"]):
+                return None
+            return {"topic": rec["topic_id"], "source": "recorded", "thread": thread_id,
+                    "root": rec["root_message_id"] or "", "summary": rec["root_summary"] or ""}
+        root, how = self._group_root(m, thread_id)
+        if root is None:
+            return None
+        last = max(last, root["create_time"] or "")
+        if self._expired(last, m):
+            log.info("话题 %s 最近活动 %s，超过 %g 小时，不再自动归属", thread_id, last, self.cfg.threads.group_owner_hours)
+            return None
+        owner = self._message_owner(root)
+        if owner is None:
+            return None
+        summary = duty.short(first_line(root["content"] or ""), 60)   # first_line 先把卡片还原（7.48）
+        self.store.add_group_thread(thread_id, m.chat_id, owner[0], owner[1], root["message_id"], summary,
+                                    last or m.create_time or now_iso())
+        log.info("话题 %s 归 %s（%s，开头那条 %s 靠 %s 找到）", thread_id, owner[0], owner[1], root["message_id"], how)
+        return {"topic": owner[0], "source": owner[1], "thread": thread_id, "root": root["message_id"],
+                "summary": summary}
+
+    def _quote_owner(self, m: Message, exclude: str) -> dict | None:
+        """引用归属：被引用的那条在某个话题里 → 那个话题的归属；否则它送到过 / 转交给 / 是谁代发的 → 那个会话。
+        被引用的那条离现在超过 group_owner_hours 不算（同话题过期）。"""
+        q = self.store.get_message(m.reply_to) if m.reply_to else None
+        if q is None or q["chat_id"] != m.chat_id:
+            return None
+        if q["thread_id"]:
+            g = self._group_thread_owner(m, q["thread_id"], exclude)
+            if g is not None:
+                return {**g, "source": "quote_thread" if g["source"] != "roster" else "roster"}
+        if self._expired(q["create_time"] or "", m):
+            return None
+        owner = self._message_owner(q)
+        if owner is None:
+            return None
+        return {"topic": owner[0], "source": "quote_" + owner[1], "thread": "", "root": q["message_id"],
+                "summary": duty.short(first_line(q["content"] or ""), 60)}
+
+    def _group_owner(self, m: Message, exclude: str = "") -> dict | None:
+        """话题 / 引用归属（A、B 类的第一步）：在话题里说的看话题；否则引用了哪条看那条。开关 [threads] group_owner。"""
+        if not self.cfg.threads.group_owner or not self._group_chat(m):
+            return None
+        if is_thread_reply(m):
+            g = self._group_thread_owner(m, m.thread_id, exclude)
+            if g is not None:
+                return g
+        if m.reply_to:
+            return self._quote_owner(m, exclude)
+        return None
+
+    def _group_reply_owner(self, m: Message) -> dict | None:
+        """C 类：别人在群里的话题回复（带 thread_id、不是开头那条、不带代回标记）→ 话题归属。主人本人、机器人自己的在路由时
+        已经是 self，不走这里。"""
+        if not self.cfg.threads.group_owner or not self._group_chat(m) or not is_thread_reply(m):
+            return None
+        if is_agent_reply(m.content, self.cfg.owner_context):
+            return None
+        return self._group_thread_owner(m, m.thread_id, m.message_id)
+
+    def _group_note(self, g: dict, m: Message, what: str) -> str:
+        """送达时附的说明：这是谁处理过的哪条下面的话题回复 / 引用的是哪条；话题长了照 7.22 渐进附最近几条。"""
+        why = GROUP_SOURCE_LABEL.get(g["source"], g["source"])
+        summary = g.get("summary") or ""
+        if not g.get("thread"):
+            return f"↩ 引用归属：这条{what}引用的是你处理过的「{summary}」（{why}）。"
+        lines = [f"🧵 这是你处理过的「{summary or '（开头那条不在账本里）'}」下面的{what}（话题 `{g['thread']}`，{why}）。"]
+        tc = self.cfg.threads
+        rows = [r for r in self.store.thread_messages_in_ledger(g["thread"]) if r["message_id"] != m.message_id
+                and r["message_id"] != g.get("root")]
+        if len(rows) + 1 >= tc.complex_min_replies:
+            me = self.cfg.self_open_id
+            items = [{"message_id": r["message_id"], "at": r["create_time"] or "", "root": False,
+                      "tpos": _seq(r["thread_position"]), "mpos": _seq(r["message_position"]),
+                      "who": "主人" if me and r["sender_id"] == me else (r["sender_name"] or r["sender_id"] or "-"),
+                      "text": plain_text(r["content"] or "")} for r in rows]   # 卡片（7.48）先还原成「标题\n正文」
+            recent = order_thread_items(items)[-tc.recent_replies:]
+            lines.append(f"话题里除了开头那条已有 {len(rows) + 1} 条（含这一条），最近 {len(recent)} 条：")
+            for x in recent:
+                at = _parse(x["at"])
+                lines.append(f"- {clock(at, self.cfg.timezone_offset) if at else '-'} {x['who']}："
+                             f"{duty.short(x['text'], tc.reply_chars)}")
+            lines.append(with_cli(f"要全貌用 `sheepdog thread --topic {g['topic']} --thread {g['thread']}`。",
+                                  self.cfg.cli_command))
+        return "\n".join(lines)
 
     def _learn_source_thread(self, m: Message) -> None:
         """7.38：主人在群里某个话题里说话，账本里还不知道这个话题的开头是哪条时，看它是不是某条还开着的提问的来源消息：
@@ -903,7 +1175,10 @@ class Collector:
         old_text = old["content"] or ""
         if is_agent_reply(old_text, self.cfg.owner_context):
             return  # 原文是会话代回的
-        topic_id = self._owner_context_target(m.chat_id)
+        ref = row_to_message(old)   # 话题 / 引用以账本里那份为准（编辑通知不一定带全）
+        ref.chat_type = ref.chat_type or m.chat_type
+        topic_id = self._owner_context_target(ref, m.message_id)
+        self._notes.pop(m.message_id, None)
         if not topic_id:
             return
         where = chat_label(m.chat_type, m.chat_name, m.chat_id)
@@ -1405,8 +1680,10 @@ class Collector:
             d, topic_id, w = self._decide(m, ctx)
             if d.route == DISPATCH and not recalled:
                 self.store.update_content(m.message_id, m, DISPATCH, d.reason, "pending", d.tags, topic_id)
+                self._write_note(m.message_id)
                 self._close_watch(w, m.message_id, self._secure(m.message_id))
             else:
+                self._notes.pop(m.message_id, None)
                 self.store.update_content(m.message_id, m)
         return True
 
@@ -2197,10 +2474,11 @@ class Dispatcher:
                 and r["chat_id"] in self.cfg.owner_chat_ids)
 
     def _priority_rows(self, rows) -> list:
-        """插队的消息：主人在找主人聊天里的回复、主人在那里撤回 / 编辑自己发过的话（7.47 第 2 条），加上引用了这些编号的
+        """插队的消息：主人在找主人聊天里的回复、主人在群里 @ 机器人的指令（7.45 A 类）、主人在找主人聊天里撤回 / 编辑自己
+        发过的话（7.47 第 2 条），加上引用了这些编号的
         escalation_list 系统消息（回复认不出回答哪条时给总线的未结列表 / 认不出来源的说明，7.38 第 5 条），保持原来的先后。
         没有主人的这两种消息就是空表。"""
-        own = [r for r in rows if r["reason"] == OWNER_REPLY or self._owner_correction(r)]
+        own = [r for r in rows if r["reason"] in (OWNER_REPLY, OWNER_INSTRUCTION) or self._owner_correction(r)]
         if not own:
             return []
         keep = {r["message_id"] for r in own}
@@ -2308,7 +2586,8 @@ class Dispatcher:
         的批次从核到那一刻起算 N 分钟）。开关是 0 时不记。"""
         if self.cfg.session.owner_priority_followup_minutes <= 0:
             return
-        own = [r for r in urgent if r["reason"] == OWNER_REPLY or self._owner_correction(r)] or list(urgent)
+        own = [r for r in urgent if r["reason"] in (OWNER_REPLY, OWNER_INSTRUCTION) or self._owner_correction(r)] \
+            or list(urgent)
         first = own[0]
         text = " ".join((first["content"] or "").split())
         rec = {"topic": t["topic_id"], "sent_at": sent_at or now_iso(), "due_from": _now().isoformat(timespec="seconds"),
@@ -3636,20 +3915,7 @@ class Dispatcher:
             except Exception as e:  # 护栏出错不能挡住投递
                 log.warning("护栏检查出错（%s）: %s", step.__name__, e)
 
-        rows = self.store.pending_dispatch()
-        groups: dict[str, list] = {}
-        for r in rows:
-            tid = r["topic_id"] or BUS_TOPIC_ID
-            if tid not in tids:
-                # 归属的会话已从名册移除或改成 known：退回总线，不丢消息
-                log.warning("消息 %s 归属的 %s 已不可投递，改投总线", r["message_id"], tid)
-                tid = BUS_TOPIC_ID
-            elif (tid != BUS_TOPIC_ID and r["security_action"] == HOLD
-                  and SECURITY_RELEASE_TAG not in json.loads(r["tags_json"] or "[]")):
-                # 兜底：被 hold 的消息没有经已核对的主人原话放行，不得投给 managed 会话
-                log.warning("消息 %s 被安全规则拦截，改投总线", r["message_id"])
-                tid = BUS_TOPIC_ID
-            groups.setdefault(tid, []).append(r)
+        rows, groups = self._pending_groups(tids)
 
         result: dict = {"pending": len(rows), "sent": 0, "topics": {}}
         for tid in tids:
@@ -3668,6 +3934,53 @@ class Dispatcher:
         # 投递以后再算一遍卡片（刚送出批次的会话变成在做）；记录只读新写的行，基本没有成本
         self._duty_round(tids, autofill=False)
         result["state"] = self.store.get_topic(BUS_TOPIC_ID)["state"]
+        return result
+
+    def _live_tids(self) -> list[str]:
+        return [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
+                                 if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED]
+
+    def _pending_groups(self, tids: list[str]) -> tuple[list, dict[str, list]]:
+        """待推消息按会话分组：归属的会话不能投了退回总线；被安全规则 hold 又没放行的只能给总线。"""
+        rows = self.store.pending_dispatch()
+        groups: dict[str, list] = {}
+        for r in rows:
+            tid = r["topic_id"] or BUS_TOPIC_ID
+            if tid not in tids:
+                # 归属的会话已从名册移除或改成 known：退回总线，不丢消息
+                log.warning("消息 %s 归属的 %s 已不可投递，改投总线", r["message_id"], tid)
+                tid = BUS_TOPIC_ID
+            elif (tid != BUS_TOPIC_ID and r["security_action"] == HOLD
+                  and SECURITY_RELEASE_TAG not in json.loads(r["tags_json"] or "[]")):
+                # 兜底：被 hold 的消息没有经已核对的主人原话放行，不得投给 managed 会话
+                log.warning("消息 %s 被安全规则拦截，改投总线", r["message_id"])
+                tid = BUS_TOPIC_ID
+            groups.setdefault(tid, []).append(r)
+        return rows, groups
+
+    def deliver_only(self) -> dict:
+        """7.45 第三节：机器人事件触发的小轮次只做投递——把待推消息按会话送出去（会话空着就发一批；在跑就按原规则排队，
+        主人的话插队）。不收回执、不判超时、不跑羊群看板全量、护栏、「需要你定」跟进和通知重试，这些留给每
+        poll_interval_seconds 一次的完整轮次；有「正在发」批次的会话（发送超时还没核对）也留给完整轮次先核。"""
+        self._record_cache = {}
+        tids = self._live_tids()
+        sending = {d["topic_id"] for d in self.store.dispatches_in_state("sending")}
+        rows, groups = self._pending_groups(tids)
+        result: dict = {"pending": len(rows), "sent": 0, "topics": {}}
+        for tid in tids:
+            if tid not in groups or tid in sending:
+                continue
+            t = self.store.get_topic(tid)
+            if t is None:
+                continue   # 总线第一轮还没建：留给完整轮次
+            self._check_human(t)
+            if self.store.get_topic(tid)["state"] != t["state"]:
+                self._duty_round([tid], autofill=False)
+            r = self._dispatch_topic(self.store.get_topic(tid), groups[tid])
+            result["topics"][tid] = r
+            result["sent"] += r["sent"]
+        if result["topics"]:
+            self._duty_round(list(result["topics"]), autofill=False)
         return result
 
     # ---------- 总线新开会话（7.10） ----------
@@ -4118,7 +4431,9 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
         if i in held and SECURITY_RELEASE_TAG not in tags:
             tags.append(SECURITY_RELEASE_TAG)
-        if self_open_id and row["sender_id"] == self_open_id:
+        if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION in tags:
+            pass   # 7.45 A 类：主人在群里 @ 机器人的指令，转过去仍是指令（标签不变），不当成回答哪条「需要你定」
+        elif self_open_id and row["sender_id"] == self_open_id:
             # 主人本人的消息（7.8）：带已核对标注，不需要 --quote；目标会话最近一条未结的「需要你定」标记已答
             if OWNER_VERIFIED_TAG not in tags:
                 tags.append(OWNER_VERIFIED_TAG)
@@ -4127,6 +4442,9 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
                 store.answer_escalation(opens[0]["message_id"], i)
                 store.set_note(i, escalation_note(opens[0]))
         store.forward_message(i, topic_id, tags)
+        # 7.45：转交的是群话题里的消息（或开头那条），话题原来归转出方的，改归接手的会话（之后的话题回复直接送它）
+        if store.repoint_group_thread(row["thread_id"] or "", row["message_id"], {src}, topic_id):
+            log.info("话题 %s 跟着转交改归 %s", row["thread_id"] or row["message_id"], topic_id)
     pats = key_patterns if key_patterns is not None else DutyConfig().patterns
     by_src: dict[str, list] = {}
     for i, row in rows.items():

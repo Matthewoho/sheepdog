@@ -47,10 +47,11 @@ CREATE TABLE IF NOT EXISTS messages (
     security_tags  TEXT,               -- 安全规则命中的 rule name 列表（JSON）
     security_action TEXT,              -- none | tag | hold（取最严）
     message_position TEXT,             -- 消息在这个聊天里的序号（lark message_position，7.22 发前检查比先后用）；空 = 不知道
-    thread_position TEXT,              -- 话题里的序号（lark thread_message_position，7.22）：普通聊天开头 "-1"、回复从 "0" 起；
-                                       -- 话题群开头 "0"
+    thread_position TEXT,              -- 话题里的序号（lark thread_message_position，7.22）：开头那条 "-1"、回复从 "0" 起
+                                       -- （7.45 用正式账本核实：普通群、话题群都是这样；7.22 说的「话题群开头 0」不对）
     received_by    TEXT,               -- 哪个身份收到的（7.26，[identity] 开着才写）：user（主人身份的搜索）| bot（机器人身份的
                                        -- 实时接收）| both；关着时为空
+    root_id        TEXT,               -- 话题 / 回复链开头那条（7.45）：只有机器人实时事件带（root_id），搜索、mget 没有；空 = 不知道
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
@@ -443,6 +444,29 @@ CREATE TABLE IF NOT EXISTS bot_dm_replies (
 );
 CREATE INDEX IF NOT EXISTS idx_bot_dm_sender ON bot_dm_replies(sender_id, replied_at);
 
+-- 群话题归属（7.45 第二节，思路来自 PR #1 @Jerry030-1，issue #2）：群里一个话题（chat_id + thread_id）归哪个会话。
+-- 认出来一次就记下，之后同一个话题的回复直接查这里；每见到话题里一条新消息就更新最近活动时间，超过 [threads]
+-- group_owner_hours 没人说话就不再自动归属（行留着，保留期后清理）
+CREATE TABLE IF NOT EXISTS group_threads (
+    thread_id        TEXT PRIMARY KEY,  -- omt_…
+    chat_id          TEXT NOT NULL,
+    topic_id         TEXT NOT NULL,     -- 归属的会话
+    source           TEXT NOT NULL,     -- delivered（开头那条送到过它）| sent（开头那条是 sheepdog 替它发的）| forwarded（话题里的
+                                        -- 消息被转交给了它）
+    root_message_id  TEXT,              -- 话题开头那条
+    root_summary     TEXT,              -- 开头那条的摘要（送达时附「这是你处理过的 … 下面的话题回复」）
+    created_at       TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL      -- 话题里最近一条消息的时间（过期按它，保留期清理也按它）
+);
+CREATE INDEX IF NOT EXISTS idx_group_threads_chat ON group_threads(chat_id);
+
+-- 找话题开头那条时 mget 过、当时还没有话题的候选（7.45）：一条消息 mget 时没有话题，就不可能是在那之前已经有回复的话题的
+-- 开头，同一批候选不再反复 mget
+CREATE TABLE IF NOT EXISTS thread_root_checks (
+    message_id TEXT PRIMARY KEY,
+    checked_at TEXT NOT NULL
+);
+
 -- 机器人不在、代回退回主人本人的群（7.26）：sheepdog doctor 列出来，建议把机器人拉进来
 CREATE TABLE IF NOT EXISTS bot_absent_chats (
     chat_id     TEXT PRIMARY KEY,
@@ -463,7 +487,7 @@ SYSTEM_ID_PREFIX = "sd_"
 MIGRATIONS = {
     "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
                  ("security_action", "TEXT"), ("message_position", "TEXT"), ("thread_position", "TEXT"),
-                 ("received_by", "TEXT")],
+                 ("received_by", "TEXT"), ("root_id", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
                ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
@@ -585,14 +609,14 @@ class Store:
                 """INSERT INTO messages(message_id,chat_id,chat_name,chat_type,sender_id,sender_name,sender_type,
                        sender_tenant_key,content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,
                        updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen,
-                       message_position,thread_position,received_by)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       message_position,thread_position,received_by,root_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
                  m.sender_tenant_key,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,
                  int(m.deleted), int(m.updated), m.update_time, route, reason,
                  json.dumps(tags, ensure_ascii=False), topic_id, dispatch_state, ts, ts, m.message_position or None,
-                 m.thread_position or None, received_by),
+                 m.thread_position or None, received_by, m.root_id or None),
             )
 
     def merge_identity_copy(self, message_id: str, m: Message, received_by: str, fill_content: bool) -> None:
@@ -609,7 +633,7 @@ class Store:
         for col, val in (("chat_name", m.chat_name), ("sender_name", m.sender_name),
                          ("sender_tenant_key", m.sender_tenant_key), ("message_position", m.message_position),
                          ("thread_position", m.thread_position), ("thread_id", m.thread_id), ("link", m.link),
-                         ("reply_to", m.reply_to)):
+                         ("reply_to", m.reply_to), ("root_id", m.root_id)):
             if val and not row[col]:
                 sets.append(f"{col}=?")
                 vals.append(val)
@@ -764,6 +788,13 @@ class Store:
         with self.tx() as c:
             c.execute("""UPDATE messages SET route='dispatch', reason='owner_context', dispatch_state='pending',
                              topic_id=?, note=? WHERE message_id=?""", (topic_id, note or None, message_id))
+
+    def route_owner_instruction(self, message_id: str, topic_id: str, tags: list[str], note: str) -> None:
+        """主人在群里 @ 机器人（7.45 A 类）：排给 topic 当指令（dispatch / owner_instruction / 待推）。"""
+        with self.tx() as c:
+            c.execute("""UPDATE messages SET route='dispatch', reason='owner_instruction', dispatch_state='pending',
+                             topic_id=?, tags_json=?, note=? WHERE message_id=?""",
+                      (topic_id, json.dumps(tags, ensure_ascii=False), note or None, message_id))
 
     def delivered_since(self, since_iso: str, limit: int = 500) -> list[sqlite3.Row]:
         """since 之后投递给会话的 IM 消息（不含 sheepdog 自己生成的、不含主人本人的背景）。"""
@@ -1181,6 +1212,75 @@ class Store:
             (topic_id, *message_ids))}
 
     # ---------- actions ----------
+    # ---------- 群话题归属（7.45） ----------
+    def group_thread(self, thread_id: str) -> sqlite3.Row | None:
+        if not thread_id:
+            return None
+        return self.conn.execute("SELECT * FROM group_threads WHERE thread_id=?", (thread_id,)).fetchone()
+
+    def add_group_thread(self, thread_id: str, chat_id: str, topic_id: str, source: str, root_message_id: str,
+                         root_summary: str, last_activity_at: str) -> None:
+        """记下（或改记）一个群话题的归属。"""
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO group_threads(thread_id,chat_id,topic_id,source,root_message_id,root_summary,created_at,
+                       last_activity_at) VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(thread_id) DO UPDATE SET topic_id=excluded.topic_id, source=excluded.source,
+                       root_message_id=COALESCE(excluded.root_message_id, group_threads.root_message_id),
+                       root_summary=COALESCE(excluded.root_summary, group_threads.root_summary),
+                       last_activity_at=MAX(group_threads.last_activity_at, excluded.last_activity_at)""",
+                (thread_id, chat_id, topic_id, source, root_message_id or None, root_summary or None, now_iso(),
+                 last_activity_at or now_iso()))
+
+    def touch_group_thread(self, thread_id: str, at: str) -> bool:
+        """话题里又有人说话：最近活动时间往后挪（只往后不往前）。没记过这个话题返回 False。"""
+        if not thread_id or not at:
+            return False
+        with self.tx() as c:
+            return c.execute("UPDATE group_threads SET last_activity_at=? WHERE thread_id=? AND last_activity_at < ?",
+                             (at, thread_id, at)).rowcount > 0
+
+    def repoint_group_thread(self, thread_id: str, root_message_id: str, from_topics: set[str], topic_id: str) -> bool:
+        """话题里的消息（或开头那条）被转交（forward）：原来归 from_topics 之一的话题改归 topic_id（source = forwarded）。"""
+        if not (thread_id or root_message_id) or not from_topics:
+            return False
+        with self.tx() as c:
+            return c.execute(
+                "UPDATE group_threads SET topic_id=?, source='forwarded' WHERE (thread_id=? OR root_message_id=?) "
+                "AND topic_id IN (%s) AND topic_id != ?" % ",".join("?" * len(from_topics)),
+                (topic_id, thread_id or "", root_message_id or "", *sorted(from_topics), topic_id)).rowcount > 0
+
+    def thread_last_activity(self, thread_id: str, exclude_message_id: str = "") -> str:
+        """账本里这个话题（含已知的开头那条）最近一条消息的时间；没有是空串。"""
+        r = self.conn.execute("SELECT MAX(create_time) FROM messages WHERE thread_id=? AND message_id != ?",
+                              (thread_id, exclude_message_id or "")).fetchone()
+        return (r[0] or "") if r else ""
+
+    def group_root_candidates(self, chat_id: str, before_iso: str, reply_since_iso: str, limit: int = 50) -> list[str]:
+        """群话题开头那条的候选（7.45）：这个群里（保留期内）投出去过的消息——送到过某个会话的、sheepdog 替会话发的——
+        账本里还没记话题编号、不晚于这条回复、也没在这个话题已经有回复以后 mget 核过的。新的在前，最多 limit 条。"""
+        rows = self.conn.execute(
+            """SELECT m.message_id FROM messages m
+               WHERE m.chat_id=? AND COALESCE(m.thread_id,'')='' AND m.create_time <= ?
+                 AND ((m.route='dispatch' AND m.dispatch_state IN ('delivered','acked') AND m.reason != 'owner_context')
+                      OR m.message_id IN (SELECT message_id FROM sends))
+                 AND NOT EXISTS (SELECT 1 FROM thread_root_checks k WHERE k.message_id=m.message_id AND k.checked_at >= ?)
+               ORDER BY m.create_time DESC, m.first_seen DESC LIMIT ?""",
+            (chat_id, before_iso, reply_since_iso, limit)).fetchall()
+        return [r[0] for r in rows]
+
+    def mark_root_checked(self, message_ids: list[str]) -> None:
+        ts = now_iso()
+        with self.tx() as c:
+            c.executemany("INSERT INTO thread_root_checks(message_id,checked_at) VALUES(?,?) "
+                          "ON CONFLICT(message_id) DO UPDATE SET checked_at=excluded.checked_at",
+                          [(i, ts) for i in message_ids])
+
+    def thread_first_seen(self, thread_id: str) -> str:
+        """账本里最早见到这个话题的回复是什么时候（first_seen，本地时间）：在那之后 mget 过、没有话题的候选不可能是它的开头。"""
+        r = self.conn.execute("SELECT MIN(first_seen) FROM messages WHERE thread_id=?", (thread_id,)).fetchone()
+        return (r[0] or "") if r else ""
+
     def add_action(self, kind: str, args: dict, requested_by: str) -> int:
         with self.tx() as c:
             cur = c.execute("INSERT INTO actions(kind,args_json,requested_by,requested_at) VALUES(?,?,?,?)",
@@ -1601,6 +1701,9 @@ class Store:
         "sends": "DELETE FROM sends WHERE sent_at < ?",
         "seen_before_send": "DELETE FROM seen_before_send WHERE seen_at < ?",
         "bot_dm_replies": "DELETE FROM bot_dm_replies WHERE replied_at < ?",
+        # 7.45 群话题归属：按最近活动时间；候选核过的记录按核的时间
+        "group_threads": "DELETE FROM group_threads WHERE last_activity_at < ?",
+        "thread_root_checks": "DELETE FROM thread_root_checks WHERE checked_at < ?",
         # 7.36：提问的来源；提问本身还开着的不删
         "escalation_sources": """DELETE FROM escalation_sources WHERE created_at < ? AND ask_message_id NOT IN
                                  (SELECT message_id FROM escalations WHERE closed_at IS NULL)""",
@@ -1668,4 +1771,5 @@ def row_to_message(row: sqlite3.Row) -> Message:
         updated=bool(row["updated"]), update_time=row["update_time"] or "",
         message_position=row["message_position"] or "",
         thread_position=row["thread_position"] or "",
+        root_id=(row["root_id"] if "root_id" in row.keys() else "") or "",
     )

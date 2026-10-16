@@ -619,6 +619,9 @@ def find_thread(store: Store, topic_id: str, key: str = "", thread: str = "") ->
         if thr["topic_id"] != topic_id and topic_id != BUS_TOPIC_ID:
             raise OutboundError(EXIT_INVALID, f"这个话题记在 {thr['topic_id']} 名下，不是你的")
         return thr, thr["thread_id"] or "", thr["root_message_id"]
+    g = store.group_thread(thread) if thread.startswith("omt_") else None
+    if g is not None and (g["topic_id"] == topic_id or topic_id == BUS_TOPIC_ID):
+        return None, thread, g["root_message_id"] or ""   # 7.45：群话题归属记在这个会话名下
     if topic_id != BUS_TOPIC_ID:
         raise OutboundError(EXIT_INVALID, "话题表里没有这个话题：只有总线能看没记过的话题")
     return None, thread if thread.startswith("omt_") else "", thread if thread.startswith("om_") else ""

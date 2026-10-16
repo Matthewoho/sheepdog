@@ -634,6 +634,48 @@ def host_report(cfg, store: Store) -> list[str]:
     return lines
 
 
+# 7.45 第三节：机器人事件到了以后再攒几秒（同一句话常常几条一起来、搜索那条路的同一条也可能马上到），再做小轮次
+BOT_EVENT_SETTLE_SECONDS = 2
+
+
+def _mini_cycle(collector: Collector, dispatcher: Dispatcher | None) -> dict | None:
+    """机器人事件触发的小轮次：只入账 + 投递，不跑搜索（搜索仍按 poll_interval_seconds，免得撞飞书频率限制）。"""
+    stats = collector.poll_bot_only()
+    if not stats or not stats.get("fetched"):
+        return stats
+    logging.info("机器人事件小轮次: %s", stats)
+    if dispatcher:
+        res = dispatcher.deliver_only()
+        logging.info("机器人事件小轮次投递: %s", res)
+    return stats
+
+
+def _wait_next(args, collector: Collector, dispatcher: Dispatcher | None, clock=None, sleep=None) -> int:
+    """两轮完整轮次之间怎么等（7.45 第三节）：[run] wake_on_bot_event 开着、起了机器人接收时，等「机器人事件到了」或「到点」，
+    先到先处理——事件到了攒 BOT_EVENT_SETTLE_SECONDS 秒做一次小轮次，接着等到点；关着（热改成关也一样，下一次等就生效）
+    或没起接收就照旧睡满间隔。返回做了几次小轮次。clock / sleep 调用时才取（测试 patch time.sleep 照样生效）。"""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    deadline = clock() + (args.interval or collector.cfg.poll_interval_seconds)
+    consumer = collector.bot_events
+    n = 0
+    while True:
+        left = deadline - clock()
+        if left <= 0:
+            return n
+        if not (collector.cfg.run.wake_on_bot_event and consumer is not None and hasattr(consumer, "wait")):
+            sleep(left)
+            return n
+        if not consumer.wait(left):
+            return n
+        sleep(max(0.0, min(BOT_EVENT_SETTLE_SECONDS, deadline - clock())))
+        try:
+            _mini_cycle(collector, dispatcher)
+        except Exception as e:  # 小轮次失败不挡下一轮
+            logging.error("机器人事件小轮次失败: %s: %s", type(e).__name__, e)
+        n += 1
+
+
 def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
     stats = collector.poll_once()
     logging.info("poll: %s", stats)
@@ -776,7 +818,7 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 logging.exception("本轮失败")
             else:
                 logging.error("本轮失败（下一轮从水位线续跑）: %s: %s", type(e).__name__, e)
-        time.sleep(args.interval or cfg.poll_interval_seconds)
+        _wait_next(args, collector, dispatcher)
 
 
 def cmd_inbox(args) -> int:

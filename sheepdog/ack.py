@@ -89,7 +89,9 @@ class Acker:
         reason = r["reason"]
         if reason == "owner_context":
             return None  # 主人本人的发言只是背景，不点（7.13）
-        if "owner_verified" in json.loads(r["tags_json"] or "[]"):
+        tags = json.loads(r["tags_json"] or "[]")
+        if "owner_verified" in tags or reason == "owner_instruction" or "owner_instruction" in tags:
+            # 7.45 A 类：主人在群里 @ 机器人的指令，确认表情和主人在找主人聊天里的回复一样（机器人身份点、永不撤）
             reason = "owner_reply"
         if _alias(reason, self.cfg.bot_reasons) in self.cfg.bot_reasons:
             return "bot"

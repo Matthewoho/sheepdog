@@ -75,6 +75,25 @@ class RoutingConfig:
     # 机器人/应用发的消息正文以其中任一前缀开头就 drop（reason self_escalation），
     # 用来挡住会话以 bot 身份找主人的私聊，防止回环
     drop_bot_message_prefixes: list[str] = field(default_factory=list)
+    # 7.45 A 类（热加载）：主人本人账号在群里 @ 机器人 = 给助理的指令（owner_instruction）：按话题 / 引用归属 → 名册负责的
+    # 会话 → 总线送去，会话在跑就插队。关掉后照旧当背景（owner_context）
+    owner_at_assistant: bool = True
+
+    def validate(self) -> None:
+        if not isinstance(self.owner_at_assistant, bool):
+            raise ConfigError("[routing] owner_at_assistant 必须是 true/false")
+
+
+@dataclass
+class RunConfig:
+    """[run]（7.45 第三节，热加载）：常驻循环怎么等下一轮。"""
+    # 开着：每轮之间不再死睡 poll_interval_seconds，机器人实时事件一到（攒 2 秒）就做一次只入账 + 投递的小轮次，
+    # 不跑搜索；关掉：照旧每轮睡满间隔
+    wake_on_bot_event: bool = True
+
+    def validate(self) -> None:
+        if not isinstance(self.wake_on_bot_event, bool):
+            raise ConfigError("[run] wake_on_bot_event 必须是 true/false")
 
 
 @dataclass
@@ -251,8 +270,18 @@ class ThreadsConfig:
     # 系统通知（没设 [notify] file 时经机器人发的那些，7.48 第 7 条）也发进这个群；
     # 这个群同时当成「找主人」聊天（等同于加进 [escalation] chat_ids）。空 = 照旧私聊 self_open_id
     owner_chat_id: str = ""
+    # 7.45 群话题归属（热加载，思路来自 PR #1 @Jerry030-1，issue #2）：群里话题回复 / 引用按话题开头那条（或被引用的那条）
+    # 当初送给了谁、是谁代发的，直接送那个会话（别人的话题回复 C 类；主人 @ 机器人 A 类、主人背景 B 类的第一步）。
+    # 关掉后回到以前：只按整群归属、watch、@ 和「最近处理过」分
+    group_owner: bool = True
+    # 话题最近一次有人说话超过这么多小时，不再自动归属（名册显式绑定的话题不受影响）。Matthew 10-15 21:3x 定 72
+    group_owner_hours: float = 72
 
     def validate(self) -> None:
+        if not isinstance(self.group_owner, bool):
+            raise ConfigError("[threads] group_owner 必须是 true/false")
+        if not _positive(self.group_owner_hours):
+            raise ConfigError("[threads] group_owner_hours 必须是正数")
         if not isinstance(self.owner_chat_id, str) or (self.owner_chat_id and not self.owner_chat_id.startswith("oc_")):
             raise ConfigError("[threads] owner_chat_id 必须是 oc_ 开头的群 ID（测试用，正式环境不要设）")
         for k in ("ask_header", "report_header"):
@@ -646,6 +675,7 @@ class Config:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     hooks: HooksConfig = field(default_factory=HooksConfig)
+    run: RunConfig = field(default_factory=RunConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -759,6 +789,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.duty, data.get("duty", {}))
     _apply(cfg.threads, data.get("threads", {}))
     _apply(cfg.hooks, data.get("hooks", {}))
+    _apply(cfg.run, data.get("run", {}))
     hosts = data.get("hosts", {})
     if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
         raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -799,6 +830,8 @@ def load_config(path: Path | None = None) -> Config:
     cfg.duty.validate()
     cfg.threads.validate()
     cfg.hooks.validate()
+    cfg.routing.validate()
+    cfg.run.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

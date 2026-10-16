@@ -45,6 +45,8 @@ class BotEventConsumer:
         # 每轮把状态写到哪（state_writer(dict)）：sheepdog run 传进来写 meta；测试里可以不传
         self.state_writer = state_writer
         self.queue: queue.Queue = queue.Queue()
+        # 7.45 第三节：收到事件就置位，常驻循环用 wait() 等它（等事件或到点，先到先处理）；poll() 取走之前清掉
+        self.arrived = threading.Event()
         self.proc = None
         self.next_start = 0.0
         self.state = {"state": "stopped", "pid": None, "started_at": "", "ready_at": "", "last_event_at": "",
@@ -111,6 +113,7 @@ class BotEventConsumer:
                 continue
             if isinstance(raw, dict):
                 self.queue.put(("event", proc, raw))
+                self.arrived.set()
 
     def _read_stderr(self, proc, stream) -> None:
         for line in stream:
@@ -125,6 +128,7 @@ class BotEventConsumer:
     # ---------- 主线程：每轮调 ----------
     def poll(self) -> list[dict]:
         """取出这期间收到的事件（原始 dict，按收到的顺序）；子进程退出了就按退避重启。"""
+        self.arrived.clear()   # 先清再取：清了以后才到的事件会再置位，下一次 wait() 马上返回，不会漏
         events: list[dict] = []
         while True:
             try:
@@ -159,6 +163,10 @@ class BotEventConsumer:
             self._spawn()
         self._write_state()
         return events
+
+    def wait(self, timeout: float) -> bool:
+        """等到收到事件（返回 True）或超时（False）。只等，不取：事件仍由 poll() 取走。"""
+        return self.arrived.wait(max(0.0, timeout))
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None

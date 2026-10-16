@@ -19,10 +19,11 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .config import ANTIGRAVITY, Config, load_config
+from .config import ANTIGRAVITY, Config, default_state_dir, load_config
 from .playbook import Playbook
 from . import session as sm
 
@@ -40,6 +41,11 @@ DEFAULT_STOP_REASON = (
     "- 处理完了：`{{receipt_command}}`\n"
     "- 还在等别人：`{{waiting_command}}`，summary 写清等谁、等什么。\n"
     "交完回执再结束。")
+# 7.45 三之二：每次被调用记一行（时间、conversationId、是不是牧羊犬的会话、拦 / 不拦及原因、耗时），用来确认 Antigravity 真的
+# 在调它、量调用次数和拦截率。<状态目录>/hooks/stop-log/<YYYY-MM-DD>.jsonl，按天一个文件，只留最近 CALL_LOG_DAYS 天；
+# 写不了不影响判断和输出
+CALL_LOG_DIR = ("hooks", "stop-log")
+CALL_LOG_DAYS = 7
 # 连账本时最多等几秒（WAL 下读不被写挡，这只是兜底）
 DB_TIMEOUT_SECONDS = 1.0
 # 会话记录只读末尾这么多字节（总线的记录很大，不全读）
@@ -193,52 +199,73 @@ def _occupied(card, cfg: Config, now: datetime) -> bool:
     return at is not None and now - at < timedelta(minutes=cfg.session.human_attach_minutes)
 
 
-def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None) -> dict | None:
+def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None, info: dict | None = None) -> dict | None:
     """要拦就返回要写到 stdout 的 dict，不拦返回 None。出错一律当不拦（异常向外抛，由 stop_main 兜住）。
+    info（7.45 三之二）：传进来就把这次调用的情况写进去（conversation_id、managed、topic、batch、reason），给调用日志用。
 
     拦的条件（全部满足，7.37 / 7.38 第 6 条）：conversationId 是牧羊犬管的 Antigravity 会话；fullyIdle 为 true；会话 running、
     手上那批的回执文件不在、账本里那批还是 sent（没收到回执）；这一批拦过的次数 < STOP_MAX_BLOCKS；会话没被主人占着（羊群
     看板的口径）；入参 transcriptPath 末尾找得到这一批，且送达以后主人没有亲自在会话里打过字。"""
+    info = info if info is not None else {}
+
+    def why(reason: str) -> None:
+        info["reason"] = reason
+        return None
+
     data = json.loads(raw)
-    if not isinstance(data, dict) or data.get("fullyIdle") is not True:
-        return None
+    if not isinstance(data, dict):
+        return why("入参不是 JSON 对象")
     cid = data.get("conversationId")
+    if isinstance(cid, str):
+        info["conversation_id"] = cid.strip()
+    if data.get("fullyIdle") is not True:
+        return why("fullyIdle 不是 true（后台任务还在跑）")
     if not isinstance(cid, str) or not cid.strip():
-        return None
+        return why("没有 conversationId")
     cfg = cfg or load_config()   # 每次调用都是新进程、现读配置：[hooks] stop 改完下一次收工就生效
+    info["state_dir"] = str(cfg.state_dir)
     if not cfg.hooks.stop:
-        return None   # 7.40 开关关掉：什么都不输出，会话照常结束
+        return why("[hooks] stop 关着")   # 7.40 开关关掉：什么都不输出，会话照常结束
     now = now or datetime.now().astimezone()
     if not cfg.db_path.is_file():
-        return None
+        return why("账本不在")
     conn = _connect_ro(cfg.db_path)
     try:
         t = _target(conn, cid.strip())
-        if t is None or t["state"] != sm.RUNNING or not t["pending_batch_id"]:
-            return None
+        info["managed"] = t is not None
+        if t is None:
+            return why("不是牧羊犬管的 Antigravity 会话")
+        info["topic"] = t["topic_id"]
+        if t["state"] != sm.RUNNING or not t["pending_batch_id"]:
+            return why(f"会话 {t['state']}，手上没有在等回执的批次")
         tid, batch = t["topic_id"], t["pending_batch_id"]
+        info["batch"] = batch
         if (cfg.receipts_dir / tid / f"{batch}.json").exists():
-            return None  # 回执交了，下一轮 sheepdog 收
+            return why("回执已交")  # 回执交了，下一轮 sheepdog 收
         d = conn.execute("SELECT state FROM dispatches WHERE batch_id=?", (batch,)).fetchone()
         if d is None or d["state"] != "sent":
-            return None
+            return why(f"批次状态 {d['state'] if d is not None else '查不到'}")
         card = conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (tid,)).fetchone()
         if _occupied(card, cfg, now):
-            return None
+            return why("被主人占着")
     finally:
         conn.close()
     # 被主人占着的另一个口径（正式配置 human_attach_minutes = 0，上面那条永远不成立）：读会话记录，这一批送达以后主人亲自
     # 打过字就不拦；末尾找不到这一批（记录不在、太长、送达那行早被挤出末尾这一段）也不拦
     tp = data.get("transcriptPath")
     if not isinstance(tp, str) or not tp.strip():
-        return None
-    if owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES, tid) is not False:
-        return None
+        return why("没有 transcriptPath")
+    typed = owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES, tid)
+    if typed is None:
+        return why("会话记录末尾找不到这一批的开头")
+    if typed:
+        return why("这批送达以后主人亲自打过字")
     p = count_path(cfg, tid)
     n = _blocked_count(p, batch) + 1
     if n > STOP_MAX_BLOCKS:
-        return None
+        return why(f"这一批已经拦过 {STOP_MAX_BLOCKS} 次")
     _write_count(p, batch, n)  # 记不下次数就不拦：宁可放它停，也不能拦个没完
+    info["reason"] = f"没交回执，第 {n} 次拦"
     cli = cfg.cli_command
     receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
     waiting = (f"{cli} receipt --topic {tid} --batch {batch} "
@@ -251,17 +278,53 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None)
     return {"decision": "continue", "reason": reason}
 
 
+def call_log_dir(state_dir: Path) -> Path:
+    return Path(state_dir).joinpath(*CALL_LOG_DIR)
+
+
+def log_call(state_dir: Path, rec: dict, now: datetime | None = None) -> None:
+    """调用日志记一行（追加写当天的文件），顺手删掉 CALL_LOG_DAYS 天以前的文件。出错向外抛，由调用方吞掉。"""
+    now = now or datetime.now().astimezone()
+    if not Path(state_dir).is_dir():
+        return   # 状态目录都没有（没装好、指错了）：不替它建目录，这次不记
+    d = call_log_dir(state_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"{now:%Y-%m-%d}.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    keep = (now - timedelta(days=CALL_LOG_DAYS - 1)).strftime("%Y-%m-%d")
+    for old in d.glob("*.jsonl"):
+        if old.stem < keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
 def stop_main(stdin, stdout, cfg: Config | None = None, now: datetime | None = None) -> int:
     """`sheepdog hook stop` 的全部逻辑：任何异常都不输出、退出码 0（Stop 出错 Antigravity 照常结束，7.34 E7；
-    但多写一个字就可能被当成要拦，所以出错时一个字也不写）。"""
+    但多写一个字就可能被当成要拦，所以出错时一个字也不写）。输出写完以后记一行调用日志（7.45 三之二），记不下就算了。"""
+    started = time.monotonic()
+    info: dict = {}
+    out = None
     try:
         raw = stdin.read()
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
-        out = stop_check(raw, cfg, now)
+        out = stop_check(raw, cfg, now, info)
         if out is not None:
             stdout.write(json.dumps(out, ensure_ascii=False))
             stdout.flush()
+    except Exception as e:
+        info["reason"] = f"出错不拦：{type(e).__name__}: {e}"[:300]
+        out = None
+    try:
+        at = now or datetime.now().astimezone()
+        state_dir = Path(info.get("state_dir") or (cfg.state_dir if cfg is not None else default_state_dir()))
+        log_call(state_dir, {
+            "at": at.isoformat(timespec="seconds"), "conversation_id": info.get("conversation_id", ""),
+            "managed": info.get("managed"), "topic": info.get("topic", ""), "batch": info.get("batch", ""),
+            "decision": "block" if out is not None else "pass", "reason": info.get("reason", ""),
+            "ms": round((time.monotonic() - started) * 1000, 1)}, at)
     except Exception:
         pass
     return 0

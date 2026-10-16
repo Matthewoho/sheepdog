@@ -42,6 +42,9 @@ drop_bot_message_prefixes = ["🐕 需要你定 ·", "🐕 汇报 ·", "🐕 回
 watch_chat_ids = []
 # 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
 keyword_skip_bot_senders = true
+# 你本人在群里 @ 机器人（7.45，要开 [identity]）= 给助理的指令：按话题 / 引用归属 → 名册负责这个群的会话 → 总线送去，
+# 会话在忙就插队。关掉（false）：照旧当你的发言背景（owner_context）。热加载
+owner_at_assistant = true
 
 [session]
 title_prefix = "[managed]"
@@ -105,6 +108,12 @@ root_chars = 300
 reply_chars = 120
 # 只给真实飞书测试用，正式环境不要设：ask / report 发进这个群、这个群当成找主人聊天（要在 [source] only_chat_ids 里）
 # owner_chat_id = "oc_xxx"
+# 群话题归属（7.45，思路来自 PR #1 @Jerry030-1）：群里的话题回复 / 引用按话题开头那条（或被引用的那条）当初送到了哪个会话、
+# 是哪个会话代发的，直接送那个会话。名册里可以用 [[session.chats]] 的 thread_id = "omt_…" 显式绑定一个话题（覆盖自动判断、
+# 不过期）。关掉（false）：回到只按整群归属、watch、@ 和「最近处理过」分。热加载
+group_owner = true
+# 话题最近一次有人说话超过这么多小时就不再自动归属
+group_owner_hours = 72
 
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
@@ -274,4 +283,10 @@ ask_owner_before_new = true    # 同上：new-session --host claude 必须带核
 # Antigravity 的 Stop hook（sheepdog hook stop，7.37）：会话这一轮要结束、手上那批还没交回执，就不让它停（同一批最多拦 2 次）。
 # 关掉（false）：hook 什么都不输出，会话照常结束，没交的回执等回执超时处理；省掉的是被拦以后会话多跑的那一轮。
 # hook 每次调用都现读这个文件，改完下一次收工就生效，不用重启，也不用改 hooks.json
+# 每次调用都在 <状态目录>/hooks/stop-log/<日期>.jsonl 记一行（拦 / 不拦及原因、耗时），只留 7 天（7.45）
 stop = true
+
+[run]
+# 机器人实时事件到了就处理（7.45，要开 [identity]）：两轮之间不再死睡 poll_interval_seconds，事件一到（攒 2 秒）就做一次
+# 只入账 + 投递的小轮次，不跑搜索。关掉（false）：照旧每轮睡满间隔。热加载
+wake_on_bot_event = true

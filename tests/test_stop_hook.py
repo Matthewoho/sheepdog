@@ -382,14 +382,16 @@ class ErrorPathTest(HookBase):
     def test_config_broken(self):
         bad = self.dir / "config.toml"
         bad.write_text("this is = = not toml", encoding="utf-8")
-        with mock.patch.dict(os.environ, {"SHEEPDOG_CONFIG": str(bad)}):
+        # 状态目录也指到临时目录：配置读不了时调用日志（7.45 三之二）退回默认状态目录，不能写到本机正式的那个
+        with mock.patch.dict(os.environ, {"SHEEPDOG_CONFIG": str(bad), "SHEEPDOG_STATE_DIR": str(self.dir / "fallback")}):
             self.assertEqual(hook.stop_main(io.BytesIO(stop_input().encode()), out := io.StringIO()), 0)
         self.assertEqual(out.getvalue(), "")
 
     def test_config_invalid_value(self):
         bad = self.dir / "config.toml"
         bad.write_text("[hosts.gemini]\nenabled = true\n", encoding="utf-8")         # ConfigError
-        with mock.patch.dict(os.environ, {"SHEEPDOG_CONFIG": str(bad)}):
+        # 状态目录也指到临时目录：配置读不了时调用日志（7.45 三之二）退回默认状态目录，不能写到本机正式的那个
+        with mock.patch.dict(os.environ, {"SHEEPDOG_CONFIG": str(bad), "SHEEPDOG_STATE_DIR": str(self.dir / "fallback")}):
             self.assertEqual(hook.stop_main(io.BytesIO(stop_input().encode()), out := io.StringIO()), 0)
         self.assertEqual(out.getvalue(), "")
 
