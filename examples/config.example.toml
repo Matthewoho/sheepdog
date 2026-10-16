@@ -62,9 +62,20 @@ reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill
 # 关掉（false）：回到原来的排队，你的回复要等那个会话交了手上那批的回执（或回执超时，见 receipt_timeout_minutes）才随下一批送到；
 # 省掉的是插队那一批（每次插话多送一次、会话多读一段）。改完常驻进程下一轮生效，不用重启
 owner_priority = true
-# 插话送到后这么多分钟内，那个会话经 sheepdog 一条消息都没发（ask / report / reply），私聊你一次（每个插话批次最多一次；
+# 插话送到后这么多分钟内，那个会话没给你发 ask / report，私聊你一次（7.52 起收进回音账本：每句最多一次；
 # 会话收掉 / 移出名册的不提醒）。0 = 关。改完常驻进程下一轮生效，不用重启
 owner_priority_followup_minutes = 10
+# 7.52 你的话一定有回音（都热加载）：
+# 一批里有你需要回应的话（找主人聊天里的回复、改口 / 撤回，群里 @ 机器人的指令），会话交这批回执时，要是从送到起它没给你发过
+# ask / report，牧羊犬把回执 summary 做成卡片替它回你（回到你那句话 / 它的话题里；群里 @ 的发到找主人聊天）。每批最多一次
+owner_receipt_relay = true
+# 带回最早在送到以后多少分钟发：这期间会话自己回了你就不带回。0 = 收到回执当轮就带回
+owner_relay_after_minutes = 0
+# 回音账本按卡住的环节私聊你，每句每个阶段最多一次：没送进任何会话当场报；排队超过这么多分钟报；送到以后这么多分钟没回音报
+# （插话送到的按上面 owner_priority_followup_minutes）。分钟数 0 = 这一项不报
+owner_undelivered_alert = true
+owner_queue_alert_minutes = 10
+owner_reply_alert_minutes = 15
 # 旧的代回前缀：playbook 里的 {{reply_prefix}}，保留兼容
 reply_prefix = "🐕 [Agent 代回] "
 

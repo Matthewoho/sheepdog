@@ -517,7 +517,8 @@ class OwnerInstructionTest(GroupBase):
         t = self.store.get_topic("tp_beta")
         self.assertEqual((t["state"], t["pending_batch_id"]), (sm.RUNNING, b1))     # 手上那批照旧等回执
         self.assertEqual(self.row(mid)["dispatch_state"], "acked")
-        self.assertTrue(self.store.get_meta("priority_followup:" + pb))            # 插话没回音提醒照常起算
+        e = self.store.echo_get(mid)                                            # 插话没回音提醒照常起算（7.52 回音账本）
+        self.assertEqual((e["stage"], e["priority"], e["batch_id"], e["kind"]), ("delivered", 1, pb, "owner_instruction"))
 
     def test_not_an_answer_to_open_escalation_even_when_forwarded(self):
         rc, out, _ = self.ask("--key", "PR #3", topic="tp_beta")

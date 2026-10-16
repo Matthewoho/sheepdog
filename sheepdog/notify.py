@@ -101,7 +101,8 @@ class OwnerDM:
     def chat_id(self) -> str:
         return (self.cfg.threads.owner_chat_id or "") if self.cfg is not None else ""
 
-    def send(self, text: str, idempotency_key: str = "") -> None:
+    def send(self, text: str, idempotency_key: str = "", reply_to: str = "", in_thread: bool = False) -> None:
+        """reply_to（7.52 回执带回）：回复主人的那一条（in_thread = 回到它的话题里），不新起一条。"""
         from .outbound import owner_content, send_owner
         if self.cfg is not None:
             plain, card = owner_content(self.cfg, text)
@@ -111,6 +112,9 @@ class OwnerDM:
 
         def one(t: str, c: dict | None):
             kw = {"card": c} if c is not None else {}
+            if reply_to:
+                return self.source.reply_to(reply_to, identity="bot", idem_key=idempotency_key, text=t,
+                                            in_thread=in_thread, **kw)
             if chat:
                 return self.source.send_to_chat(chat, t, idempotency_key, "bot", **kw)
             if idempotency_key:

@@ -289,7 +289,9 @@ CREATE TABLE IF NOT EXISTS owner_notices (
     next_at     TEXT,                  -- 待发：下一次重试不早于这个时间
     sent_at     TEXT,
     closed_at   TEXT,                  -- 标放弃的时间
-    acked_at    TEXT                   -- 人工确认已处理（sheepdog notices --ack）：不再提示、不再重发
+    acked_at    TEXT,                  -- 人工确认已处理（sheepdog notices --ack）：不再提示、不再重发
+    reply_to    TEXT,                  -- 7.52：回复哪一条（回执带回回到主人那句话 / 它的话题里）；空 = 新起一条
+    in_thread   INTEGER DEFAULT 0      -- 7.52：1 = 回到那一条的话题里
 );
 CREATE INDEX IF NOT EXISTS idx_owner_notices_state ON owner_notices(state);
 
@@ -444,6 +446,33 @@ CREATE TABLE IF NOT EXISTS bot_dm_replies (
 );
 CREATE INDEX IF NOT EXISTS idx_bot_dm_sender ON bot_dm_replies(sender_id, replied_at);
 
+-- 回音账本（7.52）：主人每一句需要回应的话（找主人聊天里的回复、改口 / 撤回，群里 @ 机器人的指令）一行，只由牧羊犬写。
+-- 阶段：undelivered（没送进任何会话）→ queued（排队等某个会话）→ delivered（送到了）→ settled（还上了）。
+-- 还上：会话在送到以后发了 ask / report（report）；回执带回发出去了（relay）；会话已收掉（topic_closed）。
+-- alerted：已经报过的阶段（逗号分隔），每个阶段最多报一次
+CREATE TABLE IF NOT EXISTS owner_echoes (
+    message_id   TEXT PRIMARY KEY,
+    chat_id      TEXT,
+    kind         TEXT NOT NULL,     -- owner_reply | owner_instruction | recalled | edited
+    said_at      TEXT,              -- 主人说这句的时间（消息 create_time）
+    stage        TEXT NOT NULL,
+    topic_id     TEXT,              -- 现在该谁回（跟着转交走）
+    reason       TEXT,              -- 没送进会话时的原因
+    recorded_at  TEXT NOT NULL,
+    stage_at     TEXT,              -- 进这个阶段的时间
+    delivered_at TEXT,              -- 送到的时间（批次 sent_at）
+    batch_id     TEXT,
+    priority     INTEGER DEFAULT 0, -- 1 = 随主人插话批次送到的
+    settled_at   TEXT,
+    settled_by   TEXT,
+    alerted      TEXT DEFAULT '',
+    relay_batch   TEXT,             -- 会话交了哪一批的回执、等着带回（回执带回，7.52）
+    relay_at      TEXT,             -- 那次回执收到的时间
+    relay_status  TEXT,
+    relay_summary TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_owner_echoes_open ON owner_echoes(settled_at, topic_id);
+
 -- 群话题归属（7.45 第二节，思路来自 PR #1 @Jerry030-1，issue #2）：群里一个话题（chat_id + thread_id）归哪个会话。
 -- 认出来一次就记下，之后同一个话题的回复直接查这里；每见到话题里一条新消息就更新最近活动时间，超过 [threads]
 -- group_owner_hours 没人说话就不再自动归属（行留着，保留期后清理）
@@ -538,6 +567,7 @@ MIGRATIONS = {
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
     "sends": [("identity", "TEXT"), ("sources_origin", "TEXT")],
+    "owner_notices": [("reply_to", "TEXT"), ("in_thread", "INTEGER DEFAULT 0")],
     "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
                     ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
                     ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT")],
@@ -1252,6 +1282,65 @@ class Store:
             (topic_id, *message_ids))}
 
     # ---------- actions ----------
+    # ---------- 回音账本（7.52） ----------
+    def echo_record(self, message_id: str, chat_id: str, kind: str, said_at: str, stage: str, topic_id: str,
+                    reason: str = "", at: str = "") -> None:
+        """记（或重记）一笔欠账。同一条消息再记（主人改口 / 撤回了已送出的那句）：重新开账，阶段、报过的都清掉。
+        at：记账时间（牧羊犬的「现在」），默认本机现在。"""
+        ts = at or now_iso()
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO owner_echoes(message_id,chat_id,kind,said_at,stage,topic_id,reason,recorded_at,stage_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind, stage=excluded.stage,
+                       topic_id=excluded.topic_id, reason=excluded.reason, recorded_at=excluded.recorded_at,
+                       stage_at=excluded.stage_at, delivered_at=NULL, batch_id=NULL, priority=0, settled_at=NULL,
+                       settled_by=NULL, alerted='', relay_batch=NULL, relay_at=NULL, relay_status=NULL,
+                       relay_summary=NULL""",
+                (message_id, chat_id, kind, said_at, stage, topic_id or None, reason or None, ts, ts))
+
+    def echo_get(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM owner_echoes WHERE message_id=?", (message_id,)).fetchone()
+
+    def echo_open(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM owner_echoes WHERE settled_at IS NULL ORDER BY said_at, message_id"
+                                 ).fetchall()
+
+    def echo_update(self, message_id: str, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as c:
+            c.execute(f"UPDATE owner_echoes SET {cols} WHERE message_id=?", (*fields.values(), message_id))
+
+    def echo_settle(self, message_ids: list[str], by: str) -> None:
+        ts = now_iso()
+        with self.tx() as c:
+            c.executemany("UPDATE owner_echoes SET stage='settled', settled_at=?, settled_by=? "
+                          "WHERE message_id=? AND settled_at IS NULL", [(ts, by, i) for i in message_ids])
+
+    def echo_mark_alerted(self, message_ids: list[str], stage: str) -> None:
+        with self.tx() as c:
+            c.executemany("UPDATE owner_echoes SET alerted = CASE WHEN COALESCE(alerted,'')='' THEN ? "
+                          "ELSE alerted || ',' || ? END WHERE message_id=?", [(stage, stage, i) for i in message_ids])
+
+    def owner_sends_since(self, topic_id: str, since_iso: str) -> int:
+        """这个会话在 since 之后（严格晚于，口径同 sends_after）经 sheepdog 给主人发过几条 ask / report（7.52：「回主人」
+        只认这两种，回群里的同事 reply 不算）。"""
+        try:
+            since = datetime.fromisoformat(since_iso or "")
+        except ValueError:
+            return 0
+        n = 0
+        for r in self.conn.execute("SELECT sent_at FROM sends WHERE topic_id=? AND kind IN ('ask','report')", (topic_id,)):
+            try:
+                at = datetime.fromisoformat(r["sent_at"] or "")
+            except ValueError:
+                continue
+            if at.tzinfo is not None and since.tzinfo is not None and at > since:
+                n += 1
+        return n
+
     # ---------- 群话题归属（7.45） ----------
     def group_thread(self, thread_id: str) -> sqlite3.Row | None:
         if not thread_id:
@@ -1504,12 +1593,14 @@ class Store:
                           [(ts, alert_id, int(merged), i) for i in ids])
 
     # ---------- 给主人的通知 ----------
-    def add_owner_notice(self, kind: str, topic_id: str, body: bytes, idem_key: str) -> int:
-        """落账本（待发）：正文字节和防重编号此后不变。"""
+    def add_owner_notice(self, kind: str, topic_id: str, body: bytes, idem_key: str, reply_to: str = "",
+                         in_thread: bool = False) -> int:
+        """落账本（待发）：正文字节、防重编号、回复哪一条此后不变。"""
         ts = now_iso()
         with self.tx() as c:
-            cur = c.execute("INSERT INTO owner_notices(kind,topic_id,body,idem_key,state,created_at,window_at,next_at) "
-                            "VALUES(?,?,?,?,'pending',?,?,?)", (kind, topic_id or None, body, idem_key, ts, ts, ts))
+            cur = c.execute("INSERT INTO owner_notices(kind,topic_id,body,idem_key,state,created_at,window_at,next_at,"
+                            "reply_to,in_thread) VALUES(?,?,?,?,'pending',?,?,?,?,?)",
+                            (kind, topic_id or None, body, idem_key, ts, ts, ts, reply_to or None, int(bool(in_thread))))
             return int(cur.lastrowid)
 
     def get_owner_notice(self, notice_id: int) -> sqlite3.Row | None:
@@ -1811,6 +1902,8 @@ class Store:
         "bot_dm_replies": "DELETE FROM bot_dm_replies WHERE replied_at < ?",
         # 7.45 群话题归属：按最近活动时间；候选核过的记录按核的时间
         "group_threads": "DELETE FROM group_threads WHERE last_activity_at < ?",
+        # 7.52 回音账本：跟着保留期清（还上、报过、没还上的都一样，按记账时间）
+        "owner_echoes": "DELETE FROM owner_echoes WHERE recorded_at < ?",
         "thread_root_checks": "DELETE FROM thread_root_checks WHERE checked_at < ?",
         # 7.36：提问的来源；提问本身还开着的不删
         "escalation_sources": """DELETE FROM escalation_sources WHERE created_at < ? AND ask_message_id NOT IN

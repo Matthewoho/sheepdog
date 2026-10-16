@@ -122,8 +122,28 @@ class SessionConfig:
     # 7.47 第 6 条（热加载）：主人插话批次送到后这么多分钟内，那个会话经 sheepdog 一条消息都没发（ask / report / reply），
     # 私聊主人一次。0 = 关
     owner_priority_followup_minutes: int = 10
+    # 7.52 主人的话一定有回音（热加载）：
+    # - owner_receipt_relay：一批里有主人需要回应的话，会话交这批回执时，要是从送到起它没给主人发过 ask / report，牧羊犬把
+    #   回执 summary 做成卡片替它回主人（每批最多一次）；
+    # - 回音账本按卡住的环节私聊主人，每个阶段每句最多一次：没送进任何会话当场报（owner_undelivered_alert）、排队超过
+    #   owner_queue_alert_minutes 报、送到以后超过 owner_reply_alert_minutes 还没回音报（插话送到的那几句仍按
+    #   owner_priority_followup_minutes，7.47 第 6 条收进了这本账）。分钟数 0 = 这一项不报
+    owner_receipt_relay: bool = True
+    # 回执带回最早在送到以后多少分钟发（带回时刻 = max(回执收到, 送到 + 这么多分钟)，这期间会话自己 ask / report 了就不带回）。
+    # 0 = 收到回执当轮就带回（规格 7.52 原文）。正式账本回放：0 分钟时带回的句子里约四分之三会话随后又自己回了（主人收两条）
+    owner_relay_after_minutes: int = 0
+    owner_undelivered_alert: bool = True
+    owner_queue_alert_minutes: int = 10
+    owner_reply_alert_minutes: int = 15
 
     def validate(self) -> None:
+        for k in ("owner_receipt_relay", "owner_undelivered_alert"):
+            if not isinstance(getattr(self, k), bool):
+                raise ConfigError(f"[session] {k} 必须是 true/false")
+        for k in ("owner_queue_alert_minutes", "owner_reply_alert_minutes", "owner_relay_after_minutes"):
+            v = getattr(self, k)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ConfigError(f"[session] {k} 必须是不小于 0 的整数（0 = 关）")
         if not isinstance(self.owner_priority, bool):
             raise ConfigError("[session] owner_priority 必须是 true/false")
         m = self.owner_priority_followup_minutes

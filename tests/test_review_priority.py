@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from sheepdog import session as sm
-from sheepdog.engine import (BUS_TOPIC_ID, PRIORITY_DISPATCH, PRIORITY_FOLLOWUP_PREFIX, PRIORITY_PREFIX, Collector,
+from sheepdog.engine import (BUS_TOPIC_ID, PRIORITY_DISPATCH, PRIORITY_PREFIX, Collector,
                              _parse, clock, forward_messages, send_fail_key, uncertain_notice_key, write_receipt)
 from sheepdog.hook import BATCH_OPENINGS, DEFAULT_STOP_REASON, opens_batch, owner_typed_after_batch
 from sheepdog.playbook import Playbook
@@ -499,7 +499,8 @@ class UncertainRecheckTest(PriorityBase):
 
 
 class PriorityFollowupTest(PriorityBase):
-    """第 6 条：插话送到后 N 分钟内会话一条消息都没发，私聊主人一次。"""
+    """第 6 条：插话送到后 N 分钟内会话没回主人（7.52 起收进回音账本：只认 ask / report），私聊主人一次。
+    回音账本一句一行：插话送到的那句记 priority = 1，按 owner_priority_followup_minutes 起算；同一句只会有这一种提醒。"""
 
     def setUp(self):
         super().setUp()
@@ -514,27 +515,34 @@ class PriorityFollowupTest(PriorityBase):
         res = self.d.dispatch_once()
         return a, res["topics"]["tp_alpha"]["priority"]
 
+    def echo(self, mid: str):
+        return self.store.echo_get(mid)
+
     def test_silent_session_owner_told_once(self):
         a, pb = self.priority()
-        self.assertEqual(len(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX)), 1)
+        e = self.echo(a)
+        self.assertEqual((e["stage"], e["priority"], e["batch_id"]), ("delivered", 1, pb))
         with later(9):
             self.d.dispatch_once()
         self.assertEqual(self.told(), [])
         with later(11):
             self.d.dispatch_once()
+        self.assertEqual(len(self.told()), 1)                                   # 插话按 10 分钟算（不是 15）
         with later(30):
             self.d.dispatch_once()
         told = self.told()
         self.assertEqual(len(told), 1, told)
         hhmm = clock(_parse(self.row(a)["create_time"]), self.cfg.timezone_offset)
-        self.assertIn(f"你 {hhmm} 回的「周五发」插话送到了「", told[0])
+        self.assertIn(f"你 {hhmm} 回的「周五发」", told[0])
+        self.assertIn("插话送到了「", told[0])
         self.assertIn("Alpha", told[0])
         self.assertIn(f"批次 `{pb}`", told[0])
-        self.assertIn("10 分钟没见它发任何消息", told[0])
-        self.assertEqual(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX), [])
+        self.assertIn("10 分钟没见它回你", told[0])
+        self.assertEqual(self.echo(a)["alerted"], "reply")
+        self.assertEqual([n for n in self.notices if "还没回你" in n], [])       # 不会再收到另一种提醒
 
     def test_session_sent_something_no_reminder(self):
-        self.priority()
+        a, _ = self.priority()
         self.store.add_send("k_test_1", "report", "tp_alpha", "om_test_sent", "收到，周五发")
         at = (datetime.now().astimezone() + timedelta(minutes=2)).isoformat(timespec="seconds")
         self.store.conn.execute("UPDATE sends SET sent_at=? WHERE idem_key='k_test_1'", (at,))
@@ -542,7 +550,18 @@ class PriorityFollowupTest(PriorityBase):
         with later(11):
             self.d.dispatch_once()
         self.assertEqual(self.told(), [])
-        self.assertEqual(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX), [])
+        self.assertEqual(self.echo(a)["settled_by"], "report")
+
+    def test_reply_to_others_does_not_count(self):
+        # 7.52：只回了群里的同事（sheepdog reply）不算回了主人
+        a, _ = self.priority()
+        self.store.add_send("k_test_r", "reply", "tp_alpha", "om_test_r", "已转达")
+        at = (datetime.now().astimezone() + timedelta(minutes=2)).isoformat(timespec="seconds")
+        self.store.conn.execute("UPDATE sends SET sent_at=? WHERE idem_key='k_test_r'", (at,))
+        self.store.conn.commit()
+        with later(11):
+            self.d.dispatch_once()
+        self.assertEqual(len(self.told()), 1)
 
     def test_send_before_priority_does_not_count(self):
         self.store.add_send("k_test_0", "report", "tp_alpha", "om_test_old", "之前发的")
@@ -556,21 +575,24 @@ class PriorityFollowupTest(PriorityBase):
 
     def test_zero_means_off(self):
         self.cfg.session.owner_priority_followup_minutes = 0
-        self.priority()
-        self.assertEqual(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX), [])
+        a, _ = self.priority()
+        self.assertIn("reply", self.echo(a)["alerted"])                        # 关着时送的这句记成报过
         self.cfg.session.owner_priority_followup_minutes = 10       # 之后再打开：关着时送的那批不补提醒
         with later(11):
             self.d.dispatch_once()
         self.assertEqual(self.told(), [])
 
     def test_switched_off_while_waiting_clears_without_reminder(self):
-        self.priority()
-        self.assertEqual(len(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX)), 1)
+        a, _ = self.priority()
+        self.assertEqual(self.echo(a)["alerted"], "")
         self.cfg.session.owner_priority_followup_minutes = 0        # 热加载改成 0
         with later(11):
             self.d.dispatch_once()
         self.assertEqual(self.told(), [])
-        self.assertEqual(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX), [])
+        self.cfg.session.owner_priority_followup_minutes = 10
+        with later(20):
+            self.d.dispatch_once()
+        self.assertEqual(self.told(), [])
 
     def test_custom_minutes(self):
         self.cfg.session.owner_priority_followup_minutes = 3
@@ -578,20 +600,20 @@ class PriorityFollowupTest(PriorityBase):
         with later(4):
             self.d.dispatch_once()
         self.assertEqual(len(self.told()), 1)
-        self.assertIn("3 分钟没见它发任何消息", self.told()[0])
+        self.assertIn("3 分钟没见它回你", self.told()[0])
 
     def test_session_removed_from_roster_not_reminded(self):
-        self.priority()
+        a, _ = self.priority()
         self.d.roster = self.roster = parse_roster(roster_data(session=[s for s in roster_data()["session"]
                                                                         if s["key"] != "alpha"]))
         with later(11):
             self.d.dispatch_once()
         self.assertEqual(self.topic()["state"], sm.CLOSED)
         self.assertEqual(self.told(), [])
-        self.assertEqual(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX), [])
+        self.assertEqual(self.echo(a)["settled_by"], "topic_closed")
 
     def test_crash_recovery_path_starts_followup_too(self):
-        self.owner_reply("周五发")
+        a = self.owner_reply("周五发")
         sent = []
 
         def accepted_then_killed(cid, content):
@@ -603,10 +625,15 @@ class PriorityFollowupTest(PriorityBase):
                 self.d.dispatch_once()
         in_record(ALPHA_CID, sent[0])                               # 重启那一轮记录里已经有了：走 _recover_sending 找到那支
         self.d.dispatch_once()
-        self.assertEqual(len(self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX)), 1)
+        self.assertEqual((self.echo(a)["stage"], self.echo(a)["priority"]), ("delivered", 1))
         with later(11):
             self.d.dispatch_once()
         self.assertEqual(len(self.told()), 1)
+
+    def test_legacy_meta_records_cleared(self):
+        self.store.set_meta("priority_followup:p20261016000000-alpha", "{}")    # 7.47 版本留下的旧记录
+        self.d.dispatch_once()
+        self.assertEqual(self.store.meta_items("priority_followup:"), [])
 
 
 class SendTimeoutTest(PriorityBase):
