@@ -975,8 +975,9 @@ class Collector:
 
     # ---------- 群话题 / 引用归属（7.45 第二节，思路来自 PR #1 @Jerry030-1，issue #2） ----------
     def _group_chat(self, m: Message) -> bool:
-        """群（普通群、话题群），不是找主人聊天、不在 ignore 名单。"""
-        return (m.chat_type not in ("p2p", SYSTEM_CHAT, "") and m.chat_id not in self.cfg.owner_chat_ids
+        """群（普通群、话题群），不是找主人那一侧的聊天（找主人聊天、7.51 的话题群）、不在 ignore 名单。
+        7.51 合并：话题群里主人说话一律走 _topic_group_message，7.45 的 A 类（@ 机器人 = 指令）和话题归属都不作用在它上面。"""
+        return (m.chat_type not in ("p2p", SYSTEM_CHAT, "") and m.chat_id not in self.cfg.owner_side_chat_ids
                 and m.chat_id not in self.cfg.routing.ignore_chat_ids)
 
     def _write_note(self, message_id: str) -> None:
@@ -1602,6 +1603,8 @@ class Collector:
         话题编号的事项开头那条。找到了顺手补上事项的话题编号。"""
         st = self.store
         item = st.item_by_thread(m.thread_id) if m.thread_id else None
+        if item is None and m.root_id and m.root_id != m.message_id:
+            item = st.item_by_root(m.root_id)   # 7.45 起事件带 root_id = 话题开头那条
         if item is None and m.reply_to:
             item = st.item_by_root(m.reply_to)
             if item is None and (s := st.send_by_message(m.reply_to)) is not None and s["root_message_id"]:
@@ -1629,8 +1632,9 @@ class Collector:
         return item
 
     def _tg_top_level(self, m: Message) -> bool:
-        """主人新开的顶层话题：序号是开头序号；没有序号（机器人事件）时没有回复对象就算（事件里的话题回复带 reply_to）。"""
-        if m.reply_to:
+        """主人新开的顶层话题：序号是开头序号；没有序号（机器人事件）时没有回复对象就算（事件里的话题回复带 reply_to，
+        7.45 起还带 root_id = 话题开头那条）。"""
+        if m.reply_to or (m.root_id and m.root_id != m.message_id):
             return False
         pos = (m.thread_position or "").strip()
         return pos == root_position(m.chat_type) if pos else True

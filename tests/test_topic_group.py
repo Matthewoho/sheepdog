@@ -67,6 +67,8 @@ class FakeLarkTG(FakeLark):
         else:
             out["message_app_link"] = (f"https://applink.larksuite.com/client/chat/open?openChatId={m['chat_id']}"
                                        f"&position={out.get('message_position', '1')}")
+        if m.get("mentions"):   # 搜索 / mget 里 @ 机器人是 app_id（7.45 核过）
+            out["mentions"] = [{"id": i, "key": f"@_user_{n}", "name": "x"} for n, i in enumerate(m["mentions"], 1)]
         return out
 
     def __call__(self, argv, capture_output=True, text=True, timeout=None):
@@ -122,6 +124,10 @@ class FakeLarkTG(FakeLark):
             raw["root_id"] = m["thread_root"]
         if with_thread and m["thread_id"]:
             raw["thread_id"] = m["thread_id"]
+        if m["thread_root"]:
+            raw["root_id"] = m["thread_root"]
+        if m.get("mentions"):
+            raw["mentions"] = [{"id": i, "key": f"@_user_{n}", "name": "x"} for n, i in enumerate(m["mentions"], 1)]
         return raw
 
 
@@ -963,3 +969,105 @@ class MiscTest(TGBase):
         with mock.patch.object(tg, "dispatcher_round", spy):
             self.d.dispatch_once()
         self.assertIn(seen["delivered"], ("acked", "delivered"))
+
+
+# ======================= 和 7.45 合并后的三处交叉 =======================
+class MergeWith745Test(TGBase):
+    """7.51 叠在 7.45 上：A 类（主人 @ 机器人 = 指令）不作用在话题群；机器人事件的小轮次照样走话题群分支、不对账索引卡；
+    话题群的抄送和 7.45 的指令都插队，插话没回音提醒都起算。"""
+
+    def setUp(self):
+        super().setUp()
+        from sheepdog.config import IdentityConfig
+        self.cfg.identity = IdentityConfig(enabled=True, bot_open_id="ou_test_botself", bot_app_id=BOT_APP)
+
+    def at_bot(self, chat: str, text: str, root: str = "", chat_type: str = "topic") -> str:
+        mid = self.lark.add(chat_id=chat, sender_id=ME, content=text, chat_type=chat_type, thread_root=root)
+        self.lark.msgs[mid]["mentions"] = [BOT_APP]
+        return mid
+
+    def test_a_class_never_applies_in_topic_group(self):
+        from sheepdog.engine import OWNER_INSTRUCTION
+        self.ask("--key", "AC-1", "--track", text="?")
+        self.poll()
+        it = self.item("AC-1")
+        c = Collector(self.cfg, self.store, self.source, self.roster)
+        # 新开顶层话题、@ 了机器人：仍是话题群入口 3（事项 + 交总线），不是 7.45 的指令
+        top = self.at_bot(TG, "@牧羊犬 帮我盯一下这个")
+        c.ingest([parse_message(self.lark.raw(top))])
+        r = self.row(top)
+        self.assertEqual((r["reason"], r["topic_id"]), ("owner_reply", BUS_TOPIC_ID))
+        self.assertIsNotNone(self.store.item_by_root(top))
+        self.assertNotIn(OWNER_INSTRUCTION, r["tags_json"])
+        # 在事项话题里 @ 机器人回复，机器人事件那一份先到：照样按话题群分支送负责会话
+        rep = self.at_bot(TG, "@牧羊犬 选 A", root=it["root_message_id"])
+        ev = parse_event(self.lark.event(rep))
+        self.assertEqual((ev.root_id, ev.mentions[0].id), (it["root_message_id"], BOT_APP))
+        c.ingest([ev], received_by="bot")
+        r = self.row(rep)
+        self.assertEqual((r["reason"], r["topic_id"]), ("owner_reply", "tp_alpha"))
+        self.assertIn("item:T-1", r["tags_json"])
+        self.assertNotIn(OWNER_INSTRUCTION, r["tags_json"])
+        self.assertFalse(c._group_chat(parse_message(self.lark.raw(rep))))
+        # 对照：普通群里主人 @ 机器人，7.45 的 A 类照常
+        grp = self.at_bot("oc_test_alpha_grp", "@牧羊犬 看一下", chat_type="group")
+        c.ingest([parse_message(self.lark.raw(grp))])
+        self.assertEqual(self.row(grp)["reason"], OWNER_INSTRUCTION)
+
+    def test_mini_cycle_routes_group_messages_and_does_not_refresh_index(self):
+        from sheepdog import cli as cli_mod
+        from test_identity import FakeConsumer
+        self.ask("--key", "MC-1", "--track", text="?")
+        self.poll()
+        self.d.dispatch_once()                         # 完整轮次：索引卡发出、置顶
+        it = self.item("MC-1")
+        idx = tg.index_info(self.store)["message_id"]
+        mid = self.owner_tg("选 B", root=it["root_message_id"])
+        consumer = FakeConsumer()
+        consumer.pending.append(self.lark.event(mid))
+        c = Collector(self.cfg, self.store, self.source, self.roster)
+        c.bot_events = consumer
+        before = len(self.lark.calls)
+        stats = cli_mod._mini_cycle(c, self.d)
+        self.assertEqual(stats["fetched"], 1)
+        r = self.row(mid)
+        self.assertEqual((r["reason"], r["topic_id"]), ("owner_reply", "tp_alpha"))   # 小轮次也走话题群分支
+        self.assertIn(r["dispatch_state"], ("delivered", "acked"))                    # 并且当轮投出去了
+        tg_calls = [x for x in self.lark.calls[before:] if x[:2] in (["im", "messages"], ["im", "pins"],
+                                                                     ["im", "+chat-members-list"])
+                    or (x[1:2] == ["+messages-send"] and _opt(x, "--chat-id") == TG)]
+        self.assertEqual(tg_calls, [])                                                 # 小轮次不对账索引卡、不查成员
+        self.assertEqual(self.lark.patched, {})
+        later = datetime.now().astimezone() + timedelta(minutes=11)
+        with mock.patch("sheepdog.engine._now", return_value=later):
+            self.d.dispatch_once()                                                     # 完整轮次：对账一次
+            self.d.dispatch_once()
+        self.assertEqual(len(self.lark.patched.get(idx, [])), 1)
+
+    def test_cc_and_instruction_both_jump_the_queue_and_start_followups(self):
+        from sheepdog.engine import OWNER_INSTRUCTION, PRIORITY_FOLLOWUP_PREFIX
+        self.ask("--key", "PQ-1", "--track", title="发版", text="今晚？")
+        self.ask("--key", "PQ-1", topic="tp_beta", title="回滚", text="窗口？")
+        self.poll()
+        # 两个会话都在跑上一批（没交回执）
+        for tid in ("tp_alpha", "tp_beta"):
+            self.store.add_system_message(tid, "bus_relay", "先做这件")
+        self.d.dispatch_once()
+        self.assertEqual({self.store.get_topic(t)["state"] for t in ("tp_alpha", "tp_beta")}, {"running"})
+        it = self.item("PQ-1")
+        reply = self.owner_tg("今晚发，窗口 30 分钟", root=it["root_message_id"])   # 没引用：beta 原件、alpha 抄送
+        grp = self.at_bot("oc_test_alpha_grp", "@牧羊犬 顺便看下告警", chat_type="group")   # 7.45 A 类 → tp_alpha
+        self.poll()
+        self.assertEqual(self.row(grp)["reason"], OWNER_INSTRUCTION)
+        rows = self.store.pending_dispatch()
+        alpha = [r for r in rows if r["topic_id"] == "tp_alpha"]
+        self.assertEqual({r["reason"] for r in self.d._priority_rows(alpha)}, {"owner_reply", OWNER_INSTRUCTION})
+        self.d.dispatch_once()
+        for tid in ("tp_alpha", "tp_beta"):
+            self.assertTrue(self.store.get_topic(tid)["pending_batch_id"].startswith("b"))   # 原来那批还在等回执
+        self.assertEqual(self.row(reply)["dispatch_state"], "acked")                 # 插队批次送达即记成已回执
+        self.assertEqual(self.row(grp)["dispatch_state"], "acked")
+        follow = {json.loads(v)["topic"] for _, v in self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX)}
+        self.assertEqual(follow, {"tp_alpha", "tp_beta"})                          # 插话没回音提醒都起算
+        self.assertEqual({e["close_reason"] for e in self.store.conn.execute("SELECT close_reason FROM escalations")},
+                         {"answered"})
