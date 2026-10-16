@@ -105,12 +105,18 @@ class Playbook:
             "cli": cfg.cli_command,
             # 7.26：只在开着时有这个键，关着时占位符和以前完全一样
             **({"identity_enabled": "1"} if getattr(getattr(cfg, "identity", None), "enabled", False) else {}),
+            # 7.51：配了话题群并开着才有这个键（接口说明里加「长期跟踪：话题群」一节）；没配时规则和指纹都不变
+            **({"topic_group_enabled": "1"} if getattr(getattr(cfg, "topic_group", None), "active", False) else {}),
         })
 
     @property
     def identity(self) -> bool:
         """[identity] 开着（7.26）：接口说明里代回那一条补一句「sheepdog 自动选身份」。关着时 base_vars 里没有这个键。"""
         return self.base_vars.get("identity_enabled") == "1"
+
+    @property
+    def topic_group(self) -> bool:
+        return self.base_vars.get("topic_group_enabled") == "1"
 
     @property
     def receipt_timeout(self) -> int:

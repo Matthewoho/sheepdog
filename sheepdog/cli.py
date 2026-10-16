@@ -231,6 +231,13 @@ def _source(cfg):
     return LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages)
 
 
+def _group_source(source, args):
+    """往话题群发东西用的飞书（7.51）：--dry-run、测试环境（[source] enabled = false）不给，常驻进程就不往群里发。"""
+    if getattr(args, "dry_run", False) or isinstance(source, NullSource):
+        return None
+    return source
+
+
 def _sinks(cfg, store: Store, dry: bool) -> dict:
     """按宿主建 sink（7.18）：sink = dryrun 只管 Antigravity；--dry-run 一律打印。没启用的宿主不建。"""
     sinks: dict = {ANTIGRAVITY: DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()}
@@ -382,6 +389,7 @@ def cmd_doctor(args) -> int:
           + ("" if cfg.owner_context.skip_prefixes or cfg.owner_context.agent_markers
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     print(owner_chats_report(cfg))
+    print(topic_group_report(cfg, store))
     for line in switches_report(cfg):
         print(line)
     for line in threads_report(cfg):
@@ -410,6 +418,23 @@ def owner_chats_report(cfg) -> str:
         return "找主人聊天: （未配置：主人在 IM 上的回复不会送回会话）"
     extra = "，含测试群 [threads] owner_chat_id" if cfg.threads.owner_chat_id else ""
     return f"找主人聊天: ✓ {len(chats)} 个{extra}，未结保留 {esc.open_hours:g} 小时"
+
+
+def topic_group_report(cfg, store: Store) -> str:
+    """doctor：话题群（7.51）配没配、开没开、是不是退回私聊了、跟踪中几件。"""
+    from . import topicgroup as tg
+    g = cfg.topic_group
+    if not g.chat_id:
+        return "话题群: 没配（[topic_group] chat_id 为空，长期跟踪的事照旧在私聊）"
+    if not g.enabled:
+        return f"话题群: {g.chat_id} 关着（[topic_group] enabled = false：都走私聊，群里的消息不分派）"
+    down = tg.down_info(store)
+    n = len(store.list_items((tg.ACTIVE, tg.DONE)))
+    if down is not None:
+        return f"话题群: ⚠ {g.chat_id} 已退回私聊（{down.get('since', '')}：{down.get('why', '')}），跟踪中 {n} 件"
+    idx = tg.index_info(store)
+    return (f"话题群: ✓ {g.chat_id}，跟踪中 {n} 件，索引卡 {idx.get('message_id') or '还没发'}，"
+            f"每 {g.index_refresh_minutes:g} 分钟对账")
 
 
 def switches_report(cfg) -> list[str]:
@@ -688,8 +713,9 @@ def cmd_poll(args) -> int:
     cfg, store, source, sink, roster, security = _build(args)
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
+    collector.dry_run = bool(getattr(args, "dry_run", False))
     dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker,
-                                                          _notifier(cfg, source, args))
+                                                          _notifier(cfg, source, args), _group_source(source, args))
     _cycle(collector, dispatcher)
     return 0
 
@@ -758,7 +784,9 @@ def cmd_run(args) -> int:
     _save_last_good(cfg)   # 启动时三样都加载成功了：存一份给会话侧命令兜底
     acker = _acker(cfg, store, source, args)
     collector = Collector(cfg, store, source, roster, security, acker)
-    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args))
+    collector.dry_run = bool(getattr(args, "dry_run", False))
+    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args),
+                            _group_source(source, args))
     logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
                  "、".join(f"{h}={s.name}" for h, s in sink.items()))
     consumer = _start_bot_events(cfg, store, source, args)
@@ -1029,7 +1057,7 @@ def cmd_forward(args) -> int:
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
         ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
-                               cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns)
+                               cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns, cfg.cli_command)
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
@@ -1678,7 +1706,7 @@ def cmd_ask(args) -> int:
                                outbound.compose(cfg, kind, tid, args.title, body))
     try:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
-                                   about=getattr(args, "about", None) or None)
+                                   about=getattr(args, "about", None) or None, track=getattr(args, "track", False))
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -1686,8 +1714,14 @@ def cmd_ask(args) -> int:
         print(line)
     if hint := outbound.source_hint(r):
         print(hint)
+    if r.note:
+        print(f"⚠ {r.note}")
     if r.already:
         print(f"之前已经发过同样的内容（防重编号相同，这次没再发）：message_id {r.message_id}")
+    elif r.item:
+        what = "新开了事项" if r.new_item else "重开了事项" if r.reopened else "发到了话题群里的事项"
+        print(f"{what} {r.item}（话题群，钥匙 {args.key}）：message_id {r.message_id}。之后用 --key {args.key} 或 --key {r.item} "
+              "的消息都发进群里这个话题；办完用 `sheepdog track done`")
     elif r.new_thread:
         print(f"已发给主人，新起了一个话题（钥匙 {args.key}）：message_id {r.message_id}。之后同一把钥匙的消息都回到这个话题里")
     elif r.root_message_id:
@@ -1796,6 +1830,94 @@ def cmd_thread(args) -> int:
         return e.code
     print(outbound.render_thread(cfg, v))
     return outbound.EXIT_OK
+
+
+def cmd_track(args) -> int:
+    """sheepdog track（7.51）：会话结束一件话题群里的事项（done）、给事项登记别名（alias）、只读列出（list）。"""
+    from . import topicgroup as tg
+    cfg = _load_cfg()
+    store = Store(cfg.db_path)
+    if args.track == "list":
+        lines = tg.list_lines(cfg, store, include_all=args.all)
+        print("\n".join(lines) if lines else "（话题群里没有跟踪中的事项）")
+        return 0
+    tid = _topic_arg(args.topic)
+    if not outbound.target_ok(store, tid):
+        print(f"track {args.track} 没做: {tid} 不是在投递的会话", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    key = " ".join((args.key if args.track == "done" else args.item).split())
+    item = tg.find_by_key(store, key)
+    if item is None or item["state"] == tg.REMOVED:
+        print(f"track {args.track} 没做: 话题群里没有钥匙 {key!r} 的事项（`sheepdog track list` 看）", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    no = tg.label(item["item_no"])
+    if args.track == "done":
+        why = " ".join((args.why or "").split())
+        if not why:
+            print("track done 没做: --why 不能为空：一句话写依据", file=sys.stderr)
+            return outbound.EXIT_INVALID
+        if item["state"] != tg.ACTIVE:
+            print(f"{no} 已经{tg.STATUS_LABEL.get(item['state'], item['state'])}，这次没动")
+            return outbound.EXIT_OK
+        tg.close(store, item, tid, why)
+        print(f"已把 {no}「{item['title']}」标成办完了；牧羊犬下一轮在话题里补一行「✅ 办完了」并更新索引卡。"
+              f"同一把钥匙再发 ask / report 会把它重开")
+        return outbound.EXIT_OK
+    alias = " ".join((args.key or "").split())
+    other = tg.find_by_key(store, alias)
+    if other is not None and other["item_no"] != item["item_no"] and other["state"] in (tg.ACTIVE, tg.DONE):
+        print(f"track alias 没做: 钥匙 {alias!r} 已经是 {tg.label(other['item_no'])} 的钥匙", file=sys.stderr)
+        return outbound.EXIT_INVALID
+    store.add_item_key(item["item_no"], alias, tg.track_norm(alias), "alias", tid)
+    print(f"已把 {alias} 登记成 {no} 的别名：之后 --key {alias} 的 ask / report 发进群里 {no} 的话题")
+    return outbound.EXIT_OK
+
+
+def cmd_topic_group(args) -> int:
+    """sheepdog topic-group create（7.51）：建话题群。--dry-run 只打印要调的 lark-cli 命令；真建群由上线脚本在主人授权后跑。
+    群主是主人，机器人当管理员，只有群主和管理员能拉人。建完把 chat_id 写进配置 [topic_group]。"""
+    import shlex as _sh
+    cfg = _load_cfg()
+    if args.tg == "status":
+        print(topic_group_report(cfg, Store(cfg.db_path)))
+        return 0
+    me = cfg.self_open_id
+    if not me:
+        print("topic-group create 没做: 配置里没有 self_open_id，不知道群主是谁", file=sys.stderr)
+        return 2
+    name = args.name.strip()
+    create = ["im", "+chat-create", "--chat-mode", "topic", "--type", "private", "--name", name, "--owner", me,
+              "--users", me, "--set-bot-manager", "--format", "json"]
+    perm = {"add_member_permission": "only_owner", "share_card_permission": "not_allowed"}
+    update = ["im", "chats", "update", "--params", '{"chat_id":"<CHAT_ID>"}', "--data", json.dumps(perm), "--yes"]
+    if args.dry_run:
+        print("# 1. 建话题群（机器人身份；群主 = 主人，机器人当管理员）")
+        print(" ".join(_sh.quote(x) for x in ["lark-cli", *create, "--as", "bot"]))
+        print("# 2. 只有群主和管理员能拉人（im chats update 是 high-risk-write，要 --yes；schema 写着只支持 chat_mode = group 的群，"
+              "话题群要在真飞书上核）")
+        print(" ".join(_sh.quote(x) for x in ["lark-cli", *update, "--as", "bot"]))
+        print("# 3. 把第 1 步返回的 chat_id 写进配置：")
+        print('[topic_group]\nenabled = true\nchat_id = "<CHAT_ID>"')
+        return 0
+    src = LarkCliSource(tz=cfg.timezone_offset)
+    try:
+        data = src._run_once(create, "bot")
+    except Exception as e:
+        print(f"建群失败: {e}", file=sys.stderr)
+        return 1
+    chat = src._find(data, "chat_id") or ""
+    if not chat:
+        print(f"建群没返回 chat_id: {json.dumps(data, ensure_ascii=False)[:300]}", file=sys.stderr)
+        return 1
+    print(f"已建话题群：{chat}")
+    try:
+        src._run_once(["im", "chats", "update", "--params", json.dumps({"chat_id": chat}), "--data", json.dumps(perm),
+                       "--yes"], "bot")
+        print("已设成只有群主和管理员能拉人")
+    except Exception as e:
+        print(f"⚠ 设「只有群主和管理员能拉人」失败（话题群可能不支持 im chats update，在群设置里手动改）：{e}")
+    print(f'把这两行写进配置 [topic_group]：\nenabled = true\nchat_id = "{chat}"')
+    return 0
 
 
 def cmd_hook_stop(args) -> int:
@@ -2008,6 +2130,9 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
         sp.add_argument("--batch", default="",
                         help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
+        sp.add_argument("--track", action="store_true",
+                        help="长期跟踪（7.51）：第一次用这把 --key 时带上，这件事放进话题群（一件事一个话题）；"
+                             "之后同一把钥匙不用再带，自动发进群里那个话题")
         if name == "ask":
             sp.add_argument("--about", action="append", default=[],
                             help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。"
@@ -2043,6 +2168,28 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--key", help="钥匙（ask / report 带这把 --key 发过）")
     g.add_argument("--thread", help="话题编号 omt_…（或开头那条的 om_）")
     sp.set_defaults(func=cmd_thread)
+
+    sp = sub.add_parser("track", help="话题群里的事项（7.51）：办完、登记别名、列出")
+    tsub = sp.add_subparsers(dest="track", required=True)
+    t = tsub.add_parser("done", help="这件事办完了（只认明确的命令）；牧羊犬在话题里补一行并更新索引卡")
+    t.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    t.add_argument("--key", required=True, help="钥匙或事项编号（T-12）")
+    t.add_argument("--why", required=True, help="依据，一句话")
+    t = tsub.add_parser("alias", help="给事项登记别名：之后这把钥匙的 ask / report 也发进这件事的话题")
+    t.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
+    t.add_argument("--item", required=True, help="事项编号（T-12）或它已有的钥匙")
+    t.add_argument("--key", required=True, help="要登记的钥匙")
+    t = tsub.add_parser("list", help="只读：话题群里跟踪中的事项和状态")
+    t.add_argument("--all", action="store_true", help="含已归档、已移出的")
+    sp.set_defaults(func=cmd_track)
+
+    sp = sub.add_parser("topic-group", help="话题群（7.51）：建群（create，--dry-run 只打印命令）、看状态（status）")
+    gsub = sp.add_subparsers(dest="tg", required=True)
+    g = gsub.add_parser("create", help="建话题群：群主是主人、机器人当管理员、只有群主和管理员能拉人")
+    g.add_argument("--name", default="🐕 牧羊犬 · 长期跟踪", help="群名")
+    g.add_argument("--dry-run", action="store_true", help="只打印要调的 lark-cli 命令，不建群")
+    gsub.add_parser("status", help="只读：配没配、开没开、是不是退回私聊了")
+    sp.set_defaults(func=cmd_topic_group)
 
     sp = sub.add_parser("hook", help="Antigravity 生命周期 hook（由 hooks.json 调用，不是给人敲的）")
     hsub = sp.add_subparsers(dest="hook", required=True)

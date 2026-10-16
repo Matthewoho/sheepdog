@@ -70,6 +70,10 @@ class SendResult:
     sources: list = field(default_factory=list)      # [(消息号, 聊天)]
     duplicates: list = field(default_factory=list)   # 同一来源已有别的会话在问（还开着）
     batch_chats: int = 0            # 不给 --about 时这一批候选消息来自几个聊天（7.38：多于一个就不记来源）
+    item: str = ""                  # 7.51：发进了话题群里哪件事项（T-12）；空 = 私聊
+    new_item: bool = False          # 这次新开了这件事项（发了标题卡）
+    reopened: bool = False          # 这件事办完 / 归档了，这次重开
+    note: str = ""                  # 给会话看的一句提示（--track 没生效、群不可用退回私聊等）
 
 
 @dataclass
@@ -128,9 +132,14 @@ def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | Non
 
 
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
-                  key: str = "", batch: str = "", about: list[str] | None = None) -> SendResult:
+                  key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False) -> SendResult:
     """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。
-    ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。"""
+    ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。
+    7.51：这把钥匙是话题群里的一件事项，或者第一次用这把钥匙时带 --track（track = True）：发进话题群里那件事的话题
+    （没有就先开一件、发标题卡）；群发不进去就退回私聊，并发一条系统通知。"""
+    from . import topicgroup as tg
+    if track and not _one_line(key):
+        raise OutboundError(EXIT_INVALID, "--track 要和 --key 一起用：长期跟踪的事要有钥匙")
     if kind not in (ASK, REPORT):
         raise OutboundError(EXIT_INVALID, f"未知种类 {kind!r}")
     if not target_ok(store, topic_id):
@@ -150,7 +159,71 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     if prev is not None:
         res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text,
                          batch_chats=n_chats)
+        it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
+        res.item = tg.label(it["item_no"]) if it is not None else ""
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+    route = tg.route_for_send(cfg, store, topic_id, key, track)
+    if route.group:
+        try:
+            res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route)
+            res.batch_chats = n_chats
+            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+        except _GroupDown as e:
+            route = tg.SendRoute(note=f"话题群发不进去（{e}），已退回私聊，这条发进了私聊")
+    res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik)
+    res.batch_chats, res.note = n_chats, route.note
+    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+
+
+class _GroupDown(Exception):
+    """往话题群发失败（飞书报错，不是超时）：已标记退回私聊，这一条改发私聊。"""
+
+
+def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str,
+                   text: str, ik: str, route) -> SendResult:
+    """7.51：发进话题群里那件事的话题。没有这件事就先开（标题卡是开头那条），办完 / 归档的重开。只有 ask @ 主人。
+    超时原样抛（OutboundError 退出码 1，会话原样重试：标题卡和这一条的防重编号都不变，飞书只发一条）。"""
+    from . import topicgroup as tg
+    item, created = route.item, False
+    if item is None:
+        item = tg.open_item(store, title, topic_id, topic_id, tg.ORIGIN_TRACK, cfg.topic_group.chat_id, key=key,
+                            topic_id=topic_id, related=route.related)
+        created = True
+    else:
+        # 别的会话用同一把钥匙（-、_、空格不分）也发进这件事：钥匙原样记一笔（已经有的不动）
+        store.add_item_key(item["item_no"], key, tg.track_norm(key), "alias", topic_id)
+    t = store.get_topic(topic_id)
+    opener = f"{((t['title'] or '').strip() if t is not None else '') or topic_id}（{topic_id}）"
+    try:
+        item = tg.ensure_title(cfg, store, source, item, opener, key)
+        plain, card = owner_content(cfg, text, at=kind == ASK)   # 群里只有「需要你定」@ 主人
+        res = send_owner(lambda tx, c: source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx,
+                                                       card=c, in_thread=True), plain, card)
+    except LarkTimeout as e:
+        raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
+    except SourceError as e:
+        if created and not store.get_item(item["item_no"])["root_message_id"]:
+            store.delete_item(item["item_no"])
+        why = " ".join(str(e).split())[:200]
+        tg.mark_down(cfg, store, f"往话题群发消息失败：{why}")
+        raise _GroupDown(why)
+    mid = res["message_id"]
+    reopened = tg.reopen(store, item)
+    tg.touch(store, item["item_no"])
+    tg.mark_dirty(store)
+    if not item["thread_id"] and res.get("thread_id"):
+        store.update_item(item["item_no"], thread_id=res["thread_id"])
+    store.add_send(ik, kind, topic_id, mid, text, root_message_id=item["root_message_id"], key=key, norm_key=nk,
+                   identity=ident.BOT if cfg.identity.enabled else None)
+    # 会话发的提问、汇报照旧记来源（主人引用回复时按这里送回）；牧羊犬自己的话不记
+    store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
+    return SendResult(mid, root_message_id=item["root_message_id"], new_thread=created, text=text,
+                      item=tg.label(item["item_no"]), new_item=created, reopened=reopened)
+
+
+def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str, text: str,
+             ik: str) -> SendResult:
+    """私聊主人（7.22 一事一串，原来的路）。"""
     root = store.thread_by_key(topic_id, nk) if nk else None
     # 7.29：话题里的回复不提醒主人，末尾 @ 他（第一行不变，照旧认得出「需要你定」和会话）；7.48：发成卡片
     plain, card = owner_content(cfg, text, at=root is not None)
@@ -185,8 +258,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
                    identity=ident.BOT if cfg.identity.enabled else None)
     # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
-    res = SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text, batch_chats=n_chats)
-    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+    return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
 
 
 def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: str, origin: str,
@@ -237,6 +309,15 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
     opens = open_escalations(store, cfg.escalation.open_hours, topic_id)
     if key:
         thr = store.thread_by_key(topic_id, duty.norm_key(key))
+        from . import topicgroup as tg
+        item = tg.find_by_key(store, key) if cfg.topic_group.chat_id else None
+        if item is not None and item["root_message_id"]:
+            # 7.51：这把钥匙是话题群里的一件事项：结掉这个会话在群里那个话题里还开着的，那句话回在群里的话题
+            root = item["root_message_id"]
+            in_thread = {s["message_id"] for s in store.sends_in_thread(root)}
+            mine = [e for e in opens if e["message_id"] in in_thread]
+            if mine or thr is None:
+                return mine, root, root
         if thr is None:
             raise OutboundError(EXIT_INVALID, f"{topic_id} 名下没有钥匙 {key!r} 的话题（ask 带这把 --key 发过才有）")
         root = thr["root_message_id"]
@@ -473,7 +554,7 @@ def owner_spoke_since(cfg: Config, store: Store, source, target: sqlite3.Row) ->
 def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
     """10-13 热修：要回复的那条在「找主人」聊天里（[escalation] chat_ids、[threads] owner_chat_id）就拒绝。
     sheepdog reply 是以主人身份回别人的；在找主人聊天里用它，等于以主人身份回主人自己，还会被当成主人亲自回复投回会话。"""
-    if chat_id and chat_id in cfg.owner_chat_ids:
+    if chat_id and chat_id in cfg.owner_side_chat_ids:
         raise OutboundError(EXIT_INVALID,
                             "要回复的那条在「找主人」聊天里（主人和机器人的私聊），sheepdog reply 只用来以主人身份回别人，"
                             "不能在这里用。回主人请用 "
@@ -605,15 +686,24 @@ class ThreadView:
 
 def find_thread(store: Store, topic_id: str, key: str = "", thread: str = "") -> tuple[sqlite3.Row | None, str, str]:
     """按钥匙或话题编号（omt_ / 开头那条的 om_）找话题。返回 (话题行或 None, thread_id, 开头那条)。
-    钥匙找不到、或话题记在别的会话名下（总线除外）抛 OutboundError。"""
+    钥匙找不到、或话题记在别的会话名下（总线除外）抛 OutboundError。
+    7.51：话题群里的事项谁都能看（一件事跨会话），按钥匙（含 T-编号）或话题编号找得到就返回 (None, 话题编号, 开头那条)。"""
+    item = None
     if key:
         thr = store.thread_by_key(topic_id, duty.norm_key(key))
+        from . import topicgroup as tg
+        item = tg.find_by_key(store, key) if thr is None else None
+        if item is not None and item["root_message_id"]:
+            return None, item["thread_id"] or "", item["root_message_id"]
         if thr is None:
             raise OutboundError(EXIT_INVALID, f"{topic_id} 名下没有钥匙 {key!r} 的话题（ask / report 带这把 --key 发过才有）")
         return thr, thr["thread_id"] or "", thr["root_message_id"]
     thread = (thread or "").strip()
     if not thread.startswith(("omt_", "om_")):
         raise OutboundError(EXIT_INVALID, "--thread 要给 omt_ 开头的话题编号或开头那条的 om_ 消息号")
+    item = store.item_by_thread(thread) or store.item_by_root(thread)
+    if item is not None and item["root_message_id"]:
+        return None, item["thread_id"] or "", item["root_message_id"]
     thr = store.thread_by_thread_id(thread) or store.thread_by_root(thread)
     if thr is not None:
         if thr["topic_id"] != topic_id and topic_id != BUS_TOPIC_ID:

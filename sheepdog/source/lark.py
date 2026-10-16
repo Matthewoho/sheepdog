@@ -346,6 +346,34 @@ class LarkCliSource:
         return {"message_id": str(mid), "chat_id": str(self._find(data, "chat_id") or ""),
                 "thread_id": str(self._find(data, "thread_id") or "")}
 
+    # ---------- 话题群（7.51）：改卡、置顶、查成员。机器人身份，只试一次 ----------
+    def patch_card(self, message_id: str, card: dict, identity: str = "bot") -> None:
+        """整张覆盖机器人发的卡片（im messages patch，PATCH /open-apis/im/v1/messages/:message_id）：只能改 14 天内发的、
+        内容不超过 30 KB；卡片 2.0 只有共享卡片，可以改。"""
+        self._run_once(["im", "messages", "patch", "--params", json.dumps({"message_id": message_id}),
+                        "--data", json.dumps({"content": json.dumps(card, ensure_ascii=False)}, ensure_ascii=False)],
+                       identity)
+
+    def pin(self, message_id: str, identity: str = "bot") -> None:
+        """置顶（im pins create，POST /open-apis/im/v1/pins）。"""
+        self._run_once(["im", "pins", "create", "--data", json.dumps({"message_id": message_id})], identity)
+
+    def unpin(self, message_id: str, identity: str = "bot") -> None:
+        """取消置顶（im pins delete）。lark-cli 标成 high-risk-write，要带 --yes；只在 [topic_group] unpin_old_index 打开时调。"""
+        self._run_once(["im", "pins", "delete", "--params", json.dumps({"message_id": message_id}), "--yes"], identity)
+
+    def chat_members(self, chat_id: str, identity: str = "bot") -> dict:
+        """群成员（im +chat-members-list，只读）：{"users": [open_id…], "bots": [app_id / open_id…]}。翻完所有页。"""
+        data = self._run_once(["im", "+chat-members-list", "--chat-id", chat_id, "--page-all", "--page-limit", "0",
+                               "--format", "json"], identity)
+        d = data.get("data") if isinstance(data.get("data"), dict) else data
+        users = [u.get("member_id") or u.get("open_id") for u in d.get("users") or [] if isinstance(u, dict)]
+        bots = []
+        for b in d.get("bots") or []:
+            if isinstance(b, dict):
+                bots += [x for x in (b.get("app_id"), b.get("member_id"), b.get("open_id")) if x]
+        return {"users": [u for u in users if u], "bots": bots}
+
     # ---------- 读：话题、发前检查（7.22），user 身份，只读 ----------
     def thread_messages(self, thread: str, order: str = "asc", max_pages: int = 10) -> list[Message]:
         """一个话题里的回复（thread 可以是 omt_ 话题编号，也可以是开头那条的 om_ 消息号）。

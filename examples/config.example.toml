@@ -115,6 +115,19 @@ group_owner = true
 # 话题最近一次有人说话超过这么多小时就不再自动归属
 group_owner_hours = 72
 
+[topic_group]
+# 长期跟踪的话题放进专门的话题群（7.51）：一件事一个话题（事项，编号 T-<数字>），群里置顶一张索引卡。
+# chat_id 留空 = 不用话题群，和以前一模一样。群用 `sheepdog topic-group create` 建（--dry-run 先看要调的命令）：
+# 群主是你、机器人当管理员、只有群主和管理员能拉人。全部热加载
+enabled = true
+# chat_id = "oc_xxx"
+# 索引卡多久按证据对账一次（分钟）；没办完、多少天没动静算「沉睡」；办完以后多少小时没动静归档
+index_refresh_minutes = 10
+stale_after_days = 7
+archive_after_hours = 72
+# 索引卡满 13 天重发一张以后要不要取消旧卡的置顶（lark-cli 把取消置顶标成高风险，要 --yes）。默认不取消，旧卡改成「已停用」
+unpin_old_index = false
+
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
 enabled = true

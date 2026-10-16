@@ -304,6 +304,44 @@ class ThreadsConfig:
 
 
 @dataclass
+class TopicGroupConfig:
+    """[topic_group]（7.51 长期跟踪的话题放进专门的话题群）。热加载，常驻进程下一轮生效，会话侧命令每次现读。
+
+    没设 chat_id（默认）= 和以前一模一样：没有话题群，ask / report 照旧进私聊。
+    设了 chat_id、enabled = true：会话第一次用一把钥匙发 ask / report 时带 --track、主人在私聊里整句回「放群里」、
+    主人在群里新开顶层话题，这三种事进群（一件事一个话题，事项编号 T-<数字>）；群里置顶一张索引卡。
+    设了 chat_id、enabled = false：照旧走私聊；群里的消息一律不分派（drop），也不往群里发。
+    测试环境把 chat_id 设成测试用的话题群就行，一切照常发进它。"""
+    enabled: bool = True
+    chat_id: str = ""
+    # 索引卡多久按证据对账一次（分钟）；中间有事项开出来 / 办完 / 重开时下一轮就对账
+    index_refresh_minutes: float = 10
+    # 没办完、这么多天没动静：索引卡「沉睡」
+    stale_after_days: float = 7
+    # 办完以后这么多小时没动静就归档（不再上索引卡）
+    archive_after_hours: float = 72
+    # 索引卡满 13 天重发一张以后，要不要取消旧卡的置顶。lark-cli 把取消置顶（im pins delete）标成 high-risk-write，
+    # 要带 --yes 才执行；默认 false = 不取消，旧卡改成「已停用，请看最新置顶的那张」。打开前要主人同意（7.51 实现侧加的开关）
+    unpin_old_index: bool = False
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("[topic_group] enabled 必须是 true/false")
+        if not isinstance(self.unpin_old_index, bool):
+            raise ConfigError("[topic_group] unpin_old_index 必须是 true/false")
+        if not isinstance(self.chat_id, str) or (self.chat_id and not self.chat_id.startswith("oc_")):
+            raise ConfigError("[topic_group] chat_id 必须是 oc_ 开头的群 ID（sheepdog topic-group create 建的话题群）；留空 = 不用话题群")
+        for k in ("index_refresh_minutes", "stale_after_days", "archive_after_hours"):
+            if not _positive(getattr(self, k)):
+                raise ConfigError(f"[topic_group] {k} 必须是正数")
+
+    @property
+    def active(self) -> bool:
+        """配了话题群并且开着。"""
+        return bool(self.enabled and self.chat_id)
+
+
+@dataclass
 class LoopGuardConfig:
     # 防止和 Agent 机器人来回循环（7.14）。名字 / id 的具体值只写在个人配置里
     agent_sender_names: list[str] = field(default_factory=list)   # 发送人名字包含其一（不分大小写）即视为 Agent
@@ -668,6 +706,7 @@ class Config:
     audit: AuditConfig = field(default_factory=AuditConfig)
     duty: DutyConfig = field(default_factory=DutyConfig)
     threads: ThreadsConfig = field(default_factory=ThreadsConfig)
+    topic_group: TopicGroupConfig = field(default_factory=TopicGroupConfig)
     # 会话在自己终端里敲的 sheepdog 命令（提示词里所有「去跑 sheepdog …」的命令文字都用它）。
     # 测试环境改成一个只连测试配置的包装脚本的绝对路径，免得会话把操作写进正式账本。热加载，下一轮生效
     cli_name: str = "sheepdog"
@@ -704,6 +743,17 @@ class Config:
         out = list(self.escalation.chat_ids)
         if self.threads.owner_chat_id and self.threads.owner_chat_id not in out:
             out.append(self.threads.owner_chat_id)
+        return out
+
+    @property
+    def owner_side_chat_ids(self) -> list[str]:
+        """「找主人」那一侧的聊天（7.51）：找主人聊天，加上配了的话题群（[topic_group] chat_id，开没开都算）。
+        这些聊天里主人说的话不当成别处的背景、不算防循环、不能当提问来源、不能用 sheepdog reply 代回；
+        入账时先于普通路由处理（话题群走自己的分支）。"""
+        out = self.owner_chat_ids
+        tg = self.topic_group.chat_id
+        if tg and tg not in out:
+            out.append(tg)
         return out
 
     def host_enabled(self, host: str) -> bool:
@@ -788,6 +838,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.audit, data.get("audit", {}))
     _apply(cfg.duty, data.get("duty", {}))
     _apply(cfg.threads, data.get("threads", {}))
+    _apply(cfg.topic_group, data.get("topic_group", {}))
     _apply(cfg.hooks, data.get("hooks", {}))
     _apply(cfg.run, data.get("run", {}))
     hosts = data.get("hosts", {})
@@ -829,6 +880,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.audit.validate()
     cfg.duty.validate()
     cfg.threads.validate()
+    cfg.topic_group.validate()
     cfg.hooks.validate()
     cfg.routing.validate()
     cfg.run.validate()
@@ -842,6 +894,11 @@ def load_config(path: Path | None = None) -> Config:
     if owner_chat and cfg.source.only_chat_ids and owner_chat not in cfg.source.only_chat_ids:
         raise ConfigError(f"[threads] owner_chat_id {owner_chat} 不在 [source] only_chat_ids 里：找主人的群拉不到，"
                           "主人的回复送不回会话")
+    tg = cfg.topic_group.chat_id
+    if tg and tg in cfg.owner_chat_ids:
+        raise ConfigError(f"[topic_group] chat_id {tg} 和找主人聊天是同一个：话题群要另建一个")
+    if tg and cfg.source.only_chat_ids and tg not in cfg.source.only_chat_ids:
+        raise ConfigError(f"[topic_group] chat_id {tg} 不在 [source] only_chat_ids 里：话题群拉不到，主人在群里说的话送不回会话")
     if owner_chat and not cfg.escalation.header_regex:
         raise ConfigError("[threads] owner_chat_id 已配置但 [escalation] header_regex 为空：ask 发的「需要你定」将无法识别")
     for h in cfg.hosts.values():

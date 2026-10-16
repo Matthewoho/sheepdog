@@ -85,7 +85,7 @@ def batch_sources(cfg, store: Store, batch_id: str) -> list[tuple[str, str]]:
     d = store.get_dispatch(batch_id)
     ids = json.loads(d["message_ids"] or "[]") if d is not None else [
         r[0] for r in store.conn.execute("SELECT message_id FROM messages WHERE batch_id=? ORDER BY rowid", (batch_id,))]
-    owner_chats = set(cfg.owner_chat_ids)
+    owner_chats = set(cfg.owner_side_chat_ids)
     out: list[tuple[str, str]] = []
     for mid in ids:
         if not mid or mid.startswith(SYSTEM_ID_PREFIX):
@@ -260,7 +260,7 @@ def _owner_followups(cfg, store: Store, srcs) -> list:
     在来源消息所在话题里的（按来源消息的 thread_id 比：它本身在话题里，或者它就是话题开头那条、账本里已经补上了话题编号——
     engine._learn_source_thread 在主人在群话题里说话时补）。找主人聊天里的不算。"""
     me = cfg.self_open_id
-    owner_chats = set(cfg.owner_chat_ids)
+    owner_chats = set(cfg.owner_side_chat_ids)
     out: dict[str, object] = {}
     p2p_chats: set[str] = set()
     for s in srcs:

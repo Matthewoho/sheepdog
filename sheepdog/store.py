@@ -476,6 +476,46 @@ CREATE TABLE IF NOT EXISTS bot_absent_chats (
     first_at    TEXT NOT NULL,
     last_at     TEXT NOT NULL
 );
+
+-- 跟踪事项（7.51 话题群）：一件事一行、一个话题。编号 item_no 对外写成 T-<item_no>。不跟 7 天保留期走：归档满 30 天才删
+CREATE TABLE IF NOT EXISTS tracked_items (
+    item_no            INTEGER PRIMARY KEY AUTOINCREMENT,
+    title              TEXT NOT NULL,
+    owner_topic        TEXT,              -- 负责会话（转交后跟着改）
+    opened_by          TEXT,              -- 谁开的：会话 topic_id | owner（主人）
+    origin             TEXT NOT NULL,     -- track（会话 --track）| owner_move（主人「放群里」）| owner_topic（主人在群里新开）
+    state              TEXT NOT NULL,     -- active | done | archived | removed（只在明确的事件上改）
+    status             TEXT,              -- 上一次对账按证据算出的显示状态（变化时在话题里发一行）
+    chat_id            TEXT,              -- 话题群
+    root_message_id    TEXT,              -- 群里这个话题开头那条（标题卡，或主人开的那条）；还没发出去是空
+    thread_id          TEXT,              -- omt_…；发出时可能不知道，mget / 拉取以后补
+    dm_root_message_id TEXT,              -- 私聊里原来那个话题的开头那条（「放群里」搬进来的；owner_threads 里这行跟着不清）
+    related_item       INTEGER,           -- 可能相关：同一把钥匙归档超过 14 天又用到时新开的，指向老的那件
+    done_by            TEXT,              -- 办完 / 移出是谁说的：会话 topic_id | owner
+    done_why           TEXT,
+    handoff_to         TEXT,              -- 转交给了谁、话题里还没说「已交给 …」（说完清空）
+    handoff_at         TEXT,
+    opened_at          TEXT NOT NULL,
+    last_activity_at   TEXT,              -- 最近动静（会话往里发、主人在里面说话）
+    done_at            TEXT,
+    archived_at        TEXT,
+    reopened_at        TEXT,
+    removed_at         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_root ON tracked_items(root_message_id) WHERE root_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_items_thread ON tracked_items(thread_id);
+CREATE INDEX IF NOT EXISTS idx_items_dm_root ON tracked_items(dm_root_message_id);
+
+-- 事项的钥匙（7.51）：编号本身（kind = number）、会话的钥匙（key）、别名（alias）。norm_key = topicgroup.track_norm
+CREATE TABLE IF NOT EXISTS tracked_keys (
+    norm_key  TEXT NOT NULL,
+    item_no   INTEGER NOT NULL,
+    key       TEXT,
+    kind      TEXT NOT NULL,
+    topic_id  TEXT,
+    added_at  TEXT NOT NULL,
+    PRIMARY KEY (norm_key, item_no)
+);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -1676,6 +1716,72 @@ class Store:
                               "ORDER BY create_time DESC LIMIT 1", (person_id,)).fetchone()
         return r[0] if r else ""
 
+    # ---------- 跟踪事项（7.51） ----------
+    def add_item(self, *, title: str, owner_topic: str, opened_by: str, origin: str, chat_id: str,
+                 dm_root_message_id: str = "", related_item: int | None = None, root_message_id: str = "",
+                 thread_id: str = "") -> int:
+        ts = now_iso()
+        with self.tx() as c:
+            cur = c.execute(
+                """INSERT INTO tracked_items(title,owner_topic,opened_by,origin,state,chat_id,root_message_id,thread_id,
+                       dm_root_message_id,related_item,opened_at,last_activity_at) VALUES(?,?,?,?,'active',?,?,?,?,?,?,?)""",
+                (title, owner_topic or None, opened_by or None, origin, chat_id or None, root_message_id or None,
+                 thread_id or None, dm_root_message_id or None, related_item, ts, ts))
+            return int(cur.lastrowid)
+
+    def get_item(self, item_no: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM tracked_items WHERE item_no=?", (item_no,)).fetchone()
+
+    def item_by_root(self, message_id: str) -> sqlite3.Row | None:
+        if not message_id:
+            return None
+        return self.conn.execute("SELECT * FROM tracked_items WHERE root_message_id=?", (message_id,)).fetchone()
+
+    def item_by_thread(self, thread_id: str) -> sqlite3.Row | None:
+        if not thread_id:
+            return None
+        return self.conn.execute("SELECT * FROM tracked_items WHERE thread_id=? ORDER BY item_no DESC LIMIT 1",
+                                 (thread_id,)).fetchone()
+
+    def item_by_dm_root(self, message_id: str) -> sqlite3.Row | None:
+        if not message_id:
+            return None
+        return self.conn.execute("SELECT * FROM tracked_items WHERE dm_root_message_id=? ORDER BY item_no DESC LIMIT 1",
+                                 (message_id,)).fetchone()
+
+    def list_items(self, states: tuple[str, ...]) -> list[sqlite3.Row]:
+        marks = ",".join("?" * len(states))
+        return self.conn.execute(f"SELECT * FROM tracked_items WHERE state IN ({marks}) ORDER BY item_no",
+                                 states).fetchall()
+
+    def update_item(self, item_no: int, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as c:
+            c.execute(f"UPDATE tracked_items SET {cols} WHERE item_no=?", (*fields.values(), item_no))
+
+    def delete_item(self, item_no: int) -> None:
+        with self.tx() as c:
+            c.execute("DELETE FROM tracked_keys WHERE item_no=?", (item_no,))
+            c.execute("DELETE FROM tracked_items WHERE item_no=?", (item_no,))
+
+    def add_item_key(self, item_no: int, key: str, norm_key: str, kind: str, topic_id: str = "") -> bool:
+        if not norm_key:
+            return False
+        with self.tx() as c:
+            return c.execute("INSERT OR IGNORE INTO tracked_keys(norm_key,item_no,key,kind,topic_id,added_at) "
+                             "VALUES(?,?,?,?,?,?)", (norm_key, item_no, key, kind, topic_id or None, now_iso())).rowcount > 0
+
+    def item_keys(self, item_no: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM tracked_keys WHERE item_no=? ORDER BY added_at, rowid", (item_no,)).fetchall()
+
+    def items_by_norm_key(self, norm_key: str) -> list[sqlite3.Row]:
+        """这把钥匙（track_norm 以后）对应的事项，新的在前。"""
+        return self.conn.execute(
+            "SELECT i.* FROM tracked_items i JOIN tracked_keys k ON k.item_no = i.item_no WHERE k.norm_key=? "
+            "ORDER BY i.item_no DESC", (norm_key,)).fetchall()
+
     # ---------- 保留期清理 ----------
     # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
     PRUNE_SQL = {
@@ -1697,7 +1803,9 @@ class Store:
         "owner_notices": """DELETE FROM owner_notices WHERE COALESCE(acked_at, sent_at) < ?
                             AND (state = 'sent' OR acked_at IS NOT NULL)""",
         # 一事一串（7.22）：话题按最近一次往里发的时间；清掉以后同一把钥匙再发就新起一个话题
-        "owner_threads": "DELETE FROM owner_threads WHERE COALESCE(last_post_at, created_at) < ?",
+        # 7.51：跟踪事项指向的私聊话题（「放群里」以前那个）不清，事项删了才跟着清
+        "owner_threads": """DELETE FROM owner_threads WHERE COALESCE(last_post_at, created_at) < ? AND root_message_id NOT IN
+                            (SELECT dm_root_message_id FROM tracked_items WHERE dm_root_message_id IS NOT NULL)""",
         "sends": "DELETE FROM sends WHERE sent_at < ?",
         "seen_before_send": "DELETE FROM seen_before_send WHERE seen_at < ?",
         "bot_dm_replies": "DELETE FROM bot_dm_replies WHERE replied_at < ?",
@@ -1719,6 +1827,9 @@ class Store:
                       (SELECT message_id FROM messages WHERE dispatch_state IN ('pending','sending','delivered','uncertain')))""",
     }
 
+    # 跟踪事项（7.51）归档满多少天删
+    ITEM_PURGE_DAYS = 30
+
     def prune(self, retention_days: int, receipts_dir: Path | None = None,
               runs_dir: Path | None = None, history_days: int | None = None) -> dict[str, int]:
         """清理超过 retention_days 的记录与回执文件、超过 history_days（默认同 retention_days）的在岗表履历；
@@ -1728,7 +1839,15 @@ class Store:
         hcut = (now - timedelta(days=history_days if history_days is not None else retention_days)
                 ).isoformat(timespec="seconds")
         out: dict[str, int] = {}
+        # 7.51：跟踪事项归档满 ITEM_PURGE_DAYS 天才删（和它的钥匙一起），不跟 retention_days
+        icut = (now - timedelta(days=self.ITEM_PURGE_DAYS)).isoformat(timespec="seconds")
         with self.tx() as c:
+            gone = [r[0] for r in c.execute("SELECT item_no FROM tracked_items WHERE state='archived' "
+                                            "AND archived_at IS NOT NULL AND archived_at < ?", (icut,))]
+            for no in gone:
+                c.execute("DELETE FROM tracked_keys WHERE item_no=?", (no,))
+                c.execute("DELETE FROM tracked_items WHERE item_no=?", (no,))
+            out["tracked_items"] = len(gone)
             for table, sql in self.PRUNE_SQL.items():
                 out[table] = c.execute(sql, (cutoff,)).rowcount
             for table, sql in self.PRUNE_DUTY_SQL.items():

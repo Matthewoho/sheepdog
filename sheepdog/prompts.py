@@ -52,6 +52,8 @@ REASON_LABEL = {
     "escalation_expiring": "「需要你定」快到期",
     "audit_offender": "危险命令提醒",
     "audit_notify": "别的会话跑了危险命令",
+    # 话题群（7.51）
+    "topic_group": "话题群事项",
     # 在岗表（7.20）
     "duty_mail": "会话留言",
     "duty_mail_paused": "会话留言暂停",
@@ -177,7 +179,7 @@ def managed_receipt_line(cli_host: bool, receipt_timeout: int) -> str:
 
 def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: int, extra: list[str] = (),
                       cli_host: bool = False, cli: str = "sheepdog", identity: bool = False,
-                      receipt_timeout: int = 20) -> str:
+                      receipt_timeout: int = 20, topic_group: bool = False) -> str:
     lines = [
         "## sheepdog 接口说明",
         "### 回执",
@@ -196,6 +198,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
         *duty_interface(topic_id, cli_host),
         *owner_interface(topic_id, identity),
+        *(topic_group_interface(topic_id) if topic_group else []),
     ]
     if bus:
         lines += [
@@ -260,6 +263,23 @@ def owner_interface(topic_id: str, identity: bool = False) -> list[str]:
     ]
 
 
+def topic_group_interface(topic_id: str) -> list[str]:
+    """话题群（7.51）的接口说明：只在配了话题群并开着时加（没配时接口说明和规则指纹都不变）。"""
+    return [
+        "### 长期跟踪：话题群",
+        f"`sheepdog ask / report --topic {topic_id} --key <钥匙> --track …`：要长期跟的事（跨天的、要等别人的、有审批 / PR / "
+        "工单号的、项目类的），第一次用这把钥匙时带 --track，sheepdog 在主人的话题群里给它开一个话题（事项，编号 T-<数字>），"
+        "这条发进去。之后同一把钥匙（`-`、`_`、空格不分）不用再带 --track，自动发进群里那个话题；事项编号本身也是钥匙。"
+        "这把钥匙在私聊里已经开过话题的，--track 不生效（主人可以回「放群里」搬进去）。群里只有「需要你定」会 @ 主人。",
+        "主人在话题群里说话送到你这里时标「主人在 IM 的回复」，附事项编号：在话题里回复 = 回给这件事的会话；没引用时，话题里"
+        "几个会话都有没答的提问，就每个会话各收一份（抄送）。主人在群里新开的话题先到总线，由总线转交，事项编号跟着带过去。",
+        f"`sheepdog track done --topic {topic_id} --key <钥匙或 T-编号> --why \"<依据>\"`：这件事办完了（只认这条命令和主人在"
+        "话题里整句回「办完了」「关掉」），sheepdog 在话题里补一行、更新置顶的索引卡；同一把钥匙再发会重开。"
+        f"`sheepdog track alias --topic {topic_id} --item T-<编号> --key <你的钥匙>`：给事项登记别名。"
+        "`sheepdog track list`：只读，看话题群里各件事的状态。",
+    ]
+
+
 def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
     """在岗表（7.20）的接口说明：登记活、给别的会话留言、看别人在干什么。"""
     lines = [
@@ -292,6 +312,7 @@ def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, 
         pb.render("common.md", **v),
         overlay,
         interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity,
+                                   topic_group=pb.topic_group,
                           receipt_timeout=pb.receipt_timeout),
         "现在只需回复「已就绪」，等待第一批信号。",
     )
@@ -316,6 +337,7 @@ def standing_rules_bus(pb: Playbook, plain_title: str, roster_text: str, overlay
     return _join(pb.render("security.md", **v), pb.render("bus.md", roster=roster_text, **v),
                  pb.render("common.md", **v), overlay,
                  interface_section("tp_bus", bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity,
+                                   topic_group=pb.topic_group,
                                    receipt_timeout=pb.receipt_timeout))
 
 
@@ -333,7 +355,7 @@ def standing_rules_managed(pb: Playbook, s: RosterSession, remind: list[int], ex
     return _join(pb.render("security.md", **v), _onboarding_body(pb, s), pb.render("common.md", **v),
                  _cli_host_rules(pb, s),
                  interface_section(s.topic_id, bus=False, remind=remind, expire=expire, cli_host=s.is_cli_host,
-                                   cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout))
+                                   cli=pb.cli, identity=pb.identity, topic_group=pb.topic_group, receipt_timeout=pb.receipt_timeout))
 
 
 def rules_update_message(rules: str, note: str = "") -> str:
@@ -374,7 +396,7 @@ def onboarding_prompt(pb: Playbook, s: RosterSession, batch_id: str, remind: lis
         pb.render("common.md", session_title=s.display_title, topic_id=s.topic_id),
         _cli_host_rules(pb, s),
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=confirm, cli_host=s.is_cli_host,
-                          cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout),
+                          cli=pb.cli, identity=pb.identity, topic_group=pb.topic_group, receipt_timeout=pb.receipt_timeout),
     )
 
 
@@ -404,7 +426,7 @@ def adopted_bootstrap(pb: Playbook, s: RosterSession, title: str, read_batch_id:
         _cli_host_rules(pb, s),
         owner_quote_section(*owner_quote) if owner_quote else "",
         interface_section(s.topic_id, bus=False, remind=remind, expire=expire, extra=extra, cli_host=s.is_cli_host,
-                          cli=pb.cli, identity=pb.identity, receipt_timeout=pb.receipt_timeout),
+                          cli=pb.cli, identity=pb.identity, topic_group=pb.topic_group, receipt_timeout=pb.receipt_timeout),
         "" if s.predecessor_conversation_id else "现在只需回复「已就绪」，等待第一批信号。",
     )
 
