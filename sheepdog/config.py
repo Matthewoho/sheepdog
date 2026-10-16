@@ -323,6 +323,13 @@ class TopicGroupConfig:
     # 索引卡满 13 天重发一张以后，要不要取消旧卡的置顶。lark-cli 把取消置顶（im pins delete）标成 high-risk-write，
     # 要带 --yes 才执行；默认 false = 不取消，旧卡改成「已停用，请看最新置顶的那张」。打开前要主人同意（7.51 实现侧加的开关）
     unpin_old_index: bool = False
+    # 索引卡「建议放进群」那一栏（10-16 18:0x 架构侧定）：私聊里还没进群的话题，最近 suggest_active_hours 小时内有动静，
+    # 并且拖过 suggest_after_hours 小时、或主人在里面回过 suggest_owner_replies 次以上；最多列 suggest_max 件（按最近动静
+    # 从新到旧），多的写「另有 N 件」
+    suggest_after_hours: float = 8
+    suggest_owner_replies: int = 2
+    suggest_active_hours: float = 24
+    suggest_max: int = 10
 
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -331,9 +338,13 @@ class TopicGroupConfig:
             raise ConfigError("[topic_group] unpin_old_index 必须是 true/false")
         if not isinstance(self.chat_id, str) or (self.chat_id and not self.chat_id.startswith("oc_")):
             raise ConfigError("[topic_group] chat_id 必须是 oc_ 开头的群 ID（sheepdog topic-group create 建的话题群）；留空 = 不用话题群")
-        for k in ("index_refresh_minutes", "stale_after_days", "archive_after_hours"):
+        for k in ("index_refresh_minutes", "stale_after_days", "archive_after_hours", "suggest_after_hours",
+                  "suggest_active_hours"):
             if not _positive(getattr(self, k)):
                 raise ConfigError(f"[topic_group] {k} 必须是正数")
+        for k in ("suggest_owner_replies", "suggest_max"):
+            if not _positive(getattr(self, k), integer=True):
+                raise ConfigError(f"[topic_group] {k} 必须是正整数")
 
     @property
     def active(self) -> bool:

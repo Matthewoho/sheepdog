@@ -127,6 +127,12 @@ stale_after_days = 7
 archive_after_hours = 72
 # 索引卡满 13 天重发一张以后要不要取消旧卡的置顶（lark-cli 把取消置顶标成高风险，要 --yes）。默认不取消，旧卡改成「已停用」
 unpin_old_index = false
+# 索引卡「建议放进群」：私聊里还没进群的话题，最近 suggest_active_hours 小时内有动静，并且拖过 suggest_after_hours 小时、
+# 或你在里面回过 suggest_owner_replies 次以上；最多列 suggest_max 件（最近的在前），多的写「另有 N 件」
+suggest_after_hours = 8
+suggest_owner_replies = 2
+suggest_active_hours = 24
+suggest_max = 10
 
 [owner_context]
 # 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态

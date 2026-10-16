@@ -73,11 +73,8 @@ PURGE_AFTER_DAYS = 30
 INDEX_RENEW_DAYS = 13
 # 多久查一次群成员
 MEMBER_CHECK_MINUTES = 10
-# 「建议放进群」：最近几天有动静的私聊话题里，满足任一条的（数字沿用 v0 的门槛，v1 不自动搬，只列出来）
-SUGGEST_LOOKBACK_DAYS = 3
-SUGGEST_AFTER_HOURS = 8
-SUGGEST_OWNER_REPLIES = 2
-SUGGEST_SESSIONS = 2
+# 「建议放进群」的门槛在配置 [topic_group] suggest_*（10-16 18:0x 架构侧收紧：只看拖过几小时、主人回过几次，
+# 最近 suggest_active_hours 小时有动静，最多列 suggest_max 件）
 # 索引卡每栏最多列几件（卡片有 30KB 上限）
 INDEX_ROWS = 12
 
@@ -493,19 +490,18 @@ def status(cfg, store: Store, item, now: datetime | None = None) -> str:
 
 # ======================= 建议放进群（私聊里长期在跟的） =======================
 def suggestions(cfg, store: Store, now: datetime | None = None, owner_chats: list[str] | None = None) -> list[dict]:
-    """私聊话题（7.22 一事一串）里，最近 SUGGEST_LOOKBACK_DAYS 天有动静、还没进群、满足任一条的：从开出来到最后一次动静
-    超过 SUGGEST_AFTER_HOURS 小时；主人在里面回过 SUGGEST_OWNER_REPLIES 次以上；SUGGEST_SESSIONS 个以上会话在用同一把钥匙
-    （钥匙按 track_norm 比）。只读。"""
+    """私聊话题（7.22 一事一串）里还没进群、最近 [topic_group] suggest_active_hours 小时内有动静（会话往里发，或主人在里面
+    回复）、并且满足任一条的：从开出来到最近一次动静超过 suggest_after_hours 小时；主人在里面回过 suggest_owner_replies 次
+    以上。同一把钥匙（track_norm）只列最近那个话题。按最近动静从新到旧排，全部返回（列几件由 render_index 按 suggest_max 截）。
+    只读。"""
+    g = cfg.topic_group
     now = now or eng._now()
     me = cfg.self_open_id
-    since = (now - timedelta(days=SUGGEST_LOOKBACK_DAYS)).isoformat(timespec="seconds")
+    active_from = now - timedelta(hours=g.suggest_active_hours)
     chats = owner_chats if owner_chats is not None else cfg.owner_chat_ids
+    # 最近一次动静要算上主人的回复（owner_threads.last_post_at 只记会话往里发的），所以先不按时间筛，逐个话题算
     rows = store.conn.execute("SELECT * FROM owner_threads WHERE norm_key IS NOT NULL AND key IS NOT NULL "
-                              "AND COALESCE(last_post_at, created_at) >= ? AND created_at <= ?",
-                              (since, now.isoformat(timespec="seconds"))).fetchall()
-    by_key: dict[str, list] = {}
-    for r in store.conn.execute("SELECT topic_id, key FROM owner_threads WHERE key IS NOT NULL"):
-        by_key.setdefault(track_norm(r["key"]), []).append(r["topic_id"])
+                              "AND created_at <= ?", (now.isoformat(timespec="seconds"),)).fetchall()
     moved = {r[0] for r in store.conn.execute(
         "SELECT dm_root_message_id FROM tracked_items WHERE dm_root_message_id IS NOT NULL AND state != 'removed'")}
     out: dict[str, dict] = {}
@@ -528,22 +524,21 @@ def suggestions(cfg, store: Store, now: datetime | None = None, owner_chats: lis
                 t = _parse(x["create_time"])
                 if t is not None and (last is None or t > last):
                     last = t
-        span = (last - created).total_seconds() / 3600 if created and last else 0
-        sessions = len(set(by_key.get(nk, [])))
+        if last is None or last < active_from:
+            continue   # 最近 suggest_active_hours 小时没动静：不列
+        span = (last - created).total_seconds() / 3600 if created else 0
         why = []
-        if span >= SUGGEST_AFTER_HOURS:
+        if span >= g.suggest_after_hours:
             why.append(f"拖了 {span:.0f} 小时")
-        if len(replies) >= SUGGEST_OWNER_REPLIES:
+        if len(replies) >= g.suggest_owner_replies:
             why.append(f"你回过 {len(replies)} 次")
-        if sessions >= SUGGEST_SESSIONS:
-            why.append(f"{sessions} 个会话在跟")
         if not why:
             continue
         cur = out.get(nk)
         cand = {"key": r["key"], "norm_key": nk, "title": r["title"] or r["key"], "topic_id": r["topic_id"],
                 "root_message_id": r["root_message_id"], "thread_id": r["thread_id"] or "", "why": why,
                 "last_at": last.isoformat(timespec="seconds") if last else "", "span_hours": round(span, 1),
-                "owner_replies": len(replies), "sessions": sessions}
+                "owner_replies": len(replies)}
         if cur is None or cand["last_at"] > cur["last_at"]:
             out[nk] = cand
     return sorted(out.values(), key=lambda x: x["last_at"], reverse=True)
@@ -608,10 +603,11 @@ def render_index(cfg, data: dict, rows: int = INDEX_ROWS) -> str:
     sugg = data["suggest"]
     lines.append("")
     lines.append(f"**建议放进群（{len(sugg)}）**：在私聊那件事的话题里整句回「放群里」")
-    for s in sugg[:rows]:
+    cap = min(rows, cfg.topic_group.suggest_max)
+    for s in sugg[:cap]:
         lines.append(f"- {duty.short(s['title'], 40)}（钥匙 `{s['key']}`）· {'、'.join(s['why'])}")
-    if len(sugg) > rows:
-        lines.append(f"- 还有 {len(sugg) - rows} 件没列出")
+    if len(sugg) > cap:
+        lines.append(f"- 另有 {len(sugg) - cap} 件")
     if not sugg:
         lines.append("- （无）")
     if data["per_session"]:

@@ -604,23 +604,88 @@ class IndexTest(TGBase):
         self.assertEqual(len([c for c in self.lark.tg_sent()[n:] if c[1] == "+messages-reply"]), 0)
 
     def test_suggest_column(self):
-        # 私聊里长期在跟的：主人回过 2 次、或拖了 8 小时以上、或两个会话在用同一把钥匙
+        # 私聊里长期在跟的：主人回过 2 次、或拖了 8 小时以上；两个会话用同一把钥匙不算（10-16 18:0x 收紧）
         self.ask("--key", "LONG-1", text="?")
         self.ask("--key", "long_1", topic="tp_beta", text="?")
         self.ask("--key", "SHORT", text="?")
         self.poll()
-        data = tg.build_index(self.cfg, self.store)
-        self.assertEqual([s["norm_key"] for s in data["suggest"]], ["LONG1"])
-        self.assertIn("2 个会话在跟", data["suggest"][0]["why"])
+        self.assertEqual(tg.build_index(self.cfg, self.store)["suggest"], [])
         root = self.store.thread_by_key("tp_alpha", "SHORT")["root_message_id"]
+        self.owner_dm_thread(root, "a")
+        self.poll()
+        self.assertEqual(tg.build_index(self.cfg, self.store)["suggest"], [])       # 回过 1 次不够
+        self.owner_dm_thread(root, "b")
+        self.poll()
+        sug = tg.build_index(self.cfg, self.store)["suggest"]
+        self.assertEqual([s["norm_key"] for s in sug], ["SHORT"])
+        self.assertEqual(sug[0]["why"], ["你回过 2 次"])
+        # 放进群以后不再建议
+        self.owner_dm_thread(root, "放群里")
+        self.poll()
+        self.assertEqual(tg.build_index(self.cfg, self.store)["suggest"], [])
+
+    def age_thread(self, root: str, hours: float, created_hours: float | None = None) -> None:
+        """把这个私聊话题整个挪到 hours 小时以前（话题表、会话发的、主人在里面的回复）；created_hours 单独把开出来的时间挪更早。"""
+        now = datetime.now().astimezone()
+        at = (now - timedelta(hours=hours)).isoformat(timespec="seconds")
+        made = (now - timedelta(hours=created_hours if created_hours is not None else hours)).isoformat(timespec="seconds")
+        thr = self.store.thread_by_root(root)
+        c = self.store.conn
+        c.execute("UPDATE owner_threads SET created_at=?, last_post_at=? WHERE root_message_id=?", (made, at, root))
+        c.execute("UPDATE sends SET sent_at=? WHERE root_message_id=?", (at, root))
+        if thr["thread_id"]:
+            c.execute("UPDATE messages SET create_time=? WHERE thread_id=?", (at, thr["thread_id"]))
+        c.commit()
+
+    def test_suggest_span_and_active_window(self):
+        g = self.cfg.topic_group
+        self.assertEqual((g.suggest_after_hours, g.suggest_owner_replies, g.suggest_active_hours, g.suggest_max),
+                         (8, 2, 24, 10))
+        self.ask("--key", "SPAN", text="?")
+        self.poll()
+        root = self.store.thread_by_key("tp_alpha", "SPAN")["root_message_id"]
+        self.age_thread(root, hours=1, created_hours=9)           # 开出来 9 小时、1 小时前还有动静：拖过 8 小时
+        sug = tg.build_index(self.cfg, self.store)["suggest"]
+        self.assertEqual([s["norm_key"] for s in sug], ["SPAN"])
+        self.assertEqual(sug[0]["why"], ["拖了 8 小时"])
+        self.age_thread(root, hours=25, created_hours=40)         # 25 小时没动静：不列
+        self.assertEqual(tg.build_index(self.cfg, self.store)["suggest"], [])
+        # 主人回过 2 次、回复也都在 24 小时以前：照样不列
         self.owner_dm_thread(root, "a")
         self.owner_dm_thread(root, "b")
         self.poll()
-        self.assertEqual({s["norm_key"] for s in tg.build_index(self.cfg, self.store)["suggest"]}, {"LONG1", "SHORT"})
-        # 放进群以后不再建议
-        mid = self.owner_dm_thread(root, "放群里")
+        self.age_thread(root, hours=25, created_hours=40)
+        self.assertEqual(tg.build_index(self.cfg, self.store)["suggest"], [])
+        # 主人刚在里面回了一句：最近动静算主人的回复，重新列进来
+        self.owner_dm_thread(root, "c")
         self.poll()
-        self.assertEqual({s["norm_key"] for s in tg.build_index(self.cfg, self.store)["suggest"]}, {"LONG1"})
+        self.assertEqual([s["norm_key"] for s in tg.build_index(self.cfg, self.store)["suggest"]], ["SPAN"])
+        # 热加载：窗口改大，25 小时以前的也算
+        g.suggest_active_hours = 48
+        self.age_thread(root, hours=25, created_hours=40)
+        self.assertEqual([s["norm_key"] for s in tg.build_index(self.cfg, self.store)["suggest"]], ["SPAN"])
+
+    def test_suggest_at_most_n_newest_first(self):
+        keys = [f"K{i:02d}" for i in range(12)]
+        for i, k in enumerate(keys):
+            self.ask("--key", k, text="?")
+        self.poll()
+        for i, k in enumerate(keys):
+            root = self.store.thread_by_key("tp_alpha", k)["root_message_id"]
+            self.age_thread(root, hours=12 - i, created_hours=20)   # K11 最新
+        data = tg.build_index(self.cfg, self.store)
+        self.assertEqual([s["key"] for s in data["suggest"]], list(reversed(keys)))
+        text = tg.render_index(self.cfg, data)
+        part = text.split("**建议放进群")[1].split("\n\n")[0]
+        listed = [ln for ln in part.splitlines() if ln.startswith("- ") and "钥匙" in ln]
+        self.assertEqual([ln.split("`")[1] for ln in listed], list(reversed(keys))[:10])
+        self.assertIn("- 另有 2 件", part)
+        self.assertIn("**建议放进群（12）**", text)
+        # 热加载：改成最多 3 件
+        self.cfg.topic_group.suggest_max = 3
+        part = tg.render_index(self.cfg, tg.build_index(self.cfg, self.store)).split("**建议放进群")[1]
+        self.assertEqual(len([ln for ln in part.splitlines() if ln.startswith("- ") and "钥匙" in ln]), 3)
+        self.assertIn("- 另有 9 件", part)
 
 
 # ======================= F：保留期 =======================
@@ -797,6 +862,8 @@ class SwitchTest(TGBase):
                             "header_regex = '(?P<topic>tp_x)'\n", "同一个"),
                            ('[topic_group]\nchat_id = "x"\n', "oc_"),
                            ('[topic_group]\nchat_id = "oc_a"\nindex_refresh_minutes = 0\n', "正数"),
+                           ('[topic_group]\nchat_id = "oc_a"\nsuggest_max = 2.5\n', "正整数"),
+                           ('[topic_group]\nchat_id = "oc_a"\nsuggest_active_hours = 0\n', "正数"),
                            ('[topic_group]\nchat_id = "oc_a"\n[source]\nonly_chat_ids = ["oc_b"]\n', "only_chat_ids")):
             bad.write_text(body, encoding="utf-8")
             with self.assertRaises(Exception) as cm:
