@@ -364,3 +364,12 @@ class EchoLedgerTest(EchoBase):
                 p.write_text(f'self_open_id = "{ME}"\n[session]\n{bad}\n', encoding="utf-8")
                 with self.assertRaises(ConfigError):
                     load_config(p)
+
+    def test_ignored_group_at_bot_not_recorded(self):
+        """ignore 的群里主人 @ 机器人：7.56 一处判定说不管，回音账本也不记、不报「没送到」。"""
+        self.cfg.routing.ignore_chat_ids.append(OPS)
+        mid = self.say(sender=ME, content="@Mattheuu 测试群里随便说", mentions=[APP])
+        self.pull(mid)
+        self.assertIsNone(self.echo(mid))
+        self.d.dispatch_once()
+        self.assertEqual(self.dm.texts("没送到任何会话"), [])

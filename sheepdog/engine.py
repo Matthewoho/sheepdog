@@ -3204,7 +3204,8 @@ class Dispatcher:
         tgid = self.cfg.topic_group.chat_id
         chat = e["chat_id"] or ""
         r = self.store.get_message(e["message_id"])
-        if r is None or e["kind"] == "recalled" or not (chat in self.cfg.owner_chat_ids or (tgid and chat == tgid)):
+        # 找主人那一侧（找主人聊天、话题群）按 7.56 的一处判定认
+        if r is None or e["kind"] == "recalled" or self.cfg.chat_scope(chat) != OWNER_SIDE:
             return "new", False
         m = row_to_message(r)
         if tgid and chat == tgid:
