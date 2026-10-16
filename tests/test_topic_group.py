@@ -597,8 +597,7 @@ class IndexTest(TGBase):
             self.assertIn(word, text)
         # 话题里只在三种变化时发一行：等你定、办完、重开（进行中、等别人、沉睡、过期不发）
         self.d.dispatch_once()
-        lines = [sent_text(c) for c in self.lark.tg_sent() if c[1] == "+messages-reply" and
-                 sent_text(c).startswith(("🟠", "✅", "🔁"))]
+        lines = [r[0] for r in st.conn.execute("SELECT text FROM sends WHERE kind='tg_change' ORDER BY rowid")]
         self.assertEqual(sorted(x.split("：")[0] for x in lines), ["✅ 办完了", "🟠 等你定"])
         n = len(self.lark.tg_sent())
         self.d.dispatch_once()   # 状态没变：不再发
@@ -648,8 +647,13 @@ class RetentionTest(TGBase):
         mid = self.owner_dm_thread(root, "还记得这件吗")
         self.poll()
         self.assertEqual((self.row(mid)["reason"], self.row(mid)["topic_id"]), ("owner_reply", "tp_alpha"))
-        # 归档满 30 天：事项、钥匙删掉，私聊话题跟着可以清
+        # 归档了、还不满 30 天（超过了 7 天保留期）：不删
         it = self.item("KEEP")
+        self.store.update_item(it["item_no"], state="archived",
+                               archived_at=(datetime.now().astimezone() - timedelta(days=10)).isoformat(timespec="seconds"))
+        self.assertEqual(self.store.prune(7)["tracked_items"], 0)
+        self.assertIsNotNone(self.store.get_item(it["item_no"]))
+        # 归档满 30 天：事项、钥匙删掉，私聊话题跟着可以清
         self.store.update_item(it["item_no"], state="archived",
                                archived_at=(datetime.now().astimezone() - timedelta(days=31)).isoformat(timespec="seconds"))
         out = self.store.prune(7)
@@ -886,7 +890,7 @@ class MiscTest(TGBase):
         real = tg.dispatcher_round
 
         def spy(disp):
-            seen["delivered"] = self.row(mid)["dispatch_state"]
+            seen.setdefault("delivered", self.row(mid)["dispatch_state"])   # 这一轮第一次对账时
             return real(disp)
 
         with mock.patch.object(tg, "dispatcher_round", spy):
