@@ -192,10 +192,8 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
     else:
         # 别的会话用同一把钥匙（-、_、空格不分）也发进这件事：钥匙原样记一笔（已经有的不动）
         store.add_item_key(item["item_no"], key, tg.track_norm(key), "alias", topic_id)
-    t = store.get_topic(topic_id)
-    opener = f"{((t['title'] or '').strip() if t is not None else '') or topic_id}（{topic_id}）"
     try:
-        item = tg.ensure_title(cfg, store, source, item, opener, key)
+        item = tg.ensure_title(cfg, store, source, item, "", key)   # 副标题「<会话显示名>开的」按事项现算
         plain, card = owner_content(cfg, text, at=kind == ASK)   # 群里只有「需要你定」@ 主人
         res = send_owner(lambda tx, c: source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx,
                                                        card=c, in_thread=True), plain, card)

@@ -186,7 +186,8 @@ class EntryTest(TGBase):
         title, ask = self.lark.tg_sent()
         self.assertEqual((title[1], _opt(title, "--chat-id"), _opt(title, "--as")), ("+messages-send", TG, "bot"))
         self.assertTrue(sent_text(title).startswith("🗂 T-1 · 证书交接"), sent_text(title))
-        self.assertIn("Alpha 需求（tp_alpha）开的", sent_text(title))
+        card = json.loads(_opt(title, "--content"))
+        self.assertTrue(card["header"]["subtitle"]["content"].startswith("钥匙 SSL-CERT-HANDOVER · Alpha 需求开的 · "))
         it = self.item("SSL-CERT-HANDOVER")
         self.assertEqual((it["origin"], it["owner_topic"], it["root_message_id"]), ("track", "tp_alpha",
                                                                                   self.lark.idem[_opt(title, "--idempotency-key")]))
@@ -243,8 +244,7 @@ class EntryTest(TGBase):
         it = self.item("vps_3x_ui")
         self.assertEqual((it["origin"], it["owner_topic"], it["dm_root_message_id"]), ("owner_move", "tp_alpha", root))
         title = self.lark.tg_sent()[0]
-        self.assertIn("私聊里原来的话题", sent_text(title))
-        self.assertIn("/client/thread/open?open_chat_id=" + ESC_CHAT, sent_text(title))   # 链回私聊话题
+        self.assertIn(" · 你从私聊放进群 · ", json.loads(_opt(title, "--content"))["header"]["subtitle"]["content"])
         # 私聊旧话题里贴上链接（kind = tg_moved，读回丢弃）
         note = [c for c in self.lark.sent("+messages-reply") if _opt(c, "--message-id") == root][-1]
         self.assertIn("这件事已经放进话题群：T-1", sent_text(note))
@@ -541,12 +541,18 @@ class IndexTest(TGBase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(_opt(sent[0], "--msg-type"), "interactive")
         text = sent_text(sent[0])
-        self.assertIn("**等你定（1）**", text)
-        self.assertIn("[T-1 要你定的](https://applink.larksuite.com/client/thread/open?open_chat_id=" + TG, text)
-        # 内容没变：不改卡（到了对账时间也不改）
-        with mock.patch("sheepdog.engine._now", return_value=datetime.now().astimezone() + timedelta(minutes=11)):
+        self.assertIn("**等你定 · 1 件**", text)
+        self.assertIn("**T-1 · 要你定的** [打开](https://applink.larksuite.com/client/thread/open?open_chat_id=" + TG, text)
+        # 内容没变：不改卡（同一时刻再对账一次；「已等多久」这类时间变了才算变）
+        fixed = datetime.now().astimezone()
+        with mock.patch("sheepdog.engine._now", return_value=fixed):
+            tg.mark_dirty(self.store)
             self.d.dispatch_once()
-        self.assertEqual(self.lark.patched, {})
+            first = len(self.lark.patched.get(idx, []))
+            tg.mark_dirty(self.store)
+            self.d.dispatch_once()
+        self.assertEqual(len(self.lark.patched.get(idx, [])), first)
+        self.lark.patched.clear()
         # 状态变了（会话结案那条提问 → 进行中）：整张覆盖
         self.poll()
         e = self.store.conn.execute("SELECT message_id FROM escalations").fetchone()[0]
@@ -554,7 +560,8 @@ class IndexTest(TGBase):
         tg.mark_dirty(self.store)
         self.d.dispatch_once()
         self.assertEqual(len(self.lark.patched[idx]), 1)
-        self.assertIn("**进行中（1）**", self.card_text(self.lark.patched[idx][0]))
+        self.assertIn("**进行中 · 1 件**", self.card_text(self.lark.patched[idx][0]))
+        self.assertEqual(self.lark.patched[idx][0]["header"]["template"], "blue")    # 没有等你定的：蓝色
         # 满 13 天：重发一张、置顶新的，旧卡改成「已停用」，默认不取消旧卡置顶（要 --yes）
         info = tg.index_info(self.store)
         info["sent_at"] = (datetime.now().astimezone() - timedelta(days=13, minutes=1)).isoformat(timespec="seconds")
@@ -598,9 +605,10 @@ class IndexTest(TGBase):
                                "sleeping": ["睡着的"], "done": ["办完的"]})
         self.assertEqual(data["per_session"], {"Alpha 需求": 5})
         text = tg.render_index(cfg, data)
-        for word in ("等你定（1）", "过期未定（1）", "进行中（1）", "等别人（1）", "沉睡（1）", "最近办完（1）", "建议放进群（0）",
-                     "各会话跟踪数：Alpha 需求 5"):
+        for word in ("等你定 · 1 件", "过期未定 · 1 件", "进行中 · 1 件", "等别人 · 1 件", "沉睡 · 1 件", "最近办完 · 1 件",
+                     "各会话跟踪：Alpha 需求 5", "Alpha 需求 · 最近动静 8 天前", "已过期没答", "办完"):
             self.assertIn(word, text)
+        self.assertNotIn("建议放进群", text)                                     # 没有建议时那一栏不出现
         # 话题里只在三种变化时发一行：等你定、办完、重开（进行中、等别人、沉睡、过期不发）
         self.d.dispatch_once()
         lines = [r[0] for r in st.conn.execute("SELECT text FROM sends WHERE kind='tg_change' ORDER BY rowid")]
@@ -681,17 +689,17 @@ class IndexTest(TGBase):
             self.age_thread(root, hours=12 - i, created_hours=20)   # K11 最新
         data = tg.build_index(self.cfg, self.store)
         self.assertEqual([s["key"] for s in data["suggest"]], list(reversed(keys)))
-        text = tg.render_index(self.cfg, data)
-        part = text.split("**建议放进群")[1].split("\n\n")[0]
-        listed = [ln for ln in part.splitlines() if ln.startswith("- ") and "钥匙" in ln]
-        self.assertEqual([ln.split("`")[1] for ln in listed], list(reversed(keys))[:10])
-        self.assertIn("- 另有 2 件", part)
-        self.assertIn("**建议放进群（12）**", text)
+        v = tg.index_view(self.cfg, data)
+        self.assertEqual([x["meta"].split(" · ")[1] for x in v["suggest"]], [f"钥匙 {k}" for k in reversed(keys)][:10])
+        self.assertEqual((v["n_suggest"], v["more_suggest"]), (12, 2))
+        text = tg.index_text(v)
+        self.assertIn("建议放进群 · 12 件\n" + tg.SUGGEST_HOW, text)
+        self.assertIn("- 另有 2 件", text)
+        self.assertIn("另有 2 件", json.dumps(tg.index_card(v), ensure_ascii=False))
         # 热加载：改成最多 3 件
         self.cfg.topic_group.suggest_max = 3
-        part = tg.render_index(self.cfg, tg.build_index(self.cfg, self.store)).split("**建议放进群")[1]
-        self.assertEqual(len([ln for ln in part.splitlines() if ln.startswith("- ") and "钥匙" in ln]), 3)
-        self.assertIn("- 另有 9 件", part)
+        v = tg.index_view(self.cfg, tg.build_index(self.cfg, self.store))
+        self.assertEqual((len(v["suggest"]), v["more_suggest"]), (3, 9))
 
 
 # ======================= F：保留期 =======================
@@ -1094,13 +1102,108 @@ class PendingRelayoutTest(TGBase):
     def test_titles_use_markdown_free_excerpt(self):
         self.ask("--key", "MD-1", "--track", title="**证书**交接", text="?")
         title = self.lark.tg_sent()[0]
-        self.assertTrue(sent_text(title).startswith("🗂 T-1 · 证书交接"), sent_text(title))
+        self.assertEqual(json.loads(_opt(title, "--content"))["header"]["title"]["content"], "🗂 T-1 · 证书交接")
         mid = self.owner_tg("## 发版 **计划**\n- 先灰度\n- 再全量")
         self.poll()
         it = self.store.item_by_root(mid)
         self.assertEqual(it["title"], "发版 计划")
         self.d.dispatch_once()
         idx = [sent_text(c) for c in self.lark.tg_sent() if sent_text(c).startswith("📌")][0]
-        self.assertIn("T-2 发版 计划]", idx)
-        self.assertIn("T-1 证书交接]", idx)
+        self.assertIn("**T-2 · 发版 计划**", idx)
+        self.assertIn("**T-1 · 证书交接**", idx)
         self.assertNotIn("**证书**", idx)
+
+
+# ======================= 索引卡、标题卡的样子（10-17 00:3x 收干净，排版同「待办」卡片） =======================
+class CardLookTest(TGBase):
+    def index_card_now(self) -> tuple[dict, str]:
+        v = tg.index_view(self.cfg, tg.build_index(self.cfg, self.store))
+        return tg.index_card(v), tg.index_text(v)
+
+    def test_index_header_subtitle_colour_and_two_line_rows(self):
+        self.store.update_topic(BUS_TOPIC_ID, title="[managed] Lark 信号·总线")
+        self.ask("--key", "LK-1", "--track", title="要你定的事", text="?")
+        self.ask("--key", "LK-2", "--track", kind="report", title="在做的事", text="..", topic=BUS_TOPIC_ID)
+        self.poll()
+        card, text = self.index_card_now()
+        h = card["header"]
+        self.assertEqual((h["title"]["content"], h["template"]), ("📌 话题群索引", "orange"))   # 有等你定：橙色
+        self.assertRegex(h["subtitle"]["content"], r"^\d\d:\d\d 更新 · 跟踪 2 件 · 等你定 1$")
+        self.assertNotIn("北京时间", json.dumps(card, ensure_ascii=False))
+        self.assertNotIn("对账", json.dumps(card, ensure_ascii=False))
+        md = [e["content"] for e in card["body"]["elements"] if e["tag"] == "markdown"]
+        self.assertEqual(md[0], "**等你定 · 1 件**")
+        row = md[1].split("\n")
+        self.assertEqual(len(row), 2)
+        self.assertTrue(row[0].startswith("**T-1 · 要你定的事** [打开](https://"), row[0])
+        self.assertRegex(row[1], r"^<font color='grey'>Alpha 需求 · \d\d:\d\d 问 · 已等 \d+ 分钟</font>$")
+        bus_row = next(x for x in md if x.startswith("**T-2"))
+        self.assertIn("<font color='grey'>Lark 信号·总线 · 最近动静 ", bus_row)          # 会话显示名去掉 [managed]
+        self.assertNotIn("[managed]", json.dumps(card, ensure_ascii=False))
+        self.assertIn({"tag": "hr"}, card["body"]["elements"])                            # 栏与栏、件与件之间分隔线
+        self.assertNotIn("（无）", text)
+        for word in ("过期未定", "等别人", "沉睡", "最近办完", "建议放进群"):                 # 空栏不显示
+            self.assertNotIn(word, text)
+        foot = card["body"]["elements"][-1]
+        self.assertEqual(foot["text_size"], "notation")
+        self.assertIn("<font color='grey'>" + tg.INDEX_FOOTER + "</font>", foot["content"])
+        # 纯文本版同样的顺序
+        self.assertTrue(text.startswith("📌 话题群索引 · "))
+        self.assertLess(text.index("等你定 · 1 件"), text.index("进行中 · 1 件"))
+        self.assertTrue(text.endswith(tg.INDEX_FOOTER))
+        # 办完的写几点办完；没有等你定时蓝色
+        tg.close(self.store, self.item("LK-1"), "tp_alpha", "定了")
+        card, text = self.index_card_now()
+        self.assertEqual(card["header"]["template"], "blue")
+        self.assertRegex(text, r"Alpha 需求 · \d\d:\d\d 办完")
+
+    def test_index_all_empty_and_suggest_only_when_present(self):
+        card, text = self.index_card_now()
+        self.assertEqual([e["content"] for e in card["body"]["elements"]], ["现在没有在跟的事"])
+        self.assertEqual(card["header"]["template"], "blue")
+        self.assertRegex(text, r"^📌 话题群索引 · \d\d:\d\d 更新 · 跟踪 0 件 · 等你定 0\n\n现在没有在跟的事$")
+        # 有建议放进群的：出现那一栏，第一行灰色小字说怎么放
+        self.ask("--key", "SG-1", text="?")
+        self.poll()
+        root = self.store.thread_by_key("tp_alpha", "SG-1")["root_message_id"]
+        self.owner_dm_thread(root, "a")
+        self.owner_dm_thread(root, "b")
+        self.poll()
+        card, text = self.index_card_now()
+        md = [e["content"] for e in card["body"]["elements"] if e["tag"] == "markdown"]
+        self.assertEqual(md[0], "现在没有在跟的事")
+        self.assertEqual(md[1], f"**建议放进群 · 1 件**\n<font color='grey'>{tg.SUGGEST_HOW}</font>")
+        self.assertRegex(md[2], r"^\*\*发版时间\*\* \[打开\]\(https://[^)]+\)\n<font color='grey'>Alpha 需求 · 钥匙 SG-1 · "
+                                r"你回过 2 次 · 最近动静 \d+ 分钟前</font>$")
+
+    def test_title_card_header_and_one_grey_line(self):
+        self.store.update_topic(BUS_TOPIC_ID, title="[managed] Lark 信号·总线")
+        self.ask("--key", "G2-TEST", "--track", title="G2 话题群测试：VPS 选型", text="?", topic=BUS_TOPIC_ID)
+        call = self.lark.tg_sent()[0]
+        card = json.loads(_opt(call, "--content"))
+        self.assertEqual(card["header"]["title"]["content"], "🗂 T-1 · G2 话题群测试：VPS 选型")
+        self.assertRegex(card["header"]["subtitle"]["content"], r"^钥匙 G2-TEST · Lark 信号·总线开的 · \d\d-\d\d \d\d:\d\d$")
+        self.assertEqual(card["header"]["template"], "blue")
+        self.assertEqual(card["body"]["elements"], [{"tag": "markdown", "content": f"<font color='grey'>{tg.TITLE_FOOTER}</font>",
+                                                     "text_size": "notation"}])
+        sent = self.store.conn.execute("SELECT text FROM sends WHERE kind='tg_title'").fetchone()[0]
+        self.assertRegex(sent, r"^🗂 T-1 · G2 话题群测试：VPS 选型\n钥匙 G2-TEST · Lark 信号·总线开的 · \d\d-\d\d \d\d:\d\d\n"
+                               + tg.TITLE_FOOTER + "$")                                    # 纯文本版（记账、卡片被拒时发它）
+        # 「可能相关」放在灰色小字前面一行
+        it = self.item("G2-TEST")
+        tg.close(self.store, it, BUS_TOPIC_ID, "好了")
+        self.store.update_item(it["item_no"], state="archived",
+                               archived_at=(datetime.now().astimezone() - timedelta(days=15)).isoformat(timespec="seconds"))
+        self.ask("--key", "G2-TEST", "--track", title="又一轮", text="?", topic=BUS_TOPIC_ID)
+        card = json.loads(_opt([c for c in self.lark.tg_sent() if "--content" in c and "T-2" in _opt(c, "--content")][0],
+                               "--content"))
+        els = card["body"]["elements"]
+        self.assertEqual(len(els), 2)
+        self.assertTrue(els[0]["content"].startswith("可能相关：T-1 [打开](https://"), els[0]["content"])
+        self.assertEqual(els[1]["content"], f"<font color='grey'>{tg.TITLE_FOOTER}</font>")
+        # owner_card 关着：标题卡发纯文本
+        self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + "[notify]\nowner_card = false\n", encoding="utf-8")
+        self.ask("--key", "PLAIN-1", "--track", title="纯文本", text="?")
+        plain = [c for c in self.lark.tg_sent() if _opt(c, "--chat-id") == TG][-1]
+        self.assertNotIn("--content", plain)
+        self.assertTrue(_opt(plain, "--text").startswith("🗂 T-3 · 纯文本\n钥匙 PLAIN-1 · Alpha 需求开的 · "))

@@ -1817,7 +1817,7 @@ class Collector:
                             topic_id=topic, dm_root=dm_root)
         try:
             if not self.dry_run and hasattr(self.source, "send_to_chat"):
-                item = tg.ensure_title(self.cfg, self.store, self.source, item, "主人（从私聊放进群）", key)
+                item = tg.ensure_title(self.cfg, self.store, self.source, item, "", key)
         except SourceError as e:
             if isinstance(e, LarkTimeout):
                 log.warning("「放群里」的标题卡发送超时，常驻进程下一轮用同一个防重编号补发: %s", e)
