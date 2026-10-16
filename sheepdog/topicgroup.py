@@ -506,9 +506,25 @@ def item_asks(store: Store, item) -> list:
     return [e for _, _, e in out]
 
 
+def answered_in_flight(store: Store) -> set[str]:
+    """已经有主人的回复（或抄送）带着 escalation:<提问> 排在路上、还没送到会话的提问。它们在送到的那一刻才标「已答」，
+    但在主人眼里已经答了（10-17 00:37 P1C：同一轮读回两条 ask、又拉到主人没引用的回复，话题里多发了一行过时的「等你定」）。"""
+    out: set[str] = set()
+    prefix = eng.ESCALATION_TAG_PREFIX
+    for (tags,) in store.conn.execute(
+            "SELECT tags_json FROM messages WHERE route='dispatch' AND COALESCE(dispatch_state,'pending') "
+            "IN ('pending','sending','uncertain') AND tags_json LIKE ?", (f'%"{prefix}%',)):
+        for t in json.loads(tags or "[]"):
+            if t.startswith(prefix):
+                out.add(t[len(prefix):])
+    return out
+
+
 def open_asks(cfg, store: Store, item) -> list:
+    """这件事里还开着的「需要你定」：没结、没过期，也没有主人的回复正排着要送过去（按这一刻的最终状态算）。"""
     cutoff = eng._now() - timedelta(hours=cfg.escalation.open_hours)
-    return [e for e in item_asks(store, item) if not e["closed_at"]
+    flying = answered_in_flight(store)
+    return [e for e in item_asks(store, item) if not e["closed_at"] and e["message_id"] not in flying
             and ((a := _parse(e["asked_at"])) is None or a >= cutoff)]
 
 
@@ -808,10 +824,12 @@ def change_lines(cfg, store: Store, item, st: str) -> list[tuple[str, str]]:
     if prev in (S_DONE, S_ARCHIVED) and st not in (S_DONE, S_ARCHIVED):
         out.append(("🔁 重开", "reopen:" + (item["reopened_at"] or "")))
     if st == S_DECIDE and prev != S_DECIDE:
+        # 发之前再核一次：那条提问这一刻还开着（没结、没有主人的回复排在路上）才发
         e = open_asks(cfg, store, item)
-        from .pending import ask_title
-        what = _excerpt(ask_title(cfg, e[0]["text"]), 40) if e else ""
-        out.append(("🟠 等你定" + (f"：{what}" if what else ""), "decide:" + (e[0]["message_id"] if e else "")))
+        if e:
+            from .pending import ask_title
+            what = _excerpt(ask_title(cfg, e[0]["text"]), 40)
+            out.append(("🟠 等你定" + (f"：{what}" if what else ""), "decide:" + e[0]["message_id"]))
     if st == S_DONE and prev not in (S_DONE, S_ARCHIVED):
         who = item["done_by"] or ""
         who = "你" if who == "owner" else _name(cfg, store, who) if who else ""

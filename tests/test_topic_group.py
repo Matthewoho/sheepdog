@@ -1207,3 +1207,35 @@ class CardLookTest(TGBase):
         plain = [c for c in self.lark.tg_sent() if _opt(c, "--chat-id") == TG][-1]
         self.assertNotIn("--content", plain)
         self.assertTrue(_opt(plain, "--text").startswith("🗂 T-3 · 纯文本\n钥匙 PLAIN-1 · Alpha 需求开的 · "))
+
+
+# ======================= 话题里的「等你定」按这一轮的最终状态发（10-17 00:37 P1C） =======================
+class ChangeLineFinalStateTest(TGBase):
+    def decide_lines(self) -> list[str]:
+        return [r[0] for r in self.store.conn.execute("SELECT text FROM sends WHERE kind='tg_change' ORDER BY rowid")
+                if r[0].startswith("🟠")]
+
+    def test_ask_registered_and_answered_in_same_round_posts_no_decide_line(self):
+        """P1C 00:36:32 总线和 tp_cc2 在 T-1 里各发一条 ask；00:37 那一轮读回两条、同一轮又拉到主人没引用的回复（送一个、
+        抄送另一个）。回复还排在路上（送到的那一刻才标已答）时对账，不该发「🟠 等你定」。"""
+        self.ask("--key", "G4", "--track", kind="report", title="G4 抄送测试", text="开个话题")
+        self.d.dispatch_once()                                   # 进行中（没有提问）
+        it = self.item("G4")
+        self.ask("--key", "G4", title="G4：总线的提问", text="A？")
+        self.ask("--key", "G4", topic="tp_beta", title="G4：抄送测试会话的提问", text="B？")
+        reply = self.owner_tg("G4 两个都同意", root=it["root_message_id"])
+        self.poll()                                              # 同一轮：两条 ask 读回登记 + 主人的回复
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM escalations WHERE closed_at IS NULL").fetchone()[0], 2)
+        self.assertEqual(self.row(reply)["dispatch_state"], "pending")                    # 回复还没送到
+        self.assertEqual(tg.open_asks(self.cfg, self.store, self.store.get_item(it["item_no"])), [])
+        tg.dispatcher_round(self.d)                              # 这一刻对账：按最终状态（都答了）
+        self.assertEqual(self.decide_lines(), [])
+        self.assertEqual(self.store.get_item(it["item_no"])["status"], tg.S_DOING)
+        self.d.dispatch_once()                                   # 送到、标已答以后也不补发
+        self.assertEqual({r[0] for r in self.store.conn.execute("SELECT close_reason FROM escalations")}, {"answered"})
+        self.assertEqual(self.decide_lines(), [])
+        # 对照（P1C 00:40 G5）：之后只有一个会话问、主人还没回 → 发「等你定」，带的是那条提问
+        self.ask("--key", "G4", topic="tp_beta", title="G5：只问抄送会话", text="C？")
+        self.poll()
+        self.d.dispatch_once()
+        self.assertEqual(self.decide_lines(), ["🟠 等你定：G5：只问抄送会话"])
