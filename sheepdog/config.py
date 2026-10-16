@@ -83,6 +83,10 @@ class RoutingConfig:
         if not isinstance(self.owner_at_assistant, bool):
             raise ConfigError("[routing] owner_at_assistant 必须是 true/false")
 
+    def ignored(self, chat_id: str) -> bool:
+        """这个聊天在 ignore 名单里（7.56：ignore 只在这里认；「该不该管」的完整判定见 Config.chat_scope）。"""
+        return chat_id in self.ignore_chat_ids
+
 
 @dataclass
 class RunConfig:
@@ -704,6 +708,35 @@ class SourceConfig:
 
 
 @dataclass
+class MediaConfig:
+    """[media]（7.54，热加载）：消息里的图片送进会话前先用用户身份下载到状态目录 media/<message_id>/，正文里换成本机路径。
+    下载失败不挡投递：原文照留，写明原因和会话自己去取的命令。"""
+    # 关掉 = 不下载，正文后面只写会话自己去取的命令
+    images: bool = True
+    # 单张上限（MB）：下完超过就删掉，当没下载下来
+    max_image_mb: float = 20
+    # 一批里最多真去下载几张（已经下过的不算）；超过的写明没下载
+    max_images_per_batch: int = 10
+    # 每张的超时（秒）
+    image_timeout_seconds: float = 30
+
+    def validate(self) -> None:
+        if not isinstance(self.images, bool):
+            raise ConfigError("[media] images 必须是 true/false")
+        for k in ("max_image_mb", "image_timeout_seconds"):
+            if not _positive(getattr(self, k)):
+                raise ConfigError(f"[media] {k} 必须是正数")
+        if not _positive(self.max_images_per_batch, integer=True):
+            raise ConfigError("[media] max_images_per_batch 必须是正整数")
+
+
+# 7.56「这个群该不该管」：Config.chat_scope 的三种结果
+OWNER_SIDE = "owner_side"   # 找主人那一侧（找主人聊天、7.51 的话题群）：走自己的分支，先于普通路由，不受 ignore 影响
+IGNORED = "ignored"         # [routing] ignore_chat_ids：不送、不当背景、不当指令、不按话题归属
+NORMAL = "normal"           # 其他：普通路由
+
+
+@dataclass
 class Config:
     # 「我」的 open_id，用于 @我 / 自己发的 / 回复我 的判定
     self_open_id: str = ""
@@ -746,6 +779,7 @@ class Config:
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     hooks: HooksConfig = field(default_factory=HooksConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    media: MediaConfig = field(default_factory=MediaConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -762,6 +796,11 @@ class Config:
     def runs_dir(self) -> Path:
         """命令行宿主每轮的输入、输出、错误（7.18）：runs/<batch_id>.in / .out / .err"""
         return self.state_dir / "runs"
+
+    @property
+    def media_dir(self) -> Path:
+        """送进会话的图片（7.54）：media/<message_id>/<钥匙>.<扩展名>"""
+        return self.state_dir / "media"
 
     @property
     def cli_command(self) -> str:
@@ -786,6 +825,16 @@ class Config:
         if tg and tg not in out:
             out.append(tg)
         return out
+
+    def chat_scope(self, chat_id: str) -> str:
+        """这个群该不该管（7.56）：所有路由入口（普通路由、名册归属、主人的发言当背景、主人 @ 机器人当指令、群话题归属）
+        都按它判，不各自再写一遍。找主人那一侧先于 ignore：它们有自己的分支（_escalation_message / 话题群），
+        配进 ignore 也照常处理。"""
+        if chat_id in self.owner_side_chat_ids:
+            return OWNER_SIDE
+        if self.routing.ignored(chat_id):
+            return IGNORED
+        return NORMAL
 
     def host_enabled(self, host: str) -> bool:
         return host == ANTIGRAVITY or (host in self.hosts and self.hosts[host].enabled)
@@ -872,6 +921,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.topic_group, data.get("topic_group", {}))
     _apply(cfg.hooks, data.get("hooks", {}))
     _apply(cfg.run, data.get("run", {}))
+    _apply(cfg.media, data.get("media", {}))
     hosts = data.get("hosts", {})
     if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
         raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -915,6 +965,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.hooks.validate()
     cfg.routing.validate()
     cfg.run.validate()
+    cfg.media.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

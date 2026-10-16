@@ -13,9 +13,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import session as sm
-from .config import ANTIGRAVITY, Config, DutyConfig
+from .config import ANTIGRAVITY, NORMAL, OWNER_SIDE, Config, DutyConfig, RoutingConfig
 from .models import Message
 from . import duty
+from . import media
 from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
                     human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
@@ -383,18 +384,18 @@ def open_dynamic_topics(store: Store) -> list:
 
 
 def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
-                    ignore_chat_ids: list[str],
+                    routing: RoutingConfig,
                     dynamic: dict[str, tuple[str, bool]] | None = None) -> tuple[RouteDecision, str | None]:
     """路由之后按名册判断归属（规格第 3 节），返回 (决策, topic_id)。reason 不变，归属写进 tags。
 
-    - 自己发的、ignore_chat_ids：不变
+    - 自己发的、ignore 名单里的（routing.ignored，7.56）：不变
     - managed 会话的聊天 + all_messages：推给它（覆盖 inbox 和免打扰 drop）
     - managed 会话的聊天 + dispatch 级：推给它
     - 名册里没人负责、但总线新开的 dynamic 会话负责（7.10）：同上
     - 其他 dispatch 级：总线
     - 其他：不变（inbox / drop）
     """
-    if d.route == SELF or d.reason == "self_escalation" or msg.chat_id in ignore_chat_ids:
+    if d.route == SELF or d.reason == "self_escalation" or routing.ignored(msg.chat_id):
         return d, None
     owner = roster.owner_of(msg.chat_id) if roster else None
     if owner:
@@ -527,11 +528,11 @@ class Collector:
                      self.cfg.cli_command))
 
     def _decide_inner(self, m: Message, ctx: RouteContext):
-        d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing.ignore_chat_ids,
+        d, topic_id = apply_ownership(m, route(m, ctx, self.cfg.routing), self.roster, self.cfg.routing,
                                       self._dynamic)
         # 等待中的回复优先归给登记等待的 topic（7.4），覆盖聊天归属、总线、Inbox、免打扰；
-        # 自己发的、升级私聊、ignore_chat_ids 不受影响
-        if d.route == SELF or d.reason == "self_escalation" or m.chat_id in self.cfg.routing.ignore_chat_ids:
+        # 自己发的、升级私聊、ignore 名单里的不受影响
+        if d.route == SELF or d.reason == "self_escalation" or self.cfg.routing.ignored(m.chat_id):
             return d, topic_id, None
         w = self.store.match_watch(m.sender_id, m.chat_id)
         g = self._group_reply_owner(m)
@@ -640,7 +641,8 @@ class Collector:
 
         # 先入账「找主人」聊天里机器人的提问（同批次里主人的回复才找得到它），再入账自己发的消息
         # （保证同批次里「回复我」能判定），最后其他
-        esc_chats = set(self.cfg.owner_side_chat_ids)
+        # 找主人那一侧（7.56：按 Config.chat_scope 一处判定）
+        esc_chats = {m.chat_id for m in msgs if self.cfg.chat_scope(m.chat_id) == OWNER_SIDE}
         me = self.cfg.self_open_id
         msgs.sort(key=lambda m: (0 if m.chat_id in esc_chats and m.sender_id != me else 1 if m.sender_id == me else 2,
                                  m.create_time))
@@ -923,7 +925,7 @@ class Collector:
         oc = self.cfg.owner_context
         if not oc.enabled:
             return False
-        if m.chat_id in self.cfg.owner_side_chat_ids or m.chat_id in self.cfg.routing.ignore_chat_ids:
+        if self.cfg.chat_scope(m.chat_id) != NORMAL:   # 7.56 一处判定：找主人那一侧、ignore 的都不当背景
             return False
         # 会话以主人身份代回的（带代回前缀）不送
         return not is_agent_reply(m.content, oc)
@@ -988,7 +990,8 @@ class Collector:
 
     def _owner_instruction_wanted(self, m: Message) -> bool:
         """发送人是主人本人账号（调用方已判）、群聊、@ 名单里有机器人（open_id 或 app_id）、不带代回标记、不在找主人聊天、
-        不在 ignore 聊天。开关 [routing] owner_at_assistant；[identity] 关着时不知道机器人是谁，一律不算。"""
+        不在 ignore 聊天（后两条由 _group_chat 按 Config.chat_scope 判，7.56）。开关 [routing] owner_at_assistant；
+        [identity] 关着时不知道机器人是谁，一律不算。"""
         if not self.cfg.routing.owner_at_assistant or not self.bot_ids or not self._group_chat(m):
             return False
         if not any(x.id in self.bot_ids for x in m.mentions if x.id):
@@ -1021,10 +1024,10 @@ class Collector:
 
     # ---------- 群话题 / 引用归属（7.45 第二节，思路来自 PR #1 @Jerry030-1，issue #2） ----------
     def _group_chat(self, m: Message) -> bool:
-        """群（普通群、话题群），不是找主人那一侧的聊天（找主人聊天、7.51 的话题群）、不在 ignore 名单。
-        7.51 合并：话题群里主人说话一律走 _topic_group_message，7.45 的 A 类（@ 机器人 = 指令）和话题归属都不作用在它上面。"""
-        return (m.chat_type not in ("p2p", SYSTEM_CHAT, "") and m.chat_id not in self.cfg.owner_side_chat_ids
-                and m.chat_id not in self.cfg.routing.ignore_chat_ids)
+        """群（普通群、话题群），不是找主人那一侧的聊天（找主人聊天、7.51 的话题群）、不在 ignore 名单：按 Config.chat_scope
+        一处判定（7.56）。7.51 合并：话题群里主人说话一律走 _topic_group_message，7.45 的 A 类（@ 机器人 = 指令）和话题归属
+        都不作用在它上面。"""
+        return m.chat_type not in ("p2p", SYSTEM_CHAT, "") and self.cfg.chat_scope(m.chat_id) == NORMAL
 
     def _write_note(self, message_id: str) -> None:
         note = self._notes.pop(message_id, "")
@@ -2094,13 +2097,14 @@ class Collector:
         if not content_changed and not recalled:
             return False
         me = self.cfg.self_open_id
-        if me and m.sender_id == me and m.chat_id not in self.cfg.owner_side_chat_ids:
+        owner_side = self.cfg.chat_scope(m.chat_id) == OWNER_SIDE   # 7.56 一处判定
+        if me and m.sender_id == me and not owner_side:
             # 主人编辑 / 撤回自己的发言：只更新账本，按 7.13 的去向送一条背景（7.13 补充）
             self.store.update_content(m.message_id, m)
             self._owner_edit(old, m, recalled)
             return True
         old_route, old_state = old["route"], old["dispatch_state"]
-        if m.chat_id in self.cfg.owner_side_chat_ids and old_route != DISPATCH:
+        if owner_side and old_route != DISPATCH:
             # 「找主人」聊天里没投递过的消息（提问 / 其他）编辑后只更新内容，不重新路由
             self.store.update_content(m.message_id, m)
             return True
@@ -2164,6 +2168,34 @@ class Dispatcher:
         self.playbook = Playbook.from_config(cfg)
         # 这一轮里各会话的记录文件（护栏用，每轮清空）
         self._record_cache: dict[tuple[str, str], Path | None] = {}
+        # 消息里的图片送进会话前先下载（7.54）：下载用的 lark-cli。空 = 这个进程不下载（试运行、只组装 prompt 的命令），
+        # 正文后面写明原因和会话自己去取的命令；常驻进程和 poll 由 cli 设上
+        self.image_binary = ""
+        self.image_off_reason = "这个进程不下载图片"
+
+    def _images(self, rows) -> dict[str, dict]:
+        """这一批里每条消息的图片下载结果（7.54）：message_id → {钥匙: media.ImageResult}。[media] 每批现读（热加载）。
+        下载失败不挡投递：结果里带原因，渲染时原文照留、写明会话自己去取的命令。"""
+        mc = self.cfg.media
+        fetcher = None
+        reason = self.image_off_reason
+        if not mc.images:
+            reason = "配置里关了图片下载（[media] images = false）"
+        elif self.image_binary:
+            fetcher = media.ImageFetcher(self.cfg.media_dir, self.image_binary, int(mc.max_image_mb * 1024 * 1024),
+                                         mc.image_timeout_seconds)
+        try:
+            out = media.resolve(rows, fetcher, mc.max_images_per_batch, reason)
+        except Exception as e:  # 兜底：图片出什么错都不能挡投递，当都没下载下来
+            log.warning("下载图片出错，这一批的图片都按没下载处理: %s: %s", type(e).__name__, e)
+            out = media.resolve(rows, None, mc.max_images_per_batch, f"下载图片出错：{type(e).__name__}: {e}")
+        for mid, res in out.items():
+            for r in res.values():
+                if r.ok and not r.cached:
+                    log.info("消息 %s 的图片 %s 已下载到 %s", mid, r.key, r.path)
+                elif not r.ok and fetcher is not None:
+                    log.warning("消息 %s 的图片 %s 没下载下来：%s", mid, r.key, r.error)
+        return out
 
     @property
     def sink(self) -> Sink:
@@ -2885,13 +2917,14 @@ class Dispatcher:
             for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in rows]):
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
+            images = self._images(rows)   # 7.54：图片先下到本机，正文里换成路径
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
                                   rules_note=self._compaction_note(t) if rules_update else "",
-                                  reminder=self.reminder(t), notes=notes, digest=digest)
+                                  reminder=self.reminder(t), notes=notes, digest=digest, images=images)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -2975,7 +3008,7 @@ class Dispatcher:
             prompt = priority_prompt(self.playbook, t["topic_id"], batch_id, t["pending_batch_id"], urgent,
                                      self._session_title(t), security=self.security, quotes=quotes,
                                      max_lines=self.cfg.session.max_message_lines, notes=notes,
-                                     reminder=self.reminder(t))
+                                     reminder=self.reminder(t), images=self._images(urgent))
             # 同普通批次：先记「正在发」再发送，崩溃后由 _recover_sending 核对（7.16）
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in urgent], state="sending")
             self._send(t, prompt, batch_id)

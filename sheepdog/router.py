@@ -86,7 +86,7 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
             return RouteDecision(DROP, "self_escalation")
 
     # 2. 强制忽略
-    if msg.chat_id in cfg.ignore_chat_ids:
+    if cfg.ignored(msg.chat_id):
         return RouteDecision(DROP, "ignored_chat")
 
     kw = _keyword_hit(msg.content, cfg.keywords)

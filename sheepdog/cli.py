@@ -77,7 +77,7 @@ from . import __version__
 from . import actions
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text
-from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, ConfigError, default_config_path, load_config
+from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
 from . import lastgood
 from . import duty
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
@@ -229,6 +229,17 @@ def _source(cfg):
     if not cfg.source.enabled:
         return NullSource()
     return LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages)
+
+
+def _wire_images(dispatcher, source, args) -> None:
+    """消息里的图片送进会话前先下载（7.54）：常驻进程和 poll 用 lark-cli 下；--dry-run 不下（正文后面写会话自己去取的命令）。
+    [media] images = false 时也不下（每批现读，热加载）。"""
+    if dispatcher is None:
+        return
+    if getattr(args, "dry_run", False):
+        dispatcher.image_off_reason = "试运行（--dry-run）不下载图片"
+        return
+    dispatcher.image_binary = getattr(source, "binary", "") or "lark-cli"
 
 
 def _group_source(source, args):
@@ -390,6 +401,9 @@ def cmd_doctor(args) -> int:
              else "（⚠ owner_context 的 skip_prefixes 和 agent_markers 都为空，无法识别代回，熔断不生效）"))
     print(owner_chats_report(cfg))
     print(topic_group_report(cfg, store))
+    for line in _test_group_warnings(cfg, store):   # 7.56：建了测试群忘了登记进 ignore，下一次 doctor 就看见
+        print(line)
+    print(media_report(cfg))
     for line in switches_report(cfg):
         print(line)
     for line in threads_report(cfg):
@@ -409,6 +423,37 @@ def cmd_doctor(args) -> int:
         print(line)
     print(duty_report(cfg, store))
     return 0 if ok else 1
+
+
+TEST_GROUP_MARK = "🧪"
+
+
+def _test_group_warnings(cfg, store: Store) -> list[str]:
+    """doctor（7.56）：账本里出现过、群名以「🧪」开头、却不在 [routing] ignore_chat_ids 里的群，逐个列出 chat_id 和群名。
+    测试群和正式共用主人的飞书身份，正式牧羊犬照样拉得到；不在 ignore 里，里面的消息会被当真（当背景、当指令送总线）。
+    找主人那一侧（找主人聊天、话题群）本来就不走普通路由，不报。群名按账本里最近的那条。只警告，不改退出码。"""
+    latest: dict[str, str] = {}
+    for r in store.conn.execute("SELECT chat_id, chat_name FROM messages WHERE chat_name LIKE ? "
+                                "ORDER BY create_time", (f"%{TEST_GROUP_MARK}%",)):
+        if r["chat_id"]:
+            latest[r["chat_id"]] = r["chat_name"] or ""
+    bad = [(cid, name.strip()) for cid, name in latest.items()
+           if name.strip().startswith(TEST_GROUP_MARK) and cfg.chat_scope(cid) == NORMAL]
+    if not bad:
+        return []
+    out = [f"测试群: ⚠ {len(bad)} 个「{TEST_GROUP_MARK}」开头的群不在 [routing] ignore_chat_ids 里，"
+           "里面的消息会被正式牧羊犬当真（当背景、当指令送总线）："]
+    out += [f"  ⚠ {cid}  {name}" for cid, name in sorted(bad, key=lambda x: x[1])]
+    return out
+
+
+def media_report(cfg) -> str:
+    """doctor：消息里的图片送进会话前先下载（7.54）。"""
+    m = cfg.media
+    if not m.images:
+        return "图片（7.54）: 关（[media] images = false），只在正文后面写会话自己去取的命令"
+    return (f"图片（7.54）: 开，下到 {cfg.media_dir}；单张上限 {m.max_image_mb:g}MB、每批最多下 {m.max_images_per_batch} 张、"
+            f"每张超时 {m.image_timeout_seconds:g} 秒；跟着 retention_days={cfg.retention_days} 清理")
 
 
 def owner_chats_report(cfg) -> str:
@@ -716,6 +761,7 @@ def cmd_poll(args) -> int:
     collector.dry_run = bool(getattr(args, "dry_run", False))
     dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker,
                                                           _notifier(cfg, source, args), _group_source(source, args))
+    _wire_images(dispatcher, source, args)
     _cycle(collector, dispatcher)
     return 0
 
@@ -787,6 +833,7 @@ def cmd_run(args) -> int:
     collector.dry_run = bool(getattr(args, "dry_run", False))
     dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args),
                             _group_source(source, args))
+    _wire_images(dispatcher, source, args)
     logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
                  "、".join(f"{h}={s.name}" for h, s in sink.items()))
     consumer = _start_bot_events(cfg, store, source, args)
@@ -809,6 +856,11 @@ def _start_bot_events(cfg, store: Store, source, args):
                                 state_writer=lambda st: store.set_meta(ident.META_CONSUMER, json.dumps(st, ensure_ascii=False)))
     consumer.start()
     return consumer
+
+
+def _prune(store: Store, cfg) -> dict[str, int]:
+    """常驻进程每小时一次的旧数据清理：账本、回执、命令行宿主的运行文件、在岗表履历，加上送进会话的图片（7.54）。"""
+    return store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir, cfg.duty.history_days, cfg.media_dir)
 
 
 def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher: Dispatcher) -> int:
@@ -834,7 +886,7 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
             if time.time() - last_prune > 3600:
-                pruned = store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir, cfg.duty.history_days)
+                pruned = _prune(store, cfg)
                 last_prune = time.time()
                 if any(pruned.values()):
                     logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,

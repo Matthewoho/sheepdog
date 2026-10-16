@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 
+from . import media
 from .playbook import Playbook
 from .roster import MANAGED, Roster, RosterSession
 from .security import NONE, SecurityConfig
@@ -531,7 +532,9 @@ def agent_sender_label(pb: Playbook) -> str:
 
 
 def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200, cli: str = "sheepdog",
-             agent_label: str = AGENT_SENDER_LABEL, extra: list[str] | None = None) -> str:
+             agent_label: str = AGENT_SENDER_LABEL, extra: list[str] | None = None, images: dict | None = None) -> str:
+    """images：这条消息里图片的下载结果（钥匙 → media.ImageResult，7.54）。下载到了的钥匙在正文里换成本机路径，
+    没下载下来的原样留着，正文后面写原因和会话自己去取的命令。"""
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -570,13 +573,14 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     lines += list(extra or [])  # 在岗表的撞车提醒（7.20）
     if banner:
         lines.append(banner)  # 警示在正文之前
-    content = (row["content"] or "").strip()
+    content, image_notes = media.apply((row["content"] or "").strip(), row["message_id"], images)
     body = content.splitlines()
     lines += ["> " + ln for ln in body[:max_lines]] or ["> (空)"]
     if len(body) > max_lines:
         # 长消息截断时明说（7.16）：之前固定只送前 40 行且没有任何提示
         lines.append(with_cli(f"…（后面还有 {len(body) - max_lines} 行未显示，用 `sheepdog show {row['message_id']}` 看全文）",
                               cli))
+    lines += image_notes
     if row["link"]:
         lines.append(f"链接：{row['link']}")
     lines.append(f"message_id: `{row['message_id']}`" + (f"（回复 `{row['reply_to']}`）" if row["reply_to"] else ""))
@@ -603,8 +607,9 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
                  cli_host: bool = False, rules_note: str = "", reminder: str = "", notes: dict | None = None,
-                 digest: str = "") -> str:
-    """rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
+                 digest: str = "", images: dict | None = None) -> str:
+    """images：每条消息里图片的下载结果（message_id → {钥匙: media.ImageResult}，7.54）。
+    rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
     7.19 K1），附在整批最末尾。notes：附在某条消息上的撞车提醒（message_id → 几行，7.20）；
     digest：总线批次附的在岗表摘要（7.20）。"""
     # 批次头永远是第一行（7.47 第 4 条返工）：Antigravity 写会话记录时长消息只留首尾各约 2KB，规则排在前面会把批次头
@@ -621,8 +626,9 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
     quotes = quotes or {}
     agent_label = agent_sender_label(pb)
     notes = notes or {}
+    images = images or {}
     parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
-                       pb.cli, agent_label, notes.get(r["message_id"])) for r in rows]
+                       pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"])) for r in rows]
     if any(r["reason"] in ("at_me", "at_bot", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
@@ -656,7 +662,8 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
 
 def priority_prompt(pb: Playbook, topic_id: str, batch_id: str, pending_batch: str, rows: list[sqlite3.Row],
                     session_title: str, security: SecurityConfig | None = None, quotes: dict | None = None,
-                    max_lines: int = 200, notes: dict | None = None, reminder: str = "") -> str:
+                    max_lines: int = 200, notes: dict | None = None, reminder: str = "",
+                    images: dict | None = None) -> str:
     """主人插话批次（7.37 第 4 件）：会话在跑上一批（running）时，找主人聊天里主人的回复不排队，当轮单独送到。
     开头说清这是插话、先答主人；不要回执（手上那批照常交），所以没有回执那一行和每批末尾的提醒；红线照附。"""
     head = pb.render_or(OWNER_PRIORITY_FILE, DEFAULT_OWNER_PRIORITY, session_title=session_title, topic_id=topic_id,
@@ -665,8 +672,9 @@ def priority_prompt(pb: Playbook, topic_id: str, batch_id: str, pending_batch: s
     quotes = quotes or {}
     notes = notes or {}
     agent_label = agent_sender_label(pb)
+    images = images or {}
     parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
-                       pb.cli, agent_label, notes.get(r["message_id"])) for r in rows]
+                       pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"])) for r in rows]
     if reminder:
         parts += ["", reminder]
     return "\n".join(parts)
