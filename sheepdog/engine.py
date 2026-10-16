@@ -1732,7 +1732,7 @@ class Collector:
         """主人在话题群新开顶层话题（入口 3）：开一件事项（编号当钥匙），当成主人的指令送总线，编号写进批次说明。"""
         from . import topicgroup as tg
         text = plain_text(m.content)
-        title = duty.short(first_line(text), 40) or "（主人开的话题）"
+        title = tg._excerpt(first_line(text), 40) or "（主人开的话题）"
         item = tg.open_item(self.store, title, BUS_TOPIC_ID, "owner", tg.ORIGIN_OWNER, m.chat_id,
                             root_message_id=m.message_id, thread_id=m.thread_id)
         no = tg.label(item["item_no"])

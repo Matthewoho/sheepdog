@@ -1071,3 +1071,36 @@ class MergeWith745Test(TGBase):
         self.assertEqual(follow, {"tp_alpha", "tp_beta"})                          # 插话没回音提醒都起算
         self.assertEqual({e["close_reason"] for e in self.store.conn.execute("SELECT close_reason FROM escalations")},
                          {"answered"})
+
+
+# ======================= 叠在「待办」重排（6c9f811 / 4cb0bf7）上 =======================
+class PendingRelayoutTest(TGBase):
+    def test_dm_pending_keeps_new_card_group_pending_points_to_index(self):
+        from sheepdog.pending import PENDING_TITLE
+        self.ask("--key", "PD-1", "--track", text="?")
+        self.poll()
+        dm = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="待办")
+        grp = self.owner_tg("待办")
+        self.poll()
+        dm_reply = [c for c in self.lark.sent("+messages-reply") if _opt(c, "--message-id") == dm]
+        grp_reply = [c for c in self.lark.sent("+messages-reply") if _opt(c, "--message-id") == grp]
+        self.assertEqual(len(dm_reply), 1)
+        self.assertTrue(sent_text(dm_reply[0]).startswith(PENDING_TITLE), sent_text(dm_reply[0]))   # 私聊：新排版的卡片
+        self.assertNotIn("索引卡", sent_text(dm_reply[0]))
+        self.assertEqual(len(grp_reply), 1)
+        self.assertIn("看置顶的索引卡", sent_text(grp_reply[0]))                                   # 群里：指向索引卡
+        self.assertEqual((self.row(dm)["reason"], self.row(grp)["reason"]), ("pending_query", "pending_query"))
+
+    def test_titles_use_markdown_free_excerpt(self):
+        self.ask("--key", "MD-1", "--track", title="**证书**交接", text="?")
+        title = self.lark.tg_sent()[0]
+        self.assertTrue(sent_text(title).startswith("🗂 T-1 · 证书交接"), sent_text(title))
+        mid = self.owner_tg("## 发版 **计划**\n- 先灰度\n- 再全量")
+        self.poll()
+        it = self.store.item_by_root(mid)
+        self.assertEqual(it["title"], "发版 计划")
+        self.d.dispatch_once()
+        idx = [sent_text(c) for c in self.lark.tg_sent() if sent_text(c).startswith("📌")][0]
+        self.assertIn("T-2 发版 计划]", idx)
+        self.assertIn("T-1 证书交接]", idx)
+        self.assertNotIn("**证书**", idx)

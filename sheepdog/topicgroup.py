@@ -96,6 +96,12 @@ def track_norm(key: str) -> str:
     return re.sub(r"[\s_\-]+", "", key or "").upper()
 
 
+def _excerpt(text: str, limit: int) -> str:
+    """给主人看的摘录（标题卡、索引卡、话题里那一行）：用「待办」那套去 markdown、合成一行、在句子边界截断（pending.excerpt）。"""
+    from .pending import excerpt
+    return excerpt(text or "", limit)
+
+
 def label(item_no: int) -> str:
     return f"{ITEM_PREFIX}{item_no}"
 
@@ -214,7 +220,7 @@ def open_item(store: Store, title: str, owner_topic: str, opened_by: str, origin
               key: str = "", topic_id: str = "", dm_root: str = "", related: int | None = None,
               root_message_id: str = "", thread_id: str = ""):
     """开一件事项：编号也登记成钥匙（T-12），会话的钥匙登记成钥匙。返回事项行。"""
-    no = store.add_item(title=duty.short(title, 60) or "（无标题）", owner_topic=owner_topic, opened_by=opened_by,
+    no = store.add_item(title=_excerpt(title, 60) or "（无标题）", owner_topic=owner_topic, opened_by=opened_by,
                         origin=origin, chat_id=chat_id, dm_root_message_id=dm_root, related_item=related,
                         root_message_id=root_message_id, thread_id=thread_id)
     store.add_item_key(no, label(no), track_norm(label(no)), "number", "")
@@ -593,7 +599,7 @@ def render_index(cfg, data: dict, rows: int = INDEX_ROWS) -> str:
         lines.append("")
         lines.append(f"**{STATUS_LABEL[st]}（{len(items)}）**")
         for x in items[:rows]:
-            title = duty.short(x["title"], 40).replace("[", "［").replace("]", "］")
+            title = _excerpt(x["title"], 40).replace("[", "［").replace("]", "］")
             name = f"[{x['label']} {title}]({x['link']})" if x["link"] else f"{x['label']} {title}"
             lines.append(f"- {name} · {x['owner']}" + (f" · {x['extra']}" if x["extra"] else ""))
         if len(items) > rows:
@@ -605,7 +611,7 @@ def render_index(cfg, data: dict, rows: int = INDEX_ROWS) -> str:
     lines.append(f"**建议放进群（{len(sugg)}）**：在私聊那件事的话题里整句回「放群里」")
     cap = min(rows, cfg.topic_group.suggest_max)
     for s in sugg[:cap]:
-        lines.append(f"- {duty.short(s['title'], 40)}（钥匙 `{s['key']}`）· {'、'.join(s['why'])}")
+        lines.append(f"- {_excerpt(s['title'], 40)}（钥匙 `{s['key']}`）· {'、'.join(s['why'])}")
     if len(sugg) > cap:
         lines.append(f"- 另有 {len(sugg) - cap} 件")
     if not sugg:
@@ -695,7 +701,7 @@ def change_lines(cfg, store: Store, item, st: str) -> list[tuple[str, str]]:
     if st == S_DECIDE and prev != S_DECIDE:
         e = open_asks(cfg, store, item)
         from .pending import ask_title
-        what = ask_title(cfg, e[0]["text"]) if e else ""
+        what = _excerpt(ask_title(cfg, e[0]["text"]), 40) if e else ""
         out.append(("🟠 等你定" + (f"：{what}" if what else ""), "decide:" + (e[0]["message_id"] if e else "")))
     if st == S_DONE and prev not in (S_DONE, S_ARCHIVED):
         who = item["done_by"] or ""
