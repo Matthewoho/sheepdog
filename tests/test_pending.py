@@ -22,7 +22,7 @@ from sheepdog.source.lark import parse_message
 from sheepdog.store import Store
 
 from test_roster import ME, REPO, later
-from test_threads import ALICE, ALPHA_P2P, BOT, ESC_CHAT, MARK, FakeLark, ThreadsBase, _opt, now8, sent_text
+from test_threads import ALICE, ALPHA_P2P, BOT, ESC_CHAT, MARK, TZ8, FakeLark, ThreadsBase, _opt, now8, sent_text
 from sheepdog.card import plain_text
 
 # 正式配置里 header_regex 的写法（10-14 只读核对）：结案那句、待办清单的第一行都不能被它认成「需要你定」
@@ -734,11 +734,34 @@ class PendingListTest(PendingBase):
 
 
 # ======================= 给主人看的「待办」卡片（10-16 19:0x Matthew：「待办卡片有点丑」） =======================
+# 「待办」卡片里的时间按「现在」决定写 HH:MM 还是带月-日（跨天带日期）。OwnerPendingTest 把时钟钉在这一刻：
+# 造数据（假飞书的消息时间、ask 的提问时间、来源消息时间）和出清单都用它，测试结果不随真实时钟变（10-17 00:01 全量里，
+# 来源按「现在减 10 分钟」造，过了午夜落到前一天，断言 HH:MM 的那条红过）
+FROZEN_NOW = datetime(2026, 10, 16, 15, 0, tzinfo=TZ8)
+
+
+def frozen_clock(test, now: datetime) -> None:
+    """把测试里造数据的「现在」（test_threads.now8、本文件的 now8）和牧羊犬判断用的「现在」（engine._now）都钉在 now。"""
+    for target in ("test_threads.now8", "test_pending.now8"):
+        p = mock.patch(target, return_value=now.replace(second=0, microsecond=0))
+        p.start()
+        test.addCleanup(p.stop)
+    p = mock.patch("sheepdog.engine._now", side_effect=lambda: test.clock)
+    p.start()
+    test.addCleanup(p.stop)
+    test.clock = now
+
+
 class OwnerPendingTest(PendingBase):
     scene = PendingListTest.scene     # 同一套场景：4 条要你定（含同来源 2 条、可能已处理 1 条）、2 件在等你
 
+    def setUp(self):
+        super().setUp()
+        frozen_clock(self, FROZEN_NOW)
+
     def view(self):
-        return pend.owner_list(self.cfg, self.store)
+        # 出清单的「现在」比造数据晚 5 分钟（假飞书的时间只到分钟）
+        return pend.owner_list(self.cfg, self.store, self.clock + timedelta(minutes=5))
 
     def els(self, card) -> list[str]:
         return [e.get("content", "<hr>") if e["tag"] != "hr" else "<hr>" for e in card["body"]["elements"]]
@@ -748,7 +771,7 @@ class OwnerPendingTest(PendingBase):
         text, card = self.view()
         h = card["header"]
         self.assertEqual(h["title"], {"tag": "plain_text", "content": "📋 待办"})
-        self.assertRegex(h["subtitle"]["content"], r"^\d\d:\d\d · 要你定 4 · 在等你 2$")
+        self.assertEqual(h["subtitle"]["content"], "15:05 · 要你定 4 · 在等你 2")   # 时钟钉住：出清单在 15:05
         self.assertEqual(h["template"], "orange")
         self.assertTrue(text.startswith("📋 待办 · " + h["subtitle"]["content"] + "\n"))
         els = self.els(card)
@@ -793,14 +816,14 @@ class OwnerPendingTest(PendingBase):
         self.assertTrue(link)
         self.assertEqual(lines[0], f"**1. 卡片测试** [打开]({link})")
         meta = lines[1]
-        self.assertRegex(meta, r"^<font color='grey'>Alpha 需求 · \d\d:\d\d 问 · 已等 \d+ 分钟 · 钥匙 T748</font>$")
+        self.assertEqual(meta, "<font color='grey'>Alpha 需求 · 15:00 问 · 已等 5 分钟 · 钥匙 T748</font>")
         self.assertNotIn("[managed]", meta)
         self.assertNotIn("tp_alpha", meta)
         ex = lines[2]
         for bad in ("###", "**", "`", "](", "- "):
             self.assertNotIn(bad, ex)
         self.assertTrue(ex.startswith("这是 7.48 卡片测试（S1），不用真的回答。 要你看的：加粗能不能显示"), ex)
-        self.assertRegex(lines[3], r"^<font color='grey'>来源：和 .+ 的私聊 \d\d:\d\d</font>$")
+        self.assertEqual(lines[3], "<font color='grey'>来源：和 Alice 的私聊 14:50</font>")   # 来源在提问前 10 分钟、同一天
         # 纯文本版：同样的顺序，一条分几行
         i = text.index("1. 卡片测试")
         block = text[i:].split("\n\n")[0].split("\n")
@@ -808,6 +831,22 @@ class OwnerPendingTest(PendingBase):
         self.assertEqual(block[1], "   " + meta.removeprefix("<font color='grey'>").removesuffix("</font>"))
         self.assertEqual(block[2], "   " + ex)
         self.assertTrue(block[3].startswith("   来源："))
+
+    def test_source_on_previous_day_shows_month_day(self):
+        # 跨天：来源在前一天 23:54、提问在当天 00:02，出清单在 00:07 → 来源带月-日，提问写 HH:MM
+        self.clock = datetime(2026, 10, 17, 0, 2, tzinfo=TZ8)
+        a = self.alice_batch(minutes=0)
+        self.lark.msgs[a]["at"] = datetime(2026, 10, 16, 23, 54, tzinfo=TZ8)
+        self.store.conn.execute("UPDATE messages SET create_time=? WHERE message_id=?",
+                                ("2026-10-16T23:54:00+08:00", a))
+        self.store.conn.commit()
+        with mock.patch("test_threads.now8", return_value=self.clock), mock.patch("test_pending.now8", return_value=self.clock):
+            self.asked("--about", a, "--key", "T748", title="跨天")
+        text, card = pend.owner_list(self.cfg, self.store, self.clock + timedelta(minutes=5))
+        item = next(e for e in self.els(card) if e.startswith("**1. "))
+        meta, src = item.split("\n")[1], item.split("\n")[-1]
+        self.assertRegex(meta, r"^<font color='grey'>Alpha 需求 · 00:02 问 · ")
+        self.assertEqual(src, "<font color='grey'>来源：和 Alice 的私聊 10-16 23:54</font>")
 
     def test_no_source_no_source_line(self):
         self.asked(title="随口", text="随便问问")
@@ -821,7 +860,7 @@ class OwnerPendingTest(PendingBase):
         text, card = self.view()
         item = next(e for e in self.els(card) if "Leon GitHub App" in e)
         meta = item.split("\n")[1]
-        self.assertRegex(meta, r" · ⚠ 可能已处理（\d\d:\d\d 你在.+里说过）</font>$")
+        self.assertRegex(meta, r" · ⚠ 可能已处理（15:02 你在.+里说过）</font>$")
 
     def test_session_name(self):
         self.assertEqual(pend.session_name(self.cfg, self.store, "tp_alpha"), "Alpha 需求")
