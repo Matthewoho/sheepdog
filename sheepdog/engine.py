@@ -76,6 +76,8 @@ GROUP_SOURCE_LABEL = {
     "quote_delivered": "引用的那条送到过你", "quote_forwarded": "引用的那条转交给了你",
     "quote_sent": "引用的那条是你经 sheepdog 发的", "quote_thread": "引用的那条所在的话题归你",
 }
+# 7.45 C 类不收这些发送人类型的话题回复（机器人 / 应用；事件里的 bot 入账时已经换成 app）
+BOT_SENDER_TYPES = ("app", "bot")
 # 找群话题开头那条时一次 mget 最多看几条候选（7.45 第二节第 3 条）
 GROUP_ROOT_MGET = 50
 # 主人的回复认不出回答哪条时，给总线的那条系统消息（未结列表 / 认不出来源）；正文里写着那条回复的编号
@@ -1104,9 +1106,12 @@ class Collector:
         return None
 
     def _group_reply_owner(self, m: Message) -> dict | None:
-        """C 类：别人在群里的话题回复（带 thread_id、不是开头那条、不带代回标记）→ 话题归属。主人本人、机器人自己的在路由时
-        已经是 self，不走这里。"""
+        """C 类：别人在群里的话题回复（带 thread_id、不是开头那条、不带代回标记、发送人是人）→ 话题归属。主人本人、机器人自己的
+        在路由时已经是 self，不走这里。别的机器人 / 应用发的话题回复不直达，照原来的路由走（@主人、关键词照旧送）：
+        架构侧 10-16 17:4x 定，回放里一个机器人对话话题（omt_19aa805de60f184c）3 天会给总线多送 77 条。"""
         if not self.cfg.threads.group_owner or not self._group_chat(m) or not is_thread_reply(m):
+            return None
+        if m.sender_type in BOT_SENDER_TYPES:
             return None
         if is_agent_reply(m.content, self.cfg.owner_context):
             return None

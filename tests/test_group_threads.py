@@ -205,6 +205,42 @@ class GroupThreadReplyTest(GroupBase):
         self.assertIn("group_thread:recorded", json.loads(self.row(rep2)["tags_json"]))
         self.assertEqual(self.mgets(), 1)
 
+    def test_bot_thread_reply_not_attributed_human_still_is(self):
+        # 架构侧 10-16 17:4x：机器人 / 应用发的话题回复不按话题归属直达，照原来的路由走；人的照旧直达
+        root = self.root_to("tp_beta")
+        bot = self.say(thread_root=root, sender="ou_test_wizard", sender_type="app", content="自动巡检：一切正常")
+        self.pull(bot)
+        r = self.row(bot)
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("inbox", "group", None))
+        self.assertNotIn("group_thread", r["tags_json"])
+        self.assertIsNone(r["note"])
+        # 机器人事件那条路（sender_type bot，入账时换成 app）同样不直达
+        bot2 = self.say(thread_root=root, sender="ou_test_wizard", sender_type="app", content="第二次巡检")
+        self.bot_hears(self.lark.event(bot2))
+        self.assertEqual(self.row(bot2)["route"], "inbox")
+        human = self.say(thread_root=root, content="人回的")
+        self.pull(human)
+        self.assertEqual((self.row(human)["reason"], self.row(human)["topic_id"]), ("thread_owner", "tp_beta"))
+
+    def test_bot_thread_reply_at_owner_or_keyword_keeps_old_route(self):
+        root = self.root_to("tp_beta")
+        at = self.say(thread_root=root, sender="ou_test_wizard", sender_type="app", content="请 Matthew 看一下",
+                      mentions=[ME])
+        self.pull(at)
+        r = self.row(at)
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "at_me", BUS_TOPIC_ID))  # 照原路由：总线
+        self.assertNotIn("group_thread", r["tags_json"])
+        self.cfg.routing.keyword_skip_bot_senders = False      # 让机器人也参与关键词
+        kw = self.say(thread_root=root, sender="ou_test_wizard", sender_type="app", content="故障已恢复")
+        self.pull(kw)
+        r = self.row(kw)
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "keyword", BUS_TOPIC_ID))  # 不是 tp_beta
+        self.assertNotIn("group_thread", r["tags_json"])
+        # 同一个话题里人发的关键词消息：照旧直达归属会话（原因保留 keyword）
+        hk = self.say(thread_root=root, content="故障我来跟")
+        self.pull(hk)
+        self.assertEqual((self.row(hk)["reason"], self.row(hk)["topic_id"]), ("keyword", "tp_beta"))
+
     def test_root_delivered_directly_and_bot_event_root_id_needs_no_mget(self):
         root = self.root_to(BUS_TOPIC_ID)               # 开头那条只送到了总线、总线没转交 → 归总线
         self.lark.calls.clear()
