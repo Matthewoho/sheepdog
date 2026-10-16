@@ -637,7 +637,7 @@ class BotDmTest(IdentityBase):
         q = self.lark.sent()[0]
         ask_mid = next(k for k, v in self.lark.msgs.items() if v["chat_id"] == ESC_CHAT)
         self.pull(ask_mid)
-        ans = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="周五")
+        ans = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="周五", quote=ask_mid)   # 7.53：回答要引用提问
         self.bot_hears(self.lark.event(ans))
         r = self.row(ans)
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), (DISPATCH, "owner_reply", "tp_alpha"))

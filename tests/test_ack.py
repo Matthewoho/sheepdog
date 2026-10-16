@@ -271,7 +271,7 @@ class BotAckTest(Base):
 
     def test_owner_reply_acked_as_bot_once_never_removed(self):
         self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
-        self.poll([self.reply("om_test_r1", "好的")])
+        self.poll([self.reply("om_test_r1", "好的", reply_to="om_test_q1")])   # 7.53：回答要引用提问
         self.assertEqual(self.im.added, [])  # 入账时不点
         self.d.dispatch_once()
         self.assertEqual(self.im.identities, {"om_test_r1": "bot"})

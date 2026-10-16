@@ -723,7 +723,7 @@ class PendingListTest(PendingBase):
     def test_other_words_are_not_the_query(self):
         self.asked()
         mid = self.owner_top("待办的那件事按 A 办")
-        self.assertEqual(self.row(mid)["reason"], "owner_reply")
+        self.assertEqual(self.row(mid)["reason"], "owner_instruction")   # 不是「待办」快捷问法；7.53 起没引用的话是指令
         self.assertEqual(self.lark.sent("+messages-reply"), [])
 
     def test_empty_list(self):

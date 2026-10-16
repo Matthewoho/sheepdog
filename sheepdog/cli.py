@@ -1057,7 +1057,8 @@ def cmd_forward(args) -> int:
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
         ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
-                               cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns, cfg.cli_command)
+                               cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns, cfg.cli_command,
+                               answers=getattr(args, "answers", "") or "")
     except ValueError as e:
         print(f"转交被拒绝: {e}", file=sys.stderr)
         return 2
@@ -1065,6 +1066,8 @@ def cmd_forward(args) -> int:
     for mid, batch, sent_at in ids.skipped:
         print(f"`{mid}` {delivered_text(args.topic, batch, sent_at, cfg.timezone_offset)}，这次不重发")
     extra = "，附主人原话 / 总线备注" if args.quote or args.note else ""
+    if getattr(args, "answers", ""):
+        print(f"已标记提问 `{args.answers}` 为已答（{args.topic}）")
     if ids or extra or not ids.skipped:
         print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
     else:
@@ -1963,6 +1966,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--message-ids", default="", help="逗号分隔；可以不带，只转达 --quote / --note")
     sp.add_argument("--quote", default="", help="主人原话，投递时标成「主人原话（经总线转达）」")
     sp.add_argument("--note", default="", help="总线备注，投递时标成「总线备注」")
+    sp.add_argument("--answers", default="", help="7.53：主人这句是在回答哪条「需要你定」（提问的 om_，只能一个）："
+                                                  "给了才关那一条；必须是 --topic 那个会话名下、还开着的")
     sp.set_defaults(func=cmd_forward)
 
     sp = sub.add_parser("spawn")

@@ -44,6 +44,7 @@ REASON_LABEL = {
     "owner_reply": "主人在 IM 的回复",
     "owner_context": "主人本人的发言",
     "owner_instruction": "主人在群里 @ 你",
+    "owner_instruction_private": "主人的指令（私聊）",
     "thread_owner": "话题归属",
     "loop_guard": "疑似循环",
     "collect_partial": "采集不完整",
@@ -83,6 +84,9 @@ OWNER_REPLY_LABEL = "✅ 主人在飞书的回复（已核对：发送人是主�
 # 主人本人账号在群里 @ 机器人（7.45 A 类）：给助理的指令，不是背景
 OWNER_INSTRUCTION_LABEL = "🗣 主人在群里 @ 了你：这是主人的指令（已核对：发送人是主人本人账号）"
 OWNER_INSTRUCTION_TAG = "owner_instruction"
+# 7.53：找主人聊天里没引用、不在话题里的话也是指令（同一个 reason / tag，同样 🗣、插队），措辞按来路换
+OWNER_PRIVATE_INSTRUCTION_LABEL = "🗣 主人在找主人聊天里说的（没引用哪条提问）：这是主人的指令（已核对：发送人是主人本人账号）"
+OWNER_PRIVATE_TAG = "owner_at:private"
 
 
 # 牧羊犬发给会话的每一条（批次、登记通知、退休通知、规则更新）都有一行以它开头的头（7.18 第 7 条靠它认）
@@ -532,9 +536,10 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
     instruction = OWNER_INSTRUCTION_TAG in tags
+    private = OWNER_PRIVATE_TAG in tags
     if instruction:
-        # 7.45 A 类：按标记认（被总线 forward 转交以后 reason 不变，标记也还在）
-        label = REASON_LABEL["owner_instruction"]
+        # 7.45 A 类：按标记认（被总线 forward 转交以后 reason 不变，标记也还在）；7.53 私聊里没引用的话措辞不同
+        label = REASON_LABEL["owner_instruction_private" if private else "owner_instruction"]
     elif "owner_verified" in tags:
         # 主人回复按标记认，不按 reason 值认：已上线账本里的旧行用的是改名前的 reason
         label = REASON_LABEL["owner_reply"]
@@ -548,7 +553,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     if quote:
         lines.append(quote)
     if instruction:
-        lines.append(OWNER_INSTRUCTION_LABEL)
+        lines.append(OWNER_PRIVATE_INSTRUCTION_LABEL if private else OWNER_INSTRUCTION_LABEL)
     elif "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
     if row["reason"] == "owner_context":

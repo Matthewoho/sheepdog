@@ -23,7 +23,8 @@ class OwnerChatBase(ThreadsBase):
         self.assertEqual(rc, 0, out)
         self.ask_mid = next(k for k, v in self.lark.msgs.items() if v["chat_id"] == ESC_CHAT)
         self.pull(self.ask_mid)
-        self.owner = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="周五发", at=now8() - timedelta(minutes=2))
+        self.owner = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="周五发", at=now8() - timedelta(minutes=2),
+                                   quote=self.ask_mid)   # 7.53：回答要引用提问
         self.pull(self.owner)
         r = self.row(self.owner)
         self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", "tp_alpha"))
@@ -100,7 +101,8 @@ class AgentReplyInOwnerChatTest(OwnerChatBase):
         r = self.row(agent)
         self.assertEqual((r["route"], r["reason"], r["topic_id"], r["dispatch_state"]),
                          ("self", "agent_reply_in_owner_chat", None, None))
-        self.assertEqual((self.row(plain)["route"], self.row(plain)["reason"]), ("dispatch", "owner_reply"))  # 主人亲自说的照旧
+        # 主人亲自说的照旧投递（7.53：没引用的是指令）
+        self.assertEqual((self.row(plain)["route"], self.row(plain)["reason"]), ("dispatch", "owner_instruction"))
         self.deliver()
         self.d.dispatch_once()
         everything = "\n".join(c for _, c in self.sink.sent)

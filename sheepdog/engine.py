@@ -1314,9 +1314,12 @@ class Collector:
     def _escalation_message(self, m: Message) -> RouteDecision:
         """先于普通路由，不受 ignore_chat_ids 影响。三种结果：登记提问 / 主人的回复 / 其他一律 drop。
         7.51：话题群（[topic_group] chat_id）在入口就分开，走自己的分支（_topic_group_message），不进私聊那套「没引用就猜」。"""
-        if self._in_topic_group(m.chat_id):
-            return self._topic_group_message(m)
         me = self.cfg.self_open_id
+        if self._in_topic_group(m.chat_id):
+            d = self._topic_group_message(m)
+            if me and m.sender_id == me and d.route == DISPATCH and d.reason in ECHO_REQUEST_REASONS:
+                self._echo_record(m, d.reason)   # 7.52：话题群里主人的话同样记一笔欠账
+            return d
         if me and m.sender_id == me:
             if m.chat_id == self.cfg.threads.owner_chat_id and is_agent_reply(m.content, self.cfg.owner_context):
                 # 测试用的找主人群（[threads] owner_chat_id）：会话以主人身份代回的，不算主人发言
@@ -1342,7 +1345,7 @@ class Collector:
                 self._pending_reply(m)
                 return d
             d = self._owner_reply(m)
-            self._echo_record(m, OWNER_REPLY)   # 7.52：主人在找主人聊天里的话，记一笔欠账
+            self._echo_record(m, d.reason)      # 7.52：主人在找主人聊天里的话，记一笔欠账（7.53：没引用的记成指令）
             return d
         if m.sender_type in ("app", "bot"):
             self._learn_thread(m)
@@ -1476,8 +1479,9 @@ class Collector:
         return t["kind"] == DYNAMIC or (self.roster is None and t["kind"] == ADOPTED)
 
     def _owner_reply(self, m: Message) -> RouteDecision:
-        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；没引用时，未结的全部属于同一个会话
-        （含只有一条）就投给它、回答其中最近的一条；未结分属不同会话或没有未结时投总线并附上列表。
+        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；在话题里回复按话题送回。
+        没引用、不在话题里的（7.53）：一律是主人的指令（owner_instruction，🗣，会插队），投总线并附上当前未结的「需要你定」
+        列表，由总线判断转给谁；是在回答某一条就由总线 forward --answers。路由这一层不猜、不关任何提问。
         不走安全闸（发送人已由 IM 账号核实）。"""
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
         tags = [OWNER_VERIFIED_TAG]
@@ -1512,23 +1516,25 @@ class Collector:
                                self.cfg.cli_command))
                 log.info("主人的回复 %s 引用了认不出来源的消息 %s，投总线", m.message_id, m.reply_to)
                 return d
-        else:
-            target = opens[0] if opens and len({e["topic_id"] for e in opens}) == 1 else None
-            # 没引用：未结全属同一会话（含只有一条）就投给它，关闭最近一条（与 forward 一致）
-        if target is not None:
-            tags.append(ESCALATION_TAG_PREFIX + target["message_id"])
-            self.store.upsert_message(m, d.route, d.reason, tags, target["topic_id"])
-            self.store.set_note(m.message_id, escalation_note(target))
-            log.info("主人的回复 %s -> %s（回答 %s）", m.message_id, target["topic_id"], target["message_id"])
-            return d
-        self.store.upsert_message(m, d.route, d.reason, tags, BUS_TOPIC_ID)
-        lines = [f"主人的回复 `{m.message_id}` 没有引用具体问题，当前未结的「需要你定」{len(opens)} 条："]
+            if target is not None:
+                tags.append(ESCALATION_TAG_PREFIX + target["message_id"])
+                self.store.upsert_message(m, d.route, d.reason, tags, target["topic_id"])
+                self.store.set_note(m.message_id, escalation_note(target))
+                log.info("主人的回复 %s -> %s（引用了提问 %s）", m.message_id, target["topic_id"], target["message_id"])
+                return d
+        # 7.53：没引用、不在话题里 = 主人的指令。不再按「现在恰好只有谁在等」猜成回答（10-17 02:43 发版那句被送进了 jev、
+        # 还关掉了 jev 的提问）：投总线，附未结列表；不打 escalation: 标签、不关任何提问
+        d = RouteDecision(DISPATCH, OWNER_INSTRUCTION, [OWNER_VERIFIED_TAG, OWNER_INSTRUCTION, OWNER_AT_TAG_PREFIX + "private"])
+        self.store.upsert_message(m, d.route, d.reason, d.tags, BUS_TOPIC_ID)
+        lines = [f"主人在找主人聊天里发了一条没引用的话 `{m.message_id}`：这是主人的指令；如果它其实是在回答下面某一条，用 "
+                 "forward --answers。当前未结的「需要你定」" + f"{len(opens)} 条："]
         lines += [f"- topic `{e['topic_id']}` | {e['asked_at']} | message_id `{e['message_id']}` | {escalation_summary(e)}"
                   for e in opens] or ["- （无）"]
-        lines.append(with_cli("判断它回答的是哪一条后，用 `sheepdog forward --topic <topic> --message-ids " + m.message_id
-                              + "` 转交。", self.cfg.cli_command))
+        lines.append(with_cli(f"新指令：转给负责的会话 `sheepdog forward --topic <topic> --message-ids {m.message_id}`；"
+                              f"是在回答某一条：`sheepdog forward --topic <那条的 topic> --message-ids {m.message_id} "
+                              "--answers <提问的 message_id>`。", self.cfg.cli_command))
         self.store.add_system_message(BUS_TOPIC_ID, ESCALATION_LIST, "\n".join(lines))
-        log.info("主人的回复 %s 无法确定回答哪条（未结 %d 条），投总线", m.message_id, len(opens))
+        log.info("主人在找主人聊天里没引用的话 %s：当成指令投总线（未结 %d 条，不猜、不关）", m.message_id, len(opens))
         return d
 
     # ---------- 话题群（7.51）：群里的消息走单独一条分支 ----------
@@ -3183,12 +3189,15 @@ class Dispatcher:
             lines += [last["relay_summary"] or "（回执没写说明）",
                       f"状态：{RELAY_STATUS_LABEL.get(last['relay_status'], last['relay_status'] or '已处理')}"]
             anchor, in_thread = "", False
-            owner_chat = [e for e in rows if e["chat_id"] in self.cfg.owner_chat_ids and e["kind"] != "recalled"]
+            tgid = self.cfg.topic_group.chat_id   # 7.51 话题群也是主人和机器人说话的地方：回到那件事的话题里
+            owner_chat = [e for e in rows if (e["chat_id"] in self.cfg.owner_chat_ids or (tgid and e["chat_id"] == tgid))
+                          and e["kind"] != "recalled"]
             if owner_chat:
                 r = self.store.get_message(owner_chat[-1]["message_id"])
                 if r is not None:
                     anchor = r["message_id"]
-                    in_thread = is_thread_reply(row_to_message(r))
+                    # 话题群里一律回到那件事的话题里（主人新开的顶层话题，它自己就是开头）
+                    in_thread = is_thread_reply(row_to_message(r)) or bool(tgid and r["chat_id"] == tgid)
             ids = [e["message_id"] for e in rows]
 
             def settle(ids=ids, key=key) -> None:
@@ -4980,11 +4989,12 @@ class ForwardResult(list):
 
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
                      verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24,
-                     key_patterns: list | None = None, cli: str = "sheepdog") -> ForwardResult:
+                     key_patterns: list | None = None, cli: str = "sheepdog", answers: str = "") -> ForwardResult:
     """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
     下一轮完成，因此同样受人类接管、onboarding 约束。
 
-    - 主人本人发的消息（sender_id == self_open_id）带「已核对」标注，并关闭目标会话最近一条未结的「需要你定」。
+    - 主人本人发的消息（sender_id == self_open_id）带「已核对」标注（群里 @ 机器人的指令照旧只标 🗣）。不再顺手关目标会话
+      最近一条未结的「需要你定」（7.53：那是猜）；只有写明 answers（提问的 om_）才关那一条：它必须是目标会话名下、还开着的。
     - quote 必须通过 verify_quote 核对（没给核对器一律拒绝），投递时标成已核对的主人原话；note 不核对，标成总线备注。
     - 被安全规则 hold 的消息只能带已核对的 quote 转交。
     - 目标是总线、known、已移除或不存在时抛 ValueError。
@@ -5006,6 +5016,17 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         if (got := delivered_to(store, rows[i])) is not None and got[0] == topic_id:
             skipped.append((i, got[1], got[2]))
             del rows[i]
+    target_q = None
+    answers = (answers or "").strip()
+    if answers:
+        target_q = store.get_escalation(answers)
+        if target_q is None:
+            raise ValueError(f"--answers {answers} 不是登记过的「需要你定」（要给提问那条的 om_ 消息号）")
+        if target_q["topic_id"] != topic_id:
+            raise ValueError(f"--answers {answers} 是 {target_q['topic_id']} 的提问，不是 {topic_id} 的：转给提问的那个会话")
+        if answers not in {e["message_id"] for e in open_escalations(store, escalation_open_hours, topic_id)}:
+            why = "已经答过" if target_q["answered_at"] else "已经结案" if target_q["closed_at"] else "已经过期"
+            raise ValueError(f"--answers {answers} 这条提问{why}，不用再关（要转交消息就去掉 --answers）")
     held = [i for i, r in rows.items() if r["security_action"] == HOLD]
     if held and not quote:
         raise ValueError(f"消息 {held} 被安全规则拦截，只能凭已核对的主人原话转交：加 --quote \"<主人原话>\"")
@@ -5017,17 +5038,13 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
         if i in held and SECURITY_RELEASE_TAG not in tags:
             tags.append(SECURITY_RELEASE_TAG)
-        if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION in tags:
-            pass   # 7.45 A 类：主人在群里 @ 机器人的指令，转过去仍是指令（标签不变），不当成回答哪条「需要你定」
-        elif self_open_id and row["sender_id"] == self_open_id:
-            # 主人本人的消息（7.8）：带已核对标注，不需要 --quote；目标会话最近一条未结的「需要你定」标记已答
-            if OWNER_VERIFIED_TAG not in tags:
-                tags.append(OWNER_VERIFIED_TAG)
-            # 7.51：主人在话题群新开的话题（事项的开头那条）是指令，不是回答哪条提问：不关「需要你定」、保留话题群的说明
-            opens = [] if store.item_by_root(i) is not None else open_escalations(store, escalation_open_hours, topic_id)
-            if opens:
-                store.answer_escalation(opens[0]["message_id"], i)
-                store.set_note(i, escalation_note(opens[0]))
+        if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION not in tags \
+                and OWNER_VERIFIED_TAG not in tags:
+            # 主人本人的消息（7.8）：带已核对标注，不需要 --quote。群里 @ 机器人的指令（7.45）转过去仍只标 🗣。
+            # 7.53：不再顺手关目标会话最近一条未结的「需要你定」（那是猜）；只认 --answers
+            tags.append(OWNER_VERIFIED_TAG)
+        if target_q is not None and self_open_id and row["sender_id"] == self_open_id and store.item_by_root(i) is None:
+            store.set_note(i, escalation_note(target_q))   # 7.51：话题群事项的开头那条保留话题群的说明
         store.forward_message(i, topic_id, tags)
         # 7.45：转交的是群话题里的消息（或开头那条），话题原来归转出方的，改归接手的会话（之后的话题回复直接送它）
         if store.repoint_group_thread(row["thread_id"] or "", row["message_id"], {src}, topic_id):
@@ -5049,6 +5066,12 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         log.warning("转交记进话题群事项出错: %s", e)
     done = [i for i, _, _ in skipped]
     ids = [i for i in ids if i in rows]
+    if target_q is not None:
+        # 7.53：总线写明了这是在回答哪一条：关那一条（答复记成转交的第一条消息；只带 --quote / --note 时记 forward）
+        by = next((i for i in [*ids, *done] if self_open_id and (store.get_message(i) or {"sender_id": ""})["sender_id"]
+                   == self_open_id), (ids or done or ["forward"])[0])
+        store.answer_escalation(answers, by)
+        log.info("转交时写明回答提问 %s（%s），已关", answers, topic_id)
     if quote or note:
         extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
         if done:

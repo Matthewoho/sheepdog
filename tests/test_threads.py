@@ -103,7 +103,8 @@ class FakeLark:
 
     # ---------- 造数据 ----------
     def add(self, *, chat_id: str, sender_id: str, content: str, at: datetime | None = None, sender_type: str = "user",
-            chat_type: str = "p2p", thread_root: str = "", message_id: str = "", msg_type: str = "text") -> str:
+            chat_type: str = "p2p", thread_root: str = "", message_id: str = "", msg_type: str = "text",
+            quote: str = "") -> str:
         self.n += 1
         mid = message_id or f"om_test_fk{self.n:04d}"
         m = {"message_id": mid, "chat_id": chat_id, "chat_type": chat_type, "content": content,
@@ -111,6 +112,8 @@ class FakeLark:
              "sender": {"id": sender_id, "sender_type": sender_type,
                         "name": "主人" if sender_id == ME else "机器人" if sender_type == "app" else "Alice"},
              "thread_root": "", "thread_id": "", "pos": None, "deleted": False, "seq": self.n, "msg_type": msg_type}
+        if quote:
+            m["reply_to"] = quote   # 引用回复：搜索结果带 reply_to（7.45 正式账本核实；话题里的回复不带）
         base = -1   # 开头那条的序号：普通聊天和话题群都是 "-1"（7.45 正式账本核实）
         if thread_root:
             root = self.msgs[thread_root]
@@ -146,6 +149,8 @@ class FakeLark:
         if m["thread_id"]:
             out["thread_id"] = m["thread_id"]
             out["thread_message_position"] = str(m["pos"])
+        elif m.get("reply_to"):
+            out["reply_to"] = m["reply_to"]
         return out
 
     def in_thread(self, root: str) -> list[str]:
@@ -694,14 +699,14 @@ class ThreadReplyTest(ThreadsBase):
         self.assertNotIn("+messages-mget", self.lark.subcommands()[-6:])
 
     def test_root_itself_is_not_a_thread_reply(self):
-        # 主人自己发的一条，后来成了话题开头：它本身照旧按「没引用」处理（这里唯一未结在 tp_alpha）
+        # 主人自己发的一条，后来成了话题开头：它本身照旧按「没引用」处理（7.53：是指令，投总线，不猜给唯一未结的 tp_alpha）
         self.ask("--key", "K12")
         self.poll()
         own = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="好的")
         self.lark.add(chat_id=ESC_CHAT, sender_id=BOT, sender_type="app", content="话题里", thread_root=own)
         self.poll()
         r = self.row(own)
-        self.assertEqual(r["topic_id"], "tp_alpha")
+        self.assertEqual((r["topic_id"], r["reason"]), (BUS_TOPIC_ID, "owner_instruction"))
         self.assertNotIn("🧵", r["note"] or "")
 
 
@@ -1107,13 +1112,13 @@ class TestSwitchesTest(ThreadsBase):
         self.use_switches(owner_chat=TEST_GROUP)
         self.ask(text="一个问题")
         self.poll()
-        # 主人在群里直接说（没引用、没话题）：按 owner_reply 走（唯一未结在 tp_alpha）
+        # 主人在群里直接说（没引用、没话题）：7.53 起是指令，投总线（不按唯一未结猜给 tp_alpha）
         plain = self.lark.add(chat_id=TEST_GROUP, chat_type="group", sender_id=ME, content="好的")
         # 会话以主人身份在群里代回的：不算主人发言
         agent = self.lark.add(chat_id=TEST_GROUP, chat_type="group", sender_id=ME,
                               content=f"<card>\n代回的话\n{MARK}\n</card>")
         self.poll()
-        self.assertEqual((self.row(plain)["reason"], self.row(plain)["topic_id"]), ("owner_reply", "tp_alpha"))
+        self.assertEqual((self.row(plain)["reason"], self.row(plain)["topic_id"]), ("owner_instruction", BUS_TOPIC_ID))
         self.assertEqual((self.row(agent)["route"], self.row(agent)["reason"]), ("drop", "escalation_agent_reply"))
         self.assertNotIn("代回的话", self.deliver())
 

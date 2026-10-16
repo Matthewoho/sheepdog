@@ -61,7 +61,9 @@ class PriorityBase(ThreadsBase):
         return self.store.get_topic(tid)
 
     def owner_reply(self, text="周五发") -> str:
-        mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content=text, at=now8() - timedelta(minutes=1))
+        # 7.53：没引用的话一律是指令（投总线）；回答提问要引用它（这里引用 tp_alpha 那条提问）
+        mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content=text, at=now8() - timedelta(minutes=1),
+                            quote=self.ask_mid)
         self.pull(mid)
         r = self.row(mid)
         self.assertEqual((r["route"], r["reason"]), ("dispatch", "owner_reply"))
@@ -178,10 +180,10 @@ class BusPriorityTest(ThreadsBase):
         self.assertEqual(bus["state"], sm.RUNNING)
         b1 = bus["pending_batch_id"]
         cid = bus["conversation_id"]
-        # 没有未结提问时，主人在找主人聊天里的话投总线
+        # 没引用的话（7.53：一律是指令）投总线
         mid = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="今天先别发版")
         self.pull(mid)
-        self.assertEqual((self.row(mid)["topic_id"], self.row(mid)["reason"]), (BUS_TOPIC_ID, "owner_reply"))
+        self.assertEqual((self.row(mid)["topic_id"], self.row(mid)["reason"]), (BUS_TOPIC_ID, "owner_instruction"))
         n = len(self.sink.to(cid))
         res = self.d.dispatch_once()
         got = self.sink.to(cid)[n:]
@@ -373,9 +375,9 @@ class EscalationListJumpsTest(ThreadsBase):
         (text,) = self.sink.to(self.cid)[n:]
         pb = res["topics"][BUS_TOPIC_ID]["priority"]
         self.assertIn("今天先别发版", text)
-        self.assertIn(f"主人的回复 `{mid}` 没有引用具体问题", text)
+        self.assertIn(f"主人在找主人聊天里发了一条没引用的话 `{mid}`：这是主人的指令", text)
         self.assertIn("共 2 条", text)
-        self.assertLess(text.index("今天先别发版"), text.index("没有引用具体问题"))     # 保持原来的先后
+        self.assertLess(text.index("今天先别发版"), text.index("没引用的话 `"))     # 保持原来的先后
         for r in (self.row(mid), self.row(sysrow["message_id"])):
             self.assertEqual((r["dispatch_state"], r["batch_id"]), ("acked", pb))
         # 不引用这条回复的 escalation_list、别的信号：照旧排队

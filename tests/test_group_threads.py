@@ -561,7 +561,8 @@ class OwnerInstructionTest(GroupBase):
         esc = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="@Mattheuu 找主人聊天里")
         self.lark.msgs[esc]["mentions"] = [APP]
         self.pull(esc)
-        self.assertNotEqual(self.row(esc)["reason"], "owner_instruction")
+        # 找主人聊天里不走群里 @ 机器人这条路；7.53 起那里没引用的话本身就是指令（owner_at:private），不是 @ 出来的
+        self.assertIn("owner_at:private", json.loads(self.row(esc)["tags_json"]))
         self.cfg.identity.enabled = False                                         # 不知道机器人是谁
         off = self.owner_at(content="@Mattheuu identity 关着")
         self.pull(off)

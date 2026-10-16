@@ -140,7 +140,8 @@ class OwnerShortcutSwitchTest(PendingBase):
         self.cfg.escalation.owner_shortcut = False
         mid = self.daiban()
         r = self.row(mid)
-        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_reply", BUS_TOPIC_ID))
+        # 关掉快捷问法：「待办」就是一句普通的话（7.53 起没引用的话是指令，投总线）
+        self.assertEqual((r["route"], r["reason"], r["topic_id"]), ("dispatch", "owner_instruction", BUS_TOPIC_ID))
         self.assertEqual(self.lark.sent("+messages-reply"), [])
 
     def test_hot_reload_reaches_the_resident_collector(self):
@@ -156,7 +157,7 @@ class OwnerShortcutSwitchTest(PendingBase):
 
         reload_into(self, base.replace("[owner_context]", "owner_shortcut = false\n[owner_context]"), col)
         self.assertIs(col.cfg, self.d.cfg)
-        self.assertEqual(self.row(daiban(5))["reason"], "owner_reply")
+        self.assertEqual(self.row(daiban(5))["reason"], "owner_instruction")
         reload_into(self, base, col)
         self.assertEqual(self.row(daiban(6))["reason"], "pending_query")
 

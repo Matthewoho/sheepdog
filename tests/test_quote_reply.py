@@ -101,10 +101,13 @@ class QuoteReplyTest(Base):
         i = next(k for k, ln in enumerate(lines) if ln.startswith("### ") and "Bob" in ln)
         self.assertTrue(lines[i + 2].startswith("↪ 回复的是"))  # 标题、@ 行之后
 
-    def test_no_reply_to_unchanged(self):
+    def test_no_reply_to_is_an_instruction_to_bus(self):
+        # 7.53：没引用的话不再按「唯一一条未结」猜成回答，投总线、提问仍开着
         self.poll([ask("om_test_q1", "tp_alpha", "唯一问题")])
         self.poll([reply("om_test_r3", "可以")])
-        self.assertEqual(self.row("om_test_r3")["topic_id"], "tp_alpha")
+        self.assertEqual((self.row("om_test_r3")["topic_id"], self.row("om_test_r3")["reason"]),
+                         (BUS_TOPIC_ID, "owner_instruction"))
+        self.assertIsNone(self.store.get_escalation("om_test_q1")["closed_at"])
 
 
 class AttributionConfigTest(Base):

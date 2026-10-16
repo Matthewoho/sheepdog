@@ -1056,7 +1056,7 @@ class MergeWith745Test(TGBase):
         self.assertEqual(len(self.lark.patched.get(idx, [])), 1)
 
     def test_cc_and_instruction_both_jump_the_queue_and_start_followups(self):
-        from sheepdog.engine import OWNER_INSTRUCTION, PRIORITY_FOLLOWUP_PREFIX
+        from sheepdog.engine import OWNER_INSTRUCTION
         self.ask("--key", "PQ-1", "--track", title="发版", text="今晚？")
         self.ask("--key", "PQ-1", topic="tp_beta", title="回滚", text="窗口？")
         self.poll()
@@ -1078,8 +1078,9 @@ class MergeWith745Test(TGBase):
             self.assertTrue(self.store.get_topic(tid)["pending_batch_id"].startswith("b"))   # 原来那批还在等回执
         self.assertEqual(self.row(reply)["dispatch_state"], "acked")                 # 插队批次送达即记成已回执
         self.assertEqual(self.row(grp)["dispatch_state"], "acked")
-        follow = {json.loads(v)["topic"] for _, v in self.store.meta_items(PRIORITY_FOLLOWUP_PREFIX)}
-        self.assertEqual(follow, {"tp_alpha", "tp_beta"})                          # 插话没回音提醒都起算
+        # 插话没回音提醒都起算（7.52 起收进回音账本：话题群里主人的话、群里 @ 机器人的指令各记一笔，按插话送到算）
+        follow = {(e["topic_id"], e["stage"], e["priority"]) for e in map(self.store.echo_get, (reply, grp))}
+        self.assertEqual(follow, {("tp_alpha", "delivered", 1), ("tp_beta", "delivered", 1)})
         self.assertEqual({e["close_reason"] for e in self.store.conn.execute("SELECT close_reason FROM escalations")},
                          {"answered"})
 
@@ -1361,3 +1362,27 @@ class LinkTest(TGBase):
         self.assertIn(f"client/chat/open?openChatId={ESC_CHAT}", idx)          # 建议栏：打开私聊
         self.assertNotIn(f"openChatId={TG}", idx)                               # 索引卡在群里：不给打开同一个群
         self.assertEqual(tg.list_lines(self.cfg, self.store, include_all=True)[0].count("http"), 0)
+
+
+# ======================= 叠在 7.52（回执带回、回音账本）上 =======================
+class EchoInTopicGroupTest(TGBase):
+    def test_owner_reply_in_item_thread_relayed_back_into_that_thread(self):
+        """回归 7.52：话题群里主人回的话，会话交了回执没回他，回音要回到那件事的话题里，不是私聊新起一条。"""
+        from test_owner_echo import FakeDM
+        from sheepdog.engine import write_receipt
+        dm = FakeDM()
+        self.d.notifier = dm
+        self.ask("--key", "EC-1", "--track", text="今晚发吗？")
+        self.poll()
+        self.d.dispatch_once()
+        it = self.item("EC-1")
+        mid = self.owner_tg("今晚发", root=it["root_message_id"])
+        self.poll()
+        self.assertEqual((self.store.echo_get(mid)["kind"], self.store.echo_get(mid)["topic_id"]), ("owner_reply", "tp_alpha"))
+        self.d.dispatch_once()
+        t = self.store.get_topic("tp_alpha")
+        write_receipt(self.cfg, "tp_alpha", t["pending_batch_id"], {"status": "handled", "summary": "今晚 22 点发"})
+        self.d.dispatch_once()
+        (c,) = [x for x in dm.calls if x["text"].startswith("✅ ")]
+        self.assertEqual((c["reply_to"], c["in_thread"]), (mid, True))
+        self.assertIn("今晚 22 点发", c["text"])

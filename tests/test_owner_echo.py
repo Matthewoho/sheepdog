@@ -77,6 +77,7 @@ class EchoBase(GroupBase):
 # ======================= 1 回执带回 =======================
 class RelayTest(EchoBase):
     def test_receipt_without_report_relays_one_card_quoting_owner(self):
+        """回归 7.52：会话交了回执、没给主人发 ask / report，主人在飞书上收不到任何回音（10-14 起 26 条）。"""
         q = self.asked()
         a = self.owner("周五发", quote=q)
         self.assertEqual((self.row(a)["reason"], self.row(a)["topic_id"]), ("owner_reply", "tp_alpha"))
@@ -258,6 +259,7 @@ class RelayTest(EchoBase):
 # ======================= 2 回音账本 =======================
 class EchoLedgerTest(EchoBase):
     def test_undelivered_reported_on_the_spot_once(self):
+        """回归 7.52：主人 @ 机器人的话没送进任何会话（10-16 19:41），谁也没收到、也没人告诉他。"""
         self.cfg.routing.owner_at_assistant = False                         # @ 机器人没当成指令（7.45 以前的样子）
         self.lark.chat_types["oc_test_never_grp"] = "group"                   # 没人负责、也没人处理过的群
         mid = self.lark.add(chat_id="oc_test_never_grp", sender_id=ME, content="@Mattheuu 绑定一下那个 session",
@@ -276,6 +278,7 @@ class EchoLedgerTest(EchoBase):
         self.assertEqual(len(self.dm.texts("没送到任何会话")), 1)
 
     def test_queued_then_delivered_then_silent_each_once(self):
+        """回归 7.52：主人的话排队、送到后没回音，没有任何提醒（只有插话批次有）。"""
         self.cfg.session.owner_priority = False                              # 不插队：排队等原来那批
         q = self.asked()
         busy = self.say(ALPHA_P2P, sender=ALICE, content="Alice 的需求")
