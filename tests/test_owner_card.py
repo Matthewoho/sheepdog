@@ -321,6 +321,30 @@ class ReadBackTest(OwnerCardBase):
         self.assertEqual(self.store.thread_by_root(root)["topic_id"], "tp_alpha")
         self.assertEqual(self.store.thread_by_root(root)["title"], "🐕 需要你定 · 发版时间 [tp_alpha]")
 
+    def test_one_line_notice_card_attributed(self):
+        # 只有一行的通知：卡片不放 header，读回是 <card>\n第一行\n</card>，还原后第一行照样认得出会话
+        self.d.notifier = cli._notifier(self.cfg, self.source, SimpleNamespace(dry_run=False))
+        self.d._notify_owner("🐕 汇报 · 投递已恢复 [tp_bus]", "投递恢复通知")
+        self.assertNotIn("header", card_of(self.sends()[-1]))
+        mid = [m for m in self.lark.msgs if self.lark.msgs[m]["chat_id"] == ESC_CHAT][-1]
+        self.assertTrue(self.lark.msgs[mid]["content"].startswith("<card>\n🐕 汇报"))
+        self.pull(mid)
+        self.assertEqual((self.row(mid)["reason"], self.store.get_bot_outbox(mid)["topic_id"]),
+                         ("escalation_bot_message", BUS_TOPIC_ID))
+
+    def test_thread_root_card_recognized_by_header_regex_alone(self):
+        # 没配 attribution_regex：话题开头那条只能靠 header_regex 认（卡片要先还原，第一行才以「🐕」开头）
+        self.cfg.escalation = EscalationConfig(chat_ids=[ESC_CHAT], header_regex=PROD_HEADER_RX)
+        self.ask_md("--key", "K10")
+        root = self.store.thread_by_key("tp_alpha", "K10")["root_message_id"]
+        r = self.lark.add(chat_id=ESC_CHAT, sender_id=ME, content="A", thread_root=root)
+        for t in ("owner_threads", "sends", "bot_outbox", "escalations"):
+            self.store.conn.execute(f"DELETE FROM {t}")
+        self.store.conn.commit()
+        self.store.upsert_message(parse_message(self.lark.raw(root)), "drop", "escalation_chat_other", [])
+        self.pull(r)
+        self.assertEqual(self.row(r)["topic_id"], "tp_alpha")
+
     def test_old_plain_text_still_recognized_when_switch_is_on(self):
         old = self.lark.add(chat_id=ESC_CHAT, sender_id="ou_test_bot", sender_type="app",
                             content="🐕 需要你定 · 老问题 [tp_alpha]\n还是纯文本")
