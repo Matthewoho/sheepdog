@@ -3,6 +3,8 @@
 
     python3.12 scripts/release_gate.py <提交号>            # 跑闸门：全绿才写闸门记录
     python3.12 scripts/release_gate.py --check <提交号>    # 上线脚本第一步：记录在、提交号对得上、3 次都绿才退出 0
+    python3.12 scripts/release_gate.py --check <提交号> --specs 7.52,7.53
+                                                         # 再按规格编号核（7.60）：这次上的每个编号都登记了守它的测试
 
 跑闸门：
 1. 用 git archive 把这个提交导出到临时目录（干净副本，不带工作树里没提交的改动）。
@@ -12,6 +14,13 @@
 3. 核 tests/REGRESSIONS.md 列的每个测试都还在、会被全量测试跑到、没被跳过（写「缺」的行不核）。
 4. 3 次全绿、回归登记也齐，才写闸门记录 <记录目录>/<完整提交号>.json：提交号、3 次各自的测试数和用时、时间。
    有红就打印哪几个红，退出码 1，不写记录。
+
+按规格编号核（7.60，`--check <提交号> --specs 7.xx,7.yy`）：
+- 读那个提交里的 tests/REGRESSIONS.md（git show <提交>:tests/REGRESSIONS.md，不读工作树）；
+- 每个编号至少要有一行列了测试（只写「缺」的不算），这个编号各行列的测试在那个提交里都在、会被全量测试跑到、没被跳过
+  （导出那个提交，用和闸门一样的发现方式核）；
+- 缺了就逐个列出「哪个编号没有登记」「登记的测试不存在」，退出码 1。闸门记录照样要核，两样都对才退出 0。
+- 不带 --specs 时只核闸门记录，和 7.55 一样。
 
 记录目录默认 ~/.local/state/sheepdog-release-gate/，可用环境变量 SHEEPDOG_RELEASE_GATE_DIR 改（测试用）。
 """
@@ -44,6 +53,8 @@ _RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s$", re.M)
 _SEP = "=" * 70
 _RED_HEAD = re.compile(r"^(FAIL|ERROR|UNEXPECTED SUCCESS): (\S+) \(([^)]+)\)")
 _TEST_ID = re.compile(r"`([A-Za-z_][\w]*\.[A-Za-z_][\w]*\.[A-Za-z_][\w]*)`")
+# 「规格」一格开头的编号：「7.47 第 1 条」「7.52 上线后」都算 7.47、7.52；7.5 和 7.52 不混
+_SPEC_NO = re.compile(r"^(\d+(?:\.\d+)+)(?![\d.])")
 
 
 def gate_dir() -> Path:
@@ -183,6 +194,22 @@ def parse_regressions(text: str) -> list[dict]:
     return rows
 
 
+def spec_no(cell: str) -> str | None:
+    """「规格」一格 → 它开头的规格编号（「7.47 第 1 条」→ 7.47）；认不出就 None。"""
+    m = _SPEC_NO.match(cell.strip())
+    return m.group(1) if m else None
+
+
+def find_tests(src: Path, home: Path, python: str, ids: list[str]) -> dict:
+    """在导出副本 src 里按全量测试的发现方式核 ids：{"missing": {测试: 为什么}, "broken_modules": [...], "total": n}。"""
+    proc = subprocess.run([python, "-c", _CHECK_CODE, json.dumps(sorted(ids))], cwd=src, env=isolated_env(home, src),
+                          capture_output=True, text=True, timeout=600)
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"核测试出错：{proc.stderr[-1000:]}") from None
+
+
 def check_regressions(src: Path, home: Path, python: str) -> dict:
     p = src / REGRESSIONS
     if not p.is_file():
@@ -190,13 +217,10 @@ def check_regressions(src: Path, home: Path, python: str) -> dict:
     rows = parse_regressions(p.read_text(encoding="utf-8"))
     bad_rows = [r for r in rows if not r["tests"] and not r["missing_guard"]]
     ids = sorted({t for r in rows for t in r["tests"]})
-    proc = subprocess.run([python, "-c", _CHECK_CODE, json.dumps(ids)], cwd=src, env=isolated_env(home, src),
-                          capture_output=True, text=True, timeout=600)
     try:
-        res = json.loads(proc.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return {"ok": False, "error": f"核回归登记出错：{proc.stderr[-1000:]}", "rows": len(rows), "tests": len(ids),
-                "missing": {}}
+        res = find_tests(src, home, python, ids)
+    except RuntimeError as e:
+        return {"ok": False, "error": f"核回归登记出错：{e}", "rows": len(rows), "tests": len(ids), "missing": {}}
     missing = res["missing"]
     errs = []
     if not rows:
@@ -272,13 +296,84 @@ def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool 
             shutil.rmtree(work, ignore_errors=True)
 
 
-def check(repo: Path, commit: str, runs: int = RUNS) -> int:
-    """上线脚本第一步：这个提交的闸门记录在、对得上、3 次都绿，才退出 0。"""
+def parse_specs(text: str) -> list[str]:
+    """--specs 的值「7.52,7.53」→ ["7.52", "7.53"]（去重、保序）；有认不出的编号就报错。"""
+    out: list[str] = []
+    for x in re.split(r"[,，\s]+", text or ""):
+        if not x:
+            continue
+        if not re.fullmatch(r"\d+(?:\.\d+)+", x):
+            raise ValueError(f"认不出的规格编号 {x!r}（要写成 7.52 这样）")
+        if x not in out:
+            out.append(x)
+    if not out:
+        raise ValueError("--specs 一个编号都没有")
+    return out
+
+
+def check_specs(repo: Path, sha: str, specs: list[str], python: str) -> list[str]:
+    """7.60：sha 这个提交里，specs 每个编号在 REGRESSIONS.md 里至少有一行列了测试，列的测试在这个提交里都在。
+
+    返回问题清单（空 = 都对）。只读那个提交（git show / git archive），不读工作树。
+    """
+    out = subprocess.run(["git", "-C", str(repo), "show", f"{sha}:{REGRESSIONS.as_posix()}"], capture_output=True)
+    if out.returncode != 0:
+        return [f"{sha[:12]} 里没有 {REGRESSIONS.as_posix()}，{'、'.join(specs)} 都没有登记"]
+    rows = parse_regressions(out.stdout.decode("utf-8", errors="replace"))
+    problems: list[str] = []
+    want: dict[str, list[str]] = {}          # 测试 → 哪几个编号登记了它
+    for s in specs:
+        mine = [r for r in rows if spec_no(r["spec"]) == s]
+        guarded = [r for r in mine if r["tests"]]
+        if not mine:
+            problems.append(f"{s} 没有登记：REGRESSIONS.md 里没有这个编号的行")
+        elif not guarded:
+            problems.append(f"{s} 没有登记守它的测试：只有写「缺」的行（{'；'.join(r['symptom'] for r in mine)}）")
+        for r in guarded:
+            for t in r["tests"]:
+                want.setdefault(t, [])
+                if s not in want[t]:
+                    want[t].append(s)
+    if not want:
+        return problems
+    work = Path(tempfile.mkdtemp(prefix="sheepdog-gate-specs-"))
+    try:
+        src = export(repo, sha, work / "src")
+        res = find_tests(src, work / "home", python, list(want))
+    except (RuntimeError, SystemExit) as e:
+        return problems + [f"核 {'、'.join(specs)} 登记的测试时出错：{e}"]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for t, why in sorted(res["missing"].items()):
+        problems.append(f"{'、'.join(want[t])} 登记的测试不存在：{t}（{why}）")
+    return problems
+
+
+def check(repo: Path, commit: str, runs: int = RUNS, specs: list[str] | None = None,
+          python: str = "python3.12") -> int:
+    """上线脚本第一步：这个提交的闸门记录在、对得上、3 次都绿，才退出 0。
+
+    带 specs（7.60）时再核：这次上的每个规格编号都登记了守它的测试、测试都在。两样都对才退出 0。
+    """
     try:
         sha = resolve(repo, commit)
     except SystemExit as e:
         print(e)
         return 1
+    rc = _check_record(sha, runs)
+    if specs is None:
+        return rc
+    problems = check_specs(repo, sha, specs, python)
+    if problems:
+        print(f"✗ {sha[:12]} 的规格编号登记对不上（{'、'.join(specs)}）：")
+        for x in problems:
+            print(f"    {x}")
+        return 1
+    print(f"✓ {sha[:12]} 的规格编号都登记了守它的测试：{'、'.join(specs)}")
+    return rc
+
+
+def _check_record(sha: str, runs: int) -> int:
     p = record_path(sha)
     if not p.is_file():
         print(f"✗ {sha[:12]} 没有闸门记录（{p}）：先跑 scripts/release_gate.py {sha}")
@@ -317,10 +412,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", type=Path, default=None, help="仓库目录（默认本脚本所在的仓库）")
     ap.add_argument("--python", default="python3.12", help="跑测试用的 Python（默认 python3.12）")
     ap.add_argument("--keep", action="store_true", help="留着临时目录（排查用）")
+    ap.add_argument("--specs", metavar="7.xx,7.yy",
+                    help="和 --check 一起用（7.60）：这次上线的规格编号，逐个核 REGRESSIONS.md 里登记了守它的测试")
     a = ap.parse_args(argv)
     repo = (a.repo or default_repo()).resolve()
+    if a.specs is not None and not a.check:
+        ap.error("--specs 要和 --check <提交号> 一起用")
     if a.check:
-        return check(repo, a.check)
+        specs = None
+        if a.specs is not None:
+            try:
+                specs = parse_specs(a.specs)
+            except ValueError as e:
+                ap.error(str(e))
+            if shutil.which(a.python) is None and not Path(a.python).is_file():
+                print(f"✗ 找不到 {a.python}")
+                return 1
+        return check(repo, a.check, specs=specs, python=a.python)
     if not a.commit:
         ap.error("要给一个提交号，或者 --check <提交号>")
     if shutil.which(a.python) is None and not Path(a.python).is_file():

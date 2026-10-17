@@ -226,6 +226,119 @@ class CheckTest(GateBase):
         self.assertEqual(bad.returncode, 1)
 
 
+SPEC_REG = """# 回归
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 9.1 第 2 条 | 造的毛病 | `test_ok.OkTest.test_a` |
+| 9.2 | 没有守卫的 | 缺 |
+| 9.10 | 另一个编号，不算 9.1 | `test_ok.OkTest.test_b` |
+"""
+
+
+class SpecsCheckTest(GateBase):
+    """回归 7.60：--check <提交> --specs 逐个核这次上的规格编号都登记了守它的测试、测试在那个提交里都在。"""
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.commit({"tests/test_ok.py": OK_TEST, "tests/REGRESSIONS.md": SPEC_REG})
+        self.assertEqual(self.run_gate(self.sha)[0], 0)
+
+    def check_specs(self, commit, specs):
+        with mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()) as out:
+            rc = gate.check(self.repo, commit, specs=specs, python=sys.executable)
+        return rc, out.getvalue()
+
+    def test_regression_760_registered_specs_pass(self):
+        """回归 7.60：编号都登记了、测试都在才放行；「9.1 第 2 条」这种带后缀的行算 9.1。"""
+        rc, out = self.check_specs(self.sha, ["9.1", "9.10"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("规格编号都登记了守它的测试：9.1、9.10", out)
+
+    def test_regression_760_unregistered_spec_is_red(self):
+        """回归 7.60：这次上的编号在 REGRESSIONS.md 里一行都没有，逐个点名，退出码 1。"""
+        rc, out = self.check_specs(self.sha, ["9.1", "9.3", "9.4"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("9.3 没有登记", out)
+        self.assertIn("9.4 没有登记", out)
+        self.assertNotIn("9.1 没有登记", out)
+
+    def test_regression_760_spec_number_matches_exactly(self):
+        """回归 7.60：9.1 和 9.10 不混：只有 9.10 的行，9.1 不算登记了；反过来也一样。"""
+        sha = self.commit({"tests/REGRESSIONS.md": SPEC_REG.replace("| 9.1 第 2 条 |", "| 9.11 |")})
+        self.assertEqual(self.run_gate(sha)[0], 0)
+        rc, out = self.check_specs(sha, ["9.1"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("9.1 没有登记", out)
+
+    def test_regression_760_que_only_spec_is_red(self):
+        """回归 7.60：只有写「缺」的行不算登记了守卫。"""
+        rc, out = self.check_specs(self.sha, ["9.2"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("9.2 没有登记守它的测试：只有写「缺」的行", out)
+
+    def test_regression_760_misspelled_test_is_red(self):
+        """回归 7.60：登记的测试名写错（那个提交里没有），点名是哪个编号、哪个测试。"""
+        reg = SPEC_REG + "| 9.5 | 名字写错了 | `test_ok.OkTest.test_a`、`test_ok.OkTest.test_typo` |\n"
+        sha = self.commit({"tests/REGRESSIONS.md": reg})
+        problems = gate.check_specs(self.repo, sha, ["9.5", "9.1"], sys.executable)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("9.5 登记的测试不存在：test_ok.OkTest.test_typo", problems[0])
+        rc, out = self.check_specs(sha, ["9.5"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("test_ok.OkTest.test_typo", out)
+
+    def test_regression_760_reads_the_commit_not_the_worktree(self):
+        """回归 7.60：读的是那个提交里的 REGRESSIONS.md 和测试，工作树里没提交的登记、测试都不算。"""
+        (self.repo / "tests" / "REGRESSIONS.md").write_text(
+            SPEC_REG + "| 9.6 | 只在工作树里 | `test_new.NewTest.test_x` |\n", encoding="utf-8")
+        (self.repo / "tests" / "test_new.py").write_text(
+            "import unittest\n\n\nclass NewTest(unittest.TestCase):\n    def test_x(self):\n        pass\n",
+            encoding="utf-8")
+        rc, out = self.check_specs(self.sha, ["9.6"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("9.6 没有登记", out)
+        # 登记提交了、测试没提交：测试不在那个提交里
+        self.git("add", "tests/REGRESSIONS.md")
+        self.git("commit", "-q", "-m", "reg only")
+        sha2 = self.git("rev-parse", "HEAD")
+        problems = gate.check_specs(self.repo, sha2, ["9.6"], sys.executable)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("9.6 登记的测试不存在：test_new.NewTest.test_x", problems[0])
+
+    def test_regression_760_record_still_required(self):
+        """回归 7.60：编号都登记了，但这个提交没过闸门（没有记录），照样退出 1。"""
+        other = self.commit({"README": "x"})
+        rc, out = self.check_specs(other, ["9.1"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("没有闸门记录", out)
+        self.assertIn("规格编号都登记了守它的测试：9.1", out)
+
+    def test_regression_760_cli(self):
+        """回归 7.60：命令行 --specs：登记齐退出 0；缺一个退出非 0；--specs 不带 --check、编号写错都报参数错。"""
+        script = REPO / "scripts" / "release_gate.py"
+
+        def run(*args):
+            return subprocess.run([sys.executable, str(script), "--repo", str(self.repo), "--python", sys.executable,
+                                   *args], env={**os.environ}, capture_output=True, text=True)
+
+        ok = run("--check", self.sha, "--specs", "9.1,9.10")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        bad = run("--check", self.sha, "--specs", "9.1, 9.7")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("9.7 没有登记", bad.stdout)
+        self.assertEqual(run("--check", self.sha).returncode, 0)          # 不带 --specs：和 7.55 一样
+        self.assertEqual(run("--specs", "9.1").returncode, 2)
+        self.assertEqual(run("--check", self.sha, "--specs", "seven").returncode, 2)
+        self.assertEqual(run("--check", self.sha, "--specs", "").returncode, 2)
+
+    def test_parse_specs(self):
+        self.assertEqual(gate.parse_specs("7.52,7.53，7.52 7.4"), ["7.52", "7.53", "7.4"])
+        self.assertEqual(gate.spec_no("7.47 第 4 条返工"), "7.47")
+        self.assertEqual(gate.spec_no("7.52上线后"), "7.52")
+        self.assertIsNone(gate.spec_no("规格"))
+
+
 class RegressionsFileTest(unittest.TestCase):
     """仓库自己的 tests/REGRESSIONS.md 认得出来：每行要么列了测试，要么写「缺」。"""
 
