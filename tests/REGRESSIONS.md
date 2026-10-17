@@ -19,10 +19,22 @@
 
 | 规格 | 症状 | 守它的测试 |
 | --- | --- | --- |
+| 7.1 | 每批信号末尾附 batch_footer.md（代回提醒），丢了这行，长上下文里会话会忘掉代回标记 | `test_roster.PlaybookTest.test_assembly_order_and_defaults`、`test_guardrails.ReminderTest.test_missing_means_nothing` |
+| 7.1 | 配置的 session.reply_prefix 替换不进 {{reply_prefix}}，开场里写的代回前缀是空的 | `test_roster.PlaybookTest.test_dispatcher_uses_config_values` |
+| 7.1 | 代回规则所在的 common.md 没拼进总线开场、登记通知、spawn 开场，会话不知道要代回 | `test_handover_watch.EscalationTest.test_common_rules_in_all_prompts` |
+| 7.2 | spawn 先给前任发退休通知、再建接手会话，前任 topic 关掉不再投递；不发或顺序反了，新旧会话会同时对外说话 | `test_handover_watch.SpawnTest.test_retire_before_new_and_predecessor_closed` |
+| 7.2 | spawn 只建一次、新 id 只记账本不回写名册；重复 spawn 或名册同步冲掉账本 id，会多建会话或丢掉接手会话 | `test_handover_watch.SpawnTest.test_spawn_once_and_no_roster_writeback` |
+| 7.2 | 接手会话回执「读完前任」之前信号排队不丢；前任交接回执原样转给接手会话一次；开场带 successor.md（前任 id、transcript 路径） | `test_handover_watch.SpawnTest.test_successor_reads_first_then_gets_signals_and_handover` |
+| 7.2 | sessions 不显示名册（留空）和账本（新会话）的差异、不显示前任，人看名册会以为会话还没建 | `test_regress_spawn.SpawnSessionsViewTest.test_regression_7_2_sessions_shows_roster_vs_ledger_and_predecessor` |
 | 7.3 | 总线 forward 转交：目标是总线、known、不存在的会话要拒绝；转到 managed 会话的消息改归属、回到待推、带上总线备注 | `test_roster.ForwardTest.test_forward_rejects_known_bus_and_unknown`、`test_roster.ForwardTest.test_forward_delivers_to_managed_with_note` |
 | 7.3 | 机器人发给主人的「找主人」消息（带 drop 前缀）被当成新信号推回总线，形成回环 | `test_handover_watch.EscalationTest.test_self_escalation_dropped` |
 | 7.4 | 等待回复：对方的回复优先归给登记等待的会话（覆盖聊天归属、总线）；同一人多条等待取最新、按聊天限定 | `test_handover_watch.WatchTest.test_reply_routed_to_watcher_until_confirmed`、`test_handover_watch.WatchTest.test_chat_scoped_and_newest_wins` |
 | 7.4 | 等待计时：15 / 30 分钟各提醒一次，60 分钟到期关闭并提示 | `test_handover_watch.WatchTest.test_nudges_once_each_then_expire` |
+| 7.5 | 回执 anchors 里的 project: 原样存进会话锚点、名册同步不冲掉、sessions 显示「关联项目」；坏了，需求和项目就挂不上 | `test_handover_watch.ProjectAnchorTest.test_project_anchor_kept_and_shown` |
+| 7.6 | playbook 占位符替换，未知占位符原样保留 | `test_roster.PlaybookTest.test_render_substitutes_and_keeps_unknown` |
+| 7.6 | playbook 文件缺了，那一段为空，doctor 报缺哪个 | `test_roster.PlaybookTest.test_missing_files_render_empty`、`test_roster.PlaybookTest.test_doctor_reports_missing` |
+| 7.6 | playbook 每次组装 prompt 时现读，改完下一批就生效，不用重启 | `test_roster.PlaybookTest.test_hot_reload` |
+| 7.6 | 业务参数进配置：watch 提醒和到期的分钟数取 [watch]，防回环前缀取 routing.drop_bot_message_prefixes，不写死 | `test_handover_watch.WatchTest.test_configurable_minutes`、`test_handover_watch.EscalationTest.test_self_escalation_dropped` |
 | 7.7 | 安全闸 hold：命中拦截规则的消息不投给名册会话、等待会话，改投总线 | `test_security.GateTest.test_hold_overrides_roster_and_all_messages`、`test_security.GateTest.test_hold_overrides_watch_and_keeps_waiting` |
 | 7.7 | 安全闸 tag：被标记的消息照常投递，正文前带警示 | `test_security.GateTest.test_tag_delivered_with_banner_before_body` |
 | 7.7 | 被 hold 的消息 forward 时要带核对过的主人原话，核不上就拒绝 | `test_security.GateTest.test_hold_forward_requires_verified_quote` |
@@ -30,16 +42,68 @@
 | 7.8 | 主人引用回复某条「需要你定」，送回提问的会话 | `test_escalation.EscalationTest.test_quoted_reply_goes_to_that_topic` |
 | 7.8 | 主人本人的消息（含编辑后重新判定）不走安全闸 | `test_escalation.EscalationTest.test_owner_reply_edit_also_skips_security_gate` |
 | 7.8 | 总线 forward 主人本人在别处的发言（本来没带已核对标记），送到时要补「✅ 已核对」标注 | `test_regress_routing.ForwardOwnerWordsRegressionTest.test_regression_7_8_forward_owner_background_gets_verified_label` |
+| 7.9 | Get 表情只在消息真正送达会话后点、只点配置的原因，排队时（主人接管）不点 | `test_ack.AckTest.test_only_configured_reasons_after_delivery`、`test_ack.AckTest.test_queued_not_acked_until_delivered` |
+| 7.9 | 每条消息只点一次（编辑重投、超时重投都不再点） | `test_ack.AckTest.test_once_per_message` |
+| 7.9 | 主人回复后撤表情：私聊撤同一聊天里更早的；群里只撤 reply_to 或 @ 了发送人的那条；at_all 不撤 | `test_ack.AckTest.test_p2p_own_message_removes_earlier_in_same_chat`、`test_ack.AckTest.test_group_reply_or_mention_removes`、`test_ack.AckTest.test_at_all_not_removed` |
+| 7.9 | 点失败只记 error、不重试；dry-run 不调接口；没有 [ack] 段完全不动 | `test_ack.AckTest.test_failures_do_not_block_and_are_not_retried`、`test_ack.AckTest.test_dry_run_does_not_call`、`test_ack.AckTest.test_config_section_switch_and_cli` |
 | 7.10 | 总线新开的会话：--chat 的聊天按归属直推给它；会话收掉后聊天归属释放回总线 | `test_dynamic.DynamicTest.test_chat_ownership`、`test_dynamic.DynamicTest.test_done_closes_and_releases` |
+| 7.11 | 改了 playbook，下一批最前面带完整新规则、只带一次；没记过指纹的老会话也当成规则变了 | `test_rules_sync.RulesSyncTest.test_common_change_sent_once_in_front`、`test_rules_sync.RulesSyncTest.test_missing_hash_treated_as_changed` |
+| 7.11 | 建会话、onboarding 时记下指纹，规则没改不重发 | `test_rules_sync.RulesSyncTest.test_hash_recorded_at_creation`、`test_rules_sync.RulesSyncTest.test_no_change_no_rules` |
+| 7.11 | 总线同样同步，但名册变化不触发整份规则重发（走「名册更新」） | `test_rules_sync.RulesSyncTest.test_bus_too_but_not_on_roster_change` |
+| 7.11 | push-rules 立即发、更新指纹；dry-run 不发不写；sessions 显示规则是否最新 | `test_rules_sync.RulesSyncTest.test_push_rules`、`test_rules_sync.RulesSyncTest.test_push_rules_cli_dry_run` |
+| 7.11 | 总线新开（dynamic）和 spawn 新建的会话：建好时记指纹，改 playbook 后同样同步；坏了，这两类会话永远收不到新规则，或第一批多发一整份规则 | `test_regress_rules_sync.RulesSyncNewSessionsTest.test_regression_7_11_dynamic_session_hash_at_creation_and_gets_update`、`test_regress_rules_sync.RulesSyncNewSessionsTest.test_regression_7_11_spawned_session_hash_at_creation_and_gets_update` |
+| 7.12 | 不在常驻进程里跑 spawn / new-session / push-rules / init / retire 只入队、不调 agentapi（会话里直接调会撞项目边界）；常驻进程直接执行；dry-run 在本地执行 | `test_actions.ActionsTest.test_non_resident_enqueues_without_agentapi`、`test_actions.ActionsTest.test_resident_runs_directly`、`test_actions.ActionsTest.test_dry_run_runs_locally` |
+| 7.12 | run 每轮先执行排队的动作；单条失败记 error，不挡后面的 | `test_actions.ActionsTest.test_run_loop_executes_actions_before_poll`、`test_actions.ActionsTest.test_run_pending_in_order_failure_does_not_block` |
+| 7.12 | retire 能给已关闭的前任或裸 conversation_id 补发退休通知，交接回执转给接手会话 | `test_actions.ActionsTest.test_retire_closed_predecessor_resends`、`test_actions.ActionsTest.test_retire_bare_conversation_id_of_unretired_predecessor` |
+| 7.12 | 排队动作按提交顺序执行；顺序反了，依赖前一条的动作报「不存在」失败，而且不重试 | `test_regress_actions.ActionsOrderTest.test_regression_7_12_actions_run_in_submission_order` |
 | 7.13 | 主人本人的发言当背景送负责会话：名册归属，其次 follow_hours 内最近处理过的会话，超时不送；只有背景时不要回执、不改状态 | `test_owner_context.OwnerContextTest.test_roster_owned_chat_goes_to_owner_as_context`、`test_owner_context.OwnerContextTest.test_follow_hours_recent_topic_or_nothing` |
 | 7.13 | 会话代回、找主人聊天、ignore 聊天里主人的话不当背景送 | `test_owner_context.OwnerContextTest.test_skipped_cases` |
 | 7.13 | 名册负责的聊天，主人先开口（这个聊天还没投递过消息）也要送负责会话 | `test_regress_routing.OwnerContextRosterRegressionTest.test_regression_7_13_owner_first_word_in_roster_chat_goes_to_owner` |
+| 7.14 | 会话和 Agent 机器人来回代回，出现以下任一就会无限循环：窗口内代回超过阈值不熔断；冷却期间对方消息照样投进会话；冷却中重复触发、重复提示；冷却结束不恢复 | `test_loop_guard.LoopGuardTest.test_breaker`、`test_loop_guard.LoopGuardTest.test_loops_cli_and_clear` |
+| 7.14 补丁 | 和真人同事来回聊也被熔断，真人的消息被拦进 Inbox（10-09 21:50）；混合聊天没按窗口内最近一条非主人消息的发送人判 | `test_loop_guard.LoopGuardTest.test_human_conversation_not_tripped`、`test_loop_guard.LoopGuardTest.test_mixed_chat_uses_latest_other_sender` |
+| 7.14 | 机器人 / Agent 发的消息（按名字、id、机器人类型）认不出来，不打 agent_sender、不带标注 | `test_loop_guard.LoopGuardTest.test_agent_detection_and_label` |
 | 7.15 | 主人引用了认不出来源的消息：送总线附原文，绝不当成回答唯一那条未结提问（10-09「方案1」事故） | `test_quote_reply.QuoteReplyTest.test_incident_unregistered_quote_goes_to_bus_not_open_question` |
 | 7.15 | 主人引用会话发给他的普通消息（不是提问），送回那个会话 | `test_quote_reply.QuoteReplyTest.test_quote_of_session_normal_reply_goes_back` |
 | 7.15 | 机器人消息的来源只认第一行；别名、标题唯一命中才算 | `test_quote_reply.QuoteReplyTest.test_attribution_only_first_line`、`test_quote_reply.QuoteReplyTest.test_aliases_and_titles_unique` |
 | 7.15 | 有引用的消息投递时都附「↪ 回复的是」 | `test_quote_reply.QuoteReplyTest.test_quote_line_everywhere` |
+| 7.16 第 1 条 | 分页没拉完照样推进水位线，后面的消息被静默丢掉；没拉完要从原 start 重拉，同一缺口只提示总线一次 | `test_gaps_collect.PartialTest.test_partial_round_keeps_watermark_and_refetches`、`test_gaps_collect.PartialTest.test_first_round_partial_without_watermark` |
+| 7.16 第 1 条 | 飞书搜索翻到 max_pages 仍 has_more、或 has_more 却没 page_token，不报「没拉完」 | `test_gaps_collect.LarkPagingTest.test_more_pages_than_limit_is_partial`、`test_gaps_collect.LarkPagingTest.test_has_more_without_token_is_partial` |
+| 7.16 第 2 条 | 发出去以后、记账之前崩溃，下一轮把同一批又投一遍；会话记录里找不到的批次没标 uncertain、自动重发了 | `test_gaps_delivery.DeliveryTest.test_crash_after_send_recovered_from_transcript_no_resend`、`test_gaps_delivery.DeliveryTest.test_not_in_transcript_uncertain_then_redeliver` |
+| 7.16 第 5 条 | prune 只清 messages，已关的提问、回执文件这些永远不清；或者反过来把未结的、不确定送没送到的也清掉 | `test_gaps_misc.PruneTest.test_prune_all_tables_and_receipts` |
+| 7.16 第 6 条 | 长消息固定只送前 40 行，截断了不提示，`sheepdog show` 看不到全文 | `test_gaps_misc.LongMessageTest.test_41st_line_now_delivered`、`test_gaps_misc.LongMessageTest.test_truncated_with_hint_and_show` |
+| 7.16 第 7 条 | run 不每轮重读 config.toml（改关键词不生效）；改坏了不沿用上一份；sink 改了当场切换（应该只提示要重启） | `test_gaps_misc.HotReloadTest.test_run_reloads_config_each_round` |
 | 7.16 第 3 条 | 对方随便回一句（寒暄）就关掉等待；等会话确认期间提醒照发 | `test_gaps_watch.WatchCandidateTest.test_chit_chat_does_not_close`、`test_gaps_watch.WatchCandidateTest.test_paused_while_replied_even_if_long_ago` |
 | 7.16 第 4 条 | 免打扰群里回复主人的消息被丢（「回复我」要排在免打扰之前） | `test_gaps_collect.MutedReplyTest.test_reply_to_me_in_muted_chat_dispatched_vip_still_dropped` |
+| 7.17 | reply-card 输出合法的 Card 2.0：正文原样、右下角灰色小字标记、中文和 emoji 不转义；宽度取配置；支持 --text-file 和标准输入；空正文报错 | `test_reply_card.ReplyCardCliTest.test_structure_and_defaults`、`test_reply_card.ReplyCardCliTest.test_config_width_and_suffix`、`test_reply_card.ReplyCardCliTest.test_text_file_stdin_and_empty` |
+| 7.17 | agent_markers 认出卡片代回（任意位置包含）：主人发言背景不送回，防循环照样计数 | `test_reply_card.AgentMarkerTest.test_is_agent_reply`、`test_reply_card.AgentMarkerTest.test_owner_context_skips_card_reply_and_loop_counts_it` |
+| 7.17 | 配置的 reply_suffix 替换不进 {{reply_suffix}}，会话被告知的代回标记和 reply-card 实际打的对不上 | `test_regress_reply_card.ReplySuffixFromConfigTest.test_regression_7_17_reply_suffix_from_config_reaches_prompts` |
+| 7.18 | 宿主分派错：Codex / Claude 会话的批次走了 Antigravity 那条路（engine 不按 topic 的 host 取 sink，cli 不按配置建各宿主的 sink） | `test_hosts.EngineHostTest.test_batch_receipt_from_answer`、`test_hosts.CliTest.test_sinks_per_host` |
+| 7.18 | 续接失效：已有会话每轮又新建一条线程或会话（Codex 没走 thread/resume，Claude 没走 --resume，新建那轮容量满重试时又新建一条） | `test_hosts.CodexSinkTest.test_resume_sequence`、`test_hosts.ClaudeSinkTest.test_new_and_resume_command_lines`、`test_hosts.CodexSinkTest.test_capacity_on_new_thread_retries_as_resume` |
+| 7.18 | 可重试错误：容量满 / 5xx 不按 5、10、20 分钟重试就记失败（或者认不出这类错误）；重试用完不进 attention | `test_hosts.CodexSinkTest.test_capacity_retries_then_fails`、`test_hosts.ClaudeSinkTest.test_capacity_is_retried`、`test_hosts.EngineHostTest.test_capacity_exhausted_marks_attention` |
+| 7.18 | 写锁冲突（Codex 应用开着线程）被当成失败计数，没有视同主人在用、退回排队；登录失效没把整个宿主标成不可用 | `test_hosts.EngineHostTest.test_write_lock_requeues_as_human_attached`、`test_hosts.CodexSinkTest.test_logged_out_marks_host_unavailable`、`test_hosts.EngineHostTest.test_login_failure_queues_and_notifies_once` |
+| 7.18（19:0x） | 新开 Codex / Claude 会话不先问主人：不带 --quote、或原话核对不通过也照样开 | `test_hosts.OwnerConsentTest.test_without_quote_rejected`、`test_hosts.OwnerConsentTest.test_unverified_quote_rejected` |
+| 7.18（20:05） | 配置档用 -p 传给 app-server，app-server 一启动就退出（10-10 20:05 日志采样会话连续 3 次失败）；应该展开成 -c | `test_hosts.CodexProfileTest.test_profile_expanded_to_c_only` |
+| 7.19 K2 | 会话被压缩后牧羊犬不知道，下一批不重推完整规则；非压缩的 CHECKPOINT 被误认成压缩；Codex 的压缩点认不出 | `test_guardrails.CompactionTest.test_bus_checkpoint_next_batch_has_full_rules_once`、`test_guardrails.CompactionTest.test_non_compaction_checkpoint_ignored`、`test_guardrails.CompactionTest.test_codex_session_rollout` |
+| 7.19 K1 | 每批末尾不附 reminders/<key>.md 的红线 | `test_guardrails.ReminderTest.test_appended_at_very_end` |
+| 7.19 K3 | 总线跑了危险命令没人知道：不私聊主人、不给犯规会话排停手提示、不知会 also_notify；已知误报不过滤；同一 step 重复报 | `test_guardrails.AuditTest.test_bus_command_alerts_owner_offender_and_also_notify`、`test_guardrails.AuditTest.test_ignore_patterns_drop_known_false_positives`、`test_guardrails.AuditTest.test_dedup_by_step_and_safe_commands_ignored` |
+| 7.19 K3 | Codex 会话跑的危险命令（CommandExecution、exec 里的 JS）认不出 | `test_guardrails.AuditTest.test_codex_command_execution_and_code_mode` |
+| 7.19 报警修复 F3 | 给主人的报警遇到飞书 429 发不出去就丢了（10-12 13:28、21:15）；应该落账本、退避重试、只到一次；发出去后崩溃，重启后不另起一条 | `test_owner_alerts.F3OwnerNoticeLedger.test_rate_limited_then_backoff_retry_sends_exactly_once`、`test_owner_alerts.F3OwnerNoticeLedger.test_crash_after_send_before_marked_sent_is_not_resent_after_restart` |
+| 7.19 报警修复 F4 | 10 分钟合并窗口把后来更严重的危险命令吞掉（10-12 21:17 发生产 BFF，没有单独报警、没有再排停手提示） | `test_owner_alerts.F4AuditMerge.test_incident_grep_then_trigger_and_approve_each_alert`、`test_owner_alerts.F4AuditMerge.test_pending_first_alert_never_holds_back_new_ones`、`test_guardrails.AuditTest.test_merge_only_repeats_of_reported_commands` |
+| 7.19 报警修复 F5 | 压缩后要等下一批才重推规则，长批次里有空档（10-12 21:02）；手上有没交差的批次时应当场补发，同一压缩点只补一次 | `test_owner_alerts.F5RulesAfterCompaction.test_compaction_mid_batch_resends_rules_in_the_same_round`、`test_owner_alerts.F5RulesAfterCompaction.test_unfinished_batch_after_receipt_timeout_also_gets_rules`、`test_owner_alerts.F5RulesAfterCompaction.test_same_point_resent_once_even_after_restart_and_reread` |
+| 7.20 | 运行状态算错：批次没人碰、或动过又停下 15 分钟不判中断；会话记录 30 分钟不动不判失联；主人在会话里说话不判被占着 | `test_duty.RunStateTest.test_stalled_when_batch_untouched_for_15_minutes_queues_and_notifies_once`、`test_duty.RunStateTest.test_lost_when_record_does_not_move_for_30_minutes`、`test_duty.RunStateTest.test_occupied_by_owner` |
+| 7.20 | 判了中断 / 失联的会话照样投递；同一段卡住每轮都私聊主人 | `test_duty.RunStateTest.test_stalled_when_batch_untouched_for_15_minutes_queues_and_notifies_once`、`test_duty.NoRecordTest.test_untouched_batch_lost_after_lost_minutes_queues_and_notifies_once` |
+| 7.20 第三轮 F1 | 找不到会话记录时整段卡住判定被跳过：卡片一直「在做」，不扣消息、不通知（黑盒 BUG-01） | `test_duty.NoRecordTest.test_untouched_batch_lost_after_lost_minutes_queues_and_notifies_once` |
+| 7.20 第三轮 F2 | 「主人在说话」两处各算各的：卡片说被占着，投递还在照投（黑盒 BUG-02） | `test_duty.OwnerOneSourceTest.test_codex_owner_message_held_through_the_card`、`test_duty.MailTest.test_tell_queued_while_recipient_busy` |
+| 7.20 | 撞车提醒不出现：消息里的编号在别的会话手上，或者最近送到过别的会话 | `test_duty.CollisionTest.test_reminder_attached_but_delivery_unchanged`、`test_duty_registration.ZeroRegistrationTest.test_routes_drive_collisions_and_board` |
+| 7.20 | 总线摘要每批都附（应该只在在岗表变了时附） | `test_duty.DigestTest.test_digest_only_when_board_changes` |
+| 7.20 | 会话留言 tell 送不到收件会话；同一对会话 10 分钟内超过 6 条不暂停、不通知总线 | `test_duty.MailTest.test_tell_delivered_next_batch_and_read_after_receipt`、`test_duty.MailTest.test_pair_rate_limit_pauses_and_notifies_bus` |
+| 7.20 | 登记了 watch 没自动挂成「等别人」的活；同一条命令连跑不标空转；履历清理把还开着的活删了 | `test_duty.RunStateTest.test_waiting_from_watch_autofill_and_from_receipt`、`test_duty.RunStateTest.test_spinning_same_command_three_times`、`test_duty.PruneTest.test_history_and_closed_work_pruned_open_work_kept` |
+| 7.20 第二轮 | 会话自报「等别人 / 等主人」把卡片改成了等回复，乱登记的一遍和不登记的一遍决定不一样 | `test_duty_registration.WrongRegistrationTest.test_declared_states_never_drive_run_state`、`test_duty_registration.TwinRunTest.test_decisions_identical` |
+| 7.20 第二轮 | 卡住的会话自报「进行中」（或做完了 / 等别人 / 等主人）就照常投递（10-12 18:0x 架构侧证伪时只有长跑抓到） | `test_regress_duty_declared.DeclaredStuckTest.test_regression_7_20_stuck_session_declaring_doing_is_still_held`、`test_regress_duty_declared.DeclaredStuckTest.test_regression_7_20_stuck_session_any_declared_state_is_still_held` |
+| 7.21 | 因回执超时卡在 attention 的会话恢复了（晚到的回执，或会话记录里有新动作），也不自动解开，排着的消息一直不投（10-11 断网，01:30 手动 reset） | `test_attention.RecoveryTest.test_late_receipt_recovers_and_delivers_queue`、`test_attention.RecoveryTest.test_transcript_activity_after_attention_recovers`、`test_attention.RecoveryTest.test_late_receipt_of_earlier_batch_also_counts` |
+| 7.21 | 恢复时把晚到那一批里会话已经处理过的消息又重投，会造成重复代回 | `test_attention.RecoveryTest.test_late_receipt_recovers_and_delivers_queue`、`test_attention.RecoveryTest.test_late_receipt_of_earlier_batch_also_counts` |
+| 7.21 | 会话进 attention 没人知道（总线自己进 attention 时，提示发给了它自己）；恢复了也不说 | `test_attention.NoticeTest.test_receipt_timeout_three_times_notifies_owner_once`、`test_attention.NoticeTest.test_bus_itself_in_attention_gets_no_self_hint`、`test_attention.RecoveryTest.test_transcript_activity_after_attention_recovers` |
+| 7.21 | 不是回执超时进的 attention（如发送失败），被晚到的回执或新动作自动解开了（应该只认回执超时，其余要人 session-reset） | `test_regress_attention_reason.SendFailedAttentionTest.test_regression_7_21_send_failed_attention_not_unlocked_by_late_receipt`、`test_regress_attention_reason.SendFailedAttentionTest.test_regression_7_21_send_failed_attention_not_unlocked_by_new_activity` |
 | 7.22 | 一事一串：同一把钥匙第一次起新消息，之后回到它的话题里 | `test_threads.AskTest.test_same_key_first_new_message_then_in_thread` |
 | 7.22 | 主人在话题里回复（没有引用），按话题送回会话、附开头那条；话题长了再附最近几条 | `test_threads.ThreadReplyTest.test_thread_reply_goes_back_with_the_root`、`test_threads.ThreadReplyTest.test_complex_thread_attaches_recent_and_thread_hint` |
 | 7.22 | 代回前先看一眼：主人已经说过话就不发、检查只读不动账本；检查失败不发 | `test_threads.ReplyCheckTest.test_owner_replied_check_is_read_only_and_idempotent`、`test_threads.ReplyCheckTest.test_check_failure_does_not_send` |
