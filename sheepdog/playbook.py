@@ -70,6 +70,9 @@ OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
                          "{{pending_batch}}（手上那批，回执照常交它）",
     "stop_receipt.md": "Stop hook 不让会话结束时给它的提示（这批还没交回执），可用 {{batch_id}} {{receipt_command}} "
                        "{{waiting_command}} {{blocked}}（这批第几次被拦）",
+    # VIP（7.61）：只在这一批里有 VIP 本人发的消息时附在批次末尾，不进任何常驻规则；缺了用代码里一段很短的默认话
+    "vip.md": "批次里有名册 [[person]] tier = vip 的人发来的消息（盖了 👑 章）时，附在这一批末尾的规则，"
+              "可用 {{vips}}（这一批盖了章的人）",
 }
 
 # 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。

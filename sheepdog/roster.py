@@ -8,6 +8,9 @@
 managed 的 conversation_id 写成空字符串 = 还没建，由 `sheepdog spawn` / `init` 新建（7.2）；
 新建出来的 id 只记在 topics 表，不回写名册文件。可以带 predecessor_conversation_id 接手旧会话。
 
+顶层还可以有 [[person]]（7.61）：名册里的「人」。tier = vip 的人发来的消息投递时盖章、批次末尾附 vip.md，
+他们的请求 `sheepdog ask` 要带 --floor。授权跟着人走，不改路由。
+
 校验失败抛 RosterError，调用方直接报错退出，不静默降级。
 """
 
@@ -31,6 +34,12 @@ _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
                  "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats",
                  "host", "model", "effort"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages", "thread_id"}
+# 名册里的「人」（7.61）：授权跟着人走，不跟着会话走。目前只有 vip 一档
+_PERSON_KEYS = {"open_id", "name", "tier", "authority"}
+VIP = "vip"
+PERSON_TIERS = (VIP,)
+# authority 里要看得出主人哪天说的：至少有一个 MM-DD（YYYY-MM-DD 里也含一个）
+_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})-(\d{1,2})(?!\d)")
 
 
 class RosterError(ValueError):
@@ -92,8 +101,19 @@ class RosterSession:
 
 
 @dataclass
+class RosterPerson:
+    """名册里的一个人（7.61）。open_id 是飞书 ou_…；tier 目前只有 vip；authority 是主人原话（带日期），只转述，不扩大。
+    和 config 的 routing.vip_sender_ids 不是一回事：那个只管「关键人发言进会话」（路由），这里管「对他放多大权」（授权）。"""
+    open_id: str
+    tier: str = VIP
+    name: str = ""
+    authority: str = ""
+
+
+@dataclass
 class Roster:
     sessions: list[RosterSession] = field(default_factory=list)
+    persons: list[RosterPerson] = field(default_factory=list)
 
     def __post_init__(self):
         # (chat_id, thread_id) → (会话, 聊天)，只收 managed 会话；thread_id 为空 = 整个聊天
@@ -102,6 +122,7 @@ class Roster:
             if s.mode == MANAGED:
                 for c in s.chats:
                     self._owner[(c.chat_id, c.thread_id)] = (s, c)
+        self._persons: dict[str, RosterPerson] = {p.open_id: p for p in self.persons}
 
     def owner_of(self, chat_id: str) -> tuple[RosterSession, RosterChat] | None:
         """整个聊天归谁（只看不带话题编号的条目；话题绑定见 thread_owner）。"""
@@ -116,6 +137,14 @@ class Roster:
 
     def by_topic(self, topic_id: str) -> RosterSession | None:
         return next((s for s in self.sessions if s.topic_id == topic_id), None)
+
+    def person(self, open_id: str) -> RosterPerson | None:
+        """按 open_id 查名册里的人（7.61）；不在名册里是 None。"""
+        return self._persons.get((open_id or "").strip())
+
+    def vips(self, exclude: str = "") -> dict[str, str]:
+        """名册里 tier = vip 的人：open_id → 名字（没写名字是空串）。exclude：排除这个 open_id（主人自己不算 VIP）。"""
+        return {p.open_id: p.name for p in self.persons if p.tier == VIP and p.open_id != exclude}
 
     @property
     def managed(self) -> list[RosterSession]:
@@ -135,7 +164,9 @@ class Roster:
                 if not c.get("thread_id"):
                     c.pop("thread_id", None)
             rows.append(d)
-        blob = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        # 7.61 的 [[person]]：没有时 hash 和以前一字不差（老名册升级后不算「名册更新」）；有时一起算
+        data = rows if not self.persons else {"session": rows, "person": [asdict(p) for p in self.persons]}
+        blob = json.dumps(data, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
@@ -155,9 +186,9 @@ def _bool(d: dict, k: str, where: str) -> bool:
 
 def parse_roster(data: dict) -> Roster:
     """校验并解析名册 dict（tomllib 的输出）。"""
-    unknown_top = set(data) - {"session"}
+    unknown_top = set(data) - {"session", "person"}
     if unknown_top:
-        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]]）")
+        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]] 和 [[person]]）")
     raw_sessions = data.get("session", [])
     if not isinstance(raw_sessions, list):
         raise RosterError("session 必须写成 [[session]] 数组")
@@ -240,7 +271,46 @@ def parse_roster(data: dict) -> Roster:
         if x.predecessor_conversation_id in live_cids:
             raise RosterError(f"session key={x.key!r}: predecessor_conversation_id 仍登记在 "
                               f"{live_cids[x.predecessor_conversation_id]!r}，先把旧条目删掉")
-    return Roster(sessions)
+    return Roster(sessions, _parse_persons(data.get("person", [])))
+
+
+def _parse_persons(raw_persons) -> list[RosterPerson]:
+    """名册顶层的 [[person]]（7.61）：open_id 必填（ou_ 开头、不重复）；tier 目前只认 vip；vip 必须写 authority（主人原话，
+    要看得出哪天说的：至少有一个 MM-DD 或 YYYY-MM-DD）。"""
+    if not isinstance(raw_persons, list):
+        raise RosterError("person 必须写成 [[person]] 数组")
+    persons: list[RosterPerson] = []
+    seen: dict[str, int] = {}
+    for i, raw in enumerate(raw_persons):
+        where = f"person[{i}]"
+        if not isinstance(raw, dict):
+            raise RosterError(f"{where}: 必须写成 [[person]] 表")
+        unknown = set(raw) - _PERSON_KEYS
+        if unknown:
+            raise RosterError(f"{where}: 未知键 {sorted(unknown)}（只允许 {sorted(_PERSON_KEYS)}，防止拼错的字段被静默忽略）")
+        open_id = _str(raw, "open_id", where)
+        where = f"person[{i}] open_id={open_id!r}"
+        if not open_id.startswith("ou_") or len(open_id) <= 3:
+            raise RosterError(f"{where}: open_id 必填，要写 ou_ 开头的飞书 open_id")
+        if open_id in seen:
+            raise RosterError(f"{where}: open_id 重复（和 person[{seen[open_id]}] 是同一个人）")
+        seen[open_id] = i
+        tier = _str(raw, "tier", where)
+        if tier not in PERSON_TIERS:
+            raise RosterError(f"{where}: tier 只能是 {' / '.join(PERSON_TIERS)}，收到 {tier!r}")
+        p = RosterPerson(open_id=open_id, tier=tier, name=_str(raw, "name", where), authority=_str(raw, "authority", where))
+        if tier == VIP:
+            if not p.authority:
+                raise RosterError(f"{where}: tier = vip 必须写 authority（主人原话，带日期）")
+            if not _has_date(p.authority):
+                raise RosterError(f"{where}: authority 要看得出主人哪天说的，写上日期（如 2026-10-18 或 10-18）")
+        persons.append(p)
+    return persons
+
+
+def _has_date(text: str) -> bool:
+    """text 里有没有一个像样的 MM-DD（月 1–12、日 1–31）。"""
+    return any(1 <= int(m) <= 12 and 1 <= int(d) <= 31 for m, d in _DATE_RE.findall(text))
 
 
 def check_hosts(roster: Roster, enabled) -> None:

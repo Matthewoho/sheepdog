@@ -310,6 +310,25 @@ attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'   # 第一行里 [
 - **结案**：`sheepdog resolve` 只结自己名下、还开着的（原会话已收掉的由总线结，`resolved_by` 记总线）；机器人在那条提问的话题里补一句「✅ 已结案：依据（会话）」，默认不 @ 你（`[escalation] resolve_notice_at`）。这句和「待办」清单拉回来都不登记成「需要你定」、不投给任何会话。
 - **待办清单**：`sheepdog pending` 只有「要你定的」一段，可能已处理的在条目下加一行「↳ 你几点在哪说过：……，已提醒 <会话> 核实」，不挪走；再列羊群看板上各会话「等主人」的活。你在找主人聊天里单独发「待办」（顶层消息），机器人当轮回这份清单，不经过总线。
 
+## VIP：授权跟着人走（7.61，名册 `[[person]]`，默认没有）
+
+有几位你信任的人，他们的请求你希望会话尽量满足、不要每件都回来等你批。授权写在**人**上，不写在会话上：不管这些人的消息被送到哪个会话，规则都跟着走。路由不变，不新增会话。
+
+```toml
+# roster.toml 顶层，可以写多条
+[[person]]
+open_id = "ou_test_vip_demo"        # 必填，飞书 open_id（ou_ 开头），不能重复
+name = "示例 VIP"                    # 盖章时显示的名字；留空用消息里的发送人名字
+tier = "vip"                         # 目前只认 vip
+authority = "2026-10-18 主人原话：……"  # tier = vip 必填：你的原话，要看得出哪天说的（至少有 MM-DD 或 YYYY-MM-DD）
+```
+
+- **校验**：未知键、open_id 重复或不是 `ou_` 开头、tier 不认识、vip 没写 authority 或 authority 里看不出日期，名册都报错（同 `[[session]]`，常驻进程沿用上一份好用的名册）。名册没有 `[[person]]` 时 `content_hash` 和以前一字不差，不触发「名册更新」；有了以后 `[[person]]` 一起算。删掉 `[[person]]` 就回到原样（热加载，下一批生效）。
+- **投递时盖章**：发送人（按 `sender_id` 认，不看正文）是名册里的 vip，这条消息的标题下面、@ 行和「↪ 回复的是」之后加一行 `👑 VIP：<名字>（规则见本批末尾）`；安全警示照旧排在后面，安全规则优先。普通批次、你的插话批次、总线 `forward --message-ids` 转交过去的原消息都盖。不盖：你自己的消息（背景、回复、指令；`self_open_id` 就算写进了 `[[person]]` 也不算）、机器人 / Agent 发的、sheepdog 自己生成的、别人在正文里转述「某某让你……」的。
+- **规则跟着批次走**：这一批有盖了章的消息，才在批次末尾（`security_footer.md`、`batch_footer.md` 之后，红线 `reminders/<key>.md` 之前）附 playbook 的 `vip.md`（可选，可用 `{{vips}}` = 这一批盖了章的人；缺了用代码里一段很短的默认话）。没有 VIP 消息的批次一个字都不多。`vip.md` 不进任何会话的常驻规则（开场、登记通知、规则同步），所以加了它不会触发规则重推。示例见 `examples/playbook/vip.md`。
+- **`ask` 当场拦**：`sheepdog ask` 关联的来源消息（给了 `--about` 就是它们；不给就是这一批送到的全部消息，不管来自几个聊天）里有一条是 VIP 本人发的，就必须带 `--floor "<碰到哪条底线>"`，否则不发、不写账本，退出码 2，stderr 写明「VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合；只有底线里的事才 ask，并用 --floor 写明碰到哪条底线」。`--floor` 记进账本 `sends.floor`（按 `message_id` 和 `escalations` 连），体检据此区分「VIP 请求又回来等你批」和「碰到底线」。`--about` 只指非 VIP 消息时不用带；`report` 完全不受影响；名册没有 `[[person]]` 时 ask 和以前一样。名册读不了时这次不核（stderr 提示一行），不把找你的路堵上。
+- **和 `[routing] vip_sender_ids` 不是一回事**：`vip_sender_ids` 是路由，只管「这些人在群里说话也送进会话、不进 Inbox」（原因标「关键人发言」）；`[[person]]` 是授权，管「对他放多大权」，不改任何消息送到哪里。两者可以各写各的。
+
 ## 一事一串：找你的消息按事归到话题里
 
 会话找你一律用 `sheepdog ask`（需要你定）/ `sheepdog report`（汇报），不再自己调 lark-cli。sheepdog 在正文前加开头一行（`[threads] ask_header` / `report_header`，默认 `🐕 需要你定 · <标题> [tp_xxx]` / `🐕 汇报 · <标题> [tp_xxx]`），以机器人身份私聊你；这一行照旧被 `[escalation] header_regex`、`attribution_regex` 认出来（`sheepdog doctor` 会核对 ask 的开头一行能不能被 header_regex 认出来）。

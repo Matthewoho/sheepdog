@@ -419,8 +419,10 @@ CREATE TABLE IF NOT EXISTS sends (
     text              TEXT,            -- 发出去的正文（卡片记卡片正文）
     sent_at           TEXT NOT NULL,
     identity          TEXT,            -- 用哪个身份发的（7.26，[identity] 开着才写）：user（主人本人）| bot（机器人）
-    sources_origin    TEXT             -- ask 发出时定下的来源口径（about | batch，来源可以是空的：一批来自多个聊天就故意不记）；
+    sources_origin    TEXT,            -- ask 发出时定下的来源口径（about | batch，来源可以是空的：一批来自多个聊天就故意不记）；
                                        -- 空 = 没定过（7.36 以前的版本发的、report、reply）。定过的不再补来源
+    floor             TEXT             -- ask 带的 --floor（7.61）：碰到哪条底线才找主人；空 = 没带。和 escalations.message_id
+                                       -- 按 message_id 连，体检按它区分「VIP 请求又去找主人批」和「碰到底线」
 );
 CREATE INDEX IF NOT EXISTS idx_sends_message ON sends(message_id);
 CREATE INDEX IF NOT EXISTS idx_sends_root ON sends(root_message_id);
@@ -570,7 +572,7 @@ MIGRATIONS = {
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
-    "sends": [("identity", "TEXT"), ("sources_origin", "TEXT")],
+    "sends": [("identity", "TEXT"), ("sources_origin", "TEXT"), ("floor", "TEXT")],
     "owner_notices": [("reply_to", "TEXT"), ("in_thread", "INTEGER DEFAULT 0")],
     "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
                     ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
@@ -1224,6 +1226,14 @@ class Store:
         """ask 发出时定下的来源口径（7.36）：记了以后补来源不再动它，没记来源也是定过的。"""
         with self.tx() as c:
             c.execute("UPDATE sends SET sources_origin=? WHERE message_id=? AND kind='ask'", (origin, message_id))
+
+    def set_send_floor(self, message_id: str, floor: str) -> None:
+        """ask 带的 --floor（7.61）：只写还空着的（重试不改第一次记下的那句）；floor 为空不写。"""
+        if not floor:
+            return
+        with self.tx() as c:
+            c.execute("UPDATE sends SET floor=? WHERE message_id=? AND kind='ask' AND COALESCE(floor,'')=''",
+                      (floor, message_id))
 
     def thread_messages_in_ledger(self, thread_id: str, root_message_id: str = "") -> list[sqlite3.Row]:
         """账本里这个话题的消息（含开头那条），按发送时间排。只读。"""

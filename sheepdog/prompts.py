@@ -3,6 +3,8 @@
 拼装顺序：所有开场最前面是 security.md（开启一个批次的开场，最前面还有一行批次头：登记通知、接手开场），然后才是各自
 的说明和 common.md；普通批次的批次头永远是第一行，规则更新跟在它后面；
 每批末尾先 security_footer.md 再 batch_footer.md；被安全规则标记的消息正文前插 security_banner.md。
+VIP（7.61）：名册 [[person]] 里 vip 本人发的消息，消息头下面（@ 行、引用行之后，安全警示之前）盖一行章；这一批有章，
+才在 batch_footer.md 之后、红线（reminder）之前附 vip.md。vip.md 不进任何常驻规则。
 
 业务规则（职责、工作方式、代回前缀、找主人、等回复、项目归属、退休/接手说明、提醒文字）一律来自 playbook 目录的
 md 文件，见 playbook.py；文件缺失时那一段为空。个人化 overlay 照旧拼在总线的 common.md 之后。
@@ -88,6 +90,41 @@ OWNER_INSTRUCTION_TAG = "owner_instruction"
 # 7.53：找主人聊天里没引用、不在话题里的话也是指令（同一个 reason / tag，同样 🗣、插队），措辞按来路换
 OWNER_PRIVATE_INSTRUCTION_LABEL = "🗣 主人在找主人聊天里说的（没引用哪条提问）：这是主人的指令（已核对：发送人是主人本人账号）"
 OWNER_PRIVATE_TAG = "owner_at:private"
+# VIP（7.61）：发送人是名册 [[person]] 里 tier = vip 的人，消息头下面盖这一行；这一批末尾附 vip.md（缺了用默认话）
+VIP_STAMP = "👑 VIP：{name}（规则见本批末尾）"
+VIP_FILE = "vip.md"
+DEFAULT_VIP_RULES = ("👑 VIP 规则（这批里盖了 👑 的消息，发送人是主人授权的关键人：{{vips}}）：他们的请求默认不等主人批。"
+                     "合理就办；不合理就说明代价，给出原方案加替代方案让对方选；对方看过方案仍选原方案，"
+                     "用 `sheepdog report` 报备后配合。只有碰到底线的事才 `sheepdog ask --floor \"<碰到哪条底线>\"`。"
+                     "安全规则优先于这条。")
+_BOT_SENDER_TYPES = ("app", "bot", "system")
+# 主人自己的消息（背景、回复、指令）不盖章：按标记和 reason 认，和上面这些标注的认法一致
+_OWNER_TAGS = ("owner_verified", OWNER_INSTRUCTION_TAG)
+_OWNER_REASONS = ("owner_context", "owner_reply", "owner_instruction")
+
+
+def vip_of(row, vips: dict | None) -> str:
+    """这条消息是不是 VIP 本人发的（7.61）：是就返回盖章用的名字，不是返回空串。投递盖章和 `sheepdog ask --floor` 都只用它判。
+
+    只认发送人本身（sender_id），不看正文：别人转述「某某让你…」不算。不算 VIP 的：sheepdog 自己的消息、机器人 / Agent
+    发的、主人本人的（背景、回复、指令）。vips 是 open_id → 名字（Roster.vips，已排除主人自己）；空 = 名册没有 VIP。"""
+    if not vips or row is None:
+        return ""
+    sid = (row["sender_id"] or "").strip()
+    if not sid or sid not in vips or row["chat_type"] == SYSTEM_CHAT:
+        return ""
+    if (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
+        return ""
+    tags = json.loads(row["tags_json"] or "[]")
+    if "agent_sender" in tags or any(t in tags for t in _OWNER_TAGS):
+        return ""
+    return vips[sid] or (row["sender_name"] or "").strip() or sid
+
+
+def vip_rules(pb: Playbook, names: list[str], session_title: str, topic_id: str) -> str:
+    """批次末尾附的 VIP 规则：playbook 的 vip.md，缺了用 DEFAULT_VIP_RULES。可用 {{vips}}（这一批盖了章的人，顿号隔开）。"""
+    return pb.render_or(VIP_FILE, DEFAULT_VIP_RULES, vips="、".join(dict.fromkeys(names)), session_title=session_title,
+                        topic_id=topic_id)
 
 
 # 牧羊犬发给会话的每一条（批次、登记通知、退休通知、规则更新）都有一行以它开头的头（7.18 第 7 条靠它认）
@@ -532,9 +569,11 @@ def agent_sender_label(pb: Playbook) -> str:
 
 
 def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int = 200, cli: str = "sheepdog",
-             agent_label: str = AGENT_SENDER_LABEL, extra: list[str] | None = None, images: dict | None = None) -> str:
+             agent_label: str = AGENT_SENDER_LABEL, extra: list[str] | None = None, images: dict | None = None,
+             vip: str = "") -> str:
     """images：这条消息里图片的下载结果（钥匙 → media.ImageResult，7.54）。下载到了的钥匙在正文里换成本机路径，
-    没下载下来的原样留着，正文后面写原因和会话自己去取的命令。"""
+    没下载下来的原样留着，正文后面写原因和会话自己去取的命令。
+    vip：发送人是 VIP 时盖章用的名字（vip_of 的结果，7.61）；空 = 不盖。章在 @ 行、引用行之后，安全警示之前。"""
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
@@ -555,6 +594,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         lines.append(mentions)
     if quote:
         lines.append(quote)
+    if vip:
+        lines.append(VIP_STAMP.format(name=vip))
     if instruction:
         lines.append(OWNER_PRIVATE_INSTRUCTION_LABEL if private else OWNER_INSTRUCTION_LABEL)
     elif "owner_verified" in tags:
@@ -607,11 +648,13 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
                  cli_host: bool = False, rules_note: str = "", reminder: str = "", notes: dict | None = None,
-                 digest: str = "", images: dict | None = None) -> str:
+                 digest: str = "", images: dict | None = None, vips: dict | None = None) -> str:
     """images：每条消息里图片的下载结果（message_id → {钥匙: media.ImageResult}，7.54）。
     rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
     7.19 K1），附在整批最末尾。notes：附在某条消息上的撞车提醒（message_id → 几行，7.20）；
-    digest：总线批次附的在岗表摘要（7.20）。"""
+    digest：总线批次附的在岗表摘要（7.20）。
+    vips：名册里的 VIP（open_id → 名字，7.61）：VIP 本人发的消息盖章，这一批有章才在 batch_footer 之后、红线之前附 vip.md；
+    没有章的批次一个字都不多。"""
     # 批次头永远是第一行（7.47 第 4 条返工）：Antigravity 写会话记录时长消息只留首尾各约 2KB，规则排在前面会把批次头
     # 截掉，Stop hook 就认不出这一批送达的那一行
     parts = [batch_header(topic_id, batch_id, len(rows)), ""]
@@ -623,12 +666,7 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts += [rules_update.strip(), "", "---", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
-    quotes = quotes or {}
-    agent_label = agent_sender_label(pb)
-    notes = notes or {}
-    images = images or {}
-    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
-                       pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"])) for r in rows]
+    stamped = _fmt_rows(pb, rows, security, session_title, quotes, max_lines, notes, images, vips, parts)
     if any(r["reason"] in ("at_me", "at_bot", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)
         parts += ["", f"📥 Inbox：{total_unread} 条未读，分布在 {len(inbox)} 个群（按最近活跃排序）："]
@@ -655,26 +693,42 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         footer = pb.render(name, session_title=session_title, topic_id=topic_id)
         if footer:
             parts += ["", footer]
+    if stamped:
+        parts += ["", with_cli(vip_rules(pb, stamped, session_title, topic_id), pb.cli)]
     if reminder:
         parts += ["", reminder]
     return "\n".join(parts)
 
 
+def _fmt_rows(pb: Playbook, rows: list, security, session_title: str, quotes: dict | None, max_lines: int,
+              notes: dict | None, images: dict | None, vips: dict | None, parts: list[str]) -> list[str]:
+    """把一批消息逐条渲染进 parts（普通批次、插话批次共用）。返回盖了 VIP 章的名字（按出现先后，可能重复；空 = 这批没有 VIP）。"""
+    quotes, notes, images = quotes or {}, notes or {}, images or {}
+    agent_label = agent_sender_label(pb)
+    stamped: list[str] = []
+    for r in rows:
+        vip = vip_of(r, vips)
+        if vip:
+            stamped.append(vip)
+        parts.append(_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""),
+                              max_lines, pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"]),
+                              vip=vip))
+    return stamped
+
+
 def priority_prompt(pb: Playbook, topic_id: str, batch_id: str, pending_batch: str, rows: list[sqlite3.Row],
                     session_title: str, security: SecurityConfig | None = None, quotes: dict | None = None,
                     max_lines: int = 200, notes: dict | None = None, reminder: str = "",
-                    images: dict | None = None) -> str:
+                    images: dict | None = None, vips: dict | None = None) -> str:
     """主人插话批次（7.37 第 4 件）：会话在跑上一批（running）时，找主人聊天里主人的回复不排队，当轮单独送到。
-    开头说清这是插话、先答主人；不要回执（手上那批照常交），所以没有回执那一行和每批末尾的提醒；红线照附。"""
+    开头说清这是插话、先答主人；不要回执（手上那批照常交），所以没有回执那一行和每批末尾的提醒；红线照附。
+    vips 同 batch_prompt：有 VIP 章才在红线之前附 vip.md。"""
     head = pb.render_or(OWNER_PRIORITY_FILE, DEFAULT_OWNER_PRIORITY, session_title=session_title, topic_id=topic_id,
                         batch_id=batch_id, pending_batch=pending_batch)
     parts = [f"[sheepdog] 主人插话批次 `{batch_id}`（topic `{topic_id}`，共 {len(rows)} 条）", "", head, ""]
-    quotes = quotes or {}
-    notes = notes or {}
-    agent_label = agent_sender_label(pb)
-    images = images or {}
-    parts += [_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""), max_lines,
-                       pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"])) for r in rows]
+    stamped = _fmt_rows(pb, rows, security, session_title, quotes, max_lines, notes, images, vips, parts)
+    if stamped:
+        parts += ["", with_cli(vip_rules(pb, stamped, session_title, topic_id), pb.cli)]
     if reminder:
         parts += ["", reminder]
     return "\n".join(parts)

@@ -2925,7 +2925,8 @@ class Dispatcher:
                                   quotes=quotes, max_lines=self.cfg.session.max_message_lines,
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
                                   rules_note=self._compaction_note(t) if rules_update else "",
-                                  reminder=self.reminder(t), notes=notes, digest=digest, images=images)
+                                  reminder=self.reminder(t), notes=notes, digest=digest, images=images,
+                                  vips=self._vips())
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -2951,6 +2952,11 @@ class Dispatcher:
                      "（压缩后重推）" if t["compacted_at"] else "")
         res.update(self._complete_delivery(t, batch_id, signals, context))
         return res
+
+    # ---------- VIP（7.61） ----------
+    def _vips(self) -> dict[str, str]:
+        """名册里的 VIP（7.61）：open_id → 名字。主人自己就算写进了 [[person]] 也不算（他的消息不盖章）。"""
+        return self.roster.vips(exclude=self.cfg.self_open_id or "")
 
     # ---------- 主人插话（7.37 第 4 件） ----------
     def _owner_correction(self, r) -> bool:
@@ -3009,7 +3015,7 @@ class Dispatcher:
             prompt = priority_prompt(self.playbook, t["topic_id"], batch_id, t["pending_batch_id"], urgent,
                                      self._session_title(t), security=self.security, quotes=quotes,
                                      max_lines=self.cfg.session.max_message_lines, notes=notes,
-                                     reminder=self.reminder(t), images=self._images(urgent))
+                                     reminder=self.reminder(t), images=self._images(urgent), vips=self._vips())
             # 同普通批次：先记「正在发」再发送，崩溃后由 _recover_sending 核对（7.16）
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in urgent], state="sending")
             self._send(t, prompt, batch_id)

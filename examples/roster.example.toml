@@ -71,3 +71,13 @@ all_messages = false
 # effort = "xhigh"                           # 这个会话单独用更高的推理档位
 # title = "示例：架构设计"
 # duty = "复杂代码和架构设计：读代码、出方案。不负责对外发送。"
+
+# 名册里的「人」（7.61）：授权跟着人走，不跟着会话走，路由不变。tier = vip 的人本人发来的消息投递时盖 👑 章、
+# 这一批末尾附 playbook 的 vip.md；会话为他们的请求 `sheepdog ask` 时必须带 --floor（碰到哪条底线）。
+# open_id 必填（ou_ 开头，不能重复）；authority 是主人原话，要看得出哪天说的（写上 YYYY-MM-DD 或 MM-DD）。
+# 和 config 的 [routing] vip_sender_ids 不是一回事：那个只管「关键人发言进会话」（路由）。
+[[person]]
+open_id = "ou_test_vip_demo"
+name = "示例 VIP"
+tier = "vip"
+authority = "2026-01-01 主人原话（示例）：「这位的需求尽量满足，不用等我批；不合理就给方案让他选，坚持就报备后配合」"

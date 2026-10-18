@@ -30,7 +30,7 @@ security_path = "security.toml"
 
 [routing]
 keywords = ["生产", "prod", "故障", "告警", "回滚", "审批"]
-vip_sender_ids = []
+vip_sender_ids = []          # 关键人发言也送进会话（路由）；和名册 [[person]] 的 VIP（授权，7.61）不是一回事
 ignore_muted_chats = true
 dispatch_at_all = true
 dispatch_bot_p2p = false

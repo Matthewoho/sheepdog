@@ -131,12 +131,53 @@ def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | Non
     return pend.ORIGIN_BATCH, srcs, n
 
 
+VIP_FLOOR_REFUSAL = ("VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合；只有底线里的事才 ask，"
+                     "并用 --floor 写明碰到哪条底线")
+
+
+def vip_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
+                batch: str = "") -> list[tuple[str, str]]:
+    """ask 关联的来源消息里，VIP 本人发的那些（7.61）：[(消息号, 名字)]。来源口径：给了 --about 就是它们；不给就是这一批送到的
+    全部消息（不管来自几个聊天，和只记单聊天来源的 default_sources 不同）。判 VIP 只用 prompts.vip_of（和投递盖章同一处）。
+    名册没有 VIP 时直接返回空，不碰账本。"""
+    if not vips:
+        return []
+    from .prompts import vip_of
+    if about and any((a or "").strip() for a in about):
+        try:
+            ids = pend.about_sources(cfg, store, about)
+        except ValueError as e:
+            raise OutboundError(EXIT_INVALID, str(e))
+    else:
+        ids = pend.batch_sources(cfg, store, batch or current_batch(store, topic_id))
+    out = []
+    for mid, _ in ids:
+        name = vip_of(store.get_message(mid), vips)
+        if name:
+            out.append((mid, name))
+    return out
+
+
+def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
+                    floor: str, batch: str = "") -> list[tuple[str, str]]:
+    """7.61：ask 关联的来源里有 VIP 本人发的消息，就必须带非空 --floor，否则拒绝（退出码 2，什么都不发、不写账本）。
+    只读。send_to_owner 发之前调它；测试环境（不发飞书）那条路由 cli 直接调。返回关联到的 VIP 消息。"""
+    hits = vip_sources(cfg, store, topic_id, about, vips, batch)
+    if hits and not _one_line(floor):
+        who = "、".join(f"{name}（{mid}）" for mid, name in hits)
+        raise OutboundError(EXIT_INVALID, f"{VIP_FLOOR_REFUSAL}。这次关联的来源里有 VIP 本人发的消息：{who}。没有发送")
+    return hits
+
+
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
-                  key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False) -> SendResult:
+                  key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
+                  floor: str = "", vips: dict | None = None) -> SendResult:
     """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。
     ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。
     7.51：这把钥匙是话题群里的一件事项，或者第一次用这把钥匙时带 --track（track = True）：发进话题群里那件事的话题
-    （没有就先开一件、发标题卡）；群发不进去就退回私聊，并发一条系统通知。"""
+    （没有就先开一件、发标题卡）；群发不进去就退回私聊，并发一条系统通知。
+    7.61：vips 是名册里的 VIP（Roster.vips）。ask 关联的来源里有 VIP 本人发的消息又没带 floor（--floor）就拒绝，在发送和
+    写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。"""
     from . import topicgroup as tg
     if track and not _one_line(key):
         raise OutboundError(EXIT_INVALID, "--track 要和 --key 一起用：长期跟踪的事要有钥匙")
@@ -152,6 +193,9 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         raise OutboundError(EXIT_INVALID, "配置里没有 self_open_id，不知道主人是谁")
     key = _one_line(key)
     nk = duty.norm_key(key) if key else ""
+    floor = _one_line(floor) if kind == ASK else ""
+    if kind == ASK:
+        check_vip_floor(cfg, store, topic_id, about, vips, floor, batch)   # 7.61：只读，拒绝时什么都没写
     text = compose(cfg, kind, topic_id, title, body)
     ik = idem_key(kind, topic_id, nk, batch or current_batch(store, topic_id), text)
     origin, srcs, n_chats = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [], 0)
@@ -161,18 +205,18 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
                          batch_chats=n_chats)
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
-        return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+        return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
     route = tg.route_for_send(cfg, store, topic_id, key, track)
     if route.group:
         try:
             res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route)
             res.batch_chats = n_chats
-            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
         except _GroupDown as e:
             route = tg.SendRoute(note=f"话题群发不进去（{e}），已退回私聊，这条发进了私聊")
     res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik)
     res.batch_chats, res.note = n_chats, route.note
-    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs)
+    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
 
 
 class _GroupDown(Exception):
@@ -260,14 +304,16 @@ def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title:
 
 
 def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: str, origin: str,
-                        srcs: list) -> SendResult:
-    """ask 发出去了（或之前已经发过）：记来源，查同一来源有没有别的会话在问。report 不记。"""
+                        srcs: list, floor: str = "") -> SendResult:
+    """ask 发出去了（或之前已经发过）：记来源，查同一来源有没有别的会话在问；带了 --floor 记进 sends.floor（7.61）。
+    report 不记。"""
     if not origin:
         return res
     if srcs:
         store.add_escalation_sources(res.message_id, topic_id, srcs, origin)
     # 来源这就定了（没记也是定了：一批来自多个聊天故意不记）；之后每轮补来源不再补它
     store.set_send_sources_origin(res.message_id, origin)
+    store.set_send_floor(res.message_id, floor)
     res.origin, res.sources = origin, srcs
     res.duplicates = pend.duplicate_asks(cfg, store, topic_id, srcs, exclude=res.message_id)
     return res
