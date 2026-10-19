@@ -191,3 +191,41 @@ class MoreCardTest(ThreadsBase):
         self.assertNotIn("kubectl -n prod", out_p)
         self.assertNotIn("排查与验证明细", out_p)
         self.assertNotIn("more", out_p)
+
+    def test_762_at_mentions_hoisted_outside_more_panel(self):
+        m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="请开启测试环境推荐")
+        self.pull(m_alice)
+        self.deliver()
+
+        # 1) 原文开头写了 <at id=ou_alice></at>，而 --summary 没写：自动提到外层 summary 最前面，且剥掉 more 开头重复的 @
+        detail_with_at = f"<at id={ALICE}></at> 已全部配好并验证通过：\n" + LONG_DETAIL
+        rc, out, err = self.cli(
+            "reply", "--topic", "tp_alpha", "--to", m_alice,
+            "--summary", SUMMARY, "--card-text", detail_with_at,
+        )
+        self.assertEqual(rc, 0, out + err)
+        c = card_of(self.lark.sent("+messages-reply")[-1])
+        els = c["body"]["elements"]
+        self.assertEqual(els[0], {"tag": "markdown", "content": f"<at id={ALICE}></at> {SUMMARY}"})
+        self._assert_reply_same_row(els[1], f"已全部配好并验证通过：\n{LONG_DETAIL}")
+
+        # 2) --text 里写了文本格式 <at user_id="ou_alice">Alice</at> + 代码块里的 `<at id=ou_fake></at>`：
+        #    真 @ 转成 <at id=ou_alice></at> 提到外层；代码块/反引号里的示例不提；<at> 标签长度不占 220 字额度
+        near_limit_sum = f'<at user_id="{ALICE}">Alice</at> ' + ("字" * 215)
+        detail_with_code_at = "说明：写法如 `<at id=ou_code_only></at>`\n" + LONG_DETAIL
+        rc2, out2, err2 = self.cli("reply-card", "--summary", near_limit_sum, "--text", detail_with_code_at)
+        self.assertEqual(rc2, 0, err2)
+        c2 = json.loads(out2)
+        els2 = c2["body"]["elements"]
+        self.assertEqual(els2[0]["content"], f"<at id={ALICE}></at> " + ("字" * 215))
+        self.assertNotIn("ou_code_only", els2[0]["content"])
+        self._assert_reply_same_row(els2[1], detail_with_code_at)
+
+        # 3) 发给主人的 ask / report：原文里引用了同事的 <at id=ou_alice></at>，不误提到给主人的白话总结开头
+        rc3, out3, err3 = self.ask("--summary", SUMMARY, kind="report", title="同步进度", text=detail_with_at)
+        self.assertEqual(rc3, 0, out3 + err3)
+        c3 = card_of(self.lark.sent()[-1])
+        self.assertEqual(c3["body"]["elements"][0], {"tag": "markdown", "content": SUMMARY})
+        self._assert_more_panel(c3["body"]["elements"][1], detail_with_at)
+
+

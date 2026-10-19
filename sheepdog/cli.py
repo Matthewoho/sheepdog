@@ -1823,7 +1823,9 @@ def cmd_ask(args) -> int:
                 print(f"{kind} 没发: {e}", file=sys.stderr)
                 return e.code
         try:
-            _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary)
+            _, _, resolved_body = resolve_summary_and_body(
+                body, summary, require_summary=cfg.notify.require_summary, hoist_at=False
+            )
         except ValueError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID

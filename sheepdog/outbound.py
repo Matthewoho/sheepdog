@@ -200,7 +200,9 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, floor, batch)   # 7.61：只读，拒绝时什么都没写
     try:
-        _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary)
+        _, _, resolved_body = resolve_summary_and_body(
+            body, summary, require_summary=cfg.notify.require_summary, hoist_at=False
+        )
     except ValueError as e:
         raise OutboundError(EXIT_INVALID, str(e))
     text = compose(cfg, kind, topic_id, title, resolved_body)

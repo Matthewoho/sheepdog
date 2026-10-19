@@ -31,11 +31,64 @@ SHORT_MESSAGE_MAX_LINES = 4
 SHORT_MESSAGE_MAX_CHARS = 160
 _MORE_SPLIT_RE = re.compile(r"^[ \t]*---(?:more|agent-read)---[ \t]*$", re.M)
 _CODE_FENCE_RE = re.compile(r"```")
+_FENCED_BLOCK_RE = re.compile(r"```.*?```", re.S)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_AT_TAG_RE = re.compile(
+    r'<at\s+(?:id|user_id)=["\']?(?P<target>ou_[A-Za-z0-9_]+|all)["\']?\s*>.*?</at>',
+    re.I | re.S,
+)
+_LEADING_AT_PREFIX_RE = re.compile(
+    r"^\s*(?:<at\s+(?:id|user_id)=[\"']?(?:ou_[A-Za-z0-9_]+|all)[\"']?\s*>.*?</at>[ \t]*)+",
+    re.I | re.S,
+)
 SUMMARY_REQUIRED_GUIDE = (
     '原文不需要改，只需要增加白话总结：加 --summary "<四刀法白话总结：≤6行、≤220字、不含代码块>"'
     '（或在原文最前面写白话总结并用一行 ---more--- 隔开），原有回复会原封不动收进 more 折叠区。'
     '四刀法：①终态与边界（做成什么、哪没动）②异动/意外 ③决策或下一步开关 ④证据锚点'
 )
+
+
+def _strip_code_spans(text: str) -> str:
+    """去掉围栏代码块和行内反引号代码，避免把文档/命令示例里的 `<at id=ou_xxx></at>` 当成真 @人。"""
+    return _INLINE_CODE_RE.sub("", _FENCED_BLOCK_RE.sub("", text or ""))
+
+
+def _at_targets(text: str) -> list[str]:
+    """按出现先后提取非代码区里的 @ 目标（ou_xxx 或 all），去重保序。"""
+    cleaned = _strip_code_spans(text)
+    return list(dict.fromkeys(m.group("target") for m in _AT_TAG_RE.finditer(cleaned)))
+
+
+def _normalize_card_at_tags(text: str) -> str:
+    """把非代码区里的 `<at user_id="ou_xxx">名字</at>` 统一转成飞书 Card 2.0 认识的 `<at id=ou_xxx></at>`。"""
+    s = text or ""
+    code_spans: list[tuple[int, int]] = [m.span() for m in _FENCED_BLOCK_RE.finditer(s)]
+    code_spans += [m.span() for m in _INLINE_CODE_RE.finditer(s)]
+
+    def _in_code(pos: int) -> bool:
+        return any(a <= pos < b for a, b in code_spans)
+
+    def _repl(m: re.Match) -> str:
+        if _in_code(m.start()):
+            return m.group(0)
+        return f"<at id={m.group('target')}></at>"
+
+    return _AT_TAG_RE.sub(_repl, s)
+
+
+def _hoist_at_tags(summary: str, detail: str) -> tuple[str, str]:
+    """7.62：把原文（more 折叠区）里的 @人自动提到外层白话总结最前面，并剥掉原文开头紧挨着的重复 @ 标签。"""
+    norm_sum = _normalize_card_at_tags(summary)
+    norm_det = _normalize_card_at_tags(detail)
+    existing = set(_at_targets(norm_sum))
+    missing = [t for t in _at_targets(norm_det) if t not in existing]
+    if missing:
+        prefix = " ".join(f"<at id={t}></at>" for t in missing)
+        norm_sum = f"{prefix} {norm_sum.lstrip()}"
+    stripped_det = _LEADING_AT_PREFIX_RE.sub("", norm_det, count=1)
+    if stripped_det.strip():
+        norm_det = stripped_det
+    return norm_sum, norm_det
 
 
 def build_more_panel(detail: str) -> dict:
@@ -80,7 +133,7 @@ def is_short_message(text: str) -> bool:
 
 
 def validate_summary(summary: str) -> str:
-    """校验四刀法白话总结：非空、≤6 行、≤220 字、不含 ``` 代码块。不合格抛 ValueError（带明确指引）。"""
+    """校验四刀法白话总结：非空、≤6 行、≤220 字（不含 <at> 标签本身长度）、不含 ``` 代码块。不合格抛 ValueError（带明确指引）。"""
     s = (summary or "").strip("\n")
     if not s.strip():
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
@@ -89,14 +142,17 @@ def validate_summary(summary: str) -> str:
     lines = s.splitlines()
     if len(lines) > SUMMARY_MAX_LINES:
         raise ValueError(f"白话总结超过 {SUMMARY_MAX_LINES} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
-    if len(s) > SUMMARY_MAX_CHARS:
-        raise ValueError(f"白话总结超过 {SUMMARY_MAX_CHARS} 字（当前 {len(s)} 字）。{SUMMARY_REQUIRED_GUIDE}")
+    visible_len = len(_AT_TAG_RE.sub("", s).strip())
+    if visible_len > SUMMARY_MAX_CHARS:
+        raise ValueError(f"白话总结超过 {SUMMARY_MAX_CHARS} 字（当前 {visible_len} 字）。{SUMMARY_REQUIRED_GUIDE}")
     return s
 
 
-def resolve_summary_and_body(body: str, summary: str = "", *, require_summary: bool = True) -> tuple[str, str, str]:
+def resolve_summary_and_body(
+    body: str, summary: str = "", *, require_summary: bool = True, hoist_at: bool = True
+) -> tuple[str, str, str]:
     """7.62：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。
-    - 传了 --summary 或正文含 ---more--- 分隔线：校验白话总结，返回 (summary, detail, "summary\\n---more---\\ndetail")；
+    - 传了 --summary 或正文含 ---more--- 分隔线：校验白话总结；hoist_at=True（代回卡片）时把原文里的 @人自动提到外层白话总结开头，返回 (summary, detail, "summary\\n---more---\\ndetail")；
     - 未传且是短消息（≤4 行、≤160 字、无代码块）：直接平铺，返回 ("", detail, detail)；
     - 未传且是长消息：require_summary=True 时抛 ValueError 拒绝并提示「原文不需要改，只需要增加白话总结」。"""
     raw = (body or "").strip("\n")
@@ -109,12 +165,17 @@ def resolve_summary_and_body(body: str, summary: str = "", *, require_summary: b
         d = inline_det if has_delim and inline_det.strip() else raw
         if not d.strip():
             raise ValueError(f"more 折叠区原文为空。{SUMMARY_REQUIRED_GUIDE}")
+        if hoist_at:
+            s, d = _hoist_at_tags(s, d)
         return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
     if has_delim:
         s = validate_summary(inline_sum)
         if not inline_det.strip():
             raise ValueError(f"more 折叠区原文为空（---more--- 下面要有原有完整回复）。{SUMMARY_REQUIRED_GUIDE}")
-        return s, inline_det, f"{s}\n{MORE_DELIMITER}\n{inline_det}"
+        d = inline_det
+        if hoist_at:
+            s, d = _hoist_at_tags(s, d)
+        return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
     if is_short_message(raw) or not require_summary:
         return "", body, body
     n_lines = len(raw.splitlines())
@@ -123,9 +184,9 @@ def resolve_summary_and_body(body: str, summary: str = "", *, require_summary: b
     raise ValueError(f"正文较长（{why}）但未提供白话总结。{SUMMARY_REQUIRED_GUIDE}")
 
 
-def _card_body_elements(body_text: str, summary: str = "") -> list[dict]:
+def _card_body_elements(body_text: str, summary: str = "", *, hoist_at: bool = True) -> list[dict]:
     """把正文（或 summary + 正文）拆成卡片 body elements：有总结/分隔线时为 [summary_md, more_panel]，否则为单个 [body_md]。"""
-    s, d, _ = resolve_summary_and_body(body_text, summary, require_summary=False)
+    s, d, _ = resolve_summary_and_body(body_text, summary, require_summary=False, hoist_at=hoist_at)
     if s:
         return [{"tag": "markdown", "content": s}, build_more_panel(d)]
     return [{"tag": "markdown", "content": body_text}]
@@ -134,7 +195,7 @@ def _card_body_elements(body_text: str, summary: str = "") -> list[dict]:
 def build_reply_card(text: str, suffix: str, width_mode: str = "compact", summary: str = "") -> dict:
     if not (text or "").strip():
         raise ValueError("正文为空")
-    s, d, _ = resolve_summary_and_body(text, summary, require_summary=False)
+    s, d, _ = resolve_summary_and_body(text, summary, require_summary=False, hoist_at=True)
     if s and suffix:
         elements = [
             {"tag": "markdown", "content": s},
@@ -167,7 +228,7 @@ def build_reply_card(text: str, suffix: str, width_mode: str = "compact", summar
             },
         ]
     else:
-        elements = _card_body_elements(text, summary)
+        elements = _card_body_elements(text, summary, hoist_at=True)
         if suffix:
             elements.append({"tag": "markdown", "content": f"<font color='grey'>{suffix}</font>",
                              "text_align": "right", "text_size": "notation"})
@@ -204,9 +265,9 @@ def build_owner_card(text: str, at_open_id: str = "", summary: str = "") -> dict
     if rest.strip():
         card["header"] = {"title": {"tag": "plain_text", "content": owner_title(first)},
                           "template": TEMPLATE_DECIDE if DECIDE_WORD in first else TEMPLATE_DEFAULT}
-        elements = _card_body_elements(rest.strip("\n"), summary)
+        elements = _card_body_elements(rest.strip("\n"), summary, hoist_at=False)
     else:
-        elements = _card_body_elements(first, summary)
+        elements = _card_body_elements(first, summary, hoist_at=False)
     if at_open_id:
         elements.append({"tag": "markdown", "content": f"<at id={at_open_id}></at>"})
     card["body"] = {"elements": elements}

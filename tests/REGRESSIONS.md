@@ -228,3 +228,5 @@
 | 7.62 | 卡片外层直接堆长正文、没把原文原封不动收进默认折叠的 `more` 面板（配原生旋转下拉箭头图标），或把短消息也多余套上折叠面板 | `test_more_card.MoreCardTest.test_762_owner_ask_and_report_fold_with_summary_and_more_panel`、`test_more_card.MoreCardTest.test_762_reply_and_reply_card_fold_with_summary_and_inline_delimiter`、`test_more_card.MoreCardTest.test_762_short_message_passes_through_without_more_panel` |
 | 7.62 | 长消息（>4 行、>160 字或含代码块）没给白话总结（或总结超 6 行、超 220 字、含代码块）未以退出码 2 拦下，或报错没明确提示「原文不需要改，只需要增加白话总结」导致模型删改原文 | `test_more_card.MoreCardTest.test_762_long_message_rejected_with_preserve_original_guidance` |
 | 7.62 | 带 `more` 折叠面板的卡片读回后认不出「需要你定」，或「待办」清单摘录把 `more` 折叠面板里的长明细漏出来 | `test_more_card.MoreCardTest.test_762_readback_and_pending_excerpt_use_summary` |
+| 7.62 | 代回原文里写的 `@人`（`<at id=ou_…>` / `<at user_id="ou_…">`）被一起折进 `more` 里面、外层白话总结看不见 `@人`，或 `<at>` 标签长度挤占 220 字额度 | `test_more_card.MoreCardTest.test_762_at_mentions_hoisted_outside_more_panel` |
+
