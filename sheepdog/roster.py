@@ -20,7 +20,7 @@ import hashlib
 import json
 import re
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 MANAGED = "managed"
@@ -32,7 +32,8 @@ DEFAULT_HOST = "antigravity"
 _KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
                  "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats",
-                 "host", "model", "effort", "patrol_every_minutes", "patrol_hours", "patrol_prompt"}
+                 "host", "model", "effort", "patrol_every_minutes", "patrol_hours", "patrol_prompt",
+                 "max_sessions", "group"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages", "thread_id"}
 # 名册里的「人」（7.61）：授权跟着人走，不跟着会话走。目前只有 vip 一档
 _PERSON_KEYS = {"open_id", "name", "tier", "authority"}
@@ -44,6 +45,17 @@ _DATE_RE = re.compile(r"(?<!\d)(\d{1,2})-(\d{1,2})(?!\d)")
 
 class RosterError(ValueError):
     pass
+
+
+def primary_topic_id(topic_id: str) -> str:
+    return topic_id.split("#", 1)[0]
+
+
+def member_index(topic_id: str) -> int:
+    if "#" not in topic_id:
+        return 1
+    _, _, tail = topic_id.partition("#")
+    return int(tail) if tail.isdigit() else 1
 
 
 def parse_patrol_hours(spec: str) -> frozenset[int]:
@@ -109,6 +121,9 @@ class RosterSession:
     patrol_every_minutes: int = 0
     patrol_hours: str = ""
     patrol_prompt: str = ""
+    # 会话组（羊圈，7.49）：max_sessions > 1 或设了 group 时，忙时自动扩出 #2..#max_sessions
+    max_sessions: int = 1
+    group: str = ""
 
     @property
     def is_cli_host(self) -> bool:
@@ -122,6 +137,18 @@ class RosterSession:
     @property
     def topic_id(self) -> str:
         return "tp_" + self.key
+
+    @property
+    def primary_key(self) -> str:
+        return self.key.split("#", 1)[0]
+
+    @property
+    def primary_topic_id(self) -> str:
+        return f"tp_{self.primary_key}"
+
+    @property
+    def group_id(self) -> str:
+        return self.group or (self.primary_key if self.max_sessions > 1 else "")
 
     @property
     def kind(self) -> str:
@@ -165,10 +192,37 @@ class Roster:
         return self._owner.get((chat_id, thread_id)) if thread_id else None
 
     def by_key(self, key: str) -> RosterSession | None:
-        return next((s for s in self.sessions if s.key == key), None)
+        direct = next((s for s in self.sessions if s.key == key), None)
+        if direct is not None or "#" not in key:
+            return direct
+        base_key, _, tail = key.partition("#")
+        if not tail.isdigit():
+            return None
+        idx = int(tail)
+        base = next((s for s in self.sessions if s.key == base_key), None)
+        if base is None or base.mode != MANAGED or idx < 2 or idx > base.max_sessions:
+            return None
+        return replace(
+            base,
+            key=key,
+            title=f"{base.display_title} #{idx}",
+            conversation_id="",
+            group=base.group_id,
+        )
 
     def by_topic(self, topic_id: str) -> RosterSession | None:
-        return next((s for s in self.sessions if s.topic_id == topic_id), None)
+        direct = next((s for s in self.sessions if s.topic_id == topic_id), None)
+        if direct is not None:
+            return direct
+        if topic_id.startswith("tp_") and "#" in topic_id:
+            return self.by_key(topic_id.removeprefix("tp_"))
+        return None
+
+    def by_group(self, group_id: str) -> RosterSession | None:
+        gid = (group_id or "").strip()
+        if not gid:
+            return None
+        return next((s for s in self.sessions if s.group_id == gid), None)
 
     def person(self, open_id: str) -> RosterPerson | None:
         """按 open_id 查名册里的人（7.61）；不在名册里是 None。"""
@@ -187,9 +241,10 @@ class Roster:
         rows = []
         for s in self.sessions:
             d = asdict(s)
-            # 7.18 新增的宿主字段、7.57 新增的巡检字段取默认值时不进 hash：老名册升级后不算「名册更新」
+            # 7.18 新增的宿主字段、7.57 新增的巡检字段、7.49 会话组字段取默认值时不进 hash：老名册升级后不算「名册更新」
             for k, default in (("host", DEFAULT_HOST), ("model", ""), ("effort", ""),
-                               ("patrol_every_minutes", 0), ("patrol_hours", ""), ("patrol_prompt", "")):
+                               ("patrol_every_minutes", 0), ("patrol_hours", ""), ("patrol_prompt", ""),
+                               ("max_sessions", 1), ("group", "")):
                 if d.get(k) == default:
                     d.pop(k, None)
             for c in d.get("chats") or []:
@@ -219,12 +274,29 @@ def _bool(d: dict, k: str, where: str) -> bool:
 
 def parse_roster(data: dict) -> Roster:
     """校验并解析名册 dict（tomllib 的输出）。"""
-    unknown_top = set(data) - {"session", "person"}
+    unknown_top = set(data) - {"session", "person", "group"}
     if unknown_top:
-        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]] 和 [[person]]）")
-    raw_sessions = data.get("session", [])
-    if not isinstance(raw_sessions, list):
+        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]]、[[group]] 和 [[person]]）")
+    raw_sessions = list(data.get("session", []))
+    if not isinstance(data.get("session", []), list):
         raise RosterError("session 必须写成 [[session]] 数组")
+    raw_groups = data.get("group", [])
+    if not isinstance(raw_groups, list):
+        raise RosterError("group 必须写成 [[group]] 数组")
+    for gi, g in enumerate(raw_groups):
+        if not isinstance(g, dict):
+            raise RosterError(f"group[{gi}]: 必须写成 [[group]] 表")
+        norm = dict(g)
+        norm.setdefault("mode", MANAGED)
+        norm.setdefault("conversation_id", "")
+        norm.setdefault("max_sessions", 3)
+        norm.setdefault("group", str(norm.get("key", "")).strip())
+        if isinstance(norm.get("chats"), list):
+            norm["chats"] = [
+                {"chat_id": c} if isinstance(c, str) else c
+                for c in norm["chats"]
+            ]
+        raw_sessions.append(norm)
 
     sessions: list[RosterSession] = []
     keys: set[str] = set()
@@ -261,6 +333,16 @@ def parse_roster(data: dict) -> Roster:
                 parse_patrol_hours(patrol_hours)
             except RosterError as e:
                 raise RosterError(f"{where}: {e}") from e
+        max_sessions = raw.get("max_sessions", 1)
+        if isinstance(max_sessions, bool) or not isinstance(max_sessions, int) or max_sessions < 1:
+            raise RosterError(f"{where}: max_sessions 必须是不小于 1 的整数")
+        group_name = _str(raw, "group", where)
+        if group_name and not _KEY_RE.match(group_name):
+            raise RosterError(f"{where}: group 只允许 [a-z0-9_-]")
+        if mode == KNOWN and (max_sessions > 1 or group_name):
+            raise RosterError(f"{where}: known 会话不能设 max_sessions > 1 或 group")
+        if group_name and max_sessions == 1 and "max_sessions" not in raw:
+            max_sessions = 3
         s = RosterSession(
             key=key, mode=mode,
             conversation_id=_str(raw, "conversation_id", where),
@@ -277,6 +359,8 @@ def parse_roster(data: dict) -> Roster:
             patrol_every_minutes=patrol_every,
             patrol_hours=patrol_hours,
             patrol_prompt=patrol_prompt,
+            max_sessions=max_sessions,
+            group=group_name,
         )
         if s.host not in HOSTS:
             raise RosterError(f"{where}: host 只能是 {' / '.join(HOSTS)}，收到 {s.host!r}")

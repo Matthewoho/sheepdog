@@ -628,6 +628,7 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
         "topic_id": tid,
         "title": t["title"],
         "host": (t["host"] if "host" in t.keys() else None) or "antigravity",
+        "group_id": (t["group_id"] if "group_id" in t.keys() else "") or "",
         "duty": t["duty"] or "",
         "session_state": t["state"],
         "run_state": state,
@@ -672,8 +673,19 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
     lines = [f"羊群看板 · {now_label}"]
     if not cards:
         return lines[0] + "\n（没有在投递的会话）"
+    group_counts: dict[str, int] = {}
+    for c in cards:
+        gid = c.get("group_id") or ""
+        if gid:
+            group_counts[gid] = group_counts.get(gid, 0) + 1
     for d in cards:
-        lines.append(f"━ 「{d['title']}」 {d['topic_id']} · {d['host']}")
+        gid = d.get("group_id") or ""
+        group_badge = (
+            f" [羊圈: {gid} · {group_counts[gid]}会话]"
+            if gid and group_counts.get(gid, 0) >= 2 and "#" not in d["topic_id"]
+            else ""
+        )
+        lines.append(f"━ 「{d['title']}」 {d['topic_id']} · {d['host']}{group_badge}")
         lines.append(f"  职责：{short(d['duty'], 80) or '-'}")
         lines.append(f"  运行状态：{state_text(d)}" + (f"；排队 {d['queued']} 条" if d["queued"] else ""))
         lines.append(f"  {d['action_label']}：{action_text(d)}"

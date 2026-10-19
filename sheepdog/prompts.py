@@ -666,12 +666,72 @@ def successor_header(topic_id: str, batch_id: str) -> str:
     return f"[sheepdog] 接手开场（topic `{topic_id}`，批次 `{batch_id}`）"
 
 
+def render_group_peer_status(
+    current_topic_id: str,
+    group_topics: list,
+    pending_counts: dict[str, int] | None = None,
+    peer_work_items: dict[str, list] | None = None,
+    peer_watches: dict[str, list] | None = None,
+) -> str:
+    """渲染羊圈同侪状态面板（7.49）：注入批次提示词前，最多 10 行（标题 + 提示 + 最多 8 条同侪）。"""
+    peers = [
+        t for t in (group_topics or [])
+        if t["topic_id"] != current_topic_id and t["state"] != "closed"
+    ]
+    if not peers:
+        return ""
+    pending_counts = pending_counts or {}
+    peer_work_items = peer_work_items or {}
+    peer_watches = peer_watches or {}
+    lines = [
+        "## 🏠 羊圈同侪状态（禁止重复认领/重复回复同侪已接手的线程）",
+    ]
+    for p in peers[:8]:
+        tid = p["topic_id"]
+        st = p["state"]
+        cnt = pending_counts.get(tid, 0)
+        cnt_str = f" · 待处理 {cnt} 条" if cnt > 0 else ""
+        details: list[str] = []
+        keys = p.keys() if hasattr(p, "keys") else ()
+        summary = (p["summary"] if "summary" in keys else "") or ""
+        if summary:
+            details.append(summary.strip().splitlines()[0][:60])
+        for wi in (peer_work_items.get(tid) or [])[:2]:
+            if isinstance(wi, str):
+                details.append(f"在办:{wi}")
+            else:
+                wkeys = wi.keys() if hasattr(wi, "keys") else ()
+                label = (
+                    (wi["summary"] if "summary" in wkeys else "")
+                    or (wi["title"] if "title" in wkeys else "")
+                    or (wi["chat_name"] if "chat_name" in wkeys else "")
+                )
+                if label:
+                    details.append(f"在办:{label}")
+        for w in (peer_watches.get(tid) or [])[:2]:
+            if isinstance(w, str):
+                details.append(f"watch:{w}")
+            else:
+                wkeys = w.keys() if hasattr(w, "keys") else ()
+                who = (
+                    (w["note"] if "note" in wkeys else "")
+                    or (w["person_id"] if "person_id" in wkeys else "")
+                    or (w["target_user_id"] if "target_user_id" in wkeys else "")
+                )
+                if who:
+                    details.append(f"watch:{who}")
+        desc = "；".join(details) if details else "空闲待命"
+        lines.append(f"- `{tid}` [{st}{cnt_str}]：{desc}")
+    return "\n".join(lines[:10])
+
+
 def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.Row], inbox: list[sqlite3.Row],
                  session_title: str, waiting_note: str = "",
                  roster_update: str = "", security: SecurityConfig | None = None, rules_update: str = "",
                  context_only: bool = False, quotes: dict | None = None, max_lines: int = 200,
                  cli_host: bool = False, rules_note: str = "", reminder: str = "", notes: dict | None = None,
-                 digest: str = "", images: dict | None = None, vips: dict | None = None) -> str:
+                 digest: str = "", images: dict | None = None, vips: dict | None = None,
+                 peer_status: str = "") -> str:
     """images：每条消息里图片的下载结果（message_id → {钥匙: media.ImageResult}，7.54）。
     rules_note：压缩后重推规则时，规则前那句话（7.19 K2）；reminder：这个会话的红线（reminders/<key>.md，
     7.19 K1），附在整批最末尾。notes：附在某条消息上的撞车提醒（message_id → 几行，7.20）；
@@ -689,6 +749,8 @@ def batch_prompt(pb: Playbook, topic_id: str, batch_id: str, rows: list[sqlite3.
         parts += [rules_update.strip(), "", "---", ""]
     if waiting_note:
         parts += [f"⏳ 仍在等待主人决策：{waiting_note}", ""]
+    if peer_status:
+        parts += [peer_status.strip(), "", "---", ""]
     stamped = _fmt_rows(pb, rows, security, session_title, quotes, max_lines, notes, images, vips, parts)
     if any(r["reason"] in ("at_me", "at_bot", "at_all") for r in rows) and inbox:
         total_unread = sum(r["unread"] or 0 for r in inbox)

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS topics (
     attention_reason TEXT,             -- 进入 attention 的原因（机器可读）：receipt_timeout | no_receipt | send_failed
                                        -- | host_failed | host_timeout | config | capacity；只有 receipt_timeout 会自动恢复
     lifecycle        TEXT,             -- dynamic 会话生命周期（7.58）：standing（常设）| oneshot（一次性）；空 = 按标题推断
+    group_id         TEXT NOT NULL DEFAULT '', -- 会话组（羊圈，7.49）：同组会话共享聊天归属与同侪看板
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -586,7 +587,7 @@ MIGRATIONS = {
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
                ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
-               ("attention_reason", "TEXT"), ("lifecycle", "TEXT")],
+               ("attention_reason", "TEXT"), ("lifecycle", "TEXT"), ("group_id", "TEXT NOT NULL DEFAULT ''")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
@@ -1047,14 +1048,14 @@ class Store:
 
     def create_topic(self, topic_id: str, title: str, kind: str, duty: str, state: str,
                      host: str = "antigravity", model: str = "", effort: str = "",
-                     lifecycle: str | None = None) -> None:
+                     lifecycle: str | None = None, group_id: str = "") -> None:
         ts = now_iso()
         with self.tx() as c:
             c.execute(
-                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,lifecycle,created_at,last_active)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,lifecycle,group_id,created_at,last_active)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None,
-                 lifecycle or None, ts, ts),
+                 lifecycle or None, group_id or "", ts, ts),
             )
 
     def count_topics_since(self, kind: str, since_iso: str) -> int:
@@ -1081,9 +1082,114 @@ class Store:
             model = fields.pop("model", "") or ""
             effort = fields.pop("effort", "") or ""
             lifecycle = fields.pop("lifecycle", None)
-            self.create_topic(topic_id, title, kind, duty, state, host, model, effort, lifecycle=lifecycle)
+            group_id = fields.pop("group_id", "") or ""
+            self.create_topic(topic_id, title, kind, duty, state, host, model, effort,
+                              lifecycle=lifecycle, group_id=group_id)
         if fields:
             self.update_topic(topic_id, **fields)
+
+    def get_group_topics(self, group_id: str, include_closed: bool = False) -> list[sqlite3.Row]:
+        """按羊圈（group_id，7.49）列出组内会话：#1（不带 #）排第一，其余按 #2, #3 升序。"""
+        gid = (group_id or "").strip()
+        if not gid:
+            return []
+        if include_closed:
+            rows = self.conn.execute("SELECT * FROM topics WHERE group_id=?", (gid,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM topics WHERE group_id=? AND state != 'closed'", (gid,)
+            ).fetchall()
+
+        def _sort_key(r: sqlite3.Row) -> tuple[int, int, str]:
+            tid = r["topic_id"]
+            if "#" not in tid:
+                return (0, 1, tid)
+            _, _, tail = tid.partition("#")
+            return (1, int(tail) if tail.isdigit() else 999999, tid)
+
+        return sorted(rows, key=_sort_key)
+
+    def find_recent_thread_topic_in_group(
+        self,
+        group_id: str,
+        chat_id: str = "",
+        root_id: str = "",
+        parent_id: str = "",
+        reply_to_msg_id: str = "",
+        thread_id: str = "",
+        sender_id: str = "",
+        window_minutes: int = 30,
+    ) -> str | None:
+        """羊圈内话题/回复链/watch/等待回复亲和性查询（7.49 Step 1）：
+        同一回复链、引用回复或未结 watch 绝不拆到别的成员。"""
+        gid = (group_id or "").strip()
+        if not gid:
+            return None
+        chain_ids = [x for x in dict.fromkeys([root_id, parent_id, reply_to_msg_id, thread_id]) if x]
+        if chain_ids:
+            placeholders = ",".join("?" for _ in chain_ids)
+            row = self.conn.execute(
+                f"""SELECT b.topic_id FROM bot_outbox b
+                    JOIN topics t ON t.topic_id = b.topic_id
+                    WHERE t.group_id = ? AND t.state != 'closed'
+                      AND b.message_id IN ({placeholders})
+                    ORDER BY b.sent_at DESC LIMIT 1""",
+                (gid, *chain_ids),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
+            row = self.conn.execute(
+                f"""SELECT e.topic_id FROM escalations e
+                    JOIN topics t ON t.topic_id = e.topic_id
+                    WHERE t.group_id = ? AND t.state != 'closed' AND e.closed_at IS NULL
+                      AND e.message_id IN ({placeholders})
+                    ORDER BY e.asked_at DESC LIMIT 1""",
+                (gid, *chain_ids),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
+            row = self.conn.execute(
+                f"""SELECT m.topic_id FROM messages m
+                    JOIN topics t ON t.topic_id = m.topic_id
+                    WHERE t.group_id = ? AND t.state != 'closed'
+                      AND m.route = 'dispatch' AND m.topic_id IS NOT NULL
+                      AND (
+                          m.message_id IN ({placeholders})
+                          OR m.root_id IN ({placeholders})
+                          OR m.reply_to IN ({placeholders})
+                          OR m.thread_id IN ({placeholders})
+                      )
+                    ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
+                (gid, *chain_ids, *chain_ids, *chain_ids, *chain_ids),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
+        if sender_id or chat_id:
+            row = self.conn.execute(
+                """SELECT w.topic_id FROM watches w
+                   JOIN topics t ON t.topic_id = w.topic_id
+                   WHERE t.group_id = ? AND t.state != 'closed' AND w.closed_at IS NULL
+                     AND (? = '' OR w.person_id = '' OR w.person_id = ?)
+                     AND (? = '' OR w.chat_id IS NULL OR w.chat_id = '' OR w.chat_id = ?)
+                   ORDER BY w.started_at DESC, w.id DESC LIMIT 1""",
+                (gid, sender_id, sender_id, chat_id, chat_id),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
+        if chat_id and sender_id and window_minutes > 0:
+            cutoff = (datetime.now().astimezone() - timedelta(minutes=window_minutes)).isoformat(timespec="seconds")
+            row = self.conn.execute(
+                """SELECT m.topic_id FROM messages m
+                   JOIN topics t ON t.topic_id = m.topic_id
+                   WHERE t.group_id = ? AND t.state = 'waiting_human'
+                     AND m.route = 'dispatch' AND m.chat_id = ? AND m.sender_id = ?
+                     AND m.first_seen >= ?
+                   ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
+                (gid, chat_id, sender_id, cutoff),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
+        return None
 
     # ---------- dispatches ----------
     def dispatch_exists(self, batch_id: str) -> bool:
@@ -1136,6 +1242,10 @@ class Store:
         return self.conn.execute(
             """SELECT COUNT(*) FROM messages WHERE route='dispatch' AND dispatch_state='pending'
                  AND reason != 'owner_context' AND topic_id=?""", (topic_id,)).fetchone()[0]
+
+    def count_pending_messages_for_topic(self, topic_id: str) -> int:
+        """排给这个会话、还没投出去的待处理消息数（7.49 羊圈繁忙度判定）。"""
+        return self.count_pending_signals(topic_id)
 
     def requeue_messages(self, message_ids: list[str]) -> None:
         """人工确认后重发（redeliver）：把这些消息放回待推。"""

@@ -23,9 +23,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable
 
+from . import session as sm
 from .card import plain_text
 from .config import RoutingConfig
 from .models import Message
+from .roster import member_index, primary_topic_id
 
 DROP = "drop"
 INBOX = "inbox"
@@ -132,3 +134,118 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
 
     # 11. 其他
     return RouteDecision(INBOX, "group")
+
+
+def route_within_group(
+    store,
+    roster,
+    target_topic_id: str,
+    *,
+    chat_id: str = "",
+    root_id: str = "",
+    parent_id: str = "",
+    reply_to_msg_id: str = "",
+    thread_id: str = "",
+    sender_id: str = "",
+    window_minutes: int = 30,
+) -> str:
+    """羊圈（7.49）组内确定性路由（纯 SQLite 状态 + 名册，零 LLM）：
+    1. 话题/回复链/watch/等待回复亲和性（绝不拆链）
+    2. 主会话（#1）空闲优先
+    3. 主会话繁忙时选空闲副会话，或按需扩出/重开 tp_<key>#2..#N
+    4. 全满时落入待处理消息最少、编号最小的成员排队
+    """
+    if not store or not target_topic_id:
+        return target_topic_id
+    base_tid = primary_topic_id(target_topic_id)
+    s = roster.by_topic(base_tid) if roster is not None else None
+    t_primary = store.get_topic(base_tid)
+    group_id = (s.group_id if s else "") or (
+        t_primary["group_id"] if t_primary is not None and "group_id" in t_primary.keys() else ""
+    )
+    max_sessions = (
+        s.max_sessions
+        if s is not None
+        else (max(1, len(store.get_group_topics(group_id))) if group_id else 1)
+    )
+    if not group_id or max_sessions <= 1:
+        return target_topic_id
+    if t_primary is not None and (t_primary["group_id"] if "group_id" in t_primary.keys() else "") != group_id:
+        store.update_topic(base_tid, group_id=group_id)
+        t_primary = store.get_topic(base_tid)
+
+    # Step 1: Thread / Reply / Watch Affinity — Never Split
+    aff_tid = store.find_recent_thread_topic_in_group(
+        group_id,
+        chat_id=chat_id,
+        root_id=root_id,
+        parent_id=parent_id,
+        reply_to_msg_id=reply_to_msg_id,
+        thread_id=thread_id,
+        sender_id=sender_id,
+        window_minutes=window_minutes,
+    )
+    if aff_tid:
+        return aff_tid
+
+    if "#" in target_topic_id:
+        t_exp = store.get_topic(target_topic_id)
+        if t_exp is not None and t_exp["state"] != sm.CLOSED:
+            return target_topic_id
+
+    # Step 2: Idle Primary First
+    if (
+        t_primary is not None
+        and t_primary["state"] == sm.ACTIVE
+        and store.count_pending_messages_for_topic(base_tid) == 0
+    ):
+        return base_tid
+
+    # Step 3: Busy Primary -> Idle Secondary or Spawn/Reopen tp_<key>#2..#N
+    members = store.get_group_topics(group_id)
+    secondaries = [m for m in members if m["topic_id"] != base_tid]
+    for m in secondaries:
+        if m["state"] == sm.ACTIVE and store.count_pending_messages_for_topic(m["topic_id"]) == 0:
+            return m["topic_id"]
+
+    existing_ids = {m["topic_id"] for m in members}
+    if len(members) < max_sessions:
+        for idx in range(2, max_sessions + 1):
+            cand_tid = f"{base_tid}#{idx}"
+            if cand_tid not in existing_ids:
+                s_mem = roster.by_topic(cand_tid) if roster is not None else None
+                base_title = (s.display_title if s else None) or (t_primary["title"] if t_primary else base_tid)
+                title = (s_mem.display_title if s_mem else None) or f"{base_title} #{idx}"
+                duty = (s_mem.duty if s_mem else None) or (t_primary["duty"] if t_primary else "") or ""
+                host = (s_mem.host if s_mem else None) or (t_primary["host"] if t_primary else "antigravity") or "antigravity"
+                model = (s_mem.model if s_mem else None) or (t_primary["model"] if t_primary else "") or ""
+                effort = (s_mem.effort if s_mem else None) or (t_primary["effort"] if t_primary else "") or ""
+                anchors_json = (
+                    json.dumps([c.chat_id for c in s.chats], ensure_ascii=False)
+                    if s is not None
+                    else (t_primary["anchors_json"] if t_primary is not None else "[]")
+                )
+                if store.get_topic(cand_tid) is None:
+                    store.create_topic(
+                        cand_tid, title, "adopted", duty, sm.ACTIVE,
+                        host, model, effort, group_id=group_id,
+                    )
+                store.update_topic(
+                    cand_tid,
+                    title=title,
+                    kind="adopted",
+                    duty=duty,
+                    state=sm.ACTIVE,
+                    group_id=group_id,
+                    anchors_json=anchors_json,
+                )
+                return cand_tid
+
+    # Step 4: Full Group Fallback
+    if not members:
+        return base_tid
+    return min(
+        members,
+        key=lambda m: (store.count_pending_messages_for_topic(m["topic_id"]), member_index(m["topic_id"])),
+    )["topic_id"]
+

@@ -270,3 +270,19 @@ class LambTest(DutyBase):
         )
         self.d._audit_commands()
         self.assertTrue(any("由羔羊 lamb_fresh01 执行" in n and "tp_alpha" in n for n in self.notices), self.notices)
+
+    def test_763_lamb_register_and_auto_discover_from_transcript(self):
+        self.test_763_lamb_register_and_board_display()
+
+    def test_763_lamb_outbound_commands_hard_blocked(self):
+        self.test_763_lamb_permission_block_outbound_and_receipt()
+
+    def test_763_parent_waiting_lamb_releases_batch_lock(self):
+        self.test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back()
+
+    def test_763_lamb_heartbeat_prevents_parent_stalled(self):
+        self.test_763_active_lamb_prevents_parent_stalled_alert()
+
+    def test_763_lamb_completion_delivers_report_batch(self):
+        self.test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back()
+

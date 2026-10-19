@@ -24,11 +24,12 @@ from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTI
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
                       adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
-                      onboarding_prompt, with_cli, quote_line, relay_content, retirement_prompt, roster_table,
-                      rules_update_message, standing_rules_bus, standing_rules_managed, watch_message, priority_prompt)
+                      onboarding_prompt, with_cli, quote_line, relay_content, render_group_peer_status,
+                      retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
+                      standing_rules_managed, watch_message, priority_prompt)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession, parse_patrol_hours
 from .security import HOLD, NONE, SecurityConfig, quote_verified
-from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
+from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route, route_within_group
 from .sink import RunResult, Sink, SinkError, SinkTimeout
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
@@ -565,6 +566,17 @@ class Collector:
             return RouteDecision(DISPATCH, reason, tags), g["topic"], None
         if w:
             return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"], w
+        if d.route == DISPATCH and topic_id and d.reason != "owner_context":
+            topic_id = route_within_group(
+                self.store,
+                self.roster,
+                topic_id,
+                chat_id=m.chat_id,
+                root_id=m.root_id,
+                reply_to_msg_id=m.reply_to,
+                thread_id=m.thread_id,
+                sender_id=m.sender_id,
+            )
         return d, topic_id, None
 
     def _secure(self, message_id: str) -> str:
@@ -956,7 +968,19 @@ class Collector:
             return g["topic"]
         owner = self.roster.owner_of(chat_id) if self.roster else None
         if owner is not None:
-            return owner[0].topic_id
+            s_own = owner[0]
+            if s_own.group_id:
+                aff = self.store.find_recent_thread_topic_in_group(
+                    s_own.group_id,
+                    chat_id=chat_id,
+                    root_id=m.root_id,
+                    reply_to_msg_id=m.reply_to,
+                    thread_id=m.thread_id,
+                    sender_id=m.sender_id,
+                )
+                if aff:
+                    return aff
+            return s_own.topic_id
         if chat_id in self._dynamic:
             return self._dynamic[chat_id][0]
         since = (_now() - timedelta(hours=self.cfg.owner_context.follow_hours)).isoformat(timespec="seconds")
@@ -1025,7 +1049,17 @@ class Collector:
             topic_id, how = g["topic"], g["source"]
             note = self._group_note(g, m, "主人的指令")
         elif self.roster is not None and (owner := self.roster.owner_of(m.chat_id)) is not None:
-            topic_id, how = owner[0].topic_id, "roster_chat"
+            topic_id = route_within_group(
+                self.store,
+                self.roster,
+                owner[0].topic_id,
+                chat_id=m.chat_id,
+                root_id=m.root_id,
+                reply_to_msg_id=m.reply_to,
+                thread_id=m.thread_id,
+                sender_id=m.sender_id,
+            )
+            how = "roster_chat"
         elif m.chat_id in self._dynamic:
             topic_id, how = self._dynamic[m.chat_id][0], "dynamic_chat"
         else:
@@ -2322,7 +2356,7 @@ class Dispatcher:
                 continue
             if t is None:
                 self.store.create_topic(s.topic_id, s.display_title, s.kind, s.duty, sm.ACTIVE, s.host, s.model,
-                                        s.effort)
+                                        s.effort, group_id=s.group_id)
                 t = self.store.get_topic(s.topic_id)
                 report["created"].append(s.topic_id)
             chat_ids = [c.chat_id for c in s.chats]
@@ -2338,6 +2372,7 @@ class Dispatcher:
                 "conversation_id": cid,
                 "anchors_json": json.dumps(chat_ids + sorted(set(keep)), ensure_ascii=False),
                 "model": s.model or None, "effort": s.effort or None,
+                "group_id": s.group_id,
             }
             # 已有会话不能换宿主（7.18）：要换就退休旧的、新开一个，走接手流程
             host = self.topic_host(t)
@@ -2366,6 +2401,18 @@ class Dispatcher:
                 if s.topic_id not in report["created"]:
                     report["updated"].append(s.topic_id)
         for t in self.store.list_topics():
+            if "#" in t["topic_id"] and (s_mem := self.roster.by_topic(t["topic_id"])) is not None:
+                live.add(t["topic_id"])
+                mem_fields = {
+                    "group_id": s_mem.group_id,
+                    "duty": s_mem.duty,
+                    "model": s_mem.model or None,
+                    "effort": s_mem.effort or None,
+                }
+                changed_mem = {k: v for k, v in mem_fields.items() if t[k] != v}
+                if changed_mem:
+                    self.store.update_topic(t["topic_id"], **changed_mem)
+                continue
             if t["kind"] in (ADOPTED, KNOWN_KIND) and t["topic_id"] not in live and t["state"] != sm.CLOSED:
                 self.store.update_topic(t["topic_id"], state=sm.CLOSED, pending_batch_id=None)
                 report["closed"].append(t["topic_id"])
@@ -2919,7 +2966,7 @@ class Dispatcher:
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
         adopted = t["kind"] in MANAGED_KINDS
-        if adopted and not t["conversation_id"]:
+        if adopted and not t["conversation_id"] and "#" not in t["topic_id"]:
             log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
             res["waiting_spawn"] = True
             return res
@@ -2946,6 +2993,21 @@ class Dispatcher:
         roster_update = ""
         batch_id = ""
         try:
+            if adopted and not t["conversation_id"] and "#" in t["topic_id"]:
+                s_mem = self.roster.by_topic(t["topic_id"])
+                if s_mem is None:
+                    log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
+                    res["waiting_spawn"] = True
+                    return res
+                w = self.cfg.watch
+                title = f"{self.cfg.session.title_prefix} {s_mem.display_title}".strip()
+                boot = adopted_bootstrap(self.playbook, s_mem, title, "", w.remind_minutes, w.expire_minutes)
+                cid = self._new_conversation(self.topic_host(t), t["topic_id"], title, boot,
+                                             t["model"] or "", t["effort"] or "")
+                ts = now_iso()
+                self.store.update_topic(t["topic_id"], conversation_id=cid, spawned_at=ts, onboarded_at=ts,
+                                        rules_hash=self.rules_hash(t), compacted_at=None)
+                t = self.store.get_topic(t["topic_id"])
             if t["kind"] == ADOPTED and not t["onboarded_at"]:
                 # 第一次收消息前先发 onboarding；消息等它回执或超时后下一轮再投
                 res.update(onboarding=self.send_onboarding(t), state=sm.RUNNING)
@@ -2976,6 +3038,18 @@ class Dispatcher:
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
             images = self._images(rows)   # 7.54：图片先下到本机，正文里换成路径
+            group_id = (t["group_id"] if "group_id" in t.keys() else "") or ""
+            peer_status = ""
+            if group_id:
+                g_topics = self.store.get_group_topics(group_id)
+                all_watches = self.store.open_watches()
+                p_counts = {gt["topic_id"]: self.store.count_pending_messages_for_topic(gt["topic_id"]) for gt in g_topics}
+                p_work = {gt["topic_id"]: self.store.open_work(gt["topic_id"]) for gt in g_topics}
+                p_watches = {
+                    gt["topic_id"]: [w for w in all_watches if w["topic_id"] == gt["topic_id"]]
+                    for gt in g_topics
+                }
+                peer_status = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches)
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
@@ -2983,7 +3057,7 @@ class Dispatcher:
                                   cli_host=self.topic_host(t) != ANTIGRAVITY,
                                   rules_note=self._compaction_note(t) if rules_update else "",
                                   reminder=self.reminder(t), notes=notes, digest=digest, images=images,
-                                  vips=self._vips())
+                                  vips=self._vips(), peer_status=peer_status)
             # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
@@ -5324,7 +5398,8 @@ def _batch_unverified_in_transcript(store: Store, topic_id: str, batch_id: str) 
 
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
                      verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24,
-                     key_patterns: list | None = None, cli: str = "sheepdog", answers: str = "") -> ForwardResult:
+                     key_patterns: list | None = None, cli: str = "sheepdog", answers: str = "",
+                     roster: Roster | None = None) -> ForwardResult:
     """把消息 / 主人原话转交给 managed 会话（规格第 6 节、7.3、7.7）。只改归属并回到待推，真正投递由 Dispatcher
     下一轮完成，因此同样受人类接管、onboarding 约束。
 
@@ -5350,6 +5425,18 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     missing = [i for i, r in rows.items() if r is None]
     if missing:
         raise ValueError(f"账本里没有这些消息: {missing}")
+    if "#" not in topic_id and not (answers or "").strip():
+        first_row = next(iter(rows.values()), None)
+        topic_id = route_within_group(
+            store,
+            roster,
+            topic_id,
+            chat_id=(first_row["chat_id"] or "") if first_row is not None else "",
+            root_id=(first_row["root_id"] or "") if first_row is not None and "root_id" in first_row.keys() else "",
+            reply_to_msg_id=(first_row["reply_to"] or "") if first_row is not None and "reply_to" in first_row.keys() else "",
+            thread_id=(first_row["thread_id"] or "") if first_row is not None and "thread_id" in first_row.keys() else "",
+            sender_id=(first_row["sender_id"] or "") if first_row is not None else "",
+        )
     skipped = []
     for i in list(rows):
         if (got := delivered_to(store, rows[i])) is not None and got[0] == topic_id:
