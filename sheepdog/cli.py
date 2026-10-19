@@ -92,7 +92,7 @@ from .prompts import with_cli
 from .roster import Roster, RosterError, check_hosts, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
-from .sink.agentapi import AgentApiSink, DryRunSink
+from .sink.agentapi import AgentApiSink, DryRunSink, transcript_contains
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
@@ -102,7 +102,7 @@ from .source import NullSource
 from .source.lark import LarkCliSource
 from .source.bot_events import BotEventConsumer
 from . import identity as ident
-from .store import Store, now_iso
+from .store import Store, infer_topic_lifecycle, now_iso
 from . import session as sm
 
 
@@ -1046,7 +1046,8 @@ def cmd_sessions(args) -> int:
                     cid, _, flag = a.partition(":")
                     chats.append(cid + ("（全部）" if flag == "all" else ""))
             print(f"  负责的聊天: {'、'.join(chats) or '-'}")
-            print(f"  创建于: {t['created_at']}  创建原因: {t['origin_note'] or '-'}")
+            lc = t["lifecycle"] or infer_topic_lifecycle(t["title"])
+            print(f"  创建于: {t['created_at']}  生命周期: {lc}  创建原因: {t['origin_note'] or '-'}")
         if t["kind"] == RETIRED:
             print(f"  交接回执: {'已转给接手会话' if not t['pending_batch_id'] else '等待中（批次 ' + t['pending_batch_id'] + '）'}")
         if t["summary"]:
@@ -1293,14 +1294,14 @@ def cmd_new_session(args) -> int:
             # 新开 Codex / Claude 会话的主人原话也在入队前核对（7.18）：被拒就不入队
             Dispatcher(cfg, store, sink, roster, security).new_session(
                 args.key, args.title, args.duty, chats, ids, args.note, validate_only=True,
-                host=args.host, model=args.model, effort=args.effort, quote=args.quote)
+                host=args.host, model=args.model, effort=args.effort, quote=args.quote, lifecycle=args.lifecycle)
         except ValueError as e:
             print(f"new-session 被拒绝: {e}", file=sys.stderr)
             return 2
         return _queued(args, store, cfg, "new_session", {"key": args.key, "title": args.title, "duty": args.duty,
                                                     "chats": chats, "message_ids": ids, "note": args.note,
                                                     "host": args.host, "model": args.model, "effort": args.effort,
-                                                    "quote": args.quote})
+                                                    "quote": args.quote, "lifecycle": args.lifecycle})
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     d = Dispatcher(cfg, store, sink, roster, security)
@@ -1308,15 +1309,20 @@ def cmd_new_session(args) -> int:
     try:
         chats = [_parse_chat(c) for c in args.chat]
         r = d.new_session(args.key, args.title, args.duty, chats, (args.message_ids or "").split(","), args.note,
-                          host=args.host, model=args.model, effort=args.effort, quote=args.quote)
+                          host=args.host, model=args.model, effort=args.effort, quote=args.quote,
+                          lifecycle=args.lifecycle)
     except ValueError as e:
         print(f"new-session 被拒绝: {e}", file=sys.stderr)
         return 2
     except SinkError as e:
         print(f"new-session 失败（没有建会话）: {e}", file=sys.stderr)
         return 1
-    print(f"已新开 {r['title']} -> {r['conversation_id']}（{HOST_LABEL.get(r['host'], r['host'])}，topic {r['topic_id']}，"
-          "只记在账本，不写名册）")
+    if r.get("reopened"):
+        print(f"已重开 {r['title']} -> {r['conversation_id']}（{HOST_LABEL.get(r['host'], r['host'])}，topic {r['topic_id']}，"
+              f"lifecycle={r.get('lifecycle')}，复用原会话，不消耗新建额度）")
+    else:
+        print(f"已新开 {r['title']} -> {r['conversation_id']}（{HOST_LABEL.get(r['host'], r['host'])}，topic {r['topic_id']}，"
+              f"lifecycle={r.get('lifecycle')}，只记在账本，不写名册）")
     if r["queued"] or args.note:
         print(f"已排队 {r['queued']} 条消息{'和 note' if args.note else ''}，sheepdog 下一轮投递")
     return 0
@@ -1425,20 +1431,58 @@ def cmd_loops(args) -> int:
     return 0
 
 
+def _can_redeliver_dispatch(store: Store, d) -> tuple[bool, str]:
+    bid = d["batch_id"]
+    t = store.get_topic(d["topic_id"])
+    cid = (t["conversation_id"] or "") if t is not None else ""
+    in_rec = bool(cid and Dispatcher.topic_host(t) == ANTIGRAVITY and transcript_contains(cid, bid))
+    if in_rec:
+        return False, f"批次 {bid} 在会话记录里已存在，无需重投"
+    if d["state"] == "uncertain":
+        return True, ""
+    if d["state"] in ("sent", "missed", "failed") and cid and Dispatcher.topic_host(t) == ANTIGRAVITY and not in_rec:
+        return True, ""
+    return False, f"批次 {bid} 状态是 {d['state']}，只有 uncertain 或会话记录里缺失的批次才需要 redeliver"
+
+
 def cmd_redeliver(args) -> int:
     cfg = _load_cfg()
     store = Store(cfg.db_path)
-    d = store.get_dispatch(args.batch)
-    if d is None:
-        print(f"批次 {args.batch} 不存在", file=sys.stderr)
+    batch_arg = (getattr(args, "batch", "") or "").strip()
+    topic_arg = (getattr(args, "topic", "") or "").strip()
+    if not batch_arg and not topic_arg:
+        print("请指定 --batch <批次号> 或 --topic <会话>", file=sys.stderr)
         return 2
-    if d["state"] != "uncertain":
-        print(f"批次 {args.batch} 状态是 {d['state']}，只有 uncertain 的才需要 redeliver", file=sys.stderr)
-        return 2
+    if batch_arg:
+        d = store.get_dispatch(batch_arg)
+        if d is None:
+            print(f"批次 {batch_arg} 不存在", file=sys.stderr)
+            return 2
+        ok, why = _can_redeliver_dispatch(store, d)
+        if not ok:
+            print(why, file=sys.stderr)
+            return 2
+    else:
+        tid = _topic_arg(topic_arg)
+        rows = store.conn.execute(
+            "SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC, rowid DESC", (tid,)
+        ).fetchall()
+        d = next((r for r in rows if _can_redeliver_dispatch(store, r)[0]), None)
+        if d is None:
+            print(f"{tid} 没有可重投的批次（uncertain 或未进会话记录的批次）", file=sys.stderr)
+            return 2
+    bid = d["batch_id"]
     ids = json.loads(d["message_ids"] or "[]")
     store.requeue_messages(ids)
-    store.set_dispatch_state(args.batch, "redelivered")
-    print(f"已把批次 {args.batch} 的 {len(ids)} 条消息放回待推，sheepdog 下一轮重发")
+    with store.tx() as c:
+        c.execute("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=?", (bid,))
+    store.set_dispatch_state(bid, "redelivered", error="manual redeliver")
+    t = store.get_topic(d["topic_id"])
+    if t is not None and (t["pending_batch_id"] == bid or t["state"] in (sm.RUNNING, sm.ATTENTION, sm.FAILED)):
+        store.update_topic(t["topic_id"], state=sm.ACTIVE, pending_batch_id=None, retries=0,
+                           attention_at=None, attention_reason=None)
+        store.set_meta(duty_reset_key(t["topic_id"]), now_iso())
+    print(f"已把批次 {bid} 的 {len(ids)} 条消息放回待推，sheepdog 下一轮重发")
     return 0
 
 
@@ -2076,6 +2120,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--effort", default="", help="推理档位（只对 codex / claude）；留空 = 这个宿主的默认值")
     sp.add_argument("--quote", default="", help="主人同意开这个会话的原话（codex / claude 且 ask_owner_before_new 时必填，"
                                                 "核对同 forward）")
+    sp.add_argument("--lifecycle", choices=("standing", "oneshot"), default=None,
+                    help="生命周期（7.58）：standing（回执 done 不关）| oneshot（回执 done 自动收掉）；不传按标题前缀推断")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
     sp.set_defaults(func=cmd_new_session)
 
@@ -2099,7 +2145,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(func=cmd_loops)
 
     sp = sub.add_parser("redeliver")
-    sp.add_argument("--batch", required=True)
+    sp.add_argument("--batch", default="", help="按批次号重投")
+    sp.add_argument("--topic", default="", help="按会话重投最近一批 uncertain 或未进会话记录的批次")
     sp.set_defaults(func=cmd_redeliver)
 
     sp = sub.add_parser("reply-card")

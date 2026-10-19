@@ -32,7 +32,7 @@ DEFAULT_HOST = "antigravity"
 _KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
                  "self_polling", "retire_self_polling", "predecessor_conversation_id", "retire_predecessor", "chats",
-                 "host", "model", "effort"}
+                 "host", "model", "effort", "patrol_every_minutes", "patrol_hours", "patrol_prompt"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages", "thread_id"}
 # 名册里的「人」（7.61）：授权跟着人走，不跟着会话走。目前只有 vip 一档
 _PERSON_KEYS = {"open_id", "name", "tier", "authority"}
@@ -44,6 +44,34 @@ _DATE_RE = re.compile(r"(?<!\d)(\d{1,2})-(\d{1,2})(?!\d)")
 
 class RosterError(ValueError):
     pass
+
+
+def parse_patrol_hours(spec: str) -> frozenset[int]:
+    """解析巡检时段（7.57），例如 '9-23' 或 '0-2,9-18'。空串返回 0..23 全集。非法格式抛 RosterError。"""
+    s = (spec or "").strip()
+    if not s:
+        return frozenset(range(24))
+    hours: set[int] = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            raise RosterError(f"patrol_hours 格式无效: {spec!r}")
+        if "-" in part:
+             pieces = part.split("-")
+             if len(pieces) != 2 or not pieces[0].strip().isdigit() or not pieces[1].strip().isdigit():
+                 raise RosterError(f"patrol_hours 区间格式无效: {part!r}（应如 9-23）")
+             lo, hi = int(pieces[0].strip()), int(pieces[1].strip())
+             if not (0 <= lo <= 23 and 0 <= hi <= 23 and lo <= hi):
+                 raise RosterError(f"patrol_hours 区间必须在 0-23 且起<=止: {part!r}")
+             hours.update(range(lo, hi + 1))
+        else:
+             if not part.isdigit():
+                 raise RosterError(f"patrol_hours 小时必须是 0-23 整数: {part!r}")
+             h = int(part)
+             if not (0 <= h <= 23):
+                 raise RosterError(f"patrol_hours 小时必须在 0-23: {part!r}")
+             hours.add(h)
+    return frozenset(hours)
 
 
 @dataclass
@@ -77,6 +105,10 @@ class RosterSession:
     host: str = DEFAULT_HOST
     model: str = ""
     effort: str = ""
+    # 定时巡检（7.57）：0 = 关；>0 = 每隔这么多分钟在空闲且无待推信号时投一条例行巡检消息
+    patrol_every_minutes: int = 0
+    patrol_hours: str = ""
+    patrol_prompt: str = ""
 
     @property
     def is_cli_host(self) -> bool:
@@ -155,8 +187,9 @@ class Roster:
         rows = []
         for s in self.sessions:
             d = asdict(s)
-            # 7.18 新增的宿主字段取默认值时不进 hash：老名册升级后不算「名册更新」
-            for k, default in (("host", DEFAULT_HOST), ("model", ""), ("effort", "")):
+            # 7.18 新增的宿主字段、7.57 新增的巡检字段取默认值时不进 hash：老名册升级后不算「名册更新」
+            for k, default in (("host", DEFAULT_HOST), ("model", ""), ("effort", ""),
+                               ("patrol_every_minutes", 0), ("patrol_hours", ""), ("patrol_prompt", "")):
                 if d.get(k) == default:
                     d.pop(k, None)
             for c in d.get("chats") or []:
@@ -214,6 +247,20 @@ def parse_roster(data: dict) -> Roster:
         mode = _str(raw, "mode", where)
         if mode not in (MANAGED, KNOWN):
             raise RosterError(f"{where}: mode 必须是 managed 或 known，收到 {mode!r}")
+        patrol_every = raw.get("patrol_every_minutes", 0)
+        if isinstance(patrol_every, bool) or not isinstance(patrol_every, int) or patrol_every < 0:
+            raise RosterError(f"{where}: patrol_every_minutes 必须是不小于 0 的整数（0 = 关）")
+        patrol_hours = _str(raw, "patrol_hours", where)
+        patrol_prompt = _str(raw, "patrol_prompt", where)
+        if patrol_every > 0 and mode != MANAGED:
+            raise RosterError(f"{where}: 只有 mode = managed 的会话才能设 patrol_every_minutes")
+        if patrol_every == 0 and (patrol_hours or patrol_prompt):
+            raise RosterError(f"{where}: 设了 patrol_hours / patrol_prompt 必须同时设 patrol_every_minutes > 0")
+        if patrol_hours:
+            try:
+                parse_patrol_hours(patrol_hours)
+            except RosterError as e:
+                raise RosterError(f"{where}: {e}") from e
         s = RosterSession(
             key=key, mode=mode,
             conversation_id=_str(raw, "conversation_id", where),
@@ -227,6 +274,9 @@ def parse_roster(data: dict) -> Roster:
             host=_str(raw, "host", where) or DEFAULT_HOST,
             model=_str(raw, "model", where),
             effort=_str(raw, "effort", where),
+            patrol_every_minutes=patrol_every,
+            patrol_hours=patrol_hours,
+            patrol_prompt=patrol_prompt,
         )
         if s.host not in HOSTS:
             raise RosterError(f"{where}: host 只能是 {' / '.join(HOSTS)}，收到 {s.host!r}")

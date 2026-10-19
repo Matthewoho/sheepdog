@@ -71,8 +71,8 @@ sheepdog pending [--json]      # 待办清单（只读）：要你定的（可�
 sheepdog resolve --topic tp_x (--message-id om_x | --key K) --why "依据"   # 会话结案自己名下还开着的「需要你定」；原会话已收掉的由总线结
 sheepdog acks [--open]         # 替你点过的确认表情及是否已撤
 sheepdog new-session --key k --title "短标题" --duty "职责与边界" [--chat oc_x[:all]]... [--message-ids a,b] [--note "..."]
-                               [--host antigravity|codex|claude] [--model M] [--effort E]
-                               # 总线临时新开一个专属会话（只在账本里，不写名册）
+                               [--host antigravity|codex|claude] [--model M] [--effort E] [--lifecycle standing|oneshot]
+                               # 总线临时新开（或重开已收掉的同 key）专属会话（只在账本里，不写名册）
 sheepdog close-session --topic tp_x   # 收掉总线新开的会话
 sheepdog push-rules [--topic tp_x] [--dry-run]   # 立即给会话发一次完整现行规则（不等新消息）
 sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title "..."]   # 给会话补发 / 手动发退休通知
@@ -80,7 +80,7 @@ sheepdog actions [--all]       # 排队 / 完成 / 失败的动作
 sheepdog show <message_id>     # 账本里这条消息的完整正文（送进会话的长消息会截断）
 sheepdog show --topic tp_x     # 这个会话最近几轮的问答（读对应宿主的记录），最后一行告诉你去哪里接着看
 sheepdog inject --text "..." [--chat oc_x] [--sender ou_x] [--at-me]   # 测试环境（[source] enabled = false）：放一条合成消息进账本
-sheepdog redeliver --batch b   # 发送中断、不确定是否送达的批次：人工确认后重发
+sheepdog redeliver (--batch b | --topic tp_x)   # 发送中断、不确定是否送达或会话记录缺失的批次：人工确认后重发
 sheepdog watch-done --id N     # 会话确认真的等到了对方的回复
 sheepdog loops [--clear <chat_id>]   # 疑似和 Agent 循环而冷却中的聊天；手动解除
 sheepdog board [--topic tp_x] [--json]   # 羊群看板：各会话的职责、运行状态、此刻 / 最近动作、名下的活、未读留言
@@ -118,9 +118,9 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 - 不插队、照旧排队的情况：会话被羊群看板判为中断 / 失联；你正在会话里（被主人占着）；会话 failed / attention / closed；Codex / Claude 会话（一轮是一次运行，running 就是在跑上一轮）。
 - 你撤回 / 编辑了自己在找主人聊天里已经送出去的话（不论当初是插队送的还是随普通批次送的）：撤回 / 改口的通知同样插队。
 - 会话在看到插话之前交的「等主人拍板」（needs_decision）回执：这一批送出后它收到过插话批次、名下也没有还开着的「需要你定」，就按 handled 收，摘要前面注明「回执说等主人拍板，但主人已在插话批次 `p…` 回复」；还有开着的提问就照旧等主人。
-- 总线把已经送到某个会话的消息再 `forward` 给同一个会话：跳过、不重发，命令输出逐条写「已在 HH:MM 随批次 `…` 送到 topic `…`，这次不重发」，全部跳过也是退出码 0。你引用回复了一条认不出来源的消息时，给总线的说明里会写被引用的那条已经送到了哪个会话。
+- 总线把已经送到某个会话的消息再 `forward` 给同一个会话：跳过、不重发，命令输出逐条写「已在 HH:MM 随批次 `…` 送到 topic `…`，这次不重发」，全部跳过也是退出码 0；但若那一批虽记了已送出、Antigravity 会话记录里却找不到批次号（送丢了，7.50#6），允许重转给同一个会话，并且当某批次的全部消息都被转走时当场放开原会话的 `pending_batch_id`。你引用回复了一条认不出来源的消息时，给总线的说明里会写被引用的那条已经送到了哪个会话。
 - 插话送到后会话一直没出声：`[session] owner_priority_followup_minutes`（默认 10，0 = 关，热加载）分钟内它经 sheepdog 一条消息都没发（ask / report / reply），私聊你一次，每个插话批次最多一次；会话收掉 / 移出名册的不提醒。
-- 发送中断 / agentapi 超时：批次先留在「正在发」，下一轮到会话记录里找批次号，找到就补记送达；找不到标 uncertain，之后 24 小时内每轮接着找，找到就补记；30 分钟还找不到私聊你一次（每批一次），附 `sheepdog redeliver --batch <批次号>`。一律不自动重发（送到了却核不到时重发就是重复）。agentapi 超时不再中断整轮，同一轮别的会话照常投递。
+- 发送中断 / agentapi 超时 / 假送达校验（7.50#6）：批次先留在「正在发」，下一轮到会话记录里找批次号，找到就补记送达；找不到标 uncertain，之后 24 小时内每轮接着找，找到就补记；30 分钟还找不到私聊你一次（每批一次），附 `sheepdog redeliver --batch <批次号>`。就算 agentapi 返回了 0（记成 `sent`），超过 `[session] verify_transcript_minutes`（默认 5，0 = 关）分钟在 Antigravity 会话记录里仍找不到批次号、且送出后会话记录没有新动作，也改标 `uncertain` 并释放会话 `pending_batch_id`，当轮私聊你一次，支持 `sheepdog redeliver --batch <批次号>` 或 `sheepdog redeliver --topic <会话>` 重投。一律不自动重发（送到了却核不到时重发就是重复）。agentapi 超时不再中断整轮，同一轮别的会话照常投递。
 
 ### 收尾查回执：Antigravity 的 Stop hook
 
@@ -132,23 +132,26 @@ sheepdog thread --topic tp_x (--key K | --thread omt_x)   # 只读：列出一�
 - 账本只读打开（不建表、不迁移），不导入投递引擎；冷启动实测约 0.13 秒（10 次中位，最大 0.13 秒；大头是导入命令行入口）。
 - 配置：`examples/antigravity-hooks.json`（只挂 Stop，timeout 10 秒）。command 换成你本机 sheepdog 的绝对路径（`which sheepdog`）；放进正式会话所在工作区的 `.agents/hooks.json`。这个文件会影响那个工作区里的所有对话，改它要你本人授权。
 
-### 名册会话也要交回执
+### 名册会话也要交回执与定时巡检（7.57）
 
 名册 managed 和总线新开的会话不交回执不会重投（只记一次「未回执」），但交回执之前会话一直算在做上一批（running），新消息排队，要等回执超时（`[session] receipt_timeout_minutes`，默认 20 分钟）才收得到下一批；你在「找主人」聊天里的回复除外，会插队送到。给会话的接口说明照这个写，分钟数取配置；批次末尾不再写「（可选）」。Codex / Claude 会话这一轮结束时没有回执就按未回执收尾，不等超时。
 
-## 总线只做轻活：没有合适的会话就新开
+名册 `managed` 会话可配置定时巡检（7.57）：`patrol_every_minutes`（整数，默认 0 = 关）、`patrol_hours`（如 `"9-22"` 或 `"0-2,9-18"`，留空 = 全天 0-23 时）、`patrol_prompt`（留空则渲染 playbook `patrol.md` 或默认巡检提示词）。当会话已 onboarding、处于 `active` 且没有在跑的批次、名下也没有待投信号、当前小时在 `patrol_hours` 内、且距上次巡检或最近一次投递已满 `patrol_every_minutes` 时，排一条系统巡检消息随正常批次投递。
+
+## 总线只做轻活：没有合适的会话就新开（7.58 一人一会话与原会话重开）
 
 总线负责分派、转交、简单确认和汇总；需要查云、读代码、跑命令、改文件、多步排查的事交给专属会话。名册里没有合适的，总线用 `sheepdog new-session` 临时新开一个（具体判断规则写在 playbook/bus.md）：
 
 - 新开的会话类型是 `dynamic`，只记在账本 topics 表，**不写名册文件**；名册同步只关 adopted / known 里缺失的条目，不碰它。名册后来加了同名 key 会报错跳过，先 `close-session` 再登记。
-- key 规则同名册（`[a-z0-9_-]`，不能是 bus），不能和名册或账本里已有的 topic 重复（含已收掉的）；`--chat` 的聊天不能已归属其他会话。
+- **生命周期（7.58）**：`--lifecycle standing|oneshot`；不传时按标题前缀（去掉 `title_prefix` 后）自动推断：`职能·` / `人·` / `项目·` 开头为 `standing`（常驻，一人一会话），其他标题默认为 `oneshot`（一次性）。
+- **回执 `done` 的区别（7.58）**：`standing` 会话（以及名册 `adopted` 会话）回执 `done` **不收掉**（等同 `handled`，留在 `active` 继续接后续消息，聊天归属保留），只有人工 `sheepdog close-session --topic tp_x` 才收掉；`oneshot` 会话回执 `done` 自动收掉，聊天归属释放回总线。
+- **同 key 重开复用原会话（7.58）**：账本里已经有已收掉（`closed`）的同 key `dynamic` 会话且 `conversation_id` 还在时，再跑 `sheepdog new-session --key <原key> ...` 会**直接重开并复用原来的 `conversation_id`**（不调宿主新建对话、保留全部历史上下文，**不消耗 `max_new_sessions_per_day` 每日新建额度**）；还在 `active` / `running` 的同 key 仍拒绝。
 - 标题 = `title_prefix` + `--title`；开场同 spawn：security.md、onboarding.md（授权用 authority_default.md）、common.md、接口说明。
 - `--message-ids` 和 `--note` 按 forward 的规则排进它的队列，下一轮投递；`--note` 同时记为创建原因。被安全规则 hold 的消息不能随 new-session 转，要先新开再 `forward --quote`。
 - `--chat` 写进它的 anchors，之后这些聊天按归属直接推给它（`:all` = 全部消息）。名册里的归属优先。
-- 配额：`[bus] max_new_sessions_per_day`（默认 5，按本地日历日计，收掉的也算）；超了拒绝并提示找你；`0` = 禁止总线新开。
-- 它回执 `done` 就收掉（adopted 的 done 不收）；也可以 `sheepdog close-session --topic tp_x` 手动收（只能关 dynamic）。收掉后聊天归属释放，再来的消息回总线，还没投出去的也退回总线。
+- 配额：`[bus] max_new_sessions_per_day`（默认 5，按本地日历日计，收掉的也算，但重开已收掉的同 key 会话不计入）；超了拒绝并提示找你；`0` = 禁止总线新建（重开已有 closed 会话不受影响）。
 - 回执 anchors 不能改聊天归属：`oc_` 开头的锚点会被忽略。
-- 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，标注「总线新开」；新开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间和创建原因。
+- 总线看到的名册（`{{roster}}` 和「名册更新」）包含这些会话，并在下方列出「已收掉但可原地重开的动态会话」；新开、重开或收掉后总线下一批会附最新名册。`sheepdog sessions` 显示创建时间、生命周期和创建原因。
 
 ## Codex 和 Claude 会话
 

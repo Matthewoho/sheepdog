@@ -22,18 +22,19 @@ from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activ
                     human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
                     scan_jsonl, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
-from .prompts import (DEFAULT_COMPACTION_NOTE, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB, adopted_bootstrap,
-                      batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message, onboarding_prompt, with_cli,
-                      quote_line, relay_content, retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
-                      standing_rules_managed, watch_message, priority_prompt)
-from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession
+from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
+                      adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
+                      onboarding_prompt, with_cli, quote_line, relay_content, retirement_prompt, roster_table,
+                      rules_update_message, standing_rules_bus, standing_rules_managed, watch_message, priority_prompt)
+from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession, parse_patrol_hours
 from .security import HOLD, NONE, SecurityConfig, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route
 from .sink import RunResult, Sink, SinkError, SinkTimeout
 from .source import Source
 from .sink.agentapi import conversation_dir, transcript_contains, transcript_path
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
-from .store import ECHO_RELAY_FIELDS, SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store, now_iso, row_to_message
+from .store import (ECHO_RELAY_FIELDS, LIFECYCLES, ONESHOT, STANDING, SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store,
+                    infer_topic_lifecycle, is_standing_topic, now_iso, row_to_message)
 from .source.lark import LarkTimeout, parse_event, parse_message as parse_thread_reply
 from . import identity
 
@@ -382,6 +383,20 @@ def dynamic_owners(store: Store) -> dict[str, tuple[str, bool]]:
 
 def open_dynamic_topics(store: Store) -> list:
     return [t for t in store.list_topics() if t["kind"] == DYNAMIC and t["state"] != sm.CLOSED]
+
+
+def closed_dynamic_topics(store: Store, roster: Roster | None = None, limit: int = 30) -> list:
+    """已收掉、可原地重开的动态会话（常驻类优先、再按最近活动倒序，最多 limit 条；排除与名册或当前开着的动态会话同 key 的）。"""
+    active_ids = {s.topic_id for s in (roster.sessions if roster else [])}
+    candidates = []
+    for t in store.list_topics():
+        if t["kind"] == DYNAMIC and t["state"] != sm.CLOSED:
+            active_ids.add(t["topic_id"])
+    for t in store.list_topics():
+        if t["kind"] == DYNAMIC and t["state"] == sm.CLOSED and t["topic_id"] not in active_ids:
+            candidates.append(t)
+    candidates.sort(key=lambda t: 0 if is_standing_topic(t) else 1)
+    return candidates[:limit]
 
 
 def apply_ownership(msg: Message, d: RouteDecision, roster: Roster | None,
@@ -2374,9 +2389,9 @@ class Dispatcher:
         if p.exists():
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
-            # adopted 会话由名册决定存续，总线是常驻入口：两者的回执 done 都不关会话，按 handled 处理；
-            # dynamic 会话是为一件事开的，done 就收掉（7.10）
-            if (t["kind"] == ADOPTED or t["topic_id"] == BUS_TOPIC_ID) and status == "done":
+            # 常驻会话（名册 adopted、总线、7.58 standing 动态会话）回执 done 都不关会话，按 handled 处理；
+            # oneshot 动态会话是为一件事开的，done 就收掉（7.10 / 7.58）
+            if is_standing_topic(t) and status == "done":
                 status = "handled"
             summary = receipt.get("summary", t["summary"])
             answered = ""
@@ -2409,11 +2424,48 @@ class Dispatcher:
         if sink is not None and hasattr(sink, "run_active") and sink.run_active(batch):
             return  # 命令行宿主这一轮还在后台跑（或等重试）：跑完由 _finish_run 收尾，不按回执超时算
         sent = _parse(t["dispatched_at"])
-        if sent and _now() - sent > timedelta(minutes=self.cfg.session.receipt_timeout_minutes):
+        now = _now()
+        vmins = self.cfg.session.verify_transcript_minutes
+        if (vmins > 0 and self.topic_host(t) == ANTIGRAVITY and (batch or "").startswith("b")
+                and sent is not None and now - sent >= timedelta(minutes=vmins)
+                and not self._batch_in_record(t, batch)
+                and not self._record_active_since(t, sent)):
+            self.store.set_dispatch_state(batch, "uncertain", error="agentapi 返回成功，但会话记录里找不到这个批次")
+            self.store.mark_batch_state(batch, "uncertain")
+            self.store.update_topic(t["topic_id"], state=sm.ACTIVE, pending_batch_id=None)
+            self._notify_uncertain_batch(t, batch, sent)
+            return
+        if sent and now - sent > timedelta(minutes=self.cfg.session.receipt_timeout_minutes):
             if adopted:
                 self._miss(t, batch)
             else:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
+
+    def _record_active_since(self, t, since: datetime) -> bool:
+        """从 since 起会话记录里有没有新动作（7.50#6）。"""
+        card = self.store.get_card(t["topic_id"])
+        act = _parse(card["last_act_at"] or "") if card is not None else None
+        if act is not None and act >= since:
+            return True
+        path = self._record_file(t)
+        at = last_activity_at(self.topic_host(t), path) if path is not None and path.exists() else None
+        return at is not None and at >= since
+
+    def _notify_uncertain_batch(self, t, batch_id: str, sent: datetime) -> None:
+        key = uncertain_notice_key(batch_id)
+        if self.store.get_meta(key):
+            return
+        tid = t["topic_id"]
+        d = self.store.get_dispatch(batch_id)
+        n = len(json.loads(d["message_ids"] or "[]")) if d is not None else 0
+        title = self._session_title(t) or tid
+        vmins = self.cfg.session.verify_transcript_minutes
+        text = (f"🐕 汇报 · 投递可能未进会话记录 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）的批次 `{batch_id}`"
+                f"（{n} 条消息，{display_time(sent, self.cfg.timezone_offset)}送出）agentapi 返回成功，但 {vmins} 分钟后"
+                f"会话记录里仍找不到该批次且无新动作，已转记为 uncertain 并解除阻塞。\n"
+                f"确认没收到可用：`sheepdog redeliver --batch {batch_id}` 或 `sheepdog redeliver --topic {tid}`")
+        log.warning("批次 %s（%s）送出 %d 分钟后会话记录里找不到且无新动作，转记为 uncertain 并解除阻塞", batch_id, tid, vmins)
+        self._notify_owner(text, "投递不确定通知", tid, before_send=lambda: self.store.set_meta(key, now_iso()))
 
     def _answered_by_priority(self, t) -> str:
         """手上这一批送出以后，这个会话收到过主人插话批次（p 开头、终态 priority、送出时间晚于这一批的 dispatched_at），并且
@@ -2681,7 +2733,7 @@ class Dispatcher:
         if receipt is not None:
             # 照回执本来会带来的状态走（handled → active，needs_decision → waiting_human …），都可投递
             status = receipt.get("status", "handled")
-            if (t["kind"] == ADOPTED or tid == BUS_TOPIC_ID) and status == "done":
+            if is_standing_topic(t) and status == "done":
                 status = "handled"
             target = sm.TRANSITIONS.get(sm.RECEIPT_EVENTS.get(status, "receipt_handled"), {}).get(sm.RUNNING)
             state = target if target in sm.DISPATCHABLE else sm.ACTIVE
@@ -2759,7 +2811,7 @@ class Dispatcher:
         w = self.cfg.watch
         prompt = bootstrap_prompt(self.playbook, t["title"], self.cfg.session.bus_title, t["topic_id"], self.roster,
                                   self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes,
-                                  open_dynamic_topics(self.store))
+                                  open_dynamic_topics(self.store), closed_dynamic_topics(self.store, self.roster))
         cid = self._new_conversation(self.topic_host(t), t["topic_id"], t["title"], prompt, "", "")
         self.store.update_topic(t["topic_id"], conversation_id=cid, rules_hash=self.rules_hash(t),
                                 compacted_at=None)
@@ -2785,7 +2837,9 @@ class Dispatcher:
         """该 topic 现行的常驻规则（每次现读 playbook）。总线算指纹时名册用占位，名册变化另走「名册更新」。"""
         w = self.cfg.watch
         if t["topic_id"] == BUS_TOPIC_ID:
-            roster_text = ROSTER_HASH_STUB if for_hash else roster_table(self.roster, open_dynamic_topics(self.store))
+            roster_text = (ROSTER_HASH_STUB if for_hash
+                           else roster_table(self.roster, open_dynamic_topics(self.store),
+                                             closed_dynamic_topics(self.store, self.roster)))
             return standing_rules_bus(self.playbook, self.cfg.session.bus_title, roster_text,
                                       self.cfg.prompt_overlay(), w.remind_minutes, w.expire_minutes)
         s = self._rules_session(t)
@@ -2898,7 +2952,8 @@ class Dispatcher:
             if not adopted:
                 t = self._ensure_bus_conversation(t)
                 if self.store.get_meta("roster_notify_bus") == "1":
-                    roster_update = roster_table(self.roster, open_dynamic_topics(self.store))
+                    roster_update = roster_table(self.roster, open_dynamic_topics(self.store),
+                                                 closed_dynamic_topics(self.store, self.roster))
             batch_id = self._new_batch_id("b", t["topic_id"])
             # 主人本人的发言（背景）与信号同批；只有背景时不要求回执、不改状态（7.13）
             signals = [r for r in rows if r["reason"] != OWNER_CONTEXT]
@@ -4577,6 +4632,10 @@ class Dispatcher:
                 step()
             except Exception as e:  # 护栏出错不能挡住投递
                 log.warning("护栏检查出错（%s）: %s", step.__name__, e)
+        try:  # 7.57：定时巡检
+            self._enqueue_patrols()
+        except Exception as e:
+            log.warning("定时巡检排入出错: %s", e)
 
         rows, groups = self._pending_groups(tids)
 
@@ -4610,6 +4669,47 @@ class Dispatcher:
             log.warning("回音账本出错: %s", e)
         result["state"] = self.store.get_topic(BUS_TOPIC_ID)["state"]
         return result
+
+    def _enqueue_patrols(self) -> int:
+        """7.57 定时巡检：给配置了 patrol_every_minutes > 0 的名册 managed 会话在空闲且无待推信号时排一条巡检系统消息。"""
+        if not self.roster:
+            return 0
+        now = _now()
+        tz, _ = _tz(self.cfg.timezone_offset)
+        local_now = now.astimezone(tz)
+        enqueued = 0
+        for s in self.roster.managed:
+            if s.patrol_every_minutes <= 0:
+                continue
+            if local_now.hour not in parse_patrol_hours(s.patrol_hours):
+                continue
+            tid = s.topic_id
+            t = self.store.get_topic(tid)
+            if t is None or t["state"] != sm.ACTIVE or not t["conversation_id"] or not t["onboarded_at"]:
+                continue
+            if t["pending_batch_id"]:
+                continue
+            card = self.store.get_card(tid)
+            if card is not None and card["run_state"] in (duty.OCCUPIED, *duty.STUCK, duty.WORKING):
+                continue
+            if self._owner_recent(self._owner_typed_at(t, card)):
+                continue
+            if self._busy(t):
+                continue
+            if self.store.count_pending_signals(tid) > 0:
+                continue
+            meta_key = f"patrol_last:{tid}"
+            last_ts = _parse(self.store.get_meta(meta_key))
+            if last_ts is not None and (now - last_ts) < timedelta(minutes=s.patrol_every_minutes):
+                continue
+            text = (s.patrol_prompt
+                    or self.playbook.render("patrol.md", session_title=s.display_title, topic_id=tid, duty=s.duty)
+                    or DEFAULT_PATROL_PROMPT)
+            self.store.add_system_message(tid, "patrol", text, tags=["patrol"])
+            self.store.set_meta(meta_key, now.isoformat(timespec="seconds"))
+            enqueued += 1
+            log.info("topic %s: 已排入例行巡检消息（间隔 %d 分钟）", tid, s.patrol_every_minutes)
+        return enqueued
 
     def _live_tids(self) -> list[str]:
         return [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
@@ -4658,28 +4758,39 @@ class Dispatcher:
             self._duty_round(list(result["topics"]), autofill=False)
         return result
 
-    # ---------- 总线新开会话（7.10） ----------
+    # ---------- 总线新开会话（7.10 / 7.58） ----------
     def new_session(self, key: str, title: str, duty: str, chats: list[tuple[str, bool]],
                     message_ids: list[str] | None = None, note: str = "", validate_only: bool = False,
-                    host: str = "", model: str = "", effort: str = "", quote: str = "") -> dict:
-        """总线临时新开一个专属会话：只写账本（kind = dynamic），不写名册。
+                    host: str = "", model: str = "", effort: str = "", quote: str = "",
+                    lifecycle: str | None = None) -> dict:
+        """总线临时新开（或原地重开已收掉的）一个专属会话：只写账本（kind = dynamic），不写名册。
 
         先做全部校验（key、宿主、主人原话、聊天归属、配额、待转消息），通过后才新建会话；建好后消息与 note 按 forward
         规则排队。宿主是 codex / claude 且 [hosts.*] ask_owner_before_new = true 时，必须带核对过的主人原话 quote
         （7.18，19:0x），原话写进新会话的开场。
+        7.58：账本里同 key 的 dynamic 会话若已 closed，原地重开并复用原 conversation_id（不新起窗口、不扣每日新开配额），
+        未显式传 lifecycle 时升格为 standing。
         """
         key, title, duty, note = key.strip(), title.strip(), duty.strip(), (note or "").strip()
         host, model, effort = (host or ANTIGRAVITY).strip(), (model or "").strip(), (effort or "").strip()
         if not _KEY_RE.match(key) or key == "bus":
             raise ValueError("--key 只允许 [a-z0-9_-]，且不能是 bus")
+        resolved_lifecycle = infer_topic_lifecycle(title, lifecycle)
         # 宿主没开直接报错，说清是哪个（7.18）；额度 max_new_sessions_per_day 所有宿主共用
         self.cfg.check_host(host)
         owner_quote = self._owner_consent(host, quote)
         topic_id = "tp_" + key
         if self.roster.by_key(key) is not None:
             raise ValueError(f"key {key!r} 已在名册里")
-        if self.store.get_topic(topic_id) is not None:
-            raise ValueError(f"{topic_id} 在账本里已存在（含已收掉的），换一个 key")
+        existing = self.store.get_topic(topic_id)
+        if existing is not None:
+            if existing["kind"] != DYNAMIC:
+                raise ValueError(f"{topic_id} 已存在（state={existing['state']}），不能覆盖名册会话")
+            if existing["state"] != sm.CLOSED:
+                raise ValueError(
+                    f"{topic_id} 已存在且开着（state={existing['state']}），"
+                    + with_cli(f"请直接用 `sheepdog forward --topic {topic_id}` 转交", self.cfg.cli_command)
+                )
         if not title or not duty:
             raise ValueError("--title 和 --duty 都必填")
         dyn = dynamic_owners(self.store)
@@ -4695,12 +4806,13 @@ class Dispatcher:
                 raise ValueError(f"聊天 {cid} 已归属名册里的 {owner[0].topic_id}")
             if cid in dyn:
                 raise ValueError(f"聊天 {cid} 已归属总线新开的 {dyn[cid][0]}")
-        quota = self.cfg.bus.max_new_sessions_per_day
-        if quota <= 0:
-            raise ValueError("配置禁止总线新开会话（[bus] max_new_sessions_per_day = 0），请找主人")
-        midnight = _now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
-        if self.store.count_topics_since(DYNAMIC, midnight) >= quota:
-            raise ValueError(f"今天已新开 {quota} 个会话，达到上限，请找主人")
+        if existing is None:
+            quota = self.cfg.bus.max_new_sessions_per_day
+            if quota <= 0:
+                raise ValueError("配置禁止总线新开会话（[bus] max_new_sessions_per_day = 0），请找主人")
+            midnight = _now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+            if self.store.count_topics_since(DYNAMIC, midnight) >= quota:
+                raise ValueError(f"今天已新开 {quota} 个会话，达到上限，请找主人")
         ids = [i.strip() for i in (message_ids or []) if i.strip()]
         for i in ids:
             row = self.store.get_message(i)
@@ -4710,17 +4822,37 @@ class Dispatcher:
                 raise ValueError(f"消息 {i} 被安全规则拦截，不能随 new-session 转交；"
                                  + with_cli("先新开会话，再用 `sheepdog forward --quote \"<主人原话>\"` 转",
                                             self.cfg.cli_command))
+        reopen_lifecycle = (infer_topic_lifecycle(title, lifecycle) if lifecycle else STANDING)
         if validate_only:
-            return {"topic_id": topic_id}
+            return {"topic_id": topic_id, "reopened": existing is not None,
+                    "lifecycle": reopen_lifecycle if existing is not None else resolved_lifecycle}
 
         full_title = f"{self.cfg.session.title_prefix} {title}".strip()
+        if existing is not None:
+            cid = existing["conversation_id"]
+            host = self.topic_host(existing)
+            self.store.update_topic(
+                topic_id, title=title, duty=duty, state=sm.ACTIVE, lifecycle=reopen_lifecycle,
+                pending_batch_id=None, retries=0, origin_note=note or existing["origin_note"],
+                anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False),
+            )
+            self.store.set_meta("roster_notify_bus", "1")
+            if ids or note:
+                forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
+                                 escalation_open_hours=self.cfg.escalation.open_hours,
+                                 key_patterns=self.cfg.duty.patterns, cli=self.cfg.cli_command)
+            log.info("已重开动态会话 %s (%s) -> %s [lifecycle=%s]", topic_id, title, cid, reopen_lifecycle)
+            return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids),
+                    "host": host, "reopened": True, "lifecycle": reopen_lifecycle}
+
         s = RosterSession(key=key, mode=MANAGED, title=title, duty=duty,
                           chats=[RosterChat(cid, "", al) for cid, al in chats], host=host, model=model, effort=effort)
         prompt = adopted_bootstrap(self.playbook, s, full_title, "", self.cfg.watch.remind_minutes,
                                    self.cfg.watch.expire_minutes, owner_quote=owner_quote)
         cid = self._new_conversation(host, topic_id, full_title, prompt, model, effort)
         ts = now_iso()
-        self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE, host, model, effort)
+        self.store.create_topic(topic_id, title, DYNAMIC, duty, sm.ACTIVE, host, model, effort,
+                                lifecycle=resolved_lifecycle)
         self.store.update_topic(topic_id, conversation_id=cid, spawned_at=ts, onboarded_at=ts, origin_note=note or None,
                                 anchors_json=json.dumps([chat_anchor(c, al) for c, al in chats], ensure_ascii=False))
         self.store.update_topic(topic_id, rules_hash=self.rules_hash(self.store.get_topic(topic_id)), compacted_at=None)
@@ -4729,8 +4861,9 @@ class Dispatcher:
             forward_messages(self.store, topic_id, ids, note=note, self_open_id=self.cfg.self_open_id,
                              escalation_open_hours=self.cfg.escalation.open_hours,
                              key_patterns=self.cfg.duty.patterns, cli=self.cfg.cli_command)
-        log.info("总线新开会话 %s（%s）-> %s（%d 条消息排队）", topic_id, host, cid, len(ids))
-        return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids), "host": host}
+        log.info("总线新开会话 %s（%s）-> %s（%d 条消息排队，lifecycle=%s）", topic_id, host, cid, len(ids), resolved_lifecycle)
+        return {"topic_id": topic_id, "conversation_id": cid, "title": full_title, "queued": len(ids), "host": host,
+                "reopened": False, "lifecycle": resolved_lifecycle}
 
     def _owner_consent(self, host: str, quote: str) -> tuple[str, str] | None:
         """新开 Codex / Claude 会话前先问主人（7.18，19:0x）：开关打开时 quote 必须是核对过的主人原话。
@@ -5067,6 +5200,16 @@ class ForwardResult(list):
         self.skipped: list[tuple[str, str, str]] = list(skipped)
 
 
+def _batch_unverified_in_transcript(store: Store, topic_id: str, batch_id: str) -> bool:
+    """7.50#6：批次记了 sent/delivered，但 Antigravity 会话记录里找不到这个批次号（投递黑洞）。"""
+    if not topic_id or not batch_id:
+        return False
+    t = store.get_topic(topic_id)
+    if t is None or Dispatcher.topic_host(t) != ANTIGRAVITY or not t["conversation_id"]:
+        return False
+    return not transcript_contains(t["conversation_id"], batch_id)
+
+
 def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: str = "", quote: str = "",
                      verify_quote=None, self_open_id: str = "", escalation_open_hours: float = 24,
                      key_patterns: list | None = None, cli: str = "sheepdog", answers: str = "") -> ForwardResult:
@@ -5081,6 +5224,7 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     - 在岗表（7.20）：转出去的消息记成转出方名下「已转交」的活（钥匙按 [duty] key_patterns 从正文认）。
     - 已经随批次送到目标会话的（topic 就是目标、有批次号、delivered / acked，7.47 第 1 条）跳过：不改回待推、不关「需要
       你定」、不记看板转交，记进返回值的 skipped；uncertain / missed / failed / context 照旧可以转。quote / note 不受影响。
+      7.50#6：若状态为 delivered 但 Antigravity 会话记录里找不到该批次号，允许重投。
     """
     _check_target(store, topic_id, "转交")
     ids = list(dict.fromkeys(i.strip() for i in message_ids if i.strip()))
@@ -5094,6 +5238,8 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     skipped = []
     for i in list(rows):
         if (got := delivered_to(store, rows[i])) is not None and got[0] == topic_id:
+            if rows[i]["dispatch_state"] == "delivered" and _batch_unverified_in_transcript(store, topic_id, got[1]):
+                continue
             skipped.append((i, got[1], got[2]))
             del rows[i]
     target_q = None
@@ -5112,8 +5258,12 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         raise ValueError(f"消息 {held} 被安全规则拦截，只能凭已核对的主人原话转交：加 --quote \"<主人原话>\"")
     if quote and not (verify_quote and verify_quote(quote)):
         raise ValueError(QUOTE_NOT_FOUND)
+    src_batches: set[tuple[str, str]] = set()
     for i, row in rows.items():
         src = row["topic_id"] or BUS_TOPIC_ID
+        old_bid = row["batch_id"] or ""
+        if old_bid:
+            src_batches.add((src, old_bid))
         tags = [x for x in json.loads(row["tags_json"] or "[]") if not x.startswith(("owner:", "forwarded_from:"))]
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
         if i in held and SECURITY_RELEASE_TAG not in tags:
@@ -5129,6 +5279,23 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         # 7.45：转交的是群话题里的消息（或开头那条），话题原来归转出方的，改归接手的会话（之后的话题回复直接送它）
         if store.repoint_group_thread(row["thread_id"] or "", row["message_id"], {src}, topic_id):
             log.info("话题 %s 跟着转交改归 %s", row["thread_id"] or row["message_id"], topic_id)
+    for src_tid, old_bid in src_batches:
+        src_t = store.get_topic(src_tid)
+        if src_t is not None and src_t["pending_batch_id"] == old_bid:
+            rem = store.conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE topic_id=? AND batch_id=? AND dispatch_state IN ('delivered','sending')",
+                (src_tid, old_bid),
+            ).fetchone()[0]
+            if rem == 0:
+                new_st = sm.ACTIVE if src_t["state"] == sm.RUNNING else src_t["state"]
+                store.update_topic(src_tid, state=new_st, pending_batch_id=None)
+                store.set_meta(duty_reset_key(src_tid), now_iso())
+                old_d = store.get_dispatch(old_bid)
+                if old_d is not None and old_d["state"] == "sent":
+                    if src_tid == topic_id:
+                        store.set_dispatch_state(old_bid, "redelivered", error="forward redeliver")
+                    else:
+                        store.set_dispatch_state(old_bid, "acked", error=f"forwarded:{topic_id}")
     pats = key_patterns if key_patterns is not None else DutyConfig().patterns
     by_src: dict[str, list] = {}
     for i, row in rows.items():

@@ -61,7 +61,11 @@ REASON_LABEL = {
     # 在岗表（7.20）
     "duty_mail": "会话留言",
     "duty_mail_paused": "会话留言暂停",
+    # 定时巡检（7.57）
+    "patrol": "例行巡检",
 }
+
+DEFAULT_PATROL_PROMPT = "例行巡检：按你的职责检查手头事项是否有新进展，处理完交回执。"
 
 RECEIPT_SCHEMA_HINT = """{
   "status": "handled | needs_decision | waiting_external | done",
@@ -160,10 +164,10 @@ def _anchor_chat(a: str) -> tuple[str, bool]:
     return cid, flag == "all"
 
 
-def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
+def roster_table(roster: Roster | None, dynamic: list | None = None, closed_dynamic: list | None = None) -> str:
     """名册表（数据）：每个会话的 title、topic、conversation、mode、职责、负责的聊天；含总线新开的 dynamic 会话。"""
     sessions = roster.sessions if roster else []
-    if not sessions and not dynamic:
+    if not sessions and not dynamic and not closed_dynamic:
         return "（名册为空）"
     lines = []
     for s in sessions:
@@ -183,6 +187,15 @@ def roster_table(roster: Roster | None, dynamic: list | None = None) -> str:
         chats = [_anchor_chat(a) for a in json.loads(t["anchors_json"] or "[]") if a.startswith("oc_")]
         if chats:
             lines.append("  负责的聊天：" + "、".join(f"`{c}`（{'全部消息' if al else '仅 dispatch 级'}）" for c, al in chats))
+    if closed_dynamic:
+        if lines:
+            lines.append("")
+        lines.append("已收掉但可原地重开的动态会话（同一个人 / 同一职能不要另起新 key，直接用原 key 调 `sheepdog new-session --key <原key> ...` 原地重开，复用原 conversation_id）：")
+        for t in closed_dynamic:
+            key = t["topic_id"].removeprefix("tp_")
+            lines.append(f"- 「{t['title']}」 key `{key}`（topic `{t['topic_id']}`） | conversation `{t['conversation_id'] or '-'}` | 已收掉（可重开）")
+            if t["duty"]:
+                lines.append(f"  原职责：{t['duty']}")
     return "\n".join(lines)
 
 
@@ -258,12 +271,14 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "### 新开 / 收掉会话",
             "`sheepdog new-session --key <k> --title \"<短标题>\" --duty \"<职责与边界>\" [--chat <oc_id>[:all]]... "
             "[--message-ids <id1,id2>] [--note \"<为什么开>\"] [--host antigravity|codex|claude] [--model <模型>] "
-            "[--effort <档位>] [--quote \"<主人原话>\"]`：名册里没有合适的会话时新开一个（只在账本里，不写名册），"
-            "消息和 note 排进它的队列；--chat 的聊天之后直接推给它（:all = 全部消息）。有每日配额，超了会被拒绝。",
+            "[--effort <档位>] [--lifecycle standing|oneshot] [--quote \"<主人原话>\"]`：名册里没有合适的会话时新开一个"
+            "（只在账本里，不写名册），消息和 note 排进它的队列；--chat 的聊天之后直接推给它（:all = 全部消息）。有每日配额，超了会被拒绝。"
+            "标题以「职能·」「人·」「项目·」开头默认 standing（回执 done 不关会话），其余默认 oneshot；"
+            "对已 closed 的动态会话再次用原 key 调用会原地重开（复用原 conversation_id，不占每日配额），同一个人不要开第二个会话。",
             "--host 是 codex / claude、且配置要求先问主人时，必须带 --quote：主人同意开这个会话的原话，"
             "核对同 forward（总线里亲口说过，或主人本人账号在飞书上的回复），不带或核对不通过就拒绝；"
             "核对过的原话会写进新会话的开场。",
-            "`sheepdog close-session --topic <tp_x>`：收掉总线新开的会话（它回执 done 时也会自动收掉），聊天归属随之释放。",
+            "`sheepdog close-session --topic <tp_x>`：收掉总线新开的会话（oneshot 会话回执 done 时也会自动收掉），聊天归属随之释放。",
             "### 要调 agentapi 的命令",
             "`new-session` / `spawn` / `push-rules` / `init` / `retire --topic <tp_x 或 conversation_id>`（给会话补发退休通知）"
             "在你的终端里执行时只入队，由 sheepdog 常驻进程下一轮执行（只有它能跨项目投递）；结果用 `sheepdog actions` 查看。",
@@ -344,13 +359,14 @@ def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
 
 # ---------- 各类开场 prompt ----------
 def bootstrap_prompt(pb: Playbook, title: str, plain_title: str, topic_id: str, roster: Roster | None,
-                     overlay: str, remind: list[int], expire: int, dynamic: list | None = None) -> str:
+                     overlay: str, remind: list[int], expire: int, dynamic: list | None = None,
+                     closed_dynamic: list | None = None) -> str:
     """总线 bootstrap：bus.md（含名册表）+ common.md + overlay + 接口说明。"""
     v = dict(session_title=plain_title, topic_id=topic_id)
     return _join(
         pb.render("security.md", **v),
         f"你是由 sheepdog 创建和管理的 session：**{title}**（topic_id: `{topic_id}`）。",
-        pb.render("bus.md", roster=roster_table(roster, dynamic), **v),
+        pb.render("bus.md", roster=roster_table(roster, dynamic, closed_dynamic), **v),
         pb.render("common.md", **v),
         overlay,
         interface_section(topic_id, bus=True, remind=remind, expire=expire, cli=pb.cli, identity=pb.identity,

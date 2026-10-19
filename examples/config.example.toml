@@ -55,6 +55,8 @@ human_attach_minutes = 15
 # 每条消息送进会话时最多带多少行正文，超过的末尾提示用 sheepdog show 看全文
 max_message_lines = 200
 receipt_timeout_minutes = 20
+# 7.50#6：批次记了 sent 但 Antigravity 会话记录里超过这么多分钟找不到批次号、且送出后会话记录没动静，改标 uncertain 并放开会话排队。0 = 关
+verify_transcript_minutes = 5
 # 代回以卡片发出：正文 + 右下角灰色小字标记（sheepdog reply-card 生成；playbook 里的 {{reply_suffix}}）
 reply_suffix = "[🐕Sheepdog Reply]"
 reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill（撑满）

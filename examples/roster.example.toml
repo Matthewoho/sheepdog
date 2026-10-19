@@ -17,6 +17,10 @@ duty = "跟进同事提来的需求：整理要点、起草回复。不负责审
 authority = ""                               # 主人在该会话里给过的授权原话；空 = 未明确授权，对外只起草
 self_polling = "每 10 分钟自己巡检一次需求私聊"   # 该会话自己的 IM 巡检，没有就留空
 retire_self_polling = true                   # true：onboarding 时请它停掉自己的巡检，以 sheepdog 推送为准
+# 7.57 定时巡检（可选，0 = 关）：到了间隔、会话空闲且没有待投信号时，排一条系统巡检消息
+# patrol_every_minutes = 60
+# patrol_hours = "9-22"                        # 留空 = 0-23 全天；支持多段如 "0-2,9-18"
+# patrol_prompt = "巡检一下名下还没结的需求，有进展就更新，没事回执 handled。"
 
 [[session.chats]]
 chat_id = "oc_test_demo_p2p"

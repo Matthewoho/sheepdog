@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS topics (
     attention_at     TEXT,             -- 进入 attention 的时间（7.21）；解除后清空
     attention_reason TEXT,             -- 进入 attention 的原因（机器可读）：receipt_timeout | no_receipt | send_failed
                                        -- | host_failed | host_timeout | config | capacity；只有 receipt_timeout 会自动恢复
+    lifecycle        TEXT,             -- dynamic 会话生命周期（7.58）：standing（常设）| oneshot（一次性）；空 = 按标题推断
     created_at       TEXT NOT NULL,
     last_active      TEXT NOT NULL
 );
@@ -566,7 +567,7 @@ MIGRATIONS = {
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
                ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
                ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
-               ("attention_reason", "TEXT")],
+               ("attention_reason", "TEXT"), ("lifecycle", "TEXT")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
@@ -582,6 +583,44 @@ MIGRATIONS = {
 
 # 向飞书查到的群名（机器人事件那条路补群名）记在 meta 里：chat_name:<chat_id> → 群名
 CHAT_NAME_META = "chat_name:"
+
+# 动态会话生命周期（7.58 + 一人一会话）
+STANDING = "standing"
+ONESHOT = "oneshot"
+LIFECYCLES = (STANDING, ONESHOT)
+STANDING_TITLE_PREFIXES = ("职能·", "人·", "项目·")
+
+
+def infer_topic_lifecycle(title: str, explicit: str | None = None) -> str:
+    """推断动态会话生命周期（7.58）：显式指定优先；否则去掉 [managed] 等前缀后看标题是否以「职能·」「人·」「项目·」开头。"""
+    if explicit:
+        v = explicit.strip()
+        if v not in LIFECYCLES:
+            raise ValueError(f"lifecycle 只能是 standing 或 oneshot，收到 {explicit!r}")
+        return v
+    raw = (title or "").strip()
+    if raw.startswith("[") and "]" in raw:
+        raw = raw.split("]", 1)[1].strip()
+    if any(raw.startswith(p) for p in STANDING_TITLE_PREFIXES):
+        return STANDING
+    return ONESHOT
+
+
+def is_standing_topic(t) -> bool:
+    """这个会话是不是常设（standing）会话：回执 done 时转为 handled 而不关闭（7.58）。"""
+    if t is None:
+        return False
+    keys = t.keys()
+    kind = t["kind"] if "kind" in keys else None
+    tid = t["topic_id"] if "topic_id" in keys else None
+    if kind == "adopted" or tid == "tp_bus":
+        return True
+    if kind == "dynamic":
+        lc = (t["lifecycle"] if "lifecycle" in keys else None) or ""
+        if lc in LIFECYCLES:
+            return lc == STANDING
+        return infer_topic_lifecycle(t["title"] if "title" in keys else "") == STANDING
+    return False
 
 
 def now_iso() -> str:
@@ -978,17 +1017,21 @@ class Store:
     def get_topic(self, topic_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM topics WHERE topic_id=?", (topic_id,)).fetchone()
 
-    def list_topics(self) -> list[sqlite3.Row]:
+    def list_topics(self, kind: str | None = None) -> list[sqlite3.Row]:
+        if kind:
+            return self.conn.execute("SELECT * FROM topics WHERE kind=? ORDER BY last_active DESC", (kind,)).fetchall()
         return self.conn.execute("SELECT * FROM topics ORDER BY last_active DESC").fetchall()
 
     def create_topic(self, topic_id: str, title: str, kind: str, duty: str, state: str,
-                     host: str = "antigravity", model: str = "", effort: str = "") -> None:
+                     host: str = "antigravity", model: str = "", effort: str = "",
+                     lifecycle: str | None = None) -> None:
         ts = now_iso()
         with self.tx() as c:
             c.execute(
-                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,created_at,last_active)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None, ts, ts),
+                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,lifecycle,created_at,last_active)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None,
+                 lifecycle or None, ts, ts),
             )
 
     def count_topics_since(self, kind: str, since_iso: str) -> int:
@@ -996,12 +1039,28 @@ class Store:
                                  (kind, since_iso)).fetchone()[0]
 
     def update_topic(self, topic_id: str, **fields) -> None:
+        fields.pop("last_error", None)
         if not fields:
             return
         fields.setdefault("last_active", now_iso())
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.tx() as c:
             c.execute(f"UPDATE topics SET {cols} WHERE topic_id=?", (*fields.values(), topic_id))
+
+    def upsert_topic(self, topic_id: str, **fields) -> None:
+        existing = self.get_topic(topic_id)
+        if existing is None:
+            title = fields.pop("title", topic_id)
+            kind = fields.pop("kind", "dynamic")
+            duty = fields.pop("duty", "")
+            state = fields.pop("state", "active")
+            host = fields.pop("host", "antigravity")
+            model = fields.pop("model", "") or ""
+            effort = fields.pop("effort", "") or ""
+            lifecycle = fields.pop("lifecycle", None)
+            self.create_topic(topic_id, title, kind, duty, state, host, model, effort, lifecycle=lifecycle)
+        if fields:
+            self.update_topic(topic_id, **fields)
 
     # ---------- dispatches ----------
     def dispatch_exists(self, batch_id: str) -> bool:

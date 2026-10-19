@@ -139,12 +139,15 @@ class SessionConfig:
     owner_undelivered_alert: bool = True
     owner_queue_alert_minutes: int = 10
     owner_reply_alert_minutes: int = 15
+    # 7.50#6：批次记成 sent 以后这么多分钟，Antigravity 会话记录里还找不到批次号且无新动作，转记为 uncertain 并解除阻塞（0 = 关）
+    verify_transcript_minutes: int = 0
 
     def validate(self) -> None:
         for k in ("owner_receipt_relay", "owner_undelivered_alert"):
             if not isinstance(getattr(self, k), bool):
                 raise ConfigError(f"[session] {k} 必须是 true/false")
-        for k in ("owner_queue_alert_minutes", "owner_reply_alert_minutes", "owner_relay_after_minutes"):
+        for k in ("owner_queue_alert_minutes", "owner_reply_alert_minutes", "owner_relay_after_minutes",
+                  "verify_transcript_minutes"):
             v = getattr(self, k)
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise ConfigError(f"[session] {k} 必须是不小于 0 的整数（0 = 关）")
