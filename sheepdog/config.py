@@ -642,15 +642,20 @@ class NotifyConfig:
 
     owner_card（7.48，默认开，热加载：常驻进程下一轮生效，ask / report / resolve 每次现读）：牧羊犬发给主人的消息
     （ask / report、系统通知、「待办」清单、结案那一句）发成卡片，正文的 markdown 原样渲染；关掉 = 照旧发纯文本。
-    不管开没开，记账（sends、bot_outbox、给主人的通知账本）的正文都是纯文本。"""
+    不管开没开，记账（sends、bot_outbox、给主人的通知账本）的正文都是纯文本。
+    require_summary（7.62，默认开）：ask / report / reply / reply-card 发送长消息（>4 行、>160 字或含代码块）时必须提供四刀法
+    白话总结（--summary 或 ---more--- 分隔线），原文自动收进 more 默认折叠区。"""
     file: str = ""
     owner_card: bool = True
+    require_summary: bool = True
 
     def validate(self) -> None:
         if not isinstance(self.file, str):
             raise ConfigError("[notify] file 必须是字符串（文件路径）；留空 = 经机器人私聊主人")
         if not isinstance(self.owner_card, bool):
             raise ConfigError("[notify] owner_card 必须是 true/false（true = 发给主人的消息发成卡片）")
+        if not isinstance(self.require_summary, bool):
+            raise ConfigError("[notify] require_summary 必须是 true/false（true = 长消息必须带白话总结）")
 
 
 @dataclass

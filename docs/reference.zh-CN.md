@@ -332,14 +332,16 @@ authority = "2026-10-18 主人原话：……"  # tier = vip 必填：你的原�
 - **`ask` 当场拦**：`sheepdog ask` 关联的来源消息（给了 `--about` 就是它们；不给就是这一批送到的全部消息，不管来自几个聊天）里有一条是 VIP 本人发的，就必须带 `--floor "<碰到哪条底线>"`，否则不发、不写账本，退出码 2，stderr 写明「VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合；只有底线里的事才 ask，并用 --floor 写明碰到哪条底线」。`--floor` 记进账本 `sends.floor`（按 `message_id` 和 `escalations` 连），体检据此区分「VIP 请求又回来等你批」和「碰到底线」。`--about` 只指非 VIP 消息时不用带；`report` 完全不受影响；名册没有 `[[person]]` 时 ask 和以前一样。名册读不了时这次不核（stderr 提示一行），不把找你的路堵上。
 - **和 `[routing] vip_sender_ids` 不是一回事**：`vip_sender_ids` 是路由，只管「这些人在群里说话也送进会话、不进 Inbox」（原因标「关键人发言」）；`[[person]]` 是授权，管「对他放多大权」，不改任何消息送到哪里。两者可以各写各的。
 
-## 一事一串：找你的消息按事归到话题里
+## 一事一串与白话总结折叠：找你的消息按事归到话题里，长文默认收进 `more`（7.22 / 7.62）
 
 会话找你一律用 `sheepdog ask`（需要你定）/ `sheepdog report`（汇报），不再自己调 lark-cli。sheepdog 在正文前加开头一行（`[threads] ask_header` / `report_header`，默认 `🐕 需要你定 · <标题> [tp_xxx]` / `🐕 汇报 · <标题> [tp_xxx]`），以机器人身份私聊你；这一行照旧被 `[escalation] header_regex`、`attribution_regex` 认出来（`sheepdog doctor` 会核对 ask 的开头一行能不能被 header_regex 认出来）。
 
 ```bash
 sheepdog ask --topic tp_x --key "PR #12" --title "发版时间" --text "周五还是下周一？建议周一"
-sheepdog report --topic tp_x --key "PR #12" --title "进度" --file body.md     # - 表示标准输入
+sheepdog report --topic tp_x --key "PR #12" --title "进度" --summary "测试已全绿，只差你的生产授权。" --file body.md
 ```
+
+- **卡片外层只露四刀法白话总结，原有回复收进 `more` 默认折叠区（7.62，`[notify] require_summary = true`）**：`ask`、`report`、`reply`、`reply-card` 发卡片时，短消息（`<= 4` 行且 `<= 160` 字且不含 ```` ``` ```` 代码块）若未传 `--summary` / `---more---` 直接展示、不加折叠按钮；长消息（超过 4 行、超过 160 字或含代码块）必须提供白话总结（`<= 6` 行、`<= 220` 字、不含代码块），可通过 `--summary "<白话总结>"` / `--summary-file <文件>` 传入，或在正文最前面写白话总结并用独立一行 `---more---` 隔开。外层只显示白话总结，原有回复原封不动放进飞书 Card 2.0 `collapsible_panel`（`expanded: false`，标题 `more` 配原生旋转下拉箭头图标 `down-small-ccm_outlined`）。未提供或超限返回退出码 2，stderr 明确提示会话「原文不需要改，只需要增加白话总结」。账本 `sends` / `bot_outbox` 记录 `---more---` 拼接文本，「待办」清单摘录（`pending.py`）只取 `---more---` 之前的白话总结。
 
 - **带 `--key`**（和羊群看板的活同一把钥匙，按 `norm_key` 比较：去空白、转大写）：同一会话同一把钥匙第一次发，在主聊天里新起一条（话题开头）；之后再发（问题、汇报都算），用 `+messages-reply --reply-in-thread` 回到开头那条的话题里，主聊天里不再并排。话题里的回复飞书默认不提醒，所以往话题里发的这几条正文末尾另起一行 @ 你（文本消息的写法 `<at user_id="ou_xxx"></at>`，按 `self_open_id`；7.29），第一行不变；在主聊天起话题的第一条不加。防重编号、`sends`、`bot_outbox` 记的正文都不含这一行。sheepdog 再拉到这条时照旧认作机器人的提问 / 汇报，不会因为 @ 了你当成「@我」再派给会话。账本 `owner_threads` 表记「话题 ↔ 会话、钥匙、开头那条、话题编号」。`--reply-in-thread` 的返回里没有话题编号（实测只有 chat_id、create_time、message_id），所以往话题里发完一条，sheepdog 只读 mget 一次开头那条把话题编号补上；mget 失败不影响发送结果，之后从拉取里补。不同会话用同一把钥匙是各自的话题。ask 照旧登记「需要你定」，羊群看板自动补的「等主人」的活用的就是这把钥匙。
 - **不带 `--key`**：和以前一样，每次主聊天里一条新消息。

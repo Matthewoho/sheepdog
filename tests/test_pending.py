@@ -806,6 +806,8 @@ class OwnerPendingTest(PendingBase):
         self.assertEqual(card["header"]["template"], "orange")
 
     def test_item_lines_meta_excerpt_source_link(self):
+        self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + "[notify]\nrequire_summary = false\n",
+                                 encoding="utf-8")
         a = self.alice_batch()
         q = self.asked("--about", a, "--key", "T748", title="**卡片**测试",
                        text="这是 7.48 卡片测试（S1），不用真的回答。\n### 要你看的\n- 加粗**能不能**显示\n- 行内代码：`sheepdog ask` 和 [链接](https://x.invalid)\n```\nkubectl get pods\n```")
@@ -943,6 +945,8 @@ class ExcerptJoinTest(PendingBase):
 
     def test_list_uses_sent_text_not_glued_readback(self):
         # 读回登记的「需要你定」里标题和下一行连成了「### 事情Sammy」：清单摘录用 ask 发出时记的原文
+        self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + "[notify]\nrequire_summary = false\n",
+                                 encoding="utf-8")
         self.asked(title="Sammy 线路", text=SAMMY)
         e = self.store.conn.execute("SELECT message_id, text FROM escalations").fetchone()
         glued = e["text"].replace("### 事情\n", "### 事情")

@@ -55,30 +55,50 @@ def _opt(args: list[str], name: str, default: str = "") -> str:
     return args[args.index(name) + 1] if name in args else default
 
 
+def _el_texts(els: list[dict], *, readback: bool) -> list[str]:
+    parts: list[str] = []
+    for el in els:
+        if el.get("tag") == "column_set":
+            for col in el.get("columns") or []:
+                parts.extend(_el_texts(col.get("elements") or [], readback=readback))
+            continue
+        if el.get("tag") == "collapsible_panel":
+            inner = "\n".join(_el_texts(el.get("elements") or [], readback=readback))
+            if readback:
+                indented = "\n".join("    " + ln if ln else "" for ln in inner.splitlines())
+                parts.append(f"▶ more\n{indented}\n▲")
+            else:
+                parts.append(f"---more---\n{inner}")
+            continue
+        text = el.get("content", "")
+        if readback:
+            text = re.sub(r"<at id=([\w-]+)></at>", lambda m: f"@{_NAMES.get(m.group(1), '某人')}({m.group(1)})", text)
+            text = re.sub(r"</?font[^>]*>", "", text)
+        parts.append(text)
+    return parts
+
+
 def sent_text(call: list[str]) -> str:
-    """一次发送的正文（7.48 起发给主人的是卡片）：纯文本就是 --text；卡片是 header 标题 + 各 markdown 元素，换行连起来，
+    """一次发送的正文（7.48 起发给主人的是卡片）：纯文本就是 --text；卡片是 header 标题 + 各元素（含 collapsible_panel），换行连起来，
     @ 主人保留卡片写法 <at id=…></at>。"""
     if "--content" not in call:
         return _opt(call, "--text")
     card = json.loads(_opt(call, "--content"))
     title = ((card.get("header") or {}).get("title") or {}).get("content", "")
-    parts = [el.get("content", "") for el in card["body"]["elements"]]
+    parts = _el_texts(card["body"]["elements"], readback=False)
     return "\n".join(([title] if title else []) + parts)
 
 
 def _card_text(content: str) -> str:
-    """卡片拉回来时的样子（7.48，10-16 只读核过正式账本里机器人发的代回卡片和别的机器人的告警卡片）：
+    """卡片拉回来时的样子（7.48 / 7.62，只读核过正式账本与真飞书 collapsible_panel 回读）：
     有 header 是 <card title="标题">（带副标题是 <card title="…" subtitle="…">），没有 header 是 <card>；
-    各 markdown 元素之间换行分开；<at id=ou_x></at> 变成 @名字(ou_x)；<font …> 标签去掉；最后一行 </card>。"""
+    各 markdown 元素之间换行分开，collapsible_panel 读回为 ▶ more\\n    缩进正文\\n▲；
+    <at id=ou_x></at> 变成 @名字(ou_x)；<font …> 标签去掉；最后一行 </card>。"""
     card = json.loads(content)
     head = (card.get("header") or {})
     title = (head.get("title") or {}).get("content", "")
     sub = (head.get("subtitle") or {}).get("content", "")
-    parts = []
-    for el in card["body"]["elements"]:
-        text = el.get("content", "")
-        text = re.sub(r"<at id=([\w-]+)></at>", lambda m: f"@{_NAMES.get(m.group(1), '某人')}({m.group(1)})", text)
-        parts.append(re.sub(r"</?font[^>]*>", "", text))
+    parts = _el_texts(card["body"]["elements"], readback=True)
     first = (f'<card title="{title}" subtitle="{sub}">' if sub else f'<card title="{title}">') if title else "<card>"
     return first + "\n" + "\n".join(parts) + "\n</card>"
 

@@ -77,7 +77,7 @@ from pathlib import Path
 from . import __version__
 from . import actions
 from .ack import Acker
-from .card import build_reply_card, owner_title, plain_text
+from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
 from . import lastgood
 from . import duty
@@ -1487,16 +1487,19 @@ def cmd_redeliver(args) -> int:
 
 
 def cmd_reply_card(args) -> int:
-    """打印代回卡片（Card 2.0）JSON（7.17），用法：
-    lark-cli im +messages-send --as user --chat-id oc_x --msg-type interactive --content "$(sheepdog reply-card --text ...)"
+    """打印代回卡片（Card 2.0）JSON（7.17 / 7.62），用法：
+    lark-cli im +messages-send --as user --chat-id oc_x --msg-type interactive --content "$(sheepdog reply-card --summary '...' --text '...')"
     """
     cfg = _load_cfg()
-    if args.text_file:
-        text = sys.stdin.read() if args.text_file == "-" else Path(args.text_file).expanduser().read_text(encoding="utf-8")
-    else:
-        text = args.text or ""
     try:
-        card = build_reply_card(text, cfg.session.reply_suffix, cfg.session.reply_card_width)
+        text = _body_arg(args.text, args.text_file)
+        summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
+    except OSError as e:
+        print(f"reply-card 被拒绝: 读不了文件: {e}", file=sys.stderr)
+        return 2
+    try:
+        _, _, combined = resolve_summary_and_body(text, summary, require_summary=cfg.notify.require_summary)
+        card = build_reply_card(combined, cfg.session.reply_suffix, cfg.session.reply_card_width)
     except ValueError as e:
         print(f"reply-card 被拒绝: {e}", file=sys.stderr)
         return 2
@@ -1793,13 +1796,15 @@ def _ask_vips(cfg) -> dict[str, str]:
 
 def cmd_ask(args) -> int:
     """sheepdog ask / report：经机器人找主人。带 --key：同一把钥匙第一次起新话题，之后回到这个话题里。
-    ask 关联的来源里有名册 VIP 本人发的消息时必须带 --floor（7.61），否则不发、不写账本，退出码 2。"""
+    ask 关联的来源里有名册 VIP 本人发的消息时必须带 --floor（7.61），否则不发、不写账本，退出码 2。
+    7.62：长消息必须带四刀法白话总结（--summary / --summary-file 或正文内 ---more---），原文自动收进 more 默认折叠区。"""
     cfg = _load_cfg()
     store = Store(cfg.db_path)
     kind = args.cmd
     tid = _topic_arg(args.topic)
     try:
         body = _body_arg(args.text, args.file)
+        summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
     except OSError as e:
         print(f"{kind} 没发: 读不了正文文件: {e}", file=sys.stderr)
         return outbound.EXIT_INVALID
@@ -1817,12 +1822,17 @@ def cmd_ask(args) -> int:
             except outbound.OutboundError as e:
                 print(f"{kind} 没发: {e}", file=sys.stderr)
                 return e.code
+        try:
+            _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary)
+        except ValueError as e:
+            print(f"{kind} 没发: {e}", file=sys.stderr)
+            return outbound.EXIT_INVALID
         return _test_env_write(cfg, "需要你定" if kind == outbound.ASK else "汇报",
-                               outbound.compose(cfg, kind, tid, args.title, body))
+                               outbound.compose(cfg, kind, tid, args.title, resolved_body))
     try:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
                                    about=getattr(args, "about", None) or None, track=getattr(args, "track", False),
-                                   floor=floor, vips=vips)
+                                   floor=floor, vips=vips, summary=summary)
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -1894,6 +1904,7 @@ def cmd_reply(args) -> int:
     tid = _topic_arg(args.topic)
     try:
         card_text = _body_arg(args.card_text, args.card_file) if args.card_text is not None or args.card_file else ""
+        summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
     except OSError as e:
         print(f"代回没发: 读不了正文文件: {e}", file=sys.stderr)
         return outbound.EXIT_INVALID
@@ -1909,14 +1920,14 @@ def cmd_reply(args) -> int:
             print(f"代回没发: {e}", file=sys.stderr)
             return e.code
         try:
-            shown, _ = outbound.reply_body(cfg, args.text or "", card_text)
+            shown, _ = outbound.reply_body(cfg, args.text or "", card_text, summary=summary)
         except ValueError as e:
             print(f"代回没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID
         return _test_env_write(cfg, "代回", f"回复 {args.to}：\n{shown}")
     try:
         r = outbound.reply(cfg, store, _source(cfg), tid, args.to, text=args.text or "", card_text=card_text,
-                           even_if_owner_replied=args.even_if_owner_replied)
+                           summary=summary, even_if_owner_replied=args.even_if_owner_replied)
     except outbound.OutboundError as e:
         print(f"代回没发: {e}", file=sys.stderr)
         return e.code
@@ -2151,8 +2162,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("reply-card")
     g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--text", help="正文")
+    g.add_argument("--text", help="原有完整回复（长消息自动收进 more 默认折叠区）")
     g.add_argument("--text-file", help="正文文件；- 表示标准输入")
+    sg = sp.add_mutually_exclusive_group()
+    sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+    sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.set_defaults(func=cmd_reply_card)
 
     sp = sub.add_parser("show")
@@ -2246,8 +2260,11 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
         sp.add_argument("--title", required=True, help="短标题（一行）")
         g = sp.add_mutually_exclusive_group(required=True)
-        g.add_argument("--text", help="正文")
+        g.add_argument("--text", help="正文（长消息原文不需要改，配合 --summary 自动收进 more 折叠区）")
         g.add_argument("--file", help="正文文件；- 表示标准输入")
+        sg = sp.add_mutually_exclusive_group()
+        sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+        sg.add_argument("--summary-file", default="", help="白话总结文件")
         sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
         sp.add_argument("--batch", default="",
                         help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
@@ -2279,9 +2296,12 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
     sp.add_argument("--to", required=True, help="要回复的那条消息（om_）")
     g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--card-text", help="卡片正文（同 reply-card --text）")
+    g.add_argument("--card-text", help="卡片正文（长消息原文不需要改，配合 --summary 自动收进 more 折叠区）")
     g.add_argument("--card-file", help="卡片正文文件，- 表示标准输入（同 reply-card --text-file）")
-    g.add_argument("--text", help="纯文本代回（末尾自动附代回标记）")
+    g.add_argument("--text", help="纯文本代回（带 --summary 时自动升格为折叠卡片）")
+    sg = sp.add_mutually_exclusive_group()
+    sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+    sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.add_argument("--even-if-owner-replied", action="store_true",
                     help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
     sp.set_defaults(func=cmd_reply)

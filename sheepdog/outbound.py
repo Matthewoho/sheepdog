@@ -30,7 +30,7 @@ from . import duty
 from . import identity as ident
 from . import pending as pend
 from . import session as sm
-from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes
+from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes, resolve_summary_and_body
 from .config import Config
 from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, is_agent_reply, open_escalations,
                      order_thread_items, root_position)
@@ -114,7 +114,9 @@ def current_batch(store: Store, topic_id: str) -> str:
     return store.latest_batch_id(topic_id, skip_prefix=PRIORITY_PREFIX)
 
 
-def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str) -> str:
+def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str, summary: str = "") -> str:
+    if (summary or "").strip():
+        _, _, body = resolve_summary_and_body(body, summary, require_summary=False)
     return cfg.threads.header(kind, _one_line(title), topic_id) + "\n" + body.strip()
 
 
@@ -171,13 +173,14 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
 
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
                   key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
-                  floor: str = "", vips: dict | None = None) -> SendResult:
+                  floor: str = "", vips: dict | None = None, summary: str = "") -> SendResult:
     """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。
     ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。
     7.51：这把钥匙是话题群里的一件事项，或者第一次用这把钥匙时带 --track（track = True）：发进话题群里那件事的话题
     （没有就先开一件、发标题卡）；群发不进去就退回私聊，并发一条系统通知。
     7.61：vips 是名册里的 VIP（Roster.vips）。ask 关联的来源里有 VIP 本人发的消息又没带 floor（--floor）就拒绝，在发送和
-    写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。"""
+    写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。
+    7.62：长消息必须提供四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区。"""
     from . import topicgroup as tg
     if track and not _one_line(key):
         raise OutboundError(EXIT_INVALID, "--track 要和 --key 一起用：长期跟踪的事要有钥匙")
@@ -196,7 +199,11 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     floor = _one_line(floor) if kind == ASK else ""
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, floor, batch)   # 7.61：只读，拒绝时什么都没写
-    text = compose(cfg, kind, topic_id, title, body)
+    try:
+        _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary)
+    except ValueError as e:
+        raise OutboundError(EXIT_INVALID, str(e))
+    text = compose(cfg, kind, topic_id, title, resolved_body)
     ik = idem_key(kind, topic_id, nk, batch or current_batch(store, topic_id), text)
     origin, srcs, n_chats = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [], 0)
     prev = store.get_send(ik)
@@ -606,17 +613,23 @@ def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
                             "（要他定的事用 sheepdog ask，参数相同），会经机器人发给他，同一把钥匙回到同一个话题里。没有发送。")
 
 
-def reply_body(cfg: Config, text: str = "", card_text: str = "") -> tuple[str, dict | None]:
+def reply_body(cfg: Config, text: str = "", card_text: str = "", summary: str = "") -> tuple[str, dict | None]:
     """代回的内容：卡片（沿用 reply-card：正文 + 右下角代回标记），或纯文本（末尾附同一个代回标记，别人一眼看出是代回、
     sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。
-    7.26：主人本人、机器人两个身份发的都一样带标记。"""
+    7.26：主人本人、机器人两个身份发的都一样带标记。
+    7.62：长消息必须带四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区；--text 带了总结也自动升格为卡片。"""
     suffix = cfg.session.reply_suffix
     if card_text:
-        card = build_reply_card(card_text, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
-        return card_text, card
+        _, _, combined = resolve_summary_and_body(card_text, summary, require_summary=cfg.notify.require_summary)
+        card = build_reply_card(combined, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
+        return combined, card
     if not (text or "").strip():
         raise ValueError("正文为空")
-    plain = text.rstrip()
+    s, _, combined = resolve_summary_and_body(text, summary, require_summary=cfg.notify.require_summary)
+    if s:
+        card = build_reply_card(combined, suffix, cfg.session.reply_card_width)
+        return combined, card
+    plain = combined.rstrip()
     if suffix and suffix not in plain:
         plain += "\n" + suffix
     return plain, None
@@ -655,7 +668,7 @@ def _send_reply(source, target_id: str, ik: str, shown: str, card: dict | None, 
 
 
 def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, text: str = "", card_text: str = "",
-          even_if_owner_replied: bool = False) -> ReplyResult:
+          summary: str = "", even_if_owner_replied: bool = False) -> ReplyResult:
     """代回：先查重（发过同样的就不再发），再发前检查（主人说过话就不发、记「发送前已看到」），最后发。
     [identity] 关着以主人身份发；开着按 identity.choose_reply_identity 选身份（7.26）。"""
     if not target_ok(store, topic_id):
@@ -664,13 +677,13 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     if not target_id.startswith("om_"):
         raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号，收到 {target_id!r}")
     enabled = cfg.identity.enabled
+    target = store.get_message(target_id)
+    if target is not None and ((text or "").strip() or (card_text or "").strip()):
+        reject_owner_chat(cfg, topic_id, target["chat_id"])   # 热修：找主人聊天里一律拒绝，在选身份之前，不管开没开 [identity]
     try:
-        shown, card = reply_body(cfg, text, card_text)
+        shown, card = reply_body(cfg, text, card_text, summary=summary)
     except ValueError as e:
         raise OutboundError(EXIT_INVALID, str(e))
-    target = store.get_message(target_id)
-    if target is not None:
-        reject_owner_chat(cfg, topic_id, target["chat_id"])   # 热修：找主人聊天里一律拒绝，在选身份之前，不管开没开 [identity]
     ik = reply_idem(store, topic_id, target_id, shown)   # 两个身份正文一样（都带标记）：230002 退回本人时编号不变
     prev = store.get_send(ik)
     if prev is not None:

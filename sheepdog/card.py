@@ -21,13 +21,156 @@ import json
 import re
 
 
-def build_reply_card(text: str, suffix: str, width_mode: str = "compact") -> dict:
+# ======================= 四刀法白话总结 + more 默认折叠区（7.62） =======================
+MORE_PANEL_TITLE = "more"
+MORE_DELIMITER = "---more---"
+LEGACY_MORE_DELIMITER = "---agent-read---"
+SUMMARY_MAX_LINES = 6
+SUMMARY_MAX_CHARS = 220
+SHORT_MESSAGE_MAX_LINES = 4
+SHORT_MESSAGE_MAX_CHARS = 160
+_MORE_SPLIT_RE = re.compile(r"^[ \t]*---(?:more|agent-read)---[ \t]*$", re.M)
+_CODE_FENCE_RE = re.compile(r"```")
+SUMMARY_REQUIRED_GUIDE = (
+    '原文不需要改，只需要增加白话总结：加 --summary "<四刀法白话总结：≤6行、≤220字、不含代码块>"'
+    '（或在原文最前面写白话总结并用一行 ---more--- 隔开），原有回复会原封不动收进 more 折叠区。'
+    '四刀法：①终态与边界（做成什么、哪没动）②异动/意外 ③决策或下一步开关 ④证据锚点'
+)
+
+
+def build_more_panel(detail: str) -> dict:
+    """7.62：把原有完整回复原封不动装进飞书 Card 2.0 原生默认折叠面板（无背景框、左侧 more + 原生旋转下拉箭头）。"""
+    return {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "padding": "0px",
+        "header": {
+            "title": {"tag": "markdown", "content": f"<font color='grey'>{MORE_PANEL_TITLE}</font>"},
+            "padding": "0px",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "color": "grey",
+                "size": "14px 14px",
+            },
+            "icon_position": "follow_text",
+            "icon_expanded_angle": -180,
+        },
+        "elements": [{"tag": "markdown", "content": detail.strip("\n")}],
+    }
+
+
+def split_more(text: str) -> tuple[str, str]:
+    """按第一行 ---more---（兼容 ---agent-read---）拆成 (白话总结, 原文)；没有分隔线时返回 ("", 原文)。"""
+    s = text or ""
+    m = _MORE_SPLIT_RE.search(s)
+    if m is None:
+        return "", s.strip("\n")
+    return s[:m.start()].strip("\n"), s[m.end():].strip("\n")
+
+
+def is_short_message(text: str) -> bool:
+    """短消息（≤4 行、≤160 字、不含 ``` 代码块）：不传 --summary 时直接平铺，无需套 more 折叠框。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if _CODE_FENCE_RE.search(s):
+        return False
+    return len(s.splitlines()) <= SHORT_MESSAGE_MAX_LINES and len(s) <= SHORT_MESSAGE_MAX_CHARS
+
+
+def validate_summary(summary: str) -> str:
+    """校验四刀法白话总结：非空、≤6 行、≤220 字、不含 ``` 代码块。不合格抛 ValueError（带明确指引）。"""
+    s = (summary or "").strip("\n")
+    if not s.strip():
+        raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
+    if _CODE_FENCE_RE.search(s):
+        raise ValueError(f"白话总结不能含代码块（代码块请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
+    lines = s.splitlines()
+    if len(lines) > SUMMARY_MAX_LINES:
+        raise ValueError(f"白话总结超过 {SUMMARY_MAX_LINES} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
+    if len(s) > SUMMARY_MAX_CHARS:
+        raise ValueError(f"白话总结超过 {SUMMARY_MAX_CHARS} 字（当前 {len(s)} 字）。{SUMMARY_REQUIRED_GUIDE}")
+    return s
+
+
+def resolve_summary_and_body(body: str, summary: str = "", *, require_summary: bool = True) -> tuple[str, str, str]:
+    """7.62：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。
+    - 传了 --summary 或正文含 ---more--- 分隔线：校验白话总结，返回 (summary, detail, "summary\\n---more---\\ndetail")；
+    - 未传且是短消息（≤4 行、≤160 字、无代码块）：直接平铺，返回 ("", detail, detail)；
+    - 未传且是长消息：require_summary=True 时抛 ValueError 拒绝并提示「原文不需要改，只需要增加白话总结」。"""
+    raw = (body or "").strip("\n")
+    if not raw.strip():
+        raise ValueError("正文为空")
+    inline_sum, inline_det = split_more(raw)
+    has_delim = _MORE_SPLIT_RE.search(raw) is not None
+    if (summary or "").strip():
+        s = validate_summary(summary)
+        d = inline_det if has_delim and inline_det.strip() else raw
+        if not d.strip():
+            raise ValueError(f"more 折叠区原文为空。{SUMMARY_REQUIRED_GUIDE}")
+        return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
+    if has_delim:
+        s = validate_summary(inline_sum)
+        if not inline_det.strip():
+            raise ValueError(f"more 折叠区原文为空（---more--- 下面要有原有完整回复）。{SUMMARY_REQUIRED_GUIDE}")
+        return s, inline_det, f"{s}\n{MORE_DELIMITER}\n{inline_det}"
+    if is_short_message(raw) or not require_summary:
+        return "", body, body
+    n_lines = len(raw.splitlines())
+    n_chars = len(raw)
+    why = "含代码块" if _CODE_FENCE_RE.search(raw) else f"{n_lines} 行 / {n_chars} 字"
+    raise ValueError(f"正文较长（{why}）但未提供白话总结。{SUMMARY_REQUIRED_GUIDE}")
+
+
+def _card_body_elements(body_text: str, summary: str = "") -> list[dict]:
+    """把正文（或 summary + 正文）拆成卡片 body elements：有总结/分隔线时为 [summary_md, more_panel]，否则为单个 [body_md]。"""
+    s, d, _ = resolve_summary_and_body(body_text, summary, require_summary=False)
+    if s:
+        return [{"tag": "markdown", "content": s}, build_more_panel(d)]
+    return [{"tag": "markdown", "content": body_text}]
+
+
+def build_reply_card(text: str, suffix: str, width_mode: str = "compact", summary: str = "") -> dict:
     if not (text or "").strip():
         raise ValueError("正文为空")
-    elements: list[dict] = [{"tag": "markdown", "content": text}]
-    if suffix:
-        elements.append({"tag": "markdown", "content": f"<font color='grey'>{suffix}</font>",
-                         "text_align": "right", "text_size": "notation"})
+    s, d, _ = resolve_summary_and_body(text, summary, require_summary=False)
+    if s and suffix:
+        elements = [
+            {"tag": "markdown", "content": s},
+            {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "horizontal_spacing": "8px",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "vertical_align": "top",
+                        "elements": [build_more_panel(d)],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "top",
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": f"<font color='grey'>{suffix}</font>",
+                                "text_align": "right",
+                                "text_size": "notation",
+                            }
+                        ],
+                    },
+                ],
+            },
+        ]
+    else:
+        elements = _card_body_elements(text, summary)
+        if suffix:
+            elements.append({"tag": "markdown", "content": f"<font color='grey'>{suffix}</font>",
+                             "text_align": "right", "text_size": "notation"})
     return {"schema": "2.0", "config": {"width_mode": width_mode}, "body": {"elements": elements}}
 
 
@@ -49,21 +192,21 @@ def owner_title(title: str) -> str:
     return " ".join((title or "").split()).replace('"', "＂")
 
 
-def build_owner_card(text: str, at_open_id: str = "") -> dict:
-    """给主人的卡片：第一行进 header 标题，其余原样进一个 markdown 元素；at_open_id 有值时末尾另起一个 markdown 元素 @ 他。
-    只有一行（结案那一句这类）时不放 header，这一行就是正文。正文为空抛 ValueError。"""
+def build_owner_card(text: str, at_open_id: str = "", summary: str = "") -> dict:
+    """给主人的卡片：第一行进 header 标题，其余原样进一个 markdown 元素（7.62：有白话总结 / ---more--- 时首屏只露白话总结，
+    原文进 more 默认折叠区）；at_open_id 有值时末尾另起一个 markdown 元素 @ 他。只有一行（结案那一句这类）时不放 header，
+    这一行就是正文。正文为空抛 ValueError。"""
     text = (text or "").strip("\n")
     if not text.strip():
         raise ValueError("正文为空")
     first, _, rest = text.partition("\n")
     card: dict = {"schema": "2.0"}
-    elements: list[dict] = []
     if rest.strip():
         card["header"] = {"title": {"tag": "plain_text", "content": owner_title(first)},
                           "template": TEMPLATE_DECIDE if DECIDE_WORD in first else TEMPLATE_DEFAULT}
-        elements.append({"tag": "markdown", "content": rest.strip("\n")})
+        elements = _card_body_elements(rest.strip("\n"), summary)
     else:
-        elements.append({"tag": "markdown", "content": first})
+        elements = _card_body_elements(first, summary)
     if at_open_id:
         elements.append({"tag": "markdown", "content": f"<at id={at_open_id}></at>"})
     card["body"] = {"elements": elements}

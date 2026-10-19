@@ -29,7 +29,7 @@ from . import duty
 from . import engine as eng
 from . import prompts
 from . import session as sm
-from .card import card_fits, plain_text
+from .card import card_fits, plain_text, split_more
 from .router import message_bodies
 from .store import SYSTEM_ID_PREFIX, Store, now_iso
 
@@ -385,11 +385,9 @@ def ask_title(cfg, text: str) -> str:
 
 
 def ask_body(text: str, limit: int = 60) -> str:
-    """提问正文（去掉开头一行）的前几十个字。卡片（7.48）按还原后的算。"""
-    bodies = message_bodies(plain_text(text or ""))
-    body = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
-    lines = body.splitlines()
-    return _short(" ".join(lines[1:]) if len(lines) > 1 else "", limit)
+    """提问正文（去掉开头一行，7.62 有 more 折叠区时只取前面的白话总结）的前几十个字。卡片（7.48）按还原后的算。"""
+    rest = _body_after_header(text)
+    return _short(" ".join(rest.splitlines()) if rest else "", limit)
 
 
 def where(chat_type: str, chat_name: str, chat_id: str) -> str:
@@ -771,10 +769,17 @@ def session_name(cfg, store: Store, topic_id: str) -> str:
 
 
 def _body_after_header(text: str) -> str:
-    """提问去掉 sheepdog 加的开头一行以后的正文（卡片按还原后的算）。"""
+    """提问去掉 sheepdog 加的开头一行以后的正文（卡片按还原后的算；7.62 有 more 折叠区时只取前面的白话总结）。"""
     bodies = message_bodies(plain_text(text or ""))
     body = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
-    return body.partition("\n")[2].strip()
+    rest = body.partition("\n")[2].strip()
+    summary, _ = split_more(rest)
+    if summary:
+        return summary.strip()
+    m = re.search(r"^[ \t]*▶[ \t]+(?:more|agent-read)\b", rest, re.M)
+    if m and rest[:m.start()].strip():
+        return rest[:m.start()].strip()
+    return rest
 
 
 def _source_marks(cfg, store: Store, srcs) -> list[dict]:

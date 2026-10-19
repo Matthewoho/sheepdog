@@ -119,9 +119,14 @@ class OwnerCardBase(ThreadsBase):
         super().setUp()
         self.cfg.escalation = EscalationConfig(chat_ids=[ESC_CHAT], header_regex=PROD_HEADER_RX,
                                                attribution_regex=PROD_ATTR_RX)
+        self.cfg.notify.require_summary = False
         txt = self.cfg_file.read_text(encoding="utf-8")
-        self.cfg_file.write_text(f'playbook_dir = "{self.cfg.playbook_dir}"\n' + txt.replace(
-            "[escalation]\n", "[escalation]\n", 1), encoding="utf-8")
+        self.cfg_file.write_text(
+            f'playbook_dir = "{self.cfg.playbook_dir}"\n'
+            + txt.replace("[escalation]\n", "[escalation]\n", 1)
+            + "[notify]\nrequire_summary = false\n",
+            encoding="utf-8",
+        )
 
     def sends(self, sub=None):
         return self.lark.sent(sub)
@@ -132,8 +137,13 @@ class OwnerCardBase(ThreadsBase):
         return out
 
     def set_cfg(self, line_section: str, key_line: str) -> None:
-        self.cfg_file.write_text(self.cfg_file.read_text(encoding="utf-8") + f"[{line_section}]\n{key_line}\n",
-                                 encoding="utf-8")
+        txt = self.cfg_file.read_text(encoding="utf-8")
+        hdr = f"[{line_section}]\n"
+        if hdr in txt:
+            txt = txt.replace(hdr, f"{hdr}{key_line}\n", 1)
+        else:
+            txt += f"{hdr}{key_line}\n"
+        self.cfg_file.write_text(txt, encoding="utf-8")
 
 
 class FourPathsTest(OwnerCardBase):
