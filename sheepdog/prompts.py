@@ -63,6 +63,8 @@ REASON_LABEL = {
     "duty_mail_paused": "会话留言暂停",
     # 定时巡检（7.57）
     "patrol": "例行巡检",
+    # 羔羊完工汇报（7.63）
+    "lamb_report": "羔羊完工汇报",
 }
 
 DEFAULT_PATROL_PROMPT = "例行巡检：按你的职责检查手头事项是否有新进展，处理完交回执。"

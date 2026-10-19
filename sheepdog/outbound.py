@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -95,6 +96,73 @@ def target_ok(store: Store, topic_id: str) -> bool:
     """能经 sheepdog 发消息的会话：总线、名册 managed、总线新开的（没收掉的）。"""
     t = store.get_topic(topic_id)
     return t is not None and t["state"] != sm.CLOSED and (topic_id == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS)
+
+
+def lamb_violation_message(
+    store: Store | None,
+    cmd: str,
+    *,
+    topic_id: str = "",
+    lamb_id: str = "",
+    cid: str = "",
+) -> str | None:
+    """7.63 羔羊越权硬拦截：判定当前调用方是否为羔羊（环境变量 SHEEPDOG_LAMB_ID / 会话 conversation_id / lambs 表匹配）。"""
+    lid = (lamb_id or os.environ.get("SHEEPDOG_LAMB_ID") or "").strip()
+    conv_id = (
+        cid
+        or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+        or os.environ.get("SHEEPDOG_CONVERSATION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or ""
+    ).strip()
+    tid = (topic_id or "").strip()
+    matched_lid = ""
+    parent_tid = ""
+    if lid:
+        lb = store.get_lamb(lid) if store is not None and hasattr(store, "get_lamb") else None
+        matched_lid = lb["lamb_id"] if lb else lid
+        parent_tid = (lb["parent_topic_id"] if lb else "") or tid or "unknown"
+    elif conv_id and store is not None and hasattr(store, "find_lamb_by_cid"):
+        lb = store.find_lamb_by_cid(conv_id)
+        if lb is not None:
+            matched_lid = lb["lamb_id"]
+            parent_tid = lb["parent_topic_id"]
+    if not matched_lid and tid and store is not None:
+        candidates = [tid]
+        if tid.startswith("tp_"):
+            candidates.append(tid.removeprefix("tp_"))
+        for c in list(candidates):
+            if c.startswith("lamb:"):
+                candidates.append(c.removeprefix("lamb:"))
+        for cand in candidates:
+            lb = (store.get_lamb(cand) if hasattr(store, "get_lamb") else None) or (
+                store.find_lamb_by_cid(cand) if hasattr(store, "find_lamb_by_cid") else None
+            )
+            if lb is not None:
+                matched_lid = lb["lamb_id"]
+                parent_tid = lb["parent_topic_id"]
+                break
+    if not matched_lid:
+        return None
+    return (
+        f"[sheepdog] 禁止越权：当前执行体是羔羊（lamb_id={matched_lid}，隶属母羊 {parent_tid}），"
+        f"物理禁止直接调用 sheepdog {cmd}（reply/ask/report/forward/receipt/resolve/watch）。"
+        f"请将核查或执行结论直接返回给母羊，由母羊统一对外回话与交回执。"
+    )
+
+
+def check_not_lamb(
+    store: Store | None,
+    cmd: str,
+    *,
+    topic_id: str = "",
+    lamb_id: str = "",
+    cid: str = "",
+) -> None:
+    msg = lamb_violation_message(store, cmd, topic_id=topic_id, lamb_id=lamb_id, cid=cid)
+    if msg:
+        raise OutboundError(EXIT_INVALID, msg)
 
 
 def _one_line(text: str) -> str:
@@ -182,6 +250,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。
     7.62：长消息必须提供四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区。"""
     from . import topicgroup as tg
+    check_not_lamb(store, kind, topic_id=topic_id)
     if track and not _one_line(key):
         raise OutboundError(EXIT_INVALID, "--track 要和 --key 一起用：长期跟踪的事要有钥匙")
     if kind not in (ASK, REPORT):
@@ -398,6 +467,7 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
             playbook=None) -> ResolveResult:
     """会话结案：只结自己名下、还开着的；结案后机器人在那条提问的话题里补一句「已结案：依据（会话）」。
     先发那句话（带防重编号，超时原样重试只发一条），发成了再在账本里结案；source 为 None（测试环境）只结案、不发。"""
+    check_not_lamb(store, "resolve", topic_id=topic_id)
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
     why = _one_line(why)
@@ -673,6 +743,7 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
           summary: str = "", even_if_owner_replied: bool = False) -> ReplyResult:
     """代回：先查重（发过同样的就不再发），再发前检查（主人说过话就不发、记「发送前已看到」），最后发。
     [identity] 关着以主人身份发；开着按 identity.choose_reply_identity 选身份（7.26）。"""
+    check_not_lamb(store, "reply", topic_id=topic_id)
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
     target_id = (target_id or "").strip()

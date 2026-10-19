@@ -549,6 +549,25 @@ CREATE TABLE IF NOT EXISTS tracked_keys (
     added_at  TEXT NOT NULL,
     PRIMARY KEY (norm_key, item_no)
 );
+
+-- 羔羊（Subagent / Lamb，7.63）：隶属母羊（parent_topic_id）的短命执行体，不进名册、不建独立 topic、禁直连飞书
+CREATE TABLE IF NOT EXISTS lambs (
+    lamb_id         TEXT PRIMARY KEY,
+    parent_topic_id TEXT NOT NULL,
+    kind            TEXT NOT NULL,     -- native_subagent | bash_worker
+    task_title      TEXT NOT NULL,
+    conversation_id TEXT,
+    pid             INTEGER,
+    state           TEXT NOT NULL,     -- running | done | failed | timeout | cancelled
+    started_at      TEXT NOT NULL,
+    last_act_at     TEXT,
+    finished_at     TEXT,
+    result_summary  TEXT,
+    log_path        TEXT,
+    reported_at     TEXT               -- 已向母羊投递 lamb_report 批次的时间
+);
+CREATE INDEX IF NOT EXISTS idx_lambs_parent ON lambs(parent_topic_id, state);
+CREATE INDEX IF NOT EXISTS idx_lambs_cid ON lambs(conversation_id);
 """
 
 # sheepdog 自己生成、投给会话的消息（交接回执、等待提醒、总线转达）用这个 chat_type 和 message_id 前缀
@@ -578,6 +597,10 @@ MIGRATIONS = {
     "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
                     ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
                     ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT")],
+    "lambs": [("parent_topic_id", "TEXT"), ("kind", "TEXT"), ("task_title", "TEXT"),
+              ("conversation_id", "TEXT"), ("pid", "INTEGER"), ("state", "TEXT"),
+              ("started_at", "TEXT"), ("last_act_at", "TEXT"), ("finished_at", "TEXT"),
+              ("result_summary", "TEXT"), ("log_path", "TEXT"), ("reported_at", "TEXT")],
 }
 
 
@@ -1961,6 +1984,124 @@ class Store:
             "SELECT i.* FROM tracked_items i JOIN tracked_keys k ON k.item_no = i.item_no WHERE k.norm_key=? "
             "ORDER BY i.item_no DESC", (norm_key,)).fetchall()
 
+    # ---------- 羔羊（Subagent / Lamb，7.63） ----------
+    LAMB_FIELDS = (
+        "parent_topic_id", "kind", "task_title", "conversation_id", "pid", "state",
+        "started_at", "last_act_at", "finished_at", "result_summary", "log_path", "reported_at",
+    )
+
+    def create_lamb(
+        self,
+        lamb_id: str,
+        parent_topic_id: str = "",
+        kind: str = "native_subagent",
+        task_title: str = "",
+        *,
+        topic_id: str = "",
+        title: str = "",
+        conversation_id: str | None = None,
+        pid: int | None = None,
+        state: str = "running",
+        started_at: str | None = None,
+        last_act_at: str | None = None,
+        finished_at: str | None = None,
+        result_summary: str | None = None,
+        log_path: str | None = None,
+        reported_at: str | None = None,
+    ) -> dict:
+        ptid = (parent_topic_id or topic_id).strip()
+        ttitle = (task_title or title or lamb_id).strip()
+        ts = started_at or now_iso()
+        act = last_act_at if last_act_at is not None else ts
+        cid = (conversation_id or "").strip() or None
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, conversation_id, pid, state,
+                                     started_at, last_act_at, finished_at, result_summary, log_path, reported_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(lamb_id) DO UPDATE SET
+                       parent_topic_id=excluded.parent_topic_id,
+                       kind=excluded.kind,
+                       task_title=excluded.task_title,
+                       conversation_id=COALESCE(excluded.conversation_id, lambs.conversation_id),
+                       pid=COALESCE(excluded.pid, lambs.pid),
+                       state=excluded.state,
+                       last_act_at=excluded.last_act_at,
+                       finished_at=COALESCE(excluded.finished_at, lambs.finished_at),
+                       result_summary=COALESCE(excluded.result_summary, lambs.result_summary),
+                       log_path=COALESCE(excluded.log_path, lambs.log_path)""",
+                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at),
+            )
+        return self.get_lamb(lamb_id) or {}
+
+    register_lamb = create_lamb
+
+    def get_lamb(self, lamb_id: str) -> dict | None:
+        r = self.conn.execute("SELECT * FROM lambs WHERE lamb_id=?", (lamb_id,)).fetchone()
+        return dict(r) if r is not None else None
+
+    def update_lamb(self, lamb_id: str, **fields) -> dict | None:
+        allowed = {k: v for k, v in fields.items() if k in self.LAMB_FIELDS}
+        if not allowed:
+            return self.get_lamb(lamb_id)
+        cols = ", ".join(f"{k}=?" for k in allowed)
+        with self.tx() as c:
+            c.execute(f"UPDATE lambs SET {cols} WHERE lamb_id=?", (*allowed.values(), lamb_id))
+        return self.get_lamb(lamb_id)
+
+    def get_active_lambs(self, parent_topic_id: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM lambs WHERE state='running'"
+        args: list = []
+        if parent_topic_id:
+            sql += " AND parent_topic_id=?"
+            args.append(parent_topic_id)
+        rows = self.conn.execute(sql + " ORDER BY started_at ASC, lamb_id ASC", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_lambs(
+        self,
+        parent_topic_id: str | None = None,
+        state: str | None = None,
+        *,
+        include_finished: bool = True,
+    ) -> list[dict]:
+        sql = "SELECT * FROM lambs WHERE 1=1"
+        args: list = []
+        if parent_topic_id:
+            sql += " AND parent_topic_id=?"
+            args.append(parent_topic_id)
+        if state:
+            sql += " AND state=?"
+            args.append(state)
+        elif not include_finished:
+            sql += " AND state='running'"
+        rows = self.conn.execute(sql + " ORDER BY started_at ASC, lamb_id ASC", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_lamb_by_cid(self, conversation_id: str) -> dict | None:
+        cid = (conversation_id or "").strip()
+        if not cid:
+            return None
+        r = self.conn.execute(
+            "SELECT * FROM lambs WHERE conversation_id=? ORDER BY (state='running') DESC, started_at DESC, lamb_id DESC LIMIT 1",
+            (cid,),
+        ).fetchone()
+        return dict(r) if r is not None else None
+
+    get_lamb_by_conversation = find_lamb_by_cid
+
+    def get_unreported_finished_lambs(self, parent_topic_id: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM lambs WHERE state IN ('done','failed','timeout','cancelled') AND (reported_at IS NULL OR reported_at='')"
+        args: list = []
+        if parent_topic_id:
+            sql += " AND parent_topic_id=?"
+            args.append(parent_topic_id)
+        rows = self.conn.execute(sql + " ORDER BY COALESCE(finished_at, started_at) ASC, lamb_id ASC", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_lamb_reported(self, lamb_id: str, reported_at: str | None = None) -> None:
+        self.update_lamb(lamb_id, reported_at=reported_at or now_iso())
+
     # ---------- 保留期清理 ----------
     # 保留期清理（7.16）：每张表按自己的时间字段；未结 / 进行中的不删
     PRUNE_SQL = {
@@ -1996,6 +2137,7 @@ class Store:
         # 7.36：提问的来源；提问本身还开着的不删
         "escalation_sources": """DELETE FROM escalation_sources WHERE created_at < ? AND ask_message_id NOT IN
                                  (SELECT message_id FROM escalations WHERE closed_at IS NULL)""",
+        "lambs": "DELETE FROM lambs WHERE finished_at IS NOT NULL AND finished_at < ? AND state != 'running'",
     }
 
     # 在岗表的履历（7.20）：按 [duty] history_days；进行中的活、还没送达或没回执的留言不删

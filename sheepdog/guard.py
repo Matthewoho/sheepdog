@@ -53,6 +53,7 @@ COMPACTION = "compaction"
 AUDIT = "audit"
 ACTIVITY = "activity"
 DUTY = "duty"
+LAMB_DISCOVERY = "lamb_discovery"
 
 AG_COMPACTION_PREFIX = "# Resuming from a compaction"
 
@@ -63,6 +64,7 @@ _NEEDLES = {
     ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
     DUTY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed", b"custom_tool_call", b"USER_INPUT", b"CHECKPOINT",
            b"compaction", b"compacted", b"compact_boundary", b"user_message", b'"type":"user"', b'"type": "user"'),
+    LAMB_DISCOVERY: (b"invoke_subagent",),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
 LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
@@ -380,3 +382,85 @@ def one_sentence(text: str, limit: int = 80) -> str:
         text = text[:m.start()]
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+# ---------- 自动发现 invoke_subagent（7.63） ----------
+_UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.I)
+
+
+@dataclass
+class SubagentInvocation:
+    lamb_id: str
+    conversation_id: str
+    task_title: str
+    step: str
+    at: str
+
+
+def _extract_subagent_fields(obj: dict, parent: dict, step_fallback: str) -> SubagentInvocation:
+    args = obj.get("args") if isinstance(obj.get("args"), dict) else (obj.get("input") if isinstance(obj.get("input"), dict) else {})
+    res = obj.get("result") if isinstance(obj.get("result"), dict) else (parent.get("result") if isinstance(parent.get("result"), dict) else {})
+
+    def pick(*vals) -> str:
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return _decoded(v) or v.strip()
+        return ""
+
+    lid = pick(
+        args.get("lamb_id"), args.get("LambId"),
+        obj.get("lamb_id"), res.get("lamb_id"),
+        parent.get("lamb_id"),
+    )
+    cid = pick(
+        args.get("conversation_id"), args.get("ConversationId"), args.get("cid"),
+        args.get("subagent_id"), args.get("SubagentId"),
+        obj.get("conversation_id"), obj.get("subagent_id"), obj.get("cid"),
+        res.get("conversation_id"), res.get("subagent_id"), res.get("cid"),
+        parent.get("subagent_conversation_id"), parent.get("subagent_id"),
+    )
+    if not cid:
+        raw_blob = json.dumps({"res": obj.get("result"), "p_res": parent.get("result"), "content": obj.get("content") or parent.get("content")}, ensure_ascii=False)
+        m = _UUID_RE.search(raw_blob)
+        if m:
+            cid = m.group(1)
+    title = one_sentence(
+        pick(
+            args.get("task_title"), args.get("TaskTitle"), args.get("title"), args.get("Title"),
+            args.get("toolSummary"), args.get("Task"), args.get("task"),
+            args.get("Prompt"), args.get("prompt"), args.get("Name"), args.get("name"),
+            args.get("toolAction"), obj.get("task_title"), obj.get("title"),
+            res.get("task_title"), res.get("title"), parent.get("task_title"), parent.get("title"),
+        ),
+        80,
+    ) or "subagent"
+    at = str(parent.get("created_at") or parent.get("timestamp") or obj.get("created_at") or "")
+    return SubagentInvocation(lamb_id=lid, conversation_id=cid, task_title=title, step=step_fallback, at=at)
+
+
+def subagent_invocations_in(host: str, d: dict, line_offset: int) -> list[SubagentInvocation]:
+    """从一行会话记录里提取 invoke_subagent 调用（7.63 自动发现）。"""
+    out: list[SubagentInvocation] = []
+    step = d.get("step_index")
+    base = str(step) if step is not None else f"@{line_offset}"
+    tcs = d.get("tool_calls")
+    if isinstance(tcs, list):
+        for i, tc in enumerate(tcs):
+            if isinstance(tc, dict) and tc.get("name") == "invoke_subagent":
+                out.append(_extract_subagent_fields(tc, d, f"{base}:{i}"))
+    if out:
+        return out
+    if d.get("name") == "invoke_subagent" or d.get("tool_name") == "invoke_subagent" or d.get("tool") == "invoke_subagent" or d.get("type") == "invoke_subagent":
+        out.append(_extract_subagent_fields(d, d, base))
+        return out
+    pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+    if pl.get("name") == "invoke_subagent" or pl.get("tool_name") == "invoke_subagent":
+        out.append(_extract_subagent_fields(pl, d, base))
+        return out
+    msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+    content = msg.get("content") if isinstance(msg.get("content"), list) else (d.get("content") if isinstance(d.get("content"), list) else [])
+    for i, item in enumerate(content):
+        if isinstance(item, dict) and item.get("name") == "invoke_subagent":
+            out.append(_extract_subagent_fields(item, d, f"{base}:{i}"))
+    return out
+

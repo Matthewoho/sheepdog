@@ -18,9 +18,9 @@ from .models import Message
 from . import duty
 from . import media
 from .card import plain_text
-from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAST_ACTIVITY_TAIL, activity_at, commands_in, first_match,
-                    human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts, record_time, redact,
-                    scan_jsonl, tool_actions, user_turn)
+from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTIVITY_TAIL, activity_at, commands_in,
+                    first_match, human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts,
+                    record_time, redact, scan_jsonl, subagent_invocations_in, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
                       adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
@@ -2425,6 +2425,8 @@ class Dispatcher:
             return  # 命令行宿主这一轮还在后台跑（或等重试）：跑完由 _finish_run 收尾，不按回执超时算
         sent = _parse(t["dispatched_at"])
         now = _now()
+        if duty.fresh_active_lambs(self.store, t["topic_id"], now, self.cfg.lamb.timeout_minutes):
+            return
         vmins = self.cfg.session.verify_transcript_minutes
         if (vmins > 0 and self.topic_host(t) == ANTIGRAVITY and (batch or "").startswith("b")
                 and sent is not None and now - sent >= timedelta(minutes=vmins)
@@ -3826,7 +3828,7 @@ class Dispatcher:
         """sheepdog 自己刚建的会话：各种用途都从头读（第一轮跑的命令也要审）。记录文件还没有，路径先空着。"""
         if not topic_id or not conversation_id:
             return
-        for purpose in (COMPACTION, AUDIT, DUTY):
+        for purpose in (COMPACTION, AUDIT, DUTY, LAMB_DISCOVERY):
             self.store.set_cursor(topic_id, purpose, conversation_id, "", 0)
 
     def _follow(self, t, purpose: str, handle, backfill: int = 0) -> None:
@@ -3971,28 +3973,107 @@ class Dispatcher:
         return self.playbook.render(f"{REMINDERS_DIR}/{key}.md", session_title=self._session_title(t),
                                     topic_id=t["topic_id"])
 
+    # ---------- 羔羊（7.63） ----------
+    def _scan_lambs(self) -> list[str]:
+        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用，若未显式 lamb register，自动补建一条 kind='subagent' 的 lambs 记录。"""
+        discovered: list[str] = []
+        for t in self.store.list_topics():
+            if (t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS) or t["state"] == sm.CLOSED \
+                    or not t["conversation_id"]:
+                continue
+            tid, host = t["topic_id"], self.topic_host(t)
+
+            def handle(off: int, d: dict, tid=tid, host=host) -> None:
+                for inv in subagent_invocations_in(host, d, off):
+                    if inv.conversation_id and self.store.find_lamb_by_cid(inv.conversation_id) is not None:
+                        continue
+                    active = self.store.get_active_lambs(tid)
+                    matched = next((lb for lb in active if lb["task_title"] == inv.task_title), None)
+                    if matched is not None:
+                        if inv.conversation_id and not matched["conversation_id"]:
+                            self.store.update_lamb(matched["lamb_id"], conversation_id=inv.conversation_id,
+                                                   last_act_at=inv.at or now_iso())
+                        continue
+                    raw_id = (inv.lamb_id or "").strip()
+                    if raw_id.startswith("lamb_") and self.store.get_lamb(raw_id) is None:
+                        lid = raw_id
+                    else:
+                        digest = hashlib.sha1(
+                            f"{tid}:{off}:{inv.step}:{inv.task_title}:{inv.conversation_id}".encode("utf-8")
+                        ).hexdigest()[:8]
+                        lid = f"lamb_{digest}"
+                    if self.store.get_lamb(lid) is not None:
+                        continue
+                    ts = inv.at or now_iso()
+                    self.store.create_lamb(lid, tid, kind="subagent", task_title=inv.task_title or "subagent",
+                                           conversation_id=inv.conversation_id or None, state="running",
+                                           started_at=ts, last_act_at=ts)
+                    discovered.append(lid)
+                    log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
+
+            self._follow(t, LAMB_DISCOVERY, handle, backfill=LAST_ACTIVITY_TAIL)
+        return discovered
+
+    discover_lambs_from_transcript = _scan_lambs
+
+    def _tick_lambs(self) -> list[str]:
+        """7.63：每轮扫描 invoke_subagent、刷新活跃羔羊心跳、判定羔羊超时（timeout_minutes），并向母羊回流已结束羔羊的 lamb_report。"""
+        self._scan_lambs()
+        now = _now()
+        timeout_delta = timedelta(minutes=self.cfg.lamb.timeout_minutes)
+        for lb in self.store.get_active_lambs():
+            lid, tid = lb["lamb_id"], lb["parent_topic_id"]
+            last_dt = _parse(lb["last_act_at"] or "") or _parse(lb["started_at"] or "")
+            if lb["conversation_id"]:
+                tp = transcript_path(lb["conversation_id"])
+                act = last_activity_at(ANTIGRAVITY, tp) if tp.exists() else None
+                if act is not None and (last_dt is None or act > last_dt):
+                    last_dt = act
+                    self.store.update_lamb(lid, last_act_at=act.astimezone().isoformat(timespec="seconds"))
+            if last_dt is not None and now - last_dt >= timeout_delta:
+                summary = lb["result_summary"] or f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时"
+                complete_lamb(self.store, lid, summary=summary, state="timeout")
+                log.warning("羔羊 %s（母羊 %s）超过 %d 分钟无心跳，已标为 timeout 并唤醒母羊",
+                            lid, tid, self.cfg.lamb.timeout_minutes)
+        reported: list[str] = []
+        for lb in self.store.get_unreported_finished_lambs():
+            complete_lamb(self.store, lb["lamb_id"], summary=lb["result_summary"] or "", state=lb["state"])
+            reported.append(lb["lamb_id"])
+        return reported
+
     def _audit_commands(self) -> None:
-        """K3：增量扫 [audit] topics 对应会话新跑的命令，命中 danger_patterns 的记下来，再按会话合并报警。"""
+        """K3：增量扫 [audit] topics 对应会话（及名下羔羊 7.63）新跑的命令，命中 danger_patterns 的记下来，再按会话合并报警。"""
         a = self.cfg.audit
         patterns, ignores = a.patterns, a.ignores
         if patterns:
             for tid in a.topics:
                 t = self.store.get_topic(tid)
-                if t is None or t["state"] == sm.CLOSED or not t["conversation_id"]:
+                if t is None or t["state"] == sm.CLOSED:
                     continue
-                host, cid = self.topic_host(t), t["conversation_id"]
+                host = self.topic_host(t)
+                targets: list[tuple[dict, str]] = []
+                if t["conversation_id"]:
+                    targets.append((t, t["conversation_id"]))
+                for lb in self.store.list_lambs(parent_topic_id=tid, include_finished=True):
+                    if lb["conversation_id"]:
+                        lt = {"topic_id": f"{tid}:lamb:{lb['lamb_id']}", "conversation_id": lb["conversation_id"],
+                              "host": ANTIGRAVITY}
+                        targets.append((lt, lb["conversation_id"]))
+                for target_t, cid in targets:
+                    thost = self.topic_host(target_t)
 
-                def handle(off: int, d: dict, tid=tid, host=host, cid=cid) -> None:
-                    for c in commands_in(host, d, off):
-                        pat = first_match(c.text, patterns)
-                        if pat and (skip := first_match(c.text, ignores)):
-                            log.info("会话 %s 的命令命中 %s，但也命中忽略规则 %s，不报", tid, pat, skip)
-                            continue
-                        shown = redact(c.text)
-                        if pat and self.store.add_audit_hit(tid, cid, c.step, shown, pat, c.at):
-                            log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, pat, shown)
+                    def handle(off: int, d: dict, tid=tid, host=thost, cid=cid) -> None:
+                        for c in commands_in(host, d, off):
+                            pat = first_match(c.text, patterns)
+                            if pat and (skip := first_match(c.text, ignores)):
+                                log.info("会话 %s 的命令命中 %s，但也命中忽略规则 %s，不报", tid, pat, skip)
+                                continue
+                            shown = redact(c.text)
+                            if pat and self.store.add_audit_hit(tid, cid, c.step, shown, pat, c.at):
+                                log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, pat, shown)
 
-                self._follow(t, AUDIT, handle)
+                    is_lamb = str(target_t["topic_id"]).startswith(f"{tid}:lamb:")
+                    self._follow(target_t, AUDIT, handle, backfill=LAST_ACTIVITY_TAIL if is_lamb else 0)
         self._flush_audit()
 
     def _flush_audit(self) -> None:
@@ -4003,7 +4084,12 @@ class Dispatcher:
         不看给主人的上一条通知发出去没有（还在待发的那条由通知账本接着重试），所以前一条没发出去也压不住新的。"""
         groups: dict[str, list] = {}
         for h in self.store.pending_audit_hits():
-            groups.setdefault(h["topic_id"], []).append(h)
+            tid = h["topic_id"]
+            if self.store.get_topic(tid) is None:
+                lb = self.store.get_lamb(tid) or self.store.find_lamb_by_cid(h["conversation_id"] or tid)
+                if lb is not None:
+                    tid = lb["parent_topic_id"]
+            groups.setdefault(tid, []).append(h)
         cutoff = _now() - timedelta(minutes=AUDIT_MERGE_MINUTES)
         for tid, hits in groups.items():
             reported, alerts = self._audit_window(tid, cutoff)
@@ -4037,18 +4123,35 @@ class Dispatcher:
         """经机器人私聊主人；给犯规的会话、[audit] also_notify 的会话各排一条系统提示。事实在这里，措辞在 playbook。
         nth：这是这个会话 10 分钟内第几次报警（三处都写明）。mark：把这些命中记成已报（在给主人的通知落了账本之后、
         发出去之前做；没有发送渠道时也照样记）。两条系统提示先排进账本，再给主人发。"""
+        if self.store.get_topic(tid) is None:
+            lb_t = self.store.get_lamb(tid) or self.store.find_lamb_by_cid(tid)
+            if lb_t is not None:
+                tid = lb_t["parent_topic_id"]
         t = self.store.get_topic(tid)
         title = (self._session_title(t) if t is not None else "") or tid
         label = HOST_LABEL.get(self.topic_host(t), self.topic_host(t)) if t is not None else ""
-        # 同一条命令（脱敏后一样）只列一行，后面标次数
+        # 同一条命令（脱敏后一样）只列一行，后面标次数；7.63：由羔羊执行的命令注明（由羔羊 <lamb_id> 执行）
         seen: dict[str, list] = {}
         for h in hits:
             seen.setdefault(h["command"], []).append(h)
         lines = []
+        lamb_ids: list[str] = []
         for cmd, hs in seen.items():
             times = "、".join(dict.fromkeys(local_hhmm(h["ran_at"]) for h in hs if h["ran_at"]))
-            lines.append(f"- {times + ' ' if times else ''}`{cmd}`" + (f"（{len(hs)} 次）" if len(hs) > 1 else ""))
+            lamb_suffix = ""
+            for h in hs:
+                lb = self.store.find_lamb_by_cid(h["conversation_id"]) if h["conversation_id"] else None
+                if lb is not None:
+                    if lb["lamb_id"] not in lamb_ids:
+                        lamb_ids.append(lb["lamb_id"])
+                    if f"由羔羊 {lb['lamb_id']} 执行" not in cmd:
+                        lamb_suffix = f"（由羔羊 {lb['lamb_id']} 执行）"
+                    break
+            lines.append(
+                f"- {times + ' ' if times else ''}`{cmd}`{lamb_suffix}" + (f"（{len(hs)} 次）" if len(hs) > 1 else "")
+            )
         commands = "\n".join(lines)
+        lamb_head = f"（由羔羊 {'、'.join(lamb_ids)} 执行）" if lamb_ids else ""
         notify = [x for x in self.cfg.audit.also_notify if x != tid and self._audit_target_ok(x)]
         cli = self.cfg.cli_command
         count = f"这是这个会话 {AUDIT_MERGE_MINUTES} 分钟内第 {nth} 次报警"
@@ -4057,7 +4160,7 @@ class Dispatcher:
         if offender_ok:
             why = self.playbook.render("audit_offender.md", session_title=title, topic_id=tid, commands=commands,
                                        alert_count=str(nth))
-            text = f"⚠️ sheepdog 在你的会话记录里看到你跑了下面的命令（命中危险命令清单；{count}）：\n{commands}"
+            text = f"⚠️ sheepdog 在你的会话记录里看到你{lamb_head}跑了下面的命令（命中危险命令清单；{count}）：\n{commands}"
             self.store.add_system_message(tid, "audit_offender", with_cli(text + (f"\n{why}" if why else ""), cli))
         # 2. 要另外知会的会话
         for x in notify:
@@ -4065,12 +4168,12 @@ class Dispatcher:
             why = self.playbook.render("audit_notify.md", session_title=self._session_title(xt), topic_id=x,
                                        commands=commands, offender_title=title, offender_topic=tid,
                                        alert_count=str(nth))
-            text = f"⚠️ 「{title}」（topic `{tid}`）跑了下面的命令（{count}）：\n{commands}"
+            text = f"⚠️ 「{title}」（topic `{tid}`）{lamb_head}跑了下面的命令（{count}）：\n{commands}"
             self.store.add_system_message(x, "audit_notify", with_cli(text + (f"\n{why}" if why else ""), cli))
         # 3. 主人（先落通知账本、记下这些命中已报，再发；没有发送渠道时只记账）
         done = (["已提示这个会话停手"] if offender_ok else []) + ([f"已告诉 {'、'.join(notify)} 别重复操作"] if notify else [])
         sent = self._notify_owner(f"🐕 汇报 · 会话跑了危险命令 [{tid}]\n「{title}」（topic `{tid}`{'，' + label if label else ''}）"
-                                  f"跑了下面的命令（命中 [audit] danger_patterns；{count}）：\n{commands}"
+                                  f"{lamb_head}跑了下面的命令（命中 [audit] danger_patterns；{count}）：\n{commands}"
                                   + (f"\n{'；'.join(done)}。" if done else ""),
                                   "危险命令报警", tid, before_send=mark)
         if not sent and mark is not None:
@@ -4262,6 +4365,11 @@ class Dispatcher:
         lock = getattr(sink, "lock_streak_since", None)
         if lock is not None and t["conversation_id"] and (since := lock(t["conversation_id"])) is not None:
             return duty.OCCUPIED, f"{label} 应用开着它（{hm(since)} 起写锁冲突）", "", False
+        # 7.63：心跳透传（防误报失联）：名下存在 running 且未超时的羔羊时，母羊视为 waiting，不判 stalled / lost，不向主人发失联报警
+        fresh_lambs = duty.fresh_active_lambs(self.store, tid, now, self.cfg.lamb.timeout_minutes)
+        if fresh_lambs:
+            lb0 = fresh_lambs[0]
+            return duty.WAITING, f"等待羔羊 {lb0['lamb_id']} ({lb0['task_title']})", "", False
         # 2. 失联：后台进程没了还没交结果
         if host != ANTIGRAVITY and t["state"] in (sm.FAILED, sm.ATTENTION):
             run = self.store.latest_run_for_topic(tid)
@@ -4618,6 +4726,10 @@ class Dispatcher:
             self._check_receipt(self.store.get_topic(tid))
         self._check_handovers()
         self._tick_watches(set(tids))
+        try:  # 7.63：羔羊发现、超时与完工汇报回流
+            self._tick_lambs()
+        except Exception as e:
+            log.warning("羔羊状态检查出错: %s", e)
         self._expire_escalations()
         try:  # 7.36：开着的「需要你定」补来源、判可能已处理、排核实 / 快到期提醒。出错不挡投递
             from . import pending as pend
@@ -5226,6 +5338,9 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
       你定」、不记看板转交，记进返回值的 skipped；uncertain / missed / failed / context 照旧可以转。quote / note 不受影响。
       7.50#6：若状态为 delivered 但 Antigravity 会话记录里找不到该批次号，允许重投。
     """
+    from . import outbound
+    if msg := outbound.lamb_violation_message(store, "forward", topic_id=topic_id):
+        raise ValueError(msg)
     _check_target(store, topic_id, "转交")
     ids = list(dict.fromkeys(i.strip() for i in message_ids if i.strip()))
     quote, note = (quote or "").strip(), (note or "").strip()
@@ -5345,6 +5460,9 @@ def close_session(store: Store, topic_id: str) -> None:
 
 def add_watch(store: Store, topic_id: str, person_id: str, chat_id: str = "", note: str = "") -> int:
     """登记一条等待（7.4）。总线和 managed 会话都可以登记。"""
+    from . import outbound
+    if msg := outbound.lamb_violation_message(store, "watch", topic_id=topic_id):
+        raise ValueError(msg)
     if topic_id != BUS_TOPIC_ID:
         _check_target(store, topic_id, "登记等待")
     elif store.get_topic(BUS_TOPIC_ID) is None:
@@ -5355,12 +5473,136 @@ def add_watch(store: Store, topic_id: str, person_id: str, chat_id: str = "", no
 
 
 def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> Path:
-    status = receipt.get("status")
-    if status not in sm.RECEIPT_EVENTS:
-        raise ValueError(f"status 必须是 {sorted(sm.RECEIPT_EVENTS)} 之一，收到 {status!r}")
-    d = cfg.receipts_dir / topic_id
-    d.mkdir(parents=True, exist_ok=True)
-    p = d / f"{batch_id}.json"
-    receipt = {**receipt, "received_at": now_iso()}
-    p.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
-    return p
+    from . import outbound
+    store = Store(cfg.db_path) if cfg.db_path.exists() else None
+    try:
+        if msg := outbound.lamb_violation_message(store, "receipt", topic_id=topic_id):
+            raise ValueError(msg)
+        status = receipt.get("status")
+        if status not in sm.RECEIPT_EVENTS:
+            raise ValueError(f"status 必须是 {sorted(sm.RECEIPT_EVENTS)} 之一，收到 {status!r}")
+        d = cfg.receipts_dir / topic_id
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{batch_id}.json"
+        receipt = {**receipt, "received_at": now_iso()}
+        p.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+        anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
+        has_lamb_anchor = any(isinstance(a, str) and a.startswith("lamb:") for a in anchors)
+        if store is not None and (status == "waiting" or has_lamb_anchor):
+            t = store.get_topic(topic_id)
+            if t is not None and t["pending_batch_id"] == batch_id and t["state"] == sm.RUNNING:
+                eff_status = "handled" if is_standing_topic(t) and status == "done" else status
+                new_state = sm.transition(t["state"], sm.RECEIPT_EVENTS.get(eff_status, "receipt_handled"))
+                store.finish_dispatch(batch_id, "acked", json.dumps(receipt, ensure_ascii=False))
+                store.mark_batch_state(batch_id, "acked")
+                fields: dict = {
+                    "state": new_state,
+                    "pending_batch_id": None,
+                    "retries": 0,
+                    "summary": receipt.get("summary", t["summary"]),
+                }
+                if merged_anchors := Dispatcher._receipt_anchors(t, receipt):
+                    fields["anchors_json"] = merged_anchors
+                store.update_topic(topic_id, **fields)
+                duty.apply_receipt_work(store, topic_id, receipt, log)
+                store.add_history(topic_id, "receipt",
+                                  f"{batch_id} {status}：{duty.short(str(receipt.get('summary') or ''), 80)}")
+            elif t is not None and has_lamb_anchor:
+                duty.apply_receipt_work(store, topic_id, receipt, log)
+        return p
+    finally:
+        if store is not None:
+            store.close()
+
+
+# ======================= 羔羊生命周期（7.63） =======================
+def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str = "subagent",
+                  conversation_id: str | None = None, lamb_id: str | None = None,
+                  pid: int | None = None, log_path: str | None = None) -> str:
+    """7.63：登记一只羔羊（subagent 或 cli），返回 lamb_id。"""
+    parent_topic_id = (parent_topic_id or "").strip()
+    if parent_topic_id and not parent_topic_id.startswith("tp_"):
+        parent_topic_id = "tp_" + parent_topic_id
+    if store.get_topic(parent_topic_id) is None:
+        raise ValueError(f"母羊会话 {parent_topic_id} 不存在")
+    if kind not in ("subagent", "cli"):
+        raise ValueError(f"kind 必须是 subagent 或 cli，收到 {kind!r}")
+    lid = (lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
+    if not lid.startswith("lamb_"):
+        lid = "lamb_" + lid
+    title = (task_title or "").strip() or lid
+    store.create_lamb(lid, parent_topic_id, kind=kind, task_title=title,
+                      conversation_id=(conversation_id or "").strip() or None,
+                      pid=pid, state="running", log_path=log_path)
+    return lid
+
+
+def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "done") -> dict:
+    """7.63：羔羊完工 / 失败 / 超时收尾：更新 lambs 表、关闭母羊名下对应的 work_items (lamb:<id>)、向母羊排入 lamb_report 系统消息。"""
+    lid = (lamb_id or "").strip()
+    lb = store.get_lamb(lid)
+    if lb is None:
+        raise ValueError(f"羔羊 {lid} 不存在")
+    final_state = state if state in ("done", "failed", "timeout") else "done"
+    ts = now_iso()
+    summary = (summary or "").strip() or (lb["result_summary"] or f"羔羊 {lid} 已结束（{final_state}）")
+    already_reported = bool(lb["reported_at"])
+    store.update_lamb(
+        lid,
+        state=final_state,
+        finished_at=lb["finished_at"] or ts,
+        last_act_at=ts,
+        result_summary=summary,
+        reported_at=lb["reported_at"] or ts,
+    )
+    pt_id = lb["parent_topic_id"]
+    nk = duty.norm_key(f"lamb:{lid}")
+    w = store.get_work(pt_id, nk)
+    if w is not None and not w["closed_at"]:
+        store.update_work(w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts)
+        store.close_route(pt_id, nk, "羔羊已完成", ts)
+        duty.record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+    mid = ""
+    if not already_reported:
+        pt = store.get_topic(pt_id)
+        if pt is not None and pt["state"] == sm.RUNNING and pt["pending_batch_id"] and not store.get_active_lambs(pt_id):
+            old_bid = pt["pending_batch_id"]
+            old_d = store.get_dispatch(old_bid)
+            if old_d is not None and old_d["state"] == "sent":
+                store.finish_dispatch(old_bid, "acked", json.dumps({"status": "waiting", "summary": f"等待羔羊 {lid} 结束"}, ensure_ascii=False))
+                store.mark_batch_state(old_bid, "acked")
+            store.update_topic(pt_id, state=sm.ACTIVE, pending_batch_id=None, retries=0)
+        log_hint = f"\n日志路径：`{lb['log_path']}`" if lb["log_path"] else ""
+        text = (
+            f"【系统提示 · 羔羊完工汇报】\n"
+            f"🐑 羔羊 `{lid}`（[{lb['kind']}] {lb['task_title']}）已结束，状态：`{final_state}`。\n"
+            f"结果摘要：{summary}{log_hint}"
+        )
+        mid = store.add_system_message(pt_id, "lamb_report", text, tags=[f"lamb:{lid}", f"lamb_state:{final_state}"])
+    return {"lamb_id": lid, "parent_topic_id": pt_id, "state": final_state, "summary": summary, "message_id": mid}
+
+
+def cancel_lamb(store: Store, lamb_id: str, reason: str = "") -> dict:
+    """7.63：取消一只羔羊，若后台进程仍在运行则终止进程并更新状态。"""
+    import os
+    import signal
+    lid = (lamb_id or "").strip()
+    lb = store.get_lamb(lid)
+    if lb is None:
+        raise ValueError(f"羔羊 {lid} 不存在")
+    pid = lb["pid"]
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    ts = now_iso()
+    summary = (reason or "").strip() or "已手动取消"
+    store.update_lamb(lid, state="failed", finished_at=lb["finished_at"] or ts, last_act_at=ts,
+                      result_summary=summary, reported_at=lb["reported_at"] or ts)
+    nk = duty.norm_key(f"lamb:{lid}")
+    w = store.get_work(lb["parent_topic_id"], nk)
+    if w is not None and not w["closed_at"]:
+        store.update_work(w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts)
+    return {"lamb_id": lid, "parent_topic_id": lb["parent_topic_id"], "state": "failed", "summary": summary}
+

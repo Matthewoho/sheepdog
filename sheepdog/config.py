@@ -738,6 +738,16 @@ class MediaConfig:
             raise ConfigError("[media] max_images_per_batch 必须是正整数")
 
 
+@dataclass
+class LambConfig:
+    """[lamb]（7.63）：羔羊（Subagent / Lamb）纳管配置。"""
+    timeout_minutes: int = 20
+
+    def validate(self) -> None:
+        if isinstance(self.timeout_minutes, bool) or not isinstance(self.timeout_minutes, (int, float)) or self.timeout_minutes <= 0:
+            raise ConfigError("[lamb] timeout_minutes 必须是正数")
+
+
 # 7.56「这个群该不该管」：Config.chat_scope 的三种结果
 OWNER_SIDE = "owner_side"   # 找主人那一侧（找主人聊天、7.51 的话题群）：走自己的分支，先于普通路由，不受 ignore 影响
 IGNORED = "ignored"         # [routing] ignore_chat_ids：不送、不当背景、不当指令、不按话题归属
@@ -788,6 +798,7 @@ class Config:
     hooks: HooksConfig = field(default_factory=HooksConfig)
     run: RunConfig = field(default_factory=RunConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
+    lamb: LambConfig = field(default_factory=LambConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -804,6 +815,11 @@ class Config:
     def runs_dir(self) -> Path:
         """命令行宿主每轮的输入、输出、错误（7.18）：runs/<batch_id>.in / .out / .err"""
         return self.state_dir / "runs"
+
+    @property
+    def lambs_dir(self) -> Path:
+        """羔羊（7.63）后台 worker 日志目录：lambs/<lamb_id>.log"""
+        return self.state_dir / "lambs"
 
     @property
     def media_dir(self) -> Path:
@@ -930,6 +946,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.hooks, data.get("hooks", {}))
     _apply(cfg.run, data.get("run", {}))
     _apply(cfg.media, data.get("media", {}))
+    _apply(cfg.lamb, data.get("lamb", {}))
     hosts = data.get("hosts", {})
     if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
         raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -974,6 +991,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.routing.validate()
     cfg.run.validate()
     cfg.media.validate()
+    cfg.lamb.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

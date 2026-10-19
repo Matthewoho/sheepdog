@@ -229,4 +229,8 @@
 | 7.62 | 长消息（>4 行、>160 字或含代码块）没给白话总结（或总结超 6 行、超 220 字、含代码块）未以退出码 2 拦下，或报错没明确提示「原文不需要改，只需要增加白话总结」导致模型删改原文 | `test_more_card.MoreCardTest.test_762_long_message_rejected_with_preserve_original_guidance` |
 | 7.62 | 带 `more` 折叠面板的卡片读回后认不出「需要你定」，或「待办」清单摘录把 `more` 折叠面板里的长明细漏出来 | `test_more_card.MoreCardTest.test_762_readback_and_pending_excerpt_use_summary` |
 | 7.62 | 代回原文里写的 `@人`（`<at id=ou_…>` / `<at user_id="ou_…">`）被一起折进 `more` 里面、外层白话总结看不见 `@人`，或 `<at>` 标签长度挤占 220 字额度 | `test_more_card.MoreCardTest.test_762_at_mentions_hoisted_outside_more_panel` |
-
+| 7.63 | 注册 subagent 羔羊或母羊 transcript 触发 `invoke_subagent` 后没写入 `lambs` 表、`sheepdog board` 未在母羊卡片下缩进展示 `↳ 🐑` 或 `--json` 缺 `lambs` 列表 | `test_lamb.LambTest.test_763_lamb_register_and_board_display` |
+| 7.63 | `sheepdog lamb spawn` 后台 CLI 命令没生成 `lamb_id` 与日志文件、`lamb done` 没更新状态与摘要，或 `lamb list` 过滤运行中 / 全部羔羊不准 | `test_lamb.LambTest.test_763_lamb_spawn_cli_and_done_lifecycle` |
+| 7.63 | 母羊交 `waiting` 回执带 `anchors: ["lamb:<id>"]` 后未当场释放 `pending_batch_id` 导致等待期间新消息阻塞、未在 `work_items` 登记 `lamb:<id>`，或羔羊完工后未向母羊投递 `lamb_report` 批次并关闭事项 | `test_lamb.LambTest.test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back` |
+| 7.63 | 羔羊环境（`SHEEPDOG_LAMB_ID` 或 `lambs.conversation_id`）越权调用 `reply` / `reply-card` / `ask` / `report` / `forward` / `receipt` / `resolve` / `watch` 未以退出码 2 硬拦截 | `test_lamb.LambTest.test_763_lamb_permission_block_outbound_and_receipt` |
+| 7.63 | 母羊等待羔羊期间超 `stall_minutes` 无自身动作，活跃羔羊新鲜心跳未透传导致母羊被误判 `stalled` / `lost` 发失联报警，或羔羊跑危险命令未归属回母羊并注明由羔羊执行 | `test_lamb.LambTest.test_763_active_lamb_prevents_parent_stalled_alert` |

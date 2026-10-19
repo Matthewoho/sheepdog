@@ -183,25 +183,43 @@ def record_closed(store: Store, w) -> None:
 def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> list[str]:
     """回执里的 work 字段（Codex 等命令行会话写不了账本，可以在回执块里带）：效果同 work set。
     格式：{"work": {...}} 或 {"work": [{...}, ...]}，字段 key title state waiting_on until expect to result。
+    7.63：回执里的 anchors 带有 lamb:<id> 时，自动登记/更新母羊名下 key="lamb:<id>"、state="waiting_other" 的活。
     返回登记了哪些钥匙；不合格的条目跳过、记日志。"""
-    items = receipt.get("work") if isinstance(receipt, dict) else None
-    if isinstance(items, dict):
-        items = [items]
-    if not isinstance(items, list):
+    if not isinstance(receipt, dict):
         return []
     done: list[str] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        try:
-            set_work(store, topic_id, str(it.get("key") or ""), title=str(it.get("title") or ""),
-                     state=str(it.get("state") or DOING), waiting_on=str(it.get("waiting_on") or ""),
-                     until=str(it.get("until") or ""), expect=str(it.get("expect") or ""),
-                     to=str(it.get("to") or ""), result=str(it.get("result") or ""))
-            done.append(str(it.get("key")))
-        except DutyError as e:
-            if log is not None:
-                log.warning("会话 %s 回执里的 work 条目不合格，跳过：%s（%s）", topic_id, e, json.dumps(it, ensure_ascii=False))
+    items = receipt.get("work")
+    if isinstance(items, dict):
+        items = [items]
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                set_work(store, topic_id, str(it.get("key") or ""), title=str(it.get("title") or ""),
+                         state=str(it.get("state") or DOING), waiting_on=str(it.get("waiting_on") or ""),
+                         until=str(it.get("until") or ""), expect=str(it.get("expect") or ""),
+                         to=str(it.get("to") or ""), result=str(it.get("result") or ""))
+                done.append(str(it.get("key")))
+            except DutyError as e:
+                if log is not None:
+                    log.warning("会话 %s 回执里的 work 条目不合格，跳过：%s（%s）", topic_id, e, json.dumps(it, ensure_ascii=False))
+    anchors = receipt.get("anchors")
+    if isinstance(anchors, list):
+        for a in anchors:
+            if isinstance(a, str) and a.startswith("lamb:"):
+                lid = a.removeprefix("lamb:").strip()
+                if not lid:
+                    continue
+                lb = store.get_lamb(lid)
+                ttitle = (lb["task_title"] if lb else "") or str(receipt.get("summary") or lid)
+                waiting_on = f"羔羊 {lid} ({ttitle})"
+                try:
+                    set_work(store, topic_id, f"lamb:{lid}", title=ttitle, state=WAITING_OTHER, waiting_on=waiting_on)
+                    done.append(f"lamb:{lid}")
+                except DutyError as e:
+                    if log is not None:
+                        log.warning("会话 %s 回执里的 lamb anchor %s 写进看板出错：%s", topic_id, a, e)
     return done
 
 
@@ -550,8 +568,24 @@ def action_label(run_state: str) -> str:
     return ACTION_NOW if run_state == WORKING else ACTION_LAST
 
 
+def fresh_active_lambs(store: Store, topic_id: str, now: datetime | None = None,
+                       timeout_minutes: float = 20) -> list[dict]:
+    """母羊名下 state='running' 且最近一次心跳未超时的活跃羔羊（7.63）。"""
+    if not hasattr(store, "get_active_lambs"):
+        return []
+    now = now or datetime.now().astimezone()
+    active = store.get_active_lambs(topic_id)
+    out: list[dict] = []
+    for lb in active:
+        dts = [x for x in (_dt(lb.get("started_at") or ""), _dt(lb.get("last_act_at") or "")) if x is not None]
+        ref = max(dts) if dts else None
+        if ref is None or (now - ref) <= timedelta(minutes=timeout_minutes):
+            out.append(lb)
+    return out
+
+
 def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: float = 4,
-              routed_hours: float = 24) -> dict:
+              routed_hours: float = 24, lamb_timeout_minutes: float = 20) -> dict:
     """一张会话卡（board / 摘要共用）：职责、运行状态、此刻 / 最近动作、手上的事、最近做完的 3 件、未读留言数。
     action 字段名不分此刻还是最近，action_label 说明是哪一种。
 
@@ -562,6 +596,17 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
     unread = store.unread_mail(tid)
     c = dict(card) if card is not None else {}
     state = c.get("run_state") or ""
+    detail = c.get("detail") or ""
+    active_lambs = store.get_active_lambs(tid) if hasattr(store, "get_active_lambs") else []
+    fresh_lambs = fresh_active_lambs(store, tid, now, lamb_timeout_minutes) if active_lambs else []
+    if fresh_lambs:
+        l0 = fresh_lambs[0]
+        lamb_wait = f"等待羔羊 {l0['lamb_id']} ({l0['task_title']})"
+        if state in (*STUCK, "", IDLE):
+            state = WAITING
+            detail = lamb_wait
+        elif state == WAITING and not detail:
+            detail = lamb_wait
     work = []
     for w in store.open_work(tid):
         d = dict(w)
@@ -579,7 +624,7 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
         d["source_label"] = SOURCE_LABEL[SRC_ROUTED]
         d["ago"] = ago_text(r["last_at"], now)
         routes.append(d)
-    return {
+    res = {
         "topic_id": tid,
         "title": t["title"],
         "host": (t["host"] if "host" in t.keys() else None) or "antigravity",
@@ -588,7 +633,7 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
         "run_state": state,
         "run_label": RUN_LABEL.get(state, "（还没算，等下一轮）"),
         "spinning": bool(c.get("spinning")),
-        "detail": c.get("detail") or "",
+        "detail": detail,
         # 找不到会话记录：动作写那句话，不带时间（卡片里留着的是记录消失以前的最后一次工具调用，不再当「最近」）
         "no_record": bool(c.get("no_record")),
         "action": NO_RECORD_ACTION if c.get("no_record") else (c.get("action") or ""),
@@ -605,6 +650,9 @@ def card_data(store: Store, t, card, now: datetime | None = None, stale_hours: f
         "recent_done": closed,
         "unread_mail": len(unread),
     }
+    if active_lambs:
+        res["lambs"] = active_lambs
+    return res
 
 
 def state_text(d: dict) -> str:
@@ -641,6 +689,15 @@ def render_board(cards: list[dict], now_label: str, compact: bool = False) -> st
         else:
             lines.append("  最近做完：（无）")
         lines.append(f"  未读留言：{d['unread_mail']}")
+        if d.get("lambs"):
+            lines.append("  活跃羔羊：")
+            for lb in d["lambs"]:
+                hb = lb.get("last_act_at") or lb.get("started_at") or "-"
+                hb_ago = ago_text(hb)
+                hb_str = f"{hb}（{hb_ago}）" if hb_ago else hb
+                lines.append(
+                    f"    ↳ 🐑 {lb['lamb_id']} [{lb['kind']}] {lb['task_title']} · {lb['state']} · 心跳 {hb_str}"
+                )
         for k, label in (("recent_receipts", "最近 3 条回执"), ("recent_actions", "最近 5 个动作")):
             if d.get(k):
                 lines.append(f"  {label}：")
@@ -741,10 +798,12 @@ def board_cards(store: Store, cfg, topic: str = "", exclude: Iterable[str] = (),
     else:
         topics = live_topics(store)
     out = []
+    lamb_timeout = getattr(getattr(cfg, "lamb", None), "timeout_minutes", 20)
     for t in topics:
         if t["topic_id"] in exclude:
             continue
-        d = card_data(store, t, store.get_card(t["topic_id"]), now, cfg.duty.stale_hours, cfg.duty.routed_active_hours)
+        d = card_data(store, t, store.get_card(t["topic_id"]), now, cfg.duty.stale_hours, cfg.duty.routed_active_hours,
+                      lamb_timeout_minutes=lamb_timeout)
         m = minutes_ago(d["compacted_at"], now)
         if m is not None and m <= cfg.duty.compacted_recent_minutes:
             d["compacted_label"] = f"刚被压缩（{ago_text(d['compacted_at'], now)}）"

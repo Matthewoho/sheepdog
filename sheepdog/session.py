@@ -59,6 +59,7 @@ TERMINAL = {CLOSED, MERGED}
 RECEIPT_EVENTS = {
     "handled": "receipt_handled",
     "needs_decision": "receipt_needs_decision",
+    "waiting": "receipt_handled",
     "waiting_external": "receipt_waiting_external",
     "done": "receipt_done",
 }

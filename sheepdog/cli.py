@@ -83,9 +83,9 @@ from . import lastgood
 from . import duty
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
-                     bus_quote_verifier, close_session, delivered_text, display_time, duty_reset_key,
-                     escalation_summary, forward_messages, open_escalations, owner_quote_verifier, unsent_notice_line,
-                     write_receipt)
+                     bus_quote_verifier, cancel_lamb, close_session, complete_lamb, delivered_text, display_time,
+                     duty_reset_key, escalation_summary, forward_messages, open_escalations, owner_quote_verifier,
+                     register_lamb, unsent_notice_line, write_receipt)
 from .models import Message, Mention
 from .playbook import PLAYBOOK_FILES, Playbook
 from .prompts import with_cli
@@ -1491,6 +1491,10 @@ def cmd_reply_card(args) -> int:
     lark-cli im +messages-send --as user --chat-id oc_x --msg-type interactive --content "$(sheepdog reply-card --summary '...' --text '...')"
     """
     cfg = _load_cfg()
+    store = Store(cfg.db_path)
+    if viol := outbound.lamb_violation_message(store, "reply-card", topic_id=getattr(args, "topic", "") or ""):
+        print(f"reply-card 被拒绝: {viol}", file=sys.stderr)
+        return 2
     try:
         text = _body_arg(args.text, args.text_file)
         summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
@@ -1803,6 +1807,11 @@ def cmd_ask(args) -> int:
     kind = args.cmd
     tid = _topic_arg(args.topic)
     try:
+        outbound.check_not_lamb(store, kind, topic_id=tid)
+    except outbound.OutboundError as e:
+        print(f"{kind} 没发: {e}", file=sys.stderr)
+        return e.code
+    try:
         body = _body_arg(args.text, args.file)
         summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
     except OSError as e:
@@ -1904,6 +1913,11 @@ def cmd_reply(args) -> int:
     cfg = _load_cfg()
     store = Store(cfg.db_path)
     tid = _topic_arg(args.topic)
+    try:
+        outbound.check_not_lamb(store, "reply", topic_id=tid)
+    except outbound.OutboundError as e:
+        print(f"代回没发: {e}", file=sys.stderr)
+        return e.code
     try:
         card_text = _body_arg(args.card_text, args.card_file) if args.card_text is not None or args.card_file else ""
         summary = _body_arg(getattr(args, "summary", None), getattr(args, "summary_file", None))
@@ -2049,6 +2063,95 @@ def cmd_topic_group(args) -> int:
     return 0
 
 
+def cmd_lamb(args) -> int:
+    """sheepdog lamb（7.63）：母羊登记/派生/收尾/列出/取消羔羊（Subagent 或后台 CLI 子进程）。"""
+    cfg = _load_cfg()
+    store = Store(cfg.db_path)
+    sub_cmd = args.lamb_cmd
+    if sub_cmd == "register":
+        tid = _topic_arg(args.topic)
+        try:
+            lid = register_lamb(store, tid, args.title, kind=args.kind, conversation_id=args.cid or None,
+                                lamb_id=args.lamb_id or None)
+        except ValueError as e:
+            print(f"lamb register 被拒绝: {e}", file=sys.stderr)
+            return 2
+        lb = store.get_lamb(lid)
+        cid_text = f"，cid={lb['conversation_id']}" if lb and lb["conversation_id"] else ""
+        print(f"已登记羔羊 {lid}（母羊 {tid}，[{args.kind}] {args.title}{cid_text}）")
+        return 0
+    if sub_cmd == "spawn":
+        tid = _topic_arg(args.topic)
+        if store.get_topic(tid) is None:
+            print(f"lamb spawn 被拒绝: 母羊会话 {tid} 不存在", file=sys.stderr)
+            return 2
+        cmd_str = (args.command or "").strip()
+        if not cmd_str:
+            print("lamb spawn 被拒绝: --cmd 不能为空", file=sys.stderr)
+            return 2
+        raw_lid = (args.lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
+        lid = raw_lid if raw_lid.startswith("lamb_") else f"lamb_{raw_lid}"
+        lambs_dir = cfg.lambs_dir
+        lambs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = lambs_dir / f"{lid}.log"
+        env = dict(os.environ)
+        env["SHEEPDOG_LAMB_ID"] = lid
+        try:
+            with log_path.open("ab") as lf:
+                proc = subprocess.Popen(cmd_str, shell=True, stdout=lf, stderr=subprocess.STDOUT,
+                                        env=env, start_new_session=True)
+            try:
+                proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+            register_lamb(store, tid, args.title, kind="cli", lamb_id=lid, pid=proc.pid, log_path=str(log_path))
+        except (OSError, ValueError) as e:
+            print(f"lamb spawn 失败: {e}", file=sys.stderr)
+            return 2
+        print(f"已启动羔羊 {lid}（母羊 {tid}，[cli] {args.title}，pid={proc.pid}，日志 {log_path}）")
+        return 0
+    if sub_cmd == "done":
+        try:
+            r = complete_lamb(store, args.lamb_id, summary=args.summary, state=args.status)
+        except ValueError as e:
+            print(f"lamb done 被拒绝: {e}", file=sys.stderr)
+            return 2
+        print(f"羔羊 {r['lamb_id']} 已标为 {r['state']}（母羊 {r['parent_topic_id']}）：{r['summary']}")
+        return 0
+    if sub_cmd == "cancel":
+        try:
+            r = cancel_lamb(store, args.lamb_id, reason=args.reason)
+        except ValueError as e:
+            print(f"lamb cancel 被拒绝: {e}", file=sys.stderr)
+            return 2
+        print(f"已取消羔羊 {r['lamb_id']}（母羊 {r['parent_topic_id']}）：{r['summary']}")
+        return 0
+    if sub_cmd == "list":
+        tid = _topic_arg(args.topic) if getattr(args, "topic", "") else None
+        rows = [dict(r) for r in store.list_lambs(parent_topic_id=tid, include_finished=bool(args.all))]
+        if getattr(args, "json", False):
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        if not rows:
+            print("没有运行中的羔羊" if not args.all else "没有羔羊记录")
+            return 0
+        for lb in rows:
+            extra = []
+            if lb.get("conversation_id"):
+                extra.append(f"cid={lb['conversation_id']}")
+            if lb.get("pid"):
+                extra.append(f"pid={lb['pid']}")
+            if lb.get("log_path"):
+                extra.append(f"log={lb['log_path']}")
+            if lb.get("result_summary"):
+                extra.append(f"结果={lb['result_summary']}")
+            tail = (" · " + " · ".join(extra)) if extra else ""
+            print(f"- {lb['lamb_id']} [{lb['kind']}] [{lb['state']}] topic={lb['parent_topic_id']} "
+                  f"title={lb['task_title']}{tail}")
+        return 0
+    return 2
+
+
 def cmd_hook_stop(args) -> int:
     from . import hook  # 只读账本、不导入别的；任何异常都不输出、退出码 0
     return hook.stop_main(sys.stdin.buffer, sys.stdout)
@@ -2163,6 +2266,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(func=cmd_redeliver)
 
     sp = sub.add_parser("reply-card")
+    sp.add_argument("--topic", default="", help="可选：调用方会话（tp_x）")
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("--text", help="原有完整回复（长消息自动收进 more 默认折叠区）")
     g.add_argument("--text-file", help="正文文件；- 表示标准输入")
@@ -2336,6 +2440,34 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--dry-run", action="store_true", help="只打印要调的 lark-cli 命令，不建群")
     gsub.add_parser("status", help="只读：配没配、开没开、是不是退回私聊了")
     sp.set_defaults(func=cmd_topic_group)
+
+    sp = sub.add_parser("lamb", help="羔羊管理（7.63）：登记 subagent、派生后台 CLI 子进程、标记完工、查看、取消")
+    lsub = sp.add_subparsers(dest="lamb_cmd", required=True)
+    lr = lsub.add_parser("register", help="登记一只 subagent 羔羊")
+    lr.add_argument("--topic", required=True, help="母羊会话（tp_x）")
+    lr.add_argument("--title", required=True, help="羔羊任务标题")
+    lr.add_argument("--cid", "--conversation-id", dest="cid", default="", help="subagent 的 conversation_id")
+    lr.add_argument("--lamb-id", "--id", dest="lamb_id", default="", help="指定 lamb_id（不填自动生成）")
+    lr.add_argument("--kind", choices=("subagent", "cli"), default="subagent", help="羔羊类型（默认 subagent）")
+    ls = lsub.add_parser("spawn", help="后台起 CLI 羔羊子进程")
+    ls.add_argument("--topic", required=True, help="母羊会话（tp_x）")
+    ls.add_argument("--title", required=True, help="羔羊任务标题")
+    ls.add_argument("--cmd", "--command", dest="command", required=True, help="后台执行的 shell 命令")
+    ls.add_argument("--lamb-id", "--id", dest="lamb_id", default="", help="指定 lamb_id（不填自动生成）")
+    ld = lsub.add_parser("done", help="标记羔羊完工或失败")
+    ld.add_argument("--lamb-id", "--id", dest="lamb_id", required=True, help="羔羊 ID")
+    ld.add_argument("--summary", "--result", dest="summary", required=True, help="结论摘要")
+    ld.add_argument("--status", "--state", dest="status", choices=("done", "failed", "timeout"), default="done")
+    ld.add_argument("--topic", default="", help="可选：母羊会话（tp_x）")
+    ll = lsub.add_parser("list", help="列出运行中或全部羔羊")
+    ll.add_argument("--topic", default="", help="按母羊会话（tp_x）过滤")
+    ll.add_argument("--all", action="store_true", help="包含已结束的羔羊")
+    ll.add_argument("--json", action="store_true", help="输出 JSON")
+    lc = lsub.add_parser("cancel", help="取消并终止运行中的羔羊")
+    lc.add_argument("--lamb-id", "--id", dest="lamb_id", required=True, help="羔羊 ID")
+    lc.add_argument("--reason", "--summary", dest="reason", default="", help="取消原因")
+    lc.add_argument("--topic", default="", help="可选：母羊会话（tp_x）")
+    sp.set_defaults(func=cmd_lamb)
 
     sp = sub.add_parser("hook", help="Antigravity 生命周期 hook（由 hooks.json 调用，不是给人敲的）")
     hsub = sp.add_subparsers(dest="hook", required=True)

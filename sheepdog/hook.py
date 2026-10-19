@@ -189,6 +189,34 @@ def _target(conn: sqlite3.Connection, conversation_id: str):
     return t if (t["host"] or ANTIGRAVITY) == ANTIGRAVITY else None
 
 
+def _find_lamb(conn: sqlite3.Connection, conversation_id: str):
+    """7.63：conversationId 不在 topics 表时，查是不是登记在 lambs 表的羔羊；命中则可回溯到 parent_topic_id。"""
+    try:
+        return conn.execute(
+            "SELECT * FROM lambs WHERE conversation_id=? ORDER BY (state='running') DESC, started_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def resolve_lamb_attribution(conn_or_store, conversation_id: str) -> tuple[str, str, str] | None:
+    """7.63：按 conversation_id 查 lambs 表回溯母羊（parent_topic_id, lamb_id, '（由羔羊 <lamb_id> 执行）'）。"""
+    cid = (conversation_id or "").strip()
+    if not cid:
+        return None
+    if hasattr(conn_or_store, "find_lamb_by_cid"):
+        lb = conn_or_store.find_lamb_by_cid(cid)
+    else:
+        row = _find_lamb(conn_or_store, cid)
+        lb = dict(row) if row is not None else None
+    if not lb:
+        return None
+    lid = lb["lamb_id"]
+    ptid = lb["parent_topic_id"]
+    return ptid, lid, f"（由羔羊 {lid} 执行）"
+
+
 def _occupied(card, cfg: Config, now: datetime) -> bool:
     """被主人占着：口径同羊群看板（卡片判为被主人占着，或主人 human_attach_minutes 分钟内在会话里亲自说过话）。"""
     if card is None:
@@ -234,6 +262,14 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None,
         t = _target(conn, cid.strip())
         info["managed"] = t is not None
         if t is None:
+            lb = _find_lamb(conn, cid.strip())
+            if lb is not None:
+                lid, ptid = lb["lamb_id"], lb["parent_topic_id"]
+                info["topic"] = ptid
+                info["lamb_id"] = lid
+                info["parent_topic_id"] = ptid
+                info["note"] = f"（由羔羊 {lid} 执行）"
+                return why(f"羔羊 {lid}（隶属 {ptid}）（由羔羊 {lid} 执行），不由 Stop hook 拦回执")
             return why("不是牧羊犬管的 Antigravity 会话")
         info["topic"] = t["topic_id"]
         if t["state"] != sm.RUNNING or not t["pending_batch_id"]:
