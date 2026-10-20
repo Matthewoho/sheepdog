@@ -195,43 +195,10 @@ def _card_body_elements(body_text: str, summary: str = "", *, hoist_at: bool = T
 def build_reply_card(text: str, suffix: str, width_mode: str = "compact", summary: str = "") -> dict:
     if not (text or "").strip():
         raise ValueError("正文为空")
-    s, d, _ = resolve_summary_and_body(text, summary, require_summary=False, hoist_at=True)
-    if s and suffix:
-        elements = [
-            {"tag": "markdown", "content": s},
-            {
-                "tag": "column_set",
-                "flex_mode": "none",
-                "horizontal_spacing": "8px",
-                "columns": [
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "vertical_align": "top",
-                        "elements": [build_more_panel(d)],
-                    },
-                    {
-                        "tag": "column",
-                        "width": "auto",
-                        "vertical_align": "top",
-                        "elements": [
-                            {
-                                "tag": "markdown",
-                                "content": f"<font color='grey'>{suffix}</font>",
-                                "text_align": "right",
-                                "text_size": "notation",
-                            }
-                        ],
-                    },
-                ],
-            },
-        ]
-    else:
-        elements = _card_body_elements(text, summary, hoist_at=True)
-        if suffix:
-            elements.append({"tag": "markdown", "content": f"<font color='grey'>{suffix}</font>",
-                             "text_align": "right", "text_size": "notation"})
+    elements = _card_body_elements(text, summary, hoist_at=True)
+    if suffix:
+        elements.append({"tag": "markdown", "content": f"<font color='grey'>{suffix}</font>",
+                         "text_align": "right", "text_size": "notation"})
     return {"schema": "2.0", "config": {"width_mode": width_mode}, "body": {"elements": elements}}
 
 

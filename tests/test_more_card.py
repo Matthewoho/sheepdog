@@ -53,12 +53,20 @@ class MoreCardTest(ThreadsBase):
         self.assertEqual(panel["header"]["icon_expanded_angle"], -180)
         self.assertEqual(panel["elements"], [{"tag": "markdown", "content": expected_detail}])
 
-    def _assert_reply_same_row(self, row_el: dict, expected_detail: str) -> None:
-        self.assertEqual(row_el["tag"], "column_set")
-        cols = row_el["columns"]
-        self.assertEqual(len(cols), 2)
-        self._assert_more_panel(cols[0]["elements"][0], expected_detail)
-        self.assertIn(MARK, cols[1]["elements"][0]["content"])
+    def _assert_reply_full_width_more(self, elements: list[dict], expected_summary: str, expected_detail: str) -> None:
+        self.assertEqual(len(elements), 3)
+        self.assertEqual(elements[0], {"tag": "markdown", "content": expected_summary})
+        self._assert_more_panel(elements[1], expected_detail)
+        self.assertEqual(
+            elements[2],
+            {
+                "tag": "markdown",
+                "content": f"<font color='grey'>{MARK}</font>",
+                "text_align": "right",
+                "text_size": "notation",
+            },
+        )
+        self.assertNotIn('"column_set"', json.dumps(elements, ensure_ascii=False))
 
     def test_762_owner_ask_and_report_fold_with_summary_and_more_panel(self):
         # 1) ask 通过 --summary 传白话总结，原文 LONG_DETAIL 一字不改收进 more 面板
@@ -84,13 +92,33 @@ class MoreCardTest(ThreadsBase):
         self._assert_more_panel(els2[1], LONG_DETAIL)
         self.assertEqual(els2[2], {"tag": "markdown", "content": f"<at id={ME}></at>"})
 
+    def test_762_reply_more_panel_is_top_level_full_width_not_in_column_set(self):
+        # 1) 单元层：build_reply_card 折叠面板直接作为 body.elements[1] 顶层元素，严禁套在 column_set 左列导致展开后右侧留白 1/3
+        card = build_reply_card(LONG_DETAIL, MARK, summary=SUMMARY)
+        els = card["body"]["elements"]
+        self._assert_reply_full_width_more(els, SUMMARY, LONG_DETAIL)
+        self.assertNotIn('"column_set"', json.dumps(card, ensure_ascii=False))
+
+        # 2) CLI 端到端：reply 与 reply-card 生成的卡片顶层均为 [summary_md, collapsible_panel, suffix_md]
+        m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="排查结果发我一下")
+        self.pull(m_alice)
+        self.deliver()
+        rc, out, err = self.cli(
+            "reply", "--topic", "tp_alpha", "--to", m_alice,
+            "--summary", SUMMARY, "--card-text", LONG_DETAIL,
+        )
+        self.assertEqual(rc, 0, out + err)
+        sent_card = card_of(self.lark.sent("+messages-reply")[-1])
+        self._assert_reply_full_width_more(sent_card["body"]["elements"], SUMMARY, LONG_DETAIL)
+        self.assertNotIn('"column_set"', json.dumps(sent_card, ensure_ascii=False))
+
     def test_762_reply_and_reply_card_fold_with_summary_and_inline_delimiter(self):
         # 先入账一条同事消息供 reply 回复
         m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="请问灰度情况？")
         self.pull(m_alice)
         self.deliver()
 
-        # 1) sheepdog reply --card-text + --summary-file：more 面板与 [🐕Sheepdog Reply] 在同一行（column_set 左 more 右标记）
+        # 1) sheepdog reply --card-text + --summary-file：more 面板作为顶层全宽元素，[🐕Sheepdog Reply] 紧随其后居右下角
         sum_file = Path(self.tmp.name) / "sum.txt"
         sum_file.write_text(SUMMARY, encoding="utf-8")
         rc, out, err = self.cli(
@@ -101,9 +129,7 @@ class MoreCardTest(ThreadsBase):
         call = self.lark.sent("+messages-reply")[-1]
         c = card_of(call)
         els = c["body"]["elements"]
-        self.assertEqual(len(els), 2)
-        self.assertEqual(els[0], {"tag": "markdown", "content": SUMMARY})
-        self._assert_reply_same_row(els[1], LONG_DETAIL)
+        self._assert_reply_full_width_more(els, SUMMARY, LONG_DETAIL)
 
         # 2) sheepdog reply-card 支持内联 ---more---（以及兼容 ---agent-read---）
         for delim in (MORE_DELIMITER, "---agent-read---"):
@@ -111,9 +137,7 @@ class MoreCardTest(ThreadsBase):
             self.assertEqual(rc_card, 0, err_card)
             parsed = json.loads(out_card)
             c_els = parsed["body"]["elements"]
-            self.assertEqual(len(c_els), 2)
-            self.assertEqual(c_els[0], {"tag": "markdown", "content": SUMMARY})
-            self._assert_reply_same_row(c_els[1], LONG_DETAIL)
+            self._assert_reply_full_width_more(c_els, SUMMARY, LONG_DETAIL)
 
     def test_762_long_message_rejected_with_preserve_original_guidance(self):
         m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="长回复测试")
@@ -206,8 +230,9 @@ class MoreCardTest(ThreadsBase):
         self.assertEqual(rc, 0, out + err)
         c = card_of(self.lark.sent("+messages-reply")[-1])
         els = c["body"]["elements"]
-        self.assertEqual(els[0], {"tag": "markdown", "content": f"<at id={ALICE}></at> {SUMMARY}"})
-        self._assert_reply_same_row(els[1], f"已全部配好并验证通过：\n{LONG_DETAIL}")
+        self._assert_reply_full_width_more(
+            els, f"<at id={ALICE}></at> {SUMMARY}", f"已全部配好并验证通过：\n{LONG_DETAIL}"
+        )
 
         # 2) --text 里写了文本格式 <at user_id="ou_alice">Alice</at> + 代码块里的 `<at id=ou_fake></at>`：
         #    真 @ 转成 <at id=ou_alice></at> 提到外层；代码块/反引号里的示例不提；<at> 标签长度不占 220 字额度
@@ -217,9 +242,10 @@ class MoreCardTest(ThreadsBase):
         self.assertEqual(rc2, 0, err2)
         c2 = json.loads(out2)
         els2 = c2["body"]["elements"]
-        self.assertEqual(els2[0]["content"], f"<at id={ALICE}></at> " + ("字" * 215))
         self.assertNotIn("ou_code_only", els2[0]["content"])
-        self._assert_reply_same_row(els2[1], detail_with_code_at)
+        self._assert_reply_full_width_more(
+            els2, f"<at id={ALICE}></at> " + ("字" * 215), detail_with_code_at
+        )
 
         # 3) 发给主人的 ask / report：原文里引用了同事的 <at id=ou_alice></at>，不误提到给主人的白话总结开头
         rc3, out3, err3 = self.ask("--summary", SUMMARY, kind="report", title="同步进度", text=detail_with_at)

@@ -229,6 +229,7 @@
 | 7.62 | 长消息（>4 行、>160 字或含代码块）没给白话总结（或总结超 6 行、超 220 字、含代码块）未以退出码 2 拦下，或报错没明确提示「原文不需要改，只需要增加白话总结」导致模型删改原文 | `test_more_card.MoreCardTest.test_762_long_message_rejected_with_preserve_original_guidance` |
 | 7.62 | 带 `more` 折叠面板的卡片读回后认不出「需要你定」，或「待办」清单摘录把 `more` 折叠面板里的长明细漏出来 | `test_more_card.MoreCardTest.test_762_readback_and_pending_excerpt_use_summary` |
 | 7.62 | 代回原文里写的 `@人`（`<at id=ou_…>` / `<at user_id="ou_…">`）被一起折进 `more` 里面、外层白话总结看不见 `@人`，或 `<at>` 标签长度挤占 220 字额度 | `test_more_card.MoreCardTest.test_762_at_mentions_hoisted_outside_more_panel` |
+| 7.62 | 代回卡片把 `more` 折叠面板套在两列 `column_set` 左列、右列放 `[🐕Sheepdog Reply]`，导致展开 `more` 后右侧被撑出约 1/3 宽度的空白列 | `test_more_card.MoreCardTest.test_762_reply_more_panel_is_top_level_full_width_not_in_column_set` |
 | 7.63 | 注册 subagent 羔羊或母羊 transcript 触发 `invoke_subagent` 后没写入 `lambs` 表、`sheepdog board` 未在母羊卡片下缩进展示 `↳ 🐑` 或 `--json` 缺 `lambs` 列表 | `test_lamb.LambTest.test_763_lamb_register_and_board_display`、`test_lamb.LambTest.test_763_lamb_register_and_auto_discover_from_transcript` |
 | 7.63 | 真实 Antigravity 3 步 transcript（`PLANNER_RESPONSE` JSON 字符串 `Subagents` 列表、`GENERIC` `Created the following subagents:` 回填 `conversationId`、`SYSTEM_MESSAGE` `[Message] ... sender=<cid>` 自动结案）解析漏掉子代理、未关联 `conversation_id` 或未自动标 `done` | `test_lamb.LambTest.test_763_real_antigravity_transcript_subagent_lifecycle` |
 | 7.63 | 专属会话常驻规则 `interface_section(bus=False)` 未包含 `### 羔羊（重活后台并发与 30 秒卸锁）`、45 秒判别式、`sheepdog lamb spawn` 与 `lamb:<lamb_id>` 卸锁说明，或误注入给总线 `tp_bus` | `test_lamb.LambTest.test_763_lamb_interface_in_standing_rules` |
