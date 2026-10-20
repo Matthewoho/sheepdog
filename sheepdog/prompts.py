@@ -313,7 +313,7 @@ def owner_interface(topic_id: str, identity: bool = False) -> list[str]:
         "所以隔一批再说同样的话照常会发，不用自己传 `--batch`。",
         f"`sheepdog reply --topic {topic_id} --to <消息号> (--card-text \"<正文>\" | --card-file <文件或 ->) "
         "[--summary \"<白话总结>\" | --summary-file <文件>]`："
-        "以主人身份代回（卡片，长正文同样只露白话总结、原有回复收进 `more` 折叠面板，右下角带代回标记；`--text` 是纯文本，末尾同样带标记）。"
+        "以主人身份代回（卡片，长正文同样只露白话总结、原有回复收进 `more` 折叠面板，右下角带代回标记；`--text` 与 `--card-text` 等价，一律发成卡片）。"
         "只用来回别人：要回复的那条在「找主人」聊天（主人和机器人的私聊）里时 sheepdog 拒绝（退出码 2），"
         f"回主人用 `sheepdog report --topic {topic_id} --key <同一件事的钥匙>`。"
         "发之前 sheepdog 会只读查一次：这个聊天里、从这条消息（和同一批里这个聊天更晚的消息）之后，主人本人有没有新发言。"
@@ -372,16 +372,16 @@ def lamb_interface(topic_id: str, cli_host: bool = False) -> list[str]:
         "- 轻活（预计 ≤ 45 秒、≤ 3 步只读查询、直接回话）：母羊当场做完交 `handled` 回执，不生羔羊。",
         "- 重活（满足任一：① 预计 > 45 秒的深挖/多仓库核对/大 JSON/大日志排查；② 盯 Cloud Build / GitHub Actions 等长耗时构建；"
         "③ 去独立工作树写代码跑测试；④ 同一批 ≥ 2 件独立活并行）：母羊只花 30 秒派羔羊并立即交 `waiting` 回执卸锁，绝不自己占着批次锁硬扛。",
-        f"- 生羔羊：`sheepdog lamb spawn --topic {topic_id} --title \"<一句话任务>\" --cmd \"<后台命令>\"`"
-        f"（或调宿主原生 `invoke_subagent` 后跑 `sheepdog lamb register --topic {topic_id} --title \"<一句话任务>\" "
-        f"--cid <子代理conversation_id>`；`sheepdog lamb list --topic {topic_id}` 查看）；",
+        f"- 生羔羊：后台脚本用 `sheepdog lamb spawn --topic {topic_id} --title \"<一句话任务>\" --cmd \"<后台命令>\"`；"
+        f"调宿主原生 `invoke_subagent` 派生子代理后，无需手动跑 `lamb register` / `lamb done`（牧羊犬会自动从会话记录发现并收尾），"
+        f"可用 `sheepdog lamb list --topic {topic_id}` 查看；",
         ("- 立即卸锁：在回答末尾附回执块 `{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}`"
          if cli_host else
          f"- 立即卸锁：`sheepdog receipt --topic {topic_id} --batch <批次ID> "
          "--json '{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}'`")
-        + "（带 `lamb:<lamb_id>` 锚点会当场释放母羊批次锁，门外新消息不阻塞）；",
-        "- 完工回流：CLI 羔羊跑完调 `sheepdog lamb done --lamb-id <lamb_id> --summary \"<≤30行结论与证据>\"`"
-        "（原生 `invoke_subagent` 回信也会自动结案），sheepdog 会把 `[羔羊完工汇报]` 投回母羊，"
+        + f"（原生子代理 `anchors` 可直接传 `\"lamb:<子代理conversationId>\"` 或 `sheepdog lamb list --topic {topic_id}` 拿到的 `\"lamb:<lamb_id>\"`，当场释放母羊批次锁，门外新消息不阻塞）；",
+        "- 完工回流：CLI 羔羊跑完自动收尾（也可显式调 `sheepdog lamb done --lamb-id <lamb_id> --summary \"<≤30行结论与证据>\"`），"
+        "原生 `invoke_subagent` 回信自动结案，sheepdog 会把 `[羔羊完工汇报]` 投回母羊，"
         "由母羊统一对外 `reply / ask / report`（羔羊严禁直接对外说话或交母羊回执）。",
     ]
 

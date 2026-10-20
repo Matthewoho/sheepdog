@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import uuid
@@ -2554,21 +2555,7 @@ class Dispatcher:
     def _watches_after_receipt(self, topic_id: str, batch_id: str, anchors: list) -> None:
         """会话回执后处理它的等待（7.16）：anchors 里 watch_done:N → 关闭（done）；
         回复随这个批次送达、但没被确认的 → 回到 waiting，从回复时间重新计时。"""
-        done = set()
-        for a in anchors:
-            if isinstance(a, str) and a.startswith("watch_done:") and a.removeprefix("watch_done:").isdigit():
-                done.add(int(a.removeprefix("watch_done:")))
-        for w in self.store.open_watches():
-            if w["topic_id"] != topic_id:
-                continue
-            if w["id"] in done:
-                self.store.close_watch(w["id"], "done")
-                log.info("等待 #%s 经回执确认已等到", w["id"])
-            elif w["status"] == "replied" and w["last_reply_message_id"]:
-                r = self.store.get_message(w["last_reply_message_id"])
-                if r is not None and r["batch_id"] == batch_id:
-                    self.store.reset_watch_waiting(w["id"])
-                    log.info("等待 #%s 的回复没被确认，回到 waiting", w["id"])
+        settle_watches_after_receipt(self.store, topic_id, batch_id, anchors)
 
     def _miss(self, t, batch: str) -> None:
         """adopted 会话回执超时：只记一次未回执、回到可投递，不重投（避免往大上下文里重复灌消息）。"""
@@ -3238,6 +3225,26 @@ class Dispatcher:
                 self.store.echo_settle([e["message_id"]], "topic_closed")
             elif self.store.owner_sends_since(e["topic_id"], e["delivered_at"] or e["stage_at"] or now):
                 self.store.echo_settle([e["message_id"]], "report")
+            elif (
+                self.cfg.session.owner_receipt_relay
+                and not e["relay_batch"]
+                and e["batch_id"]
+                and not self.store.get_meta(f"owner_relay_skipped:{e['batch_id']}")
+            ):
+                d = self.store.get_dispatch(e["batch_id"])
+                if d is not None and d["state"] in ("acked", ACKED_LATE) and d["receipt"]:
+                    try:
+                        rcpt = json.loads(d["receipt"])
+                    except json.JSONDecodeError:
+                        rcpt = {}
+                    if isinstance(rcpt, dict):
+                        t_obj = self.store.get_topic(e["topic_id"])
+                        st_val = str(rcpt.get("status") or "handled")
+                        if t_obj is not None and is_standing_topic(t_obj) and st_val == "done":
+                            st_val = "handled"
+                        sum_val = " ".join(str(rcpt.get("summary") or "").split())
+                        at_val = str(rcpt.get("received_at") or d["acked_at"] or now)
+                        self.store.echo_bind_relay(e["message_id"], e["batch_id"], at_val, st_val, sum_val)
 
     def _echo_excerpt(self, e) -> str:
         from . import pending as pend
@@ -3327,20 +3334,14 @@ class Dispatcher:
         每句只绑一次，绑上了后来的回执改不了（store.echo_bind_relay 只写还空着的）；别的普通批次送进去、还在等自己那份
         回执的不碰（10-17 04:59：推迟期间总线又交了两份回执，每份都把 04:48 那句改记到最新那份上，卡片正文成了另一件事）。
         这句被重新送了一次（转交、退回重投），_echo_sync 把绑过的作废，再按新的那一批绑。开关关着不绑。"""
-        if not self.cfg.session.owner_receipt_relay or not batch_id:
+        if not self.cfg.session.owner_receipt_relay:
+            if batch_id:
+                self.store.set_meta(f"owner_relay_skipped:{batch_id}", "1")
+            return
+        if not batch_id:
             return
         self._echo_sync()
-        status = status or (receipt.get("status") if isinstance(receipt, dict) else "") or "handled"
-        if summary is None:
-            summary = receipt.get("summary") if isinstance(receipt, dict) else ""
-        summary = " ".join(str(summary or "").split())
-        now = _now().isoformat(timespec="seconds")
-        for e in self.store.echo_open():
-            if e["stage"] != ECHO_DELIVERED or e["topic_id"] != t["topic_id"] or e["relay_batch"]:
-                continue
-            via = e["batch_id"] or ""
-            if via == batch_id or via.startswith(PRIORITY_PREFIX):
-                self.store.echo_bind_relay(e["message_id"], batch_id, now, status, summary)
+        bind_echo_relay(self.cfg, self.store, t["topic_id"], batch_id, receipt, status=status, summary=summary)
 
     def _echo_destination(self, e) -> tuple[str, bool]:
         """这句主人的话，回音该回到哪：(去处键, 是否回到话题里)。
@@ -4098,7 +4099,26 @@ class Dispatcher:
                     log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
 
                 for cid in subagent_created_cids_in(host, d):
-                    if self.store.find_lamb_by_cid(cid) is not None:
+                    existing_by_cid = self.store.find_lamb_by_cid(cid)
+                    if existing_by_cid is not None:
+                        if existing_by_cid["parent_topic_id"] == tid:
+                            active = self.store.get_active_lambs(tid)
+                            dup_empty = next(
+                                (
+                                    lb for lb in active
+                                    if lb["lamb_id"] != existing_by_cid["lamb_id"]
+                                    and lb["kind"] in ("subagent", "native_subagent")
+                                    and not (lb["conversation_id"] or "").strip()
+                                ),
+                                None,
+                            )
+                            if dup_empty is not None:
+                                merged_title = existing_by_cid["task_title"]
+                                if (not merged_title or merged_title in ("subagent", existing_by_cid["lamb_id"])) and dup_empty["task_title"]:
+                                    merged_title = dup_empty["task_title"]
+                                self.store.update_lamb(existing_by_cid["lamb_id"], task_title=merged_title)
+                                with self.store.tx() as c:
+                                    c.execute("DELETE FROM lambs WHERE lamb_id=?", (dup_empty["lamb_id"],))
                         continue
                     active = self.store.get_active_lambs(tid)
                     matched = next(
@@ -4125,45 +4145,16 @@ class Dispatcher:
 
                 for ret in subagent_returns_in(host, d):
                     active = self.store.get_active_lambs(tid)
-                    matched = next(
-                        (lb for lb in active if (lb["conversation_id"] or "").strip() == ret.conversation_id),
-                        None,
-                    )
-                    if matched is None:
-                        continue
-                    lid = matched["lamb_id"]
-                    ts = ret.at or now_iso()
-                    summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
-                    nk = duty.norm_key(f"lamb:{lid}")
-                    w = self.store.get_work(tid, nk)
-                    t_cur = self.store.get_topic(tid)
-                    if t_cur is not None and t_cur["pending_batch_id"] is None and w is not None and not w["closed_at"]:
-                        complete_lamb(self.store, lid, summary=summary, state="done")
-                    else:
-                        self.store.update_lamb(
-                            lid,
-                            state="done",
-                            finished_at=matched["finished_at"] or ts,
-                            last_act_at=ts,
-                            result_summary=summary,
-                            reported_at=matched["reported_at"] or ts,
-                            report_msg_id="native_system_message",
-                        )
-                        if w is not None and not w["closed_at"]:
-                            self.store.update_work(
-                                w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts
-                            )
-                            self.store.close_route(tid, nk, "羔羊已完成", ts)
-                            duty.record_closed(
-                                self.store,
-                                self.store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone(),
-                            )
-                    log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
+                    matched_list = [lb for lb in active if (lb["conversation_id"] or "").strip() == ret.conversation_id]
+                    for matched in matched_list:
+                        lid = matched["lamb_id"]
+                        summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
+                        complete_lamb(self.store, lid, summary=summary, state="done", report_msg_id="native_system_message")
+                        log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
 
                 kill_all, killed_cids = subagent_kills_in(host, d)
                 if kill_all or killed_cids:
                     killed_set = set(killed_cids)
-                    ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
                     for lb in self.store.get_active_lambs(tid):
                         if lb["kind"] not in ("subagent", "native_subagent"):
                             continue
@@ -4175,26 +4166,13 @@ class Dispatcher:
                             continue
                         lid = lb["lamb_id"]
                         summary = lb["result_summary"] or "已由母羊销毁"
-                        self.store.update_lamb(
+                        complete_lamb(
+                            self.store,
                             lid,
+                            summary=summary,
                             state="done",
-                            finished_at=lb["finished_at"] or ts,
-                            last_act_at=ts,
-                            result_summary=summary,
-                            reported_at=lb["reported_at"] or ts,
                             report_msg_id=lb["report_msg_id"] or "killed_by_parent",
                         )
-                        nk = duty.norm_key(f"lamb:{lid}")
-                        w = self.store.get_work(tid, nk)
-                        if w is not None and not w["closed_at"]:
-                            self.store.update_work(
-                                w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts
-                            )
-                            self.store.close_route(tid, nk, "羔羊已由母羊销毁", ts)
-                            duty.record_closed(
-                                self.store,
-                                self.store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone(),
-                            )
                         log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lid, cid)
 
             self._follow(t, LAMB_DISCOVERY, handle, backfill=LAST_ACTIVITY_TAIL)
@@ -4203,12 +4181,30 @@ class Dispatcher:
     discover_lambs_from_transcript = _scan_lambs
 
     def _tick_lambs(self) -> list[str]:
-        """7.63：每轮扫描 invoke_subagent、刷新活跃羔羊心跳、判定羔羊超时（timeout_minutes），并向母羊回流已结束羔羊的 lamb_report。"""
+        """7.63：每轮扫描 invoke_subagent、检查 CLI 子进程存活、刷新活跃羔羊心跳、判定羔羊超时（timeout_minutes），并向母羊回流已结束羔羊的 lamb_report。"""
         self._scan_lambs()
         now = _now()
         timeout_delta = timedelta(minutes=self.cfg.lamb.timeout_minutes)
         for lb in self.store.get_active_lambs():
             lid, tid = lb["lamb_id"], lb["parent_topic_id"]
+            if lb["kind"] in ("cli", "bash_worker") and lb["pid"]:
+                if not _pid_alive(int(lb["pid"])) and lb["state"] == "running":
+                    tail_lines: list[str] = []
+                    if lb["log_path"]:
+                        try:
+                            lp = Path(lb["log_path"])
+                            if lp.exists():
+                                raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+                                tail_lines = [ln.strip() for ln in raw_lines if ln.strip()][-5:]
+                        except OSError:
+                            pass
+                    tail_text = "\n".join(tail_lines)
+                    has_err = any(k in tail_text for k in ("Traceback", "Fatal", "Error", "ERROR"))
+                    st = "failed" if has_err else "done"
+                    summary = tail_text or lb["result_summary"] or "后台进程已退出"
+                    complete_lamb(self.store, lid, summary=summary, state=st)
+                    log.info("CLI 羔羊 %s（母羊 %s，pid=%s）进程已退出，自动按 %s 收尾", lid, tid, lb["pid"], st)
+                    continue
             last_dt = _parse(lb["last_act_at"] or "") or _parse(lb["started_at"] or "")
             if lb["conversation_id"]:
                 tp = transcript_path(lb["conversation_id"])
@@ -5671,6 +5667,70 @@ def add_watch(store: Store, topic_id: str, person_id: str, chat_id: str = "", no
     return store.add_watch(topic_id, person_id.strip(), (chat_id or "").strip(), note)
 
 
+def settle_watches_after_receipt(store: Store, topic_id: str, batch_id: str, anchors: list) -> None:
+    """会话回执后处理它的等待（7.16）：anchors 里 watch_done:N → 关闭（done）；
+    回复随这个批次送达、但没被确认的 → 回到 waiting，从回复时间重新计时。"""
+    done = set()
+    for a in anchors:
+        if isinstance(a, str) and a.startswith("watch_done:") and a.removeprefix("watch_done:").isdigit():
+            done.add(int(a.removeprefix("watch_done:")))
+    for w in store.open_watches():
+        if w["topic_id"] != topic_id:
+            continue
+        if w["id"] in done:
+            store.close_watch(w["id"], "done")
+            log.info("等待 #%s 经回执确认已等到", w["id"])
+        elif w["status"] == "replied" and w["last_reply_message_id"]:
+            r = store.get_message(w["last_reply_message_id"])
+            if r is not None and r["batch_id"] == batch_id:
+                store.reset_watch_waiting(w["id"])
+                log.info("等待 #%s 的回复没被确认，回到 waiting", w["id"])
+
+
+def bind_echo_relay(cfg: Config, store: Store, topic_id: str, batch_id: str, receipt: dict,
+                    status: str = "", summary: str | None = None) -> None:
+    """回执带回绑定（write_receipt 与 Dispatcher._echo_relay 共用单一写入逻辑）。"""
+    if not cfg.session.owner_receipt_relay:
+        if batch_id:
+            store.set_meta(f"owner_relay_skipped:{batch_id}", "1")
+        return
+    if not batch_id:
+        return
+    now = _now().isoformat(timespec="seconds")
+    for e in store.echo_open():
+        if e["stage"] == ECHO_UNDELIVERED:
+            continue
+        r = store.get_message(e["message_id"])
+        if r is None:
+            continue
+        tid, st = r["topic_id"] or "", r["dispatch_state"]
+        if r["route"] != DISPATCH or tid != topic_id:
+            continue
+        if tid != e["topic_id"]:
+            store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now, **ECHO_UNBOUND)
+        if st in ECHO_DELIVERED_STATES and (e["stage"] != ECHO_DELIVERED or e["batch_id"] != r["batch_id"]):
+            d_row = store.get_dispatch(r["batch_id"]) if r["batch_id"] else None
+            store.echo_update(
+                e["message_id"],
+                stage=ECHO_DELIVERED,
+                stage_at=now,
+                batch_id=r["batch_id"],
+                delivered_at=(d_row["sent_at"] if d_row is not None and d_row["sent_at"] else now),
+                priority=int(bool(r["batch_id"]) and r["batch_id"].startswith(PRIORITY_PREFIX)),
+                **(ECHO_UNBOUND if e["batch_id"] != r["batch_id"] else {}),
+            )
+    eff_status = status or (receipt.get("status") if isinstance(receipt, dict) else "") or "handled"
+    if summary is None:
+        summary = receipt.get("summary") if isinstance(receipt, dict) else ""
+    summary_clean = " ".join(str(summary or "").split())
+    for e in store.echo_open():
+        if e["stage"] != ECHO_DELIVERED or e["topic_id"] != topic_id or e["relay_batch"]:
+            continue
+        via = e["batch_id"] or ""
+        if via == batch_id or via.startswith(PRIORITY_PREFIX):
+            store.echo_bind_relay(e["message_id"], batch_id, now, eff_status, summary_clean)
+
+
 def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> Path:
     from . import outbound
     store = Store(cfg.db_path) if cfg.db_path.exists() else None
@@ -5700,12 +5760,17 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
                     "retries": 0,
                     "summary": receipt.get("summary", t["summary"]),
                 }
+                settle_watches_after_receipt(store, topic_id, batch_id, anchors)
                 if merged_anchors := Dispatcher._receipt_anchors(t, receipt):
                     fields["anchors_json"] = merged_anchors
                 store.update_topic(topic_id, **fields)
                 duty.apply_receipt_work(store, topic_id, receipt, log)
                 store.add_history(topic_id, "receipt",
                                   f"{batch_id} {status}：{duty.short(str(receipt.get('summary') or ''), 80)}")
+                try:
+                    bind_echo_relay(cfg, store, topic_id, batch_id, receipt, status=eff_status, summary=fields["summary"])
+                except Exception as e:
+                    log.warning("回执带回出错（%s/%s）: %s", topic_id, batch_id, e)
             elif t is not None and has_lamb_anchor:
                 duty.apply_receipt_work(store, topic_id, receipt, log)
         return p
@@ -5715,10 +5780,29 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
 
 
 # ======================= 羔羊生命周期（7.63） =======================
+def _pid_alive(pid: int) -> bool:
+    """检查后台子进程是否存活（若为当前进程的僵尸子进程先非阻塞回收，再用 os.kill(pid, 0) 探测）。"""
+    if pid <= 0:
+        return False
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str = "subagent",
                   conversation_id: str | None = None, lamb_id: str | None = None,
                   pid: int | None = None, log_path: str | None = None) -> str:
-    """7.63：登记一只羔羊（subagent 或 cli），返回 lamb_id。"""
+    """7.63：登记一只羔羊（subagent 或 cli），返回 lamb_id。对同母羊下的 subagent 自动去重合并。"""
     parent_topic_id = (parent_topic_id or "").strip()
     if parent_topic_id and not parent_topic_id.startswith("tp_"):
         parent_topic_id = "tp_" + parent_topic_id
@@ -5726,17 +5810,45 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
         raise ValueError(f"母羊会话 {parent_topic_id} 不存在")
     if kind not in ("subagent", "cli"):
         raise ValueError(f"kind 必须是 subagent 或 cli，收到 {kind!r}")
+    cid = (conversation_id or "").strip() or None
+    ts = now_iso()
+    if cid:
+        existing = store.find_lamb_by_cid(cid)
+        if existing is not None and existing["parent_topic_id"] == parent_topic_id:
+            existing_id = existing["lamb_id"]
+            title = (task_title or "").strip() or existing["task_title"] or existing_id
+            store.update_lamb(existing_id, task_title=title, conversation_id=cid, last_act_at=ts)
+            return existing_id
+    if kind in ("subagent", "native_subagent"):
+        active_empty = next(
+            (
+                lb for lb in store.get_active_lambs(parent_topic_id)
+                if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
+            ),
+            None,
+        )
+        if active_empty is not None:
+            existing_id = active_empty["lamb_id"]
+            title = (task_title or "").strip() or active_empty["task_title"] or existing_id
+            store.update_lamb(
+                existing_id,
+                task_title=title,
+                conversation_id=cid or active_empty["conversation_id"],
+                last_act_at=ts,
+            )
+            return existing_id
     lid = (lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
     if not lid.startswith("lamb_"):
         lid = "lamb_" + lid
     title = (task_title or "").strip() or lid
     store.create_lamb(lid, parent_topic_id, kind=kind, task_title=title,
-                      conversation_id=(conversation_id or "").strip() or None,
+                      conversation_id=cid,
                       pid=pid, state="running", log_path=log_path)
     return lid
 
 
-def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "done") -> dict:
+def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "done",
+                  report_msg_id: str | None = None) -> dict:
     """7.63：羔羊完工 / 失败 / 超时收尾：更新 lambs 表、关闭母羊名下对应的 work_items (lamb:<id>)、向母羊排入 lamb_report 系统消息。"""
     lid = (lamb_id or "").strip()
     lb = store.get_lamb(lid)
@@ -5745,22 +5857,26 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
     final_state = state if state in ("done", "failed", "timeout") else "done"
     ts = now_iso()
     summary = (summary or "").strip() or (lb["result_summary"] or f"羔羊 {lid} 已结束（{final_state}）")
-    already_reported = bool(lb["reported_at"])
-    store.update_lamb(
-        lid,
+    already_reported = bool(lb["reported_at"]) or bool(report_msg_id)
+    upd_fields = dict(
         state=final_state,
         finished_at=lb["finished_at"] or ts,
         last_act_at=ts,
         result_summary=summary,
         reported_at=lb["reported_at"] or ts,
     )
+    if report_msg_id:
+        upd_fields["report_msg_id"] = lb["report_msg_id"] or report_msg_id
+    store.update_lamb(lid, **upd_fields)
     pt_id = lb["parent_topic_id"]
-    nk = duty.norm_key(f"lamb:{lid}")
-    w = store.get_work(pt_id, nk)
-    if w is not None and not w["closed_at"]:
-        store.update_work(w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts)
-        store.close_route(pt_id, nk, "羔羊已完成", ts)
-        duty.record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+    close_why = "羔羊已由母羊销毁" if report_msg_id == "killed_by_parent" else "羔羊已完成"
+    for wk_id in filter(None, {lid, (lb["conversation_id"] or "").strip()}):
+        nk = duty.norm_key(f"lamb:{wk_id}")
+        w = store.get_work(pt_id, nk)
+        if w is not None and not w["closed_at"]:
+            store.update_work(w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts)
+            store.close_route(pt_id, nk, close_why, ts)
+            duty.record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
     mid = ""
     if not already_reported:
         pt = store.get_topic(pt_id)

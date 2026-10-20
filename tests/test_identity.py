@@ -690,9 +690,12 @@ class ReplyIdentityTest(IdentityBase):
         r = outbound.reply(self.cfg, self.store, self.source, "tp_alpha", q, text="好的")
         self.assertEqual(r.identity, "bot")
         c = self.sent_reply()[-1]
-        self.assertEqual(_opt(c, "--text"), "好的\n" + MARK)
+        self.assertEqual(_opt(c, "--msg-type"), "interactive")
+        card = json.loads(_opt(c, "--content"))
+        self.assertEqual(card, outbound.reply_body(self.cfg, card_text="好的")[1])
+        self.assertIn(MARK, json.dumps(card, ensure_ascii=False))
         self.assertEqual(_opt(c, "--idempotency-key"),
-                         outbound.idem_key("reply", "tp_alpha", q, outbound.text_fingerprint("好的\n" + MARK)))
+                         outbound.idem_key("reply", "tp_alpha", q, outbound.text_fingerprint("好的")))
 
     def test_p2p_uses_owner_with_mark(self):
         q = self.target(chat=ALPHA_P2P, chat_type="p2p")

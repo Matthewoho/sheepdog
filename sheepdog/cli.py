@@ -2098,8 +2098,8 @@ def cmd_lamb(args) -> int:
         env["SHEEPDOG_LAMB_ID"] = lid
         try:
             with log_path.open("ab") as lf:
-                proc = subprocess.Popen(cmd_str, shell=True, stdout=lf, stderr=subprocess.STDOUT,
-                                        env=env, start_new_session=True)
+                proc = subprocess.Popen(cmd_str, shell=True, stdin=subprocess.DEVNULL, stdout=lf,
+                                        stderr=subprocess.STDOUT, env=env, start_new_session=True)
             try:
                 proc.wait(timeout=0.1)
             except subprocess.TimeoutExpired:
@@ -2404,7 +2404,7 @@ def main(argv: list[str] | None = None) -> int:
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("--card-text", help="卡片正文（长消息原文不需要改，配合 --summary 自动收进 more 折叠区）")
     g.add_argument("--card-file", help="卡片正文文件，- 表示标准输入（同 reply-card --text-file）")
-    g.add_argument("--text", help="纯文本代回（带 --summary 时自动升格为折叠卡片）")
+    g.add_argument("--text", help="代回正文（同 --card-text，一律发成卡片）")
     sg = sp.add_mutually_exclusive_group()
     sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
     sg.add_argument("--summary-file", default="", help="白话总结文件")

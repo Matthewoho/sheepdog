@@ -978,7 +978,10 @@ class ReplyCheckTest(ThreadsBase):
     def test_plain_text_gets_marker_and_target_must_be_in_ledger(self):
         rc, _, _ = self.cli("reply", "--topic", "tp_alpha", "--to", self.q, "--text", "纯文本")
         self.assertEqual(rc, 0)
-        self.assertEqual(_opt(self.lark.sent()[0], "--text"), f"纯文本\n{MARK}")
+        sent_call = self.lark.sent()[0]
+        self.assertEqual(_opt(sent_call, "--msg-type"), "interactive")
+        self.assertEqual(json.loads(_opt(sent_call, "--content")), outbound.reply_body(self.cfg, card_text="纯文本")[1])
+        self.assertIn(MARK, _opt(sent_call, "--content"))
         rc, _, err = self.cli("reply", "--topic", "tp_alpha", "--to", "om_test_unknown", "--card-text", "x")
         self.assertEqual(rc, outbound.EXIT_INVALID)
         self.assertIn("账本里没有", err)

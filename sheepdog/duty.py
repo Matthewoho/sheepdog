@@ -212,6 +212,10 @@ def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> 
                 if not lid:
                     continue
                 lb = store.get_lamb(lid)
+                if lb is None:
+                    lb = store.find_lamb_by_cid(lid)
+                    if lb is not None:
+                        lid = lb["lamb_id"]
                 ttitle = (lb["task_title"] if lb else "") or str(receipt.get("summary") or lid)
                 waiting_on = f"羔羊 {lid} ({ttitle})"
                 try:

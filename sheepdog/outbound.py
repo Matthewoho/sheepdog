@@ -686,25 +686,16 @@ def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
 
 
 def reply_body(cfg: Config, text: str = "", card_text: str = "", summary: str = "") -> tuple[str, dict | None]:
-    """代回的内容：卡片（沿用 reply-card：正文 + 右下角代回标记），或纯文本（末尾附同一个代回标记，别人一眼看出是代回、
-    sheepdog 也靠它认出是会话代回）。返回 (记账用的正文, 卡片或 None)。
+    """代回的内容：一律发成卡片（沿用 reply-card：正文 + 右下角代回标记）。返回 (记账用的正文, 卡片)。
     7.26：主人本人、机器人两个身份发的都一样带标记。
-    7.62：长消息必须带四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区；--text 带了总结也自动升格为卡片。"""
+    7.62：长消息必须带四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区；--text 与 --card-text 等价，一律发成卡片。"""
     suffix = cfg.session.reply_suffix
-    if card_text:
-        _, _, combined = resolve_summary_and_body(card_text, summary, require_summary=cfg.notify.require_summary)
-        card = build_reply_card(combined, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
-        return combined, card
-    if not (text or "").strip():
+    raw = card_text if card_text else text
+    if not (raw or "").strip():
         raise ValueError("正文为空")
-    s, _, combined = resolve_summary_and_body(text, summary, require_summary=cfg.notify.require_summary)
-    if s:
-        card = build_reply_card(combined, suffix, cfg.session.reply_card_width)
-        return combined, card
-    plain = combined.rstrip()
-    if suffix and suffix not in plain:
-        plain += "\n" + suffix
-    return plain, None
+    _, _, combined = resolve_summary_and_body(raw, summary, require_summary=cfg.notify.require_summary)
+    card = build_reply_card(combined, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
+    return combined, card
 
 
 def text_fingerprint(text: str) -> str:
