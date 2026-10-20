@@ -64,7 +64,7 @@ _NEEDLES = {
     ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
     DUTY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed", b"custom_tool_call", b"USER_INPUT", b"CHECKPOINT",
            b"compaction", b"compacted", b"compact_boundary", b"user_message", b'"type":"user"', b'"type": "user"'),
-    LAMB_DISCOVERY: (b"invoke_subagent",),
+    LAMB_DISCOVERY: (b"invoke_subagent", b"Created the following subagents", b"SYSTEM_MESSAGE", b"[Message]"),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
 LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
@@ -386,6 +386,10 @@ def one_sentence(text: str, limit: int = 80) -> str:
 
 # ---------- 自动发现 invoke_subagent（7.63） ----------
 _UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.I)
+_CREATED_SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
+_SUBAGENT_MSG_HEADER_RE = re.compile(r"^\[Message\][^\n]*?\bsender=([^\s]+)")
+_SUBAGENT_MSG_TS_RE = re.compile(r"^\[Message\][^\n]*?\btimestamp=([^\s]+)")
+_SUBAGENT_MSG_CONTENT_RE = re.compile(r"^\[Message\][^\n]*?\bcontent=(.*)", re.S)
 
 
 @dataclass
@@ -397,22 +401,46 @@ class SubagentInvocation:
     at: str
 
 
+@dataclass
+class SubagentReturn:
+    conversation_id: str
+    summary: str
+    at: str
+
+
+def _pick_str(*vals) -> str:
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return _decoded(v) or v.strip()
+    return ""
+
+
+def _parse_subagents_arg(raw) -> list[dict]:
+    val = raw
+    for _ in range(2):
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return []
+            try:
+                val = json.loads(s)
+            except json.JSONDecodeError:
+                return []
+    if isinstance(val, list):
+        return [x for x in val if isinstance(x, dict)]
+    return []
+
+
 def _extract_subagent_fields(obj: dict, parent: dict, step_fallback: str) -> SubagentInvocation:
     args = obj.get("args") if isinstance(obj.get("args"), dict) else (obj.get("input") if isinstance(obj.get("input"), dict) else {})
     res = obj.get("result") if isinstance(obj.get("result"), dict) else (parent.get("result") if isinstance(parent.get("result"), dict) else {})
 
-    def pick(*vals) -> str:
-        for v in vals:
-            if isinstance(v, str) and v.strip():
-                return _decoded(v) or v.strip()
-        return ""
-
-    lid = pick(
+    lid = _pick_str(
         args.get("lamb_id"), args.get("LambId"),
         obj.get("lamb_id"), res.get("lamb_id"),
         parent.get("lamb_id"),
     )
-    cid = pick(
+    cid = _pick_str(
         args.get("conversation_id"), args.get("ConversationId"), args.get("cid"),
         args.get("subagent_id"), args.get("SubagentId"),
         obj.get("conversation_id"), obj.get("subagent_id"), obj.get("cid"),
@@ -425,17 +453,50 @@ def _extract_subagent_fields(obj: dict, parent: dict, step_fallback: str) -> Sub
         if m:
             cid = m.group(1)
     title = one_sentence(
-        pick(
+        _pick_str(
+            args.get("Role"), args.get("role"),
             args.get("task_title"), args.get("TaskTitle"), args.get("title"), args.get("Title"),
             args.get("toolSummary"), args.get("Task"), args.get("task"),
             args.get("Prompt"), args.get("prompt"), args.get("Name"), args.get("name"),
-            args.get("toolAction"), obj.get("task_title"), obj.get("title"),
+            args.get("toolAction"), obj.get("Role"), obj.get("role"), obj.get("task_title"), obj.get("title"),
             res.get("task_title"), res.get("title"), parent.get("task_title"), parent.get("title"),
         ),
         80,
     ) or "subagent"
     at = str(parent.get("created_at") or parent.get("timestamp") or obj.get("created_at") or "")
     return SubagentInvocation(lamb_id=lid, conversation_id=cid, task_title=title, step=step_fallback, at=at)
+
+
+def _extract_subagent_invocations(obj: dict, parent: dict, step_fallback: str) -> list[SubagentInvocation]:
+    args = obj.get("args") if isinstance(obj.get("args"), dict) else (obj.get("input") if isinstance(obj.get("input"), dict) else {})
+    raw_subs = args.get("Subagents") if "Subagents" in args else (args.get("subagents") if "subagents" in args else obj.get("Subagents"))
+    subs = _parse_subagents_arg(raw_subs)
+    if not subs:
+        return [_extract_subagent_fields(obj, parent, step_fallback)]
+    at = str(parent.get("created_at") or parent.get("timestamp") or obj.get("created_at") or "")
+    out: list[SubagentInvocation] = []
+    for j, sub in enumerate(subs):
+        lid = _pick_str(
+            sub.get("lamb_id"), sub.get("LambId"),
+            *(args.get("lamb_id"), args.get("LambId")) if len(subs) == 1 else (),
+        )
+        cid = _pick_str(
+            sub.get("conversation_id"), sub.get("ConversationId"), sub.get("cid"),
+            sub.get("subagent_id"), sub.get("SubagentId"),
+        )
+        title = one_sentence(
+            _pick_str(
+                sub.get("Role"), sub.get("role"),
+                sub.get("TaskTitle"), sub.get("task_title"), sub.get("Title"), sub.get("title"),
+                args.get("toolSummary"),
+                sub.get("Prompt"), sub.get("prompt"),
+                sub.get("TypeName"), sub.get("type_name"),
+                args.get("toolAction"),
+            ),
+            80,
+        ) or "subagent"
+        out.append(SubagentInvocation(lamb_id=lid, conversation_id=cid, task_title=title, step=f"{step_fallback}:{j}", at=at))
+    return out
 
 
 def subagent_invocations_in(host: str, d: dict, line_offset: int) -> list[SubagentInvocation]:
@@ -447,20 +508,67 @@ def subagent_invocations_in(host: str, d: dict, line_offset: int) -> list[Subage
     if isinstance(tcs, list):
         for i, tc in enumerate(tcs):
             if isinstance(tc, dict) and tc.get("name") == "invoke_subagent":
-                out.append(_extract_subagent_fields(tc, d, f"{base}:{i}"))
+                out.extend(_extract_subagent_invocations(tc, d, f"{base}:{i}"))
     if out:
         return out
     if d.get("name") == "invoke_subagent" or d.get("tool_name") == "invoke_subagent" or d.get("tool") == "invoke_subagent" or d.get("type") == "invoke_subagent":
-        out.append(_extract_subagent_fields(d, d, base))
+        out.extend(_extract_subagent_invocations(d, d, base))
         return out
     pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
     if pl.get("name") == "invoke_subagent" or pl.get("tool_name") == "invoke_subagent":
-        out.append(_extract_subagent_fields(pl, d, base))
+        out.extend(_extract_subagent_invocations(pl, d, base))
         return out
     msg = d.get("message") if isinstance(d.get("message"), dict) else {}
     content = msg.get("content") if isinstance(msg.get("content"), list) else (d.get("content") if isinstance(d.get("content"), list) else [])
     for i, item in enumerate(content):
         if isinstance(item, dict) and item.get("name") == "invoke_subagent":
-            out.append(_extract_subagent_fields(item, d, f"{base}:{i}"))
+            out.extend(_extract_subagent_invocations(item, d, f"{base}:{i}"))
     return out
+
+
+def subagent_created_cids_in(host: str, d: dict) -> list[str]:
+    """从 Antigravity GENERIC 'Created the following subagents:' 行提取创建出的子代理 conversationId 列表。"""
+    if d.get("type") != "GENERIC":
+        return []
+    raw_content = d.get("content")
+    text = _decoded(raw_content) if isinstance(raw_content, str) else ""
+    if not text and isinstance(raw_content, str):
+        text = raw_content
+    if "Created the following subagents:" not in text:
+        return []
+    after = text.split("Created the following subagents:", 1)[1]
+    cids = [m.group(1).strip() for m in _CREATED_SUBAGENT_CID_RE.finditer(after) if m.group(1).strip()]
+    return list(dict.fromkeys(cids))
+
+
+def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:
+    """从 Antigravity SYSTEM_MESSAGE '[Message] ... sender=<cid> ... content=...' 行提取子代理回传通知。"""
+    if d.get("type") != "SYSTEM_MESSAGE":
+        return []
+    raw_content = d.get("content")
+    text = _decoded(raw_content) if isinstance(raw_content, str) else ""
+    if not text and isinstance(raw_content, str):
+        text = raw_content
+    if "[Message]" not in text:
+        return []
+    line_at = str(d.get("created_at") or d.get("timestamp") or "")
+    out: list[SubagentReturn] = []
+    for chunk in re.split(r"(?=\[Message\])", text):
+        chunk = chunk.strip()
+        if not chunk.startswith("[Message]"):
+            continue
+        m_sender = _SUBAGENT_MSG_HEADER_RE.search(chunk)
+        if not m_sender:
+            continue
+        sender = m_sender.group(1).strip()
+        if not sender:
+            continue
+        m_ts = _SUBAGENT_MSG_TS_RE.search(chunk)
+        at = line_at or (m_ts.group(1).strip() if m_ts else "")
+        m_body = _SUBAGENT_MSG_CONTENT_RE.search(chunk)
+        raw_body = m_body.group(1).strip() if m_body else ""
+        summary = one_sentence(raw_body, 120) or "subagent returned"
+        out.append(SubagentReturn(conversation_id=sender, summary=summary, at=at))
+    return out
+
 

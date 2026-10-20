@@ -18,6 +18,7 @@ from sheepdog import cli, duty
 from sheepdog import session as sm
 from sheepdog.config import DEFAULT_DANGER_PATTERNS
 from sheepdog.engine import BUS_TOPIC_ID, complete_lamb, register_lamb, write_receipt
+from sheepdog.prompts import interface_section
 from sheepdog.sink.agentapi import transcript_path
 
 from test_duty import DutyBase, ago, tool, utc
@@ -270,6 +271,114 @@ class LambTest(DutyBase):
         )
         self.d._audit_commands()
         self.assertTrue(any("由羔羊 lamb_fresh01 执行" in n and "tp_alpha" in n for n in self.notices), self.notices)
+
+    def test_763_real_antigravity_transcript_subagent_lifecycle(self):
+        cid1 = "5d3c8ada-5ac5-4a59-88cd-1db7a643471e"
+        cid2 = "c0e09508-59d6-434b-8afc-3edf53a8ec13"
+
+        # Step 1: 真实 Antigravity PLANNER_RESPONSE（Subagents 是 JSON 字符串，且此时尚无 conversationId）
+        step1 = {
+            "step_index": 30,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(5)),
+            "thinking": "launch two subagents",
+            "content": "",
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": json.dumps([
+                            {
+                                "Model": "inherit",
+                                "Prompt": "Implement 7.63 lamb lifecycle",
+                                "Role": "Phase 1 Lamb Implementer",
+                                "TypeName": "sheepdog-implement",
+                            },
+                            {
+                                "Model": "inherit",
+                                "Prompt": "Design 7.49 session group",
+                                "Role": "Phase 2 Group Designer",
+                                "TypeName": "sheepdog-design",
+                            },
+                        ]),
+                        "toolSummary": "Launch two subagents",
+                    },
+                }
+            ],
+        }
+        # Step 2: 真实 Antigravity GENERIC（Created the following subagents: 块带出真实 conversationId）
+        step2 = {
+            "step_index": 31,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2026-10-20T05:14:57+08:00\n"
+                "Completed At: 2026-10-20T05:14:58+08:00\n"
+                "Created the following subagents:\n"
+                "{\n"
+                f'  "conversationId": "{cid1}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/test_home/.gemini/antigravity/brain/{cid1}/.system_generated/logs/transcript.jsonl",\n'
+                '  "workspaceUris": []\n'
+                "}\n"
+                "{\n"
+                f'  "conversationId": "{cid2}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/test_home/.gemini/antigravity/brain/{cid2}/.system_generated/logs/transcript.jsonl",\n'
+                '  "workspaceUris": []\n'
+                "}"
+            ),
+        }
+        self.append("conv_test_alpha", step1, step2)
+
+        # 子代理在各自 transcript 中活动（一个更新心跳，一个触发危险命令审计）
+        self.cfg.audit.topics = ["tp_alpha"]
+        self.cfg.audit.danger_patterns = list(DEFAULT_DANGER_PATTERNS)
+        self.append(cid1, tool(ago(1), "Running unit tests", "Running tests", cmd="python3 -m unittest"))
+        self.append(cid2, run_command("gcloud builds triggers run prod-api --tag=v2.0.0", step=12, at=utc(ago(1))))
+
+        self.d.dispatch_once()
+
+        active = self.store.get_active_lambs("tp_alpha")
+        self.assertEqual(len(active), 2)
+        by_cid = {lb["conversation_id"]: lb for lb in active}
+        self.assertIn(cid1, by_cid)
+        self.assertIn(cid2, by_cid)
+        self.assertEqual(by_cid[cid1]["task_title"], "Phase 1 Lamb Implementer")
+        self.assertEqual(by_cid[cid2]["task_title"], "Phase 2 Group Designer")
+        # 心跳已从子代理 transcript 刷新，且危险命令审计已归属到母羊 tp_alpha
+        self.assertTrue(any(f"由羔羊 {by_cid[cid2]['lamb_id']} 执行" in n and "tp_alpha" in n for n in self.notices), self.notices)
+
+        # Step 3: 真实 Antigravity SYSTEM_MESSAGE（子代理回信，自动将对应羔羊标为 done）
+        step3 = {
+            "step_index": 32,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(0)),
+            "content": f"[Message] timestamp=2026-10-19T21:21:22Z sender={cid2} priority=MESSAGE_PRIORITY_HIGH content=# Done report",
+        }
+        self.append("conv_test_alpha", step3)
+        self.d.dispatch_once()
+
+        lb1 = self.store.find_lamb_by_cid(cid1)
+        lb2 = self.store.find_lamb_by_cid(cid2)
+        self.assertEqual(lb1["state"], "running")
+        self.assertEqual(lb2["state"], "done")
+        self.assertIn("Done report", lb2["result_summary"])
+        self.assertEqual(lb2["report_msg_id"], "native_system_message")
+
+    def test_763_lamb_interface_in_standing_rules(self):
+        managed_if = interface_section("tp_alpha", bus=False, remind=[15], expire=60)
+        self.assertIn("### 羔羊（重活后台并发与 30 秒卸锁）", managed_if)
+        self.assertIn("45 秒", managed_if)
+        self.assertIn("sheepdog lamb spawn", managed_if)
+        self.assertIn('"anchors":["lamb:<lamb_id>"]', managed_if)
+
+        bus_if = interface_section("tp_bus", bus=True, remind=[15], expire=60)
+        self.assertNotIn("sheepdog lamb spawn", bus_if)
 
     def test_763_lamb_register_and_auto_discover_from_transcript(self):
         self.test_763_lamb_register_and_board_display()

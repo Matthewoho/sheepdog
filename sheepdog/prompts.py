@@ -254,6 +254,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         f"`watch_done:<id>`，否则下次回执后恢复等待、从回复时间重新计时；{'/'.join(map(str, remind)) or '-'} 分钟没回时提示你；"
         f"{expire} 分钟到期并提示你。`sheepdog watches` 查看，`sheepdog unwatch --id <id>` 取消。",
         *duty_interface(topic_id, cli_host),
+        *(lamb_interface(topic_id, cli_host) if not bus else []),
         *owner_interface(topic_id, identity),
         *(topic_group_interface(topic_id) if topic_group else []),
     ]
@@ -362,6 +363,26 @@ def duty_interface(topic_id: str, cli_host: bool = False) -> list[str]:
         + ("（你写不了账本时就用这个）。" if cli_host else "。"),
     ]
     return lines
+
+
+def lamb_interface(topic_id: str, cli_host: bool = False) -> list[str]:
+    """羔羊（7.63）的接口说明：重活后台并发与母羊 30 秒卸锁。"""
+    return [
+        "### 羔羊（重活后台并发与 30 秒卸锁）",
+        "- 轻活（预计 ≤ 45 秒、≤ 3 步只读查询、直接回话）：母羊当场做完交 `handled` 回执，不生羔羊。",
+        "- 重活（满足任一：① 预计 > 45 秒的深挖/多仓库核对/大 JSON/大日志排查；② 盯 Cloud Build / GitHub Actions 等长耗时构建；"
+        "③ 去独立工作树写代码跑测试；④ 同一批 ≥ 2 件独立活并行）：母羊只花 30 秒派羔羊并立即交 `waiting` 回执卸锁，绝不自己占着批次锁硬扛。",
+        f"- 生羔羊：`sheepdog lamb spawn --topic {topic_id} --title \"<一句话任务>\" --cmd \"<后台命令>\"`"
+        f"（或调宿主原生 `invoke_subagent` 后跑 `sheepdog lamb register --topic {topic_id} --title \"<一句话任务>\" "
+        f"--cid <子代理conversation_id>`；`sheepdog lamb list --topic {topic_id}` 查看）；",
+        f"- 立即卸锁：`sheepdog receipt --topic {topic_id} --batch <批次ID> "
+        "--json '{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}'`"
+        "（带 `lamb:<lamb_id>` 锚点会当场释放母羊批次锁，门外新消息不阻塞）；",
+        "- 完工回流：CLI 羔羊跑完调 `sheepdog lamb done --lamb-id <lamb_id> --summary \"<≤30行结论与证据>\"`"
+        "（原生 `invoke_subagent` 回信也会自动结案），sheepdog 会把 `[羔羊完工汇报]` 投回母羊，"
+        "由母羊统一对外 `reply / ask / report`（羔羊严禁直接对外说话或交母羊回执）。",
+    ]
+
 
 
 # ---------- 各类开场 prompt ----------

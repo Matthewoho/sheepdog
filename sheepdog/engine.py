@@ -20,7 +20,8 @@ from . import media
 from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTIVITY_TAIL, activity_at, commands_in,
                     first_match, human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts,
-                    record_time, redact, scan_jsonl, subagent_invocations_in, tool_actions, user_turn)
+                    record_time, redact, scan_jsonl, subagent_created_cids_in, subagent_invocations_in,
+                    subagent_returns_in, tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
                       adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
@@ -4049,7 +4050,7 @@ class Dispatcher:
 
     # ---------- 羔羊（7.63） ----------
     def _scan_lambs(self) -> list[str]:
-        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用，若未显式 lamb register，自动补建一条 kind='subagent' 的 lambs 记录。"""
+        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写与 SYSTEM_MESSAGE 子代理回传结案。"""
         discovered: list[str] = []
         for t in self.store.list_topics():
             if (t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS) or t["state"] == sm.CLOSED \
@@ -4084,6 +4085,69 @@ class Dispatcher:
                                            started_at=ts, last_act_at=ts)
                     discovered.append(lid)
                     log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
+
+                for cid in subagent_created_cids_in(host, d):
+                    if self.store.find_lamb_by_cid(cid) is not None:
+                        continue
+                    active = self.store.get_active_lambs(tid)
+                    matched = next(
+                        (
+                            lb for lb in active
+                            if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
+                        ),
+                        None,
+                    )
+                    ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
+                    if matched is not None:
+                        self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
+                        log.info("topic %s: 关联 subagent conversation_id %s -> %s (%s)",
+                                 tid, cid, matched["lamb_id"], matched["task_title"])
+                    else:
+                        digest = hashlib.sha1(f"{tid}:{off}:{cid}".encode("utf-8")).hexdigest()[:8]
+                        lid = f"lamb_{digest}"
+                        if self.store.get_lamb(lid) is None:
+                            self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent",
+                                                   conversation_id=cid, state="running",
+                                                   started_at=ts, last_act_at=ts)
+                            discovered.append(lid)
+                            log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
+
+                for ret in subagent_returns_in(host, d):
+                    active = self.store.get_active_lambs(tid)
+                    matched = next(
+                        (lb for lb in active if (lb["conversation_id"] or "").strip() == ret.conversation_id),
+                        None,
+                    )
+                    if matched is None:
+                        continue
+                    lid = matched["lamb_id"]
+                    ts = ret.at or now_iso()
+                    summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
+                    nk = duty.norm_key(f"lamb:{lid}")
+                    w = self.store.get_work(tid, nk)
+                    t_cur = self.store.get_topic(tid)
+                    if t_cur is not None and t_cur["pending_batch_id"] is None and w is not None and not w["closed_at"]:
+                        complete_lamb(self.store, lid, summary=summary, state="done")
+                    else:
+                        self.store.update_lamb(
+                            lid,
+                            state="done",
+                            finished_at=matched["finished_at"] or ts,
+                            last_act_at=ts,
+                            result_summary=summary,
+                            reported_at=matched["reported_at"] or ts,
+                            report_msg_id="native_system_message",
+                        )
+                        if w is not None and not w["closed_at"]:
+                            self.store.update_work(
+                                w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts
+                            )
+                            self.store.close_route(tid, nk, "羔羊已完成", ts)
+                            duty.record_closed(
+                                self.store,
+                                self.store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone(),
+                            )
+                    log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
 
             self._follow(t, LAMB_DISCOVERY, handle, backfill=LAST_ACTIVITY_TAIL)
         return discovered

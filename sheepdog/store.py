@@ -565,7 +565,8 @@ CREATE TABLE IF NOT EXISTS lambs (
     finished_at     TEXT,
     result_summary  TEXT,
     log_path        TEXT,
-    reported_at     TEXT               -- 已向母羊投递 lamb_report 批次的时间
+    reported_at     TEXT,              -- 已向母羊投递 lamb_report 批次的时间
+    report_msg_id   TEXT               -- 投递回母羊的消息号（或 native_system_message）
 );
 CREATE INDEX IF NOT EXISTS idx_lambs_parent ON lambs(parent_topic_id, state);
 CREATE INDEX IF NOT EXISTS idx_lambs_cid ON lambs(conversation_id);
@@ -601,7 +602,8 @@ MIGRATIONS = {
     "lambs": [("parent_topic_id", "TEXT"), ("kind", "TEXT"), ("task_title", "TEXT"),
               ("conversation_id", "TEXT"), ("pid", "INTEGER"), ("state", "TEXT"),
               ("started_at", "TEXT"), ("last_act_at", "TEXT"), ("finished_at", "TEXT"),
-              ("result_summary", "TEXT"), ("log_path", "TEXT"), ("reported_at", "TEXT")],
+              ("result_summary", "TEXT"), ("log_path", "TEXT"), ("reported_at", "TEXT"),
+              ("report_msg_id", "TEXT")],
 }
 
 
@@ -2098,6 +2100,7 @@ class Store:
     LAMB_FIELDS = (
         "parent_topic_id", "kind", "task_title", "conversation_id", "pid", "state",
         "started_at", "last_act_at", "finished_at", "result_summary", "log_path", "reported_at",
+        "report_msg_id",
     )
 
     def create_lamb(
@@ -2118,6 +2121,7 @@ class Store:
         result_summary: str | None = None,
         log_path: str | None = None,
         reported_at: str | None = None,
+        report_msg_id: str | None = None,
     ) -> dict:
         ptid = (parent_topic_id or topic_id).strip()
         ttitle = (task_title or title or lamb_id).strip()
@@ -2127,8 +2131,8 @@ class Store:
         with self.tx() as c:
             c.execute(
                 """INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, conversation_id, pid, state,
-                                     started_at, last_act_at, finished_at, result_summary, log_path, reported_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     started_at, last_act_at, finished_at, result_summary, log_path, reported_at, report_msg_id)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(lamb_id) DO UPDATE SET
                        parent_topic_id=excluded.parent_topic_id,
                        kind=excluded.kind,
@@ -2139,8 +2143,9 @@ class Store:
                        last_act_at=excluded.last_act_at,
                        finished_at=COALESCE(excluded.finished_at, lambs.finished_at),
                        result_summary=COALESCE(excluded.result_summary, lambs.result_summary),
-                       log_path=COALESCE(excluded.log_path, lambs.log_path)""",
-                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at),
+                       log_path=COALESCE(excluded.log_path, lambs.log_path),
+                       report_msg_id=COALESCE(excluded.report_msg_id, lambs.report_msg_id)""",
+                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at, report_msg_id),
             )
         return self.get_lamb(lamb_id) or {}
 
@@ -2165,7 +2170,7 @@ class Store:
         if parent_topic_id:
             sql += " AND parent_topic_id=?"
             args.append(parent_topic_id)
-        rows = self.conn.execute(sql + " ORDER BY started_at ASC, lamb_id ASC", args).fetchall()
+        rows = self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()
         return [dict(r) for r in rows]
 
     def list_lambs(
@@ -2185,7 +2190,7 @@ class Store:
             args.append(state)
         elif not include_finished:
             sql += " AND state='running'"
-        rows = self.conn.execute(sql + " ORDER BY started_at ASC, lamb_id ASC", args).fetchall()
+        rows = self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()
         return [dict(r) for r in rows]
 
     def find_lamb_by_cid(self, conversation_id: str) -> dict | None:
