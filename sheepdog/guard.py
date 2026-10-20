@@ -64,7 +64,13 @@ _NEEDLES = {
     ACTIVITY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed"),
     DUTY: (b"PLANNER_RESPONSE", b"GENERIC", b"item_completed", b"custom_tool_call", b"USER_INPUT", b"CHECKPOINT",
            b"compaction", b"compacted", b"compact_boundary", b"user_message", b'"type":"user"', b'"type": "user"'),
-    LAMB_DISCOVERY: (b"invoke_subagent", b"Created the following subagents", b"SYSTEM_MESSAGE", b"[Message]"),
+    LAMB_DISCOVERY: (
+        b"invoke_subagent",
+        b"Created the following subagent",
+        b"SYSTEM_MESSAGE",
+        b"[Message]",
+        b"manage_subagents",
+    ),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
 LAST_ACTIVITY_TAIL = 4 * 1024 * 1024
@@ -386,10 +392,24 @@ def one_sentence(text: str, limit: int = 80) -> str:
 
 # ---------- 自动发现 invoke_subagent（7.63） ----------
 _UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.I)
-_CREATED_SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
-_SUBAGENT_MSG_HEADER_RE = re.compile(r"^\[Message\][^\n]*?\bsender=([^\s]+)")
-_SUBAGENT_MSG_TS_RE = re.compile(r"^\[Message\][^\n]*?\btimestamp=([^\s]+)")
-_SUBAGENT_MSG_CONTENT_RE = re.compile(r"^\[Message\][^\n]*?\bcontent=(.*)", re.S)
+_CREATED_SUBAGENT_HDR_RE = re.compile(r"Created the following subagents?:\s*\n")
+_CREATED_SUBAGENT_CID_RE = re.compile(
+    r'"conversationId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+    re.I,
+)
+_TRUNCATED_SUBAGENT_ROLE_RE = re.compile(r'(?:\\?"Role\\?"|\\?"TaskTitle\\?")\s*:\s*\\?"([^"\\]+)')
+_SUBAGENT_RETURN_BLOCK_RE = re.compile(
+    r"<SYSTEM_MESSAGE>\s*\[Message\]\s+timestamp=([^\s]+)\s+"
+    r"sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s)"
+    r"[^\n]*?\bcontent=(.*?)(?:</SYSTEM_MESSAGE>|\Z)",
+    re.I | re.S,
+)
+_SUBAGENT_RETURN_DIRECT_RE = re.compile(
+    r"\A\s*\[Message\]\s+timestamp=([^\s]+)\s+"
+    r"sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s)"
+    r"[^\n]*?\bcontent=(.*?)\Z",
+    re.I | re.S,
+)
 
 
 @dataclass
@@ -425,6 +445,9 @@ def _parse_subagents_arg(raw) -> list[dict]:
             try:
                 val = json.loads(s)
             except json.JSONDecodeError:
+                roles = [m.group(1).strip() for m in _TRUNCATED_SUBAGENT_ROLE_RE.finditer(s) if m.group(1).strip()]
+                if roles:
+                    return [{"Role": r} for r in roles]
                 return []
     if isinstance(val, list):
         return [x for x in val if isinstance(x, dict)]
@@ -527,16 +550,19 @@ def subagent_invocations_in(host: str, d: dict, line_offset: int) -> list[Subage
 
 
 def subagent_created_cids_in(host: str, d: dict) -> list[str]:
-    """从 Antigravity GENERIC 'Created the following subagents:' 行提取创建出的子代理 conversationId 列表。"""
+    """从 Antigravity GENERIC 'Created the following subagent(s):' 行提取创建出的子代理 conversationId 列表。"""
     if d.get("type") != "GENERIC":
         return []
     raw_content = d.get("content")
     text = _decoded(raw_content) if isinstance(raw_content, str) else ""
     if not text and isinstance(raw_content, str):
         text = raw_content
-    if "Created the following subagents:" not in text:
+    if "Command exited with code" in text:
         return []
-    after = text.split("Created the following subagents:", 1)[1]
+    m_hdr = _CREATED_SUBAGENT_HDR_RE.search(text)
+    if not m_hdr:
+        return []
+    after = text[m_hdr.end():]
     cids = [m.group(1).strip() for m in _CREATED_SUBAGENT_CID_RE.finditer(after) if m.group(1).strip()]
     return list(dict.fromkeys(cids))
 
@@ -552,23 +578,42 @@ def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:
     if "[Message]" not in text:
         return []
     line_at = str(d.get("created_at") or d.get("timestamp") or "")
+    matches = list(_SUBAGENT_RETURN_BLOCK_RE.finditer(text))
+    if not matches:
+        matches = list(_SUBAGENT_RETURN_DIRECT_RE.finditer(text))
     out: list[SubagentReturn] = []
-    for chunk in re.split(r"(?=\[Message\])", text):
-        chunk = chunk.strip()
-        if not chunk.startswith("[Message]"):
-            continue
-        m_sender = _SUBAGENT_MSG_HEADER_RE.search(chunk)
-        if not m_sender:
-            continue
-        sender = m_sender.group(1).strip()
-        if not sender:
-            continue
-        m_ts = _SUBAGENT_MSG_TS_RE.search(chunk)
-        at = line_at or (m_ts.group(1).strip() if m_ts else "")
-        m_body = _SUBAGENT_MSG_CONTENT_RE.search(chunk)
-        raw_body = m_body.group(1).strip() if m_body else ""
+    for m in matches:
+        ts_raw = m.group(1).strip()
+        sender = m.group(2).strip()
+        raw_body = m.group(3).strip()
+        at = line_at or ts_raw
         summary = one_sentence(raw_body, 120) or "subagent returned"
         out.append(SubagentReturn(conversation_id=sender, summary=summary, at=at))
     return out
+
+
+def subagent_kills_in(host: str, d: dict) -> tuple[bool, list[str]]:
+    """从 Antigravity PLANNER_RESPONSE 的 manage_subagents 工具调用提取 (kill_all, killed_cids)。"""
+    if d.get("type") != "PLANNER_RESPONSE":
+        return False, []
+    kill_all = False
+    cids: list[str] = []
+    for tc in d.get("tool_calls") or []:
+        if not isinstance(tc, dict) or tc.get("name") != "manage_subagents":
+            continue
+        args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+        action = _pick_str(args.get("Action"), args.get("action")).lower()
+        if action == "kill_all":
+            kill_all = True
+        elif action == "kill":
+            raw_cids = args.get("ConversationIds") if "ConversationIds" in args else args.get("conversation_ids")
+            if isinstance(raw_cids, list):
+                raw_text = json.dumps(raw_cids, ensure_ascii=False)
+            else:
+                raw_text = str(raw_cids or "")
+            cids.extend(m.group(1) for m in _UUID_RE.finditer(raw_text))
+    if kill_all and not cids:
+        return True, []
+    return kill_all, list(dict.fromkeys(cids))
 
 

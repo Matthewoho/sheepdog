@@ -370,6 +370,176 @@ class LambTest(DutyBase):
         self.assertIn("Done report", lb2["result_summary"])
         self.assertEqual(lb2["report_msg_id"], "native_system_message")
 
+    def test_763_real_transcript_edge_cases_singular_truncated_cron_and_kill(self):
+        cid_single = "8daa20a2-6cb0-4211-88ef-aada2b4e6abe"
+        cid_other = "056892a5-9f21-4ad1-a4d3-e507aaf0f5a4"
+
+        # 1. Truncated Subagents JSON string + run_command stdout noise + singular "Created the following subagent:"
+        truncated_step = {
+            "step_index": 40,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(5)),
+            "truncated_fields": ["thinking", "tool_calls"],
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": '[{"Model":"inherit","Role":"Real Transcript Fixer","Prompt":"Very long prompt...\n<truncated 5134 bytes>',
+                        "toolSummary": "Launch fixer",
+                    },
+                }
+            ],
+        }
+        noise_cmd_step = {
+            "step_index": 41,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2026-10-20T14:54:46+08:00\n"
+                "Completed At: 2026-10-20T14:54:48+08:00\n"
+                "Command exited with code 0.\n\n"
+                "Command output:\n"
+                "Created the following subagents:\n"
+                '{\n  "conversationId": "deadbeef-dead-beef-dead-beefdeadbeef"\n}'
+            ),
+        }
+        singular_created_step = {
+            "step_index": 42,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2026-10-20T14:56:50+08:00\n"
+                "Completed At: 2026-10-20T14:56:52+08:00\n"
+                "Created the following subagent:\n"
+                "{\n"
+                f'  "conversationId": "{cid_single}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/.gemini/antigravity/brain/{cid_single}/.system_generated/logs/transcript.jsonl"\n'
+                "}"
+            ),
+        }
+        # 2. Second subagent + cron /task-133 and markdown prose in SYSTEM_MESSAGE (must NOT trigger subagent return)
+        second_invoke_step = {
+            "step_index": 43,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(3)),
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Role": json.dumps("Phase 2 Independent Verifier"),
+                    },
+                }
+            ],
+        }
+        second_created_step = {
+            "step_index": 44,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(3)),
+            "content": (
+                "Created At: 2026-10-20T14:57:00+08:00\n"
+                "Completed At: 2026-10-20T14:57:01+08:00\n"
+                "Created the following subagent:\n"
+                "{\n"
+                f'  "conversationId": "{cid_other}"\n'
+                "}"
+            ),
+        }
+        cron_and_prose_msg = {
+            "step_index": 45,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(2)),
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-20T07:00:00Z sender={cid_single}/task-133 "
+                "priority=MESSAGE_PRIORITY_HIGH content=Cron wakeup\n"
+                "Also note in markdown prose: [Message] timestamp=2026-10-20T07:00:00Z sender=<cid> content=example\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }
+        self.append(
+            "conv_test_alpha",
+            truncated_step,
+            noise_cmd_step,
+            singular_created_step,
+            second_invoke_step,
+            second_created_step,
+            cron_and_prose_msg,
+        )
+        self.d.dispatch_once()
+
+        # Verify: deadbeef from run_command was ignored; both real subagents are running; cron /task-133 did NOT close cid_single
+        self.assertIsNone(self.store.find_lamb_by_cid("deadbeef-dead-beef-dead-beefdeadbeef"))
+        lb_single = self.store.find_lamb_by_cid(cid_single)
+        lb_other = self.store.find_lamb_by_cid(cid_other)
+        self.assertIsNotNone(lb_single)
+        self.assertIsNotNone(lb_other)
+        self.assertEqual(lb_single["task_title"], "Real Transcript Fixer")
+        self.assertEqual(lb_single["state"], "running")
+        self.assertEqual(lb_other["task_title"], "Phase 2 Independent Verifier")
+        self.assertEqual(lb_other["state"], "running")
+
+        # Register open work_item on tp_alpha for lb_other to verify manage_subagents kill closes it
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "waiting", "summary": "等待羔羊", "anchors": [f"lamb:{lb_other['lamb_id']}"]},
+        )
+
+        # 3. Real <SYSTEM_MESSAGE> return for cid_single + manage_subagents kill for cid_other
+        real_return_step = {
+            "step_index": 46,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(1)),
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-20T07:10:00Z sender={cid_single} "
+                "priority=MESSAGE_PRIORITY_HIGH content=All edge cases fixed.\n</SYSTEM_MESSAGE>"
+            ),
+        }
+        kill_step = {
+            "step_index": 47,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(0)),
+            "tool_calls": [
+                {
+                    "name": "manage_subagents",
+                    "args": {
+                        "Action": json.dumps("kill"),
+                        "ConversationIds": json.dumps([cid_other]),
+                    },
+                }
+            ],
+        }
+        self.append("conv_test_alpha", real_return_step, kill_step)
+        self.d.dispatch_once()
+
+        lb_single_after = self.store.find_lamb_by_cid(cid_single)
+        lb_other_after = self.store.find_lamb_by_cid(cid_other)
+        self.assertEqual(lb_single_after["state"], "done")
+        self.assertIn("All edge cases fixed", lb_single_after["result_summary"])
+        self.assertEqual(lb_single_after["report_msg_id"], "native_system_message")
+
+        self.assertEqual(lb_other_after["state"], "done")
+        self.assertEqual(lb_other_after["result_summary"], "已由母羊销毁")
+        self.assertEqual(lb_other_after["report_msg_id"], "killed_by_parent")
+        w_other = self.store.get_work("tp_alpha", duty.norm_key(f"lamb:{lb_other['lamb_id']}"))
+        self.assertEqual(w_other["state"], duty.DONE)
+        self.assertIsNotNone(w_other["closed_at"])
+
     def test_763_lamb_interface_in_standing_rules(self):
         managed_if = interface_section("tp_alpha", bus=False, remind=[15], expire=60)
         self.assertIn("### 羔羊（重活后台并发与 30 秒卸锁）", managed_if)

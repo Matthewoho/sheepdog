@@ -375,9 +375,11 @@ def lamb_interface(topic_id: str, cli_host: bool = False) -> list[str]:
         f"- 生羔羊：`sheepdog lamb spawn --topic {topic_id} --title \"<一句话任务>\" --cmd \"<后台命令>\"`"
         f"（或调宿主原生 `invoke_subagent` 后跑 `sheepdog lamb register --topic {topic_id} --title \"<一句话任务>\" "
         f"--cid <子代理conversation_id>`；`sheepdog lamb list --topic {topic_id}` 查看）；",
-        f"- 立即卸锁：`sheepdog receipt --topic {topic_id} --batch <批次ID> "
-        "--json '{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}'`"
-        "（带 `lamb:<lamb_id>` 锚点会当场释放母羊批次锁，门外新消息不阻塞）；",
+        ("- 立即卸锁：在回答末尾附回执块 `{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}`"
+         if cli_host else
+         f"- 立即卸锁：`sheepdog receipt --topic {topic_id} --batch <批次ID> "
+         "--json '{\"status\":\"waiting\",\"summary\":\"已派羔羊...\",\"anchors\":[\"lamb:<lamb_id>\"]}'`")
+        + "（带 `lamb:<lamb_id>` 锚点会当场释放母羊批次锁，门外新消息不阻塞）；",
         "- 完工回流：CLI 羔羊跑完调 `sheepdog lamb done --lamb-id <lamb_id> --summary \"<≤30行结论与证据>\"`"
         "（原生 `invoke_subagent` 回信也会自动结案），sheepdog 会把 `[羔羊完工汇报]` 投回母羊，"
         "由母羊统一对外 `reply / ask / report`（羔羊严禁直接对外说话或交母羊回执）。",
