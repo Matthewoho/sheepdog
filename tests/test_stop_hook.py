@@ -167,8 +167,11 @@ class BlockTest(HookBase):
 
     def test_at_most_twice_per_batch_then_new_batch_counts_again(self):
         self.assertEqual(json.loads(self.run_main()[1])["decision"], "continue")
+        self.now += timedelta(seconds=15)
         self.assertIn("n=2", json.loads(self.run_main(stop_input(execution_num=1))[1])["reason"])
+        self.now += timedelta(seconds=15)
         self.assertEqual(self.run_main(stop_input(execution_num=2)), (0, ""))   # 第三次放行
+        self.now += timedelta(seconds=15)
         self.assertEqual(self.run_main(), (0, ""))
         nb = "b20261014073000"
         self.edit("UPDATE topics SET pending_batch_id=? WHERE topic_id='tp_bus'", nb)
@@ -176,7 +179,9 @@ class BlockTest(HookBase):
                   nb, "tp_bus", "[]", "2026-10-14T07:30:00+08:00", "sent")
         record(BUS_CID, delivered(nb, 20))
         self.assertIn("n=1", self.check()["reason"])                   # 换了批次从头算
-        self.assertEqual(json.loads(hook.count_path(self.cfg, "tp_bus").read_text()), {"batch": nb, "count": 1})
+        st = json.loads(hook.count_path(self.cfg, "tp_bus").read_text())
+        self.assertEqual((st["batch"], st["count"]), (nb, 1))
+        self.assertIn("last_blocked_at", st)
 
     def test_ledger_is_read_only(self):
         # 账本一个字节不改：只读打开，不建表、不迁移；拦的次数记在状态目录下的小文件里
@@ -498,3 +503,133 @@ class ConstantsTest(unittest.TestCase):
             self.assertIn(name, OPTIONAL_PLAYBOOK_FILES)
             self.assertTrue((REPO / "examples" / "playbook" / name).read_text(encoding="utf-8").strip())
         self.assertEqual(Playbook(REPO / "tests" / "no_such_dir").render_or("x.md", "默认 {{a}}", a="1"), "默认 1")
+
+
+class AutoResume764Test(HookBase):
+    """规格 7.64（SD-204）：宿主重登/断连瞬时 Stop 保护、60s 自动断点续跑唤醒、running 状态 session-reset。"""
+
+    def test_regression_764_rapid_stop_under_10s_marks_interrupted_and_passes_without_burning_quota(self):
+        rc1, out1 = self.run_main()
+        self.assertEqual(rc1, 0)
+        self.assertEqual(json.loads(out1)["decision"], "continue")
+        st1 = json.loads(hook.count_path(self.cfg, "tp_bus").read_text(encoding="utf-8"))
+        self.assertEqual(st1["count"], 1)
+        self.assertTrue(st1.get("last_blocked_at"))
+
+        # 1 秒后因宿主断连再次触发 Stop：不累加 count，写 interrupted=True 与 passed_at，并当场放行（pass）
+        self.now += timedelta(seconds=1)
+        info: dict = {}
+        res = hook.stop_check(stop_input(execution_num=1), self.cfg, self.now, info)
+        self.assertIsNone(res)
+        self.assertIn("间隔 <10s", info.get("reason", ""))
+        st2 = json.loads(hook.count_path(self.cfg, "tp_bus").read_text(encoding="utf-8"))
+        self.assertEqual(st2["count"], 1)
+        self.assertTrue(st2.get("interrupted"))
+        self.assertEqual(st2.get("passed_at"), self.now.isoformat(timespec="seconds"))
+
+    def test_regression_764_max_blocks_pass_keeps_stop_state_with_passed_at_until_receipt(self):
+        self.run_main()
+        self.now += timedelta(seconds=15)
+        self.run_main(stop_input(execution_num=1))
+        self.now += timedelta(seconds=15)
+        rc, out = self.run_main(stop_input(execution_num=2))
+        self.assertEqual((rc, out), (0, ""))
+        p = hook.count_path(self.cfg, "tp_bus")
+        self.assertTrue(p.exists())
+        st = json.loads(p.read_text(encoding="utf-8"))
+        self.assertEqual(st["count"], 2)
+        self.assertEqual(st["passed_at"], self.now.isoformat(timespec="seconds"))
+
+        # 提交回执后清理 stop state 文件
+        write_receipt(self.cfg, "tp_bus", BATCH, {"status": "handled", "summary": "done"})
+        self.assertFalse(p.exists())
+
+    def test_regression_764_engine_auto_resumes_once_after_60s_and_unlocks_on_second_pass(self):
+        from sheepdog.roster import parse_roster
+        from test_roster import FakeSink, roster_data
+
+        b_alpha = "b20261021000917-alpha"
+        sent_dt = self.now - timedelta(minutes=3)
+        self.edit(
+            "UPDATE topics SET state='running', pending_batch_id=?, dispatched_at=? WHERE topic_id='tp_alpha'",
+            b_alpha,
+            sent_dt.isoformat(timespec="seconds"),
+        )
+        self.edit(
+            "INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
+            b_alpha,
+            "tp_alpha",
+            '["om_test_a1"]',
+            sent_dt.isoformat(timespec="seconds"),
+            "sent",
+        )
+        record(ALPHA_CID, delivered(b_alpha))
+        stopped_dt = self.now - timedelta(seconds=65)
+        hook._write_stop_state(
+            hook.count_path(self.cfg, "tp_alpha"),
+            {
+                "batch": b_alpha,
+                "count": 1,
+                "last_blocked_at": (stopped_dt - timedelta(seconds=1)).isoformat(timespec="seconds"),
+                "interrupted": True,
+                "passed_at": stopped_dt.isoformat(timespec="seconds"),
+            },
+        )
+        sink = FakeSink()
+        store = Store(self.cfg.db_path)
+        try:
+            disp = engine.Dispatcher(self.cfg, store, sink, parse_roster(roster_data()))
+            with mock.patch("sheepdog.engine._now", return_value=self.now):
+                disp._check_receipt(store.get_topic("tp_alpha"))
+            self.assertEqual(len(sink.sent), 1)
+            self.assertIn(f"批次 `{b_alpha}` 尚未提交回执", sink.sent[0][1])
+            st_after = json.loads(hook.count_path(self.cfg, "tp_alpha").read_text(encoding="utf-8"))
+            self.assertTrue(st_after.get("auto_resumed"))
+            self.assertNotIn("passed_at", st_after)
+            t_after = store.get_topic("tp_alpha")
+            self.assertEqual(t_after["state"], sm.RUNNING)
+            self.assertEqual(t_after["dispatched_at"], self.now.isoformat(timespec="seconds"))
+
+            # 同一状态再次巡检不会重复发送唤醒
+            with mock.patch("sheepdog.engine._now", return_value=self.now + timedelta(seconds=10)):
+                disp._check_receipt(store.get_topic("tp_alpha"))
+            self.assertEqual(len(sink.sent), 1)
+
+            # 若唤醒后再次放行停机且满 60 秒仍未交回执，立即按超时解锁为 active（不干等 20 分钟）
+            second_stop = self.now + timedelta(seconds=30)
+            hook._write_stop_state(
+                hook.count_path(self.cfg, "tp_alpha"),
+                {
+                    **st_after,
+                    "passed_at": second_stop.isoformat(timespec="seconds"),
+                },
+            )
+            with mock.patch("sheepdog.engine._now", return_value=second_stop + timedelta(seconds=65)):
+                disp._check_receipt(store.get_topic("tp_alpha"))
+            t_unlocked = store.get_topic("tp_alpha")
+            self.assertEqual(t_unlocked["state"], sm.ACTIVE)
+            self.assertIsNone(t_unlocked["pending_batch_id"])
+            self.assertFalse(hook.count_path(self.cfg, "tp_alpha").exists())
+        finally:
+            store.close()
+
+    def test_regression_764_session_reset_supports_running_to_active(self):
+        self.run_main()
+        self.assertTrue(hook.count_path(self.cfg, "tp_bus").exists())
+        cfg_file = self.dir / "config.toml"
+        cfg_file.write_text(f'self_open_id = "{ME}"\n', encoding="utf-8")
+        env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": str(self.cfg.state_dir)}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch("sys.stdout", out):
+            rc = cli.main(["session-reset", "--topic", "tp_bus"])
+        self.assertEqual(rc, 0)
+        self.assertIn("已复位为 active", out.getvalue())
+        self.assertFalse(hook.count_path(self.cfg, "tp_bus").exists())
+        store = Store(self.cfg.db_path)
+        try:
+            t = store.get_topic("tp_bus")
+            self.assertEqual(t["state"], sm.ACTIVE)
+            self.assertIsNone(t["pending_batch_id"])
+            self.assertEqual(store.get_dispatch(BATCH)["state"], "missed")
+        finally:
+            store.close()

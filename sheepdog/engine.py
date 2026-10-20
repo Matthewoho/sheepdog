@@ -2433,9 +2433,11 @@ class Dispatcher:
         batch = t["pending_batch_id"]
         if not batch or t["state"] != sm.RUNNING:
             return
+        from . import hook
         adopted = t["kind"] in MANAGED_KINDS
         p = self.receipt_path(t["topic_id"], batch)
         if p.exists():
+            hook.clear_stop_state(self.cfg.state_dir, t["topic_id"])
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
             # 常驻会话（名册 adopted、总线、7.58 standing 动态会话）回执 done 都不关会话，按 handled 处理；
@@ -2476,6 +2478,8 @@ class Dispatcher:
         now = _now()
         if duty.fresh_active_lambs(self.store, t["topic_id"], now, self.cfg.lamb.timeout_minutes):
             return
+        if self._check_stopped_in_flight(t, batch, sent, now, adopted):
+            return
         vmins = self.cfg.session.verify_transcript_minutes
         if (vmins > 0 and self.topic_host(t) == ANTIGRAVITY and (batch or "").startswith("b")
                 and sent is not None and now - sent >= timedelta(minutes=vmins)
@@ -2487,10 +2491,95 @@ class Dispatcher:
             self._notify_uncertain_batch(t, batch, sent)
             return
         if sent and now - sent > timedelta(minutes=self.cfg.session.receipt_timeout_minutes):
+            hook.clear_stop_state(self.cfg.state_dir, t["topic_id"])
             if adopted:
                 self._miss(t, batch)
             else:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
+
+    def _transcript_error_at(self, t, batch: str, sent: datetime | None) -> datetime | None:
+        """7.64：检查会话记录末尾是否在当前批次送出后停在 ERROR_MESSAGE（或 status=ERROR）。"""
+        path = self._record_file(t)
+        if path is None or not path.is_file():
+            return None
+        try:
+            with path.open("rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                start = max(0, size - 256 * 1024)
+                f.seek(start)
+                data = f.read(size - start)
+        except OSError:
+            return None
+        lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        if start > 0 and lines:
+            lines = lines[1:]
+        if not lines:
+            return None
+        try:
+            last = json.loads(lines[-1])
+        except ValueError:
+            return None
+        if not isinstance(last, dict):
+            return None
+        if last.get("type") != "ERROR_MESSAGE" and last.get("status") != "ERROR":
+            return None
+        at = _parse(str(last.get("created_at") or "")) or self._record_mtime(t)
+        if at is not None and sent is not None and at < sent:
+            return None
+        return at
+
+    def _check_stopped_in_flight(self, t, batch: str, sent: datetime | None, now: datetime, adopted: bool) -> bool:
+        """7.64：会话在途因宿主退出/重登或 Stop hook 放行停机、且无活跃羔羊时：
+        静止满 60 秒自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
+        if self.topic_host(t) != ANTIGRAVITY:
+            return False
+        if self.store.get_active_lambs(t["topic_id"]):
+            return False
+        from . import hook
+        tid = t["topic_id"]
+        sp = hook.count_path(self.cfg, tid)
+        st = hook._read_stop_state(sp, batch)
+        if not st:
+            return False
+        stopped_at = None
+        if st.get("passed_at") or st.get("interrupted") is True:
+            stopped_at = _parse(str(st.get("passed_at") or st.get("last_blocked_at") or ""))
+        if stopped_at is None:
+            stopped_at = self._transcript_error_at(t, batch, sent)
+        if stopped_at is None or (now - stopped_at).total_seconds() < 60:
+            return False
+        meta_key = f"auto_resumed:{batch}"
+        already_resumed = bool(st.get("auto_resumed") or self.store.get_meta(meta_key))
+        resumed_at = _parse(str(st.get("auto_resumed_at") or self.store.get_meta(meta_key) or ""))
+        if already_resumed:
+            if resumed_at is not None and stopped_at < resumed_at:
+                return False
+            hook.clear_stop_state(self.cfg.state_dir, tid)
+            self.store.set_meta(duty_reset_key(tid), now.isoformat(timespec="seconds"))
+            if adopted:
+                self._miss(t, batch)
+            else:
+                self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
+            log.info("topic %s 批次 %s 自动续跑后再次停机满 60 秒未交回执，立即按超时解锁", tid, batch)
+            return True
+        prompt = f"[sheepdog] 检测到刚才宿主重登/中断，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
+        try:
+            self._send(t, prompt, batch)
+        except SinkError as e:
+            log.warning("topic %s 批次 %s 自动续跑唤醒发送失败（等待下一轮重试）: %s", tid, batch, e)
+            return True
+        now_str = now.isoformat(timespec="seconds")
+        new_st = {k: v for k, v in st.items() if k not in ("passed_at", "interrupted")}
+        new_st.update({"batch": batch, "count": int(st.get("count") or 0), "auto_resumed": True, "auto_resumed_at": now_str})
+        try:
+            hook._write_stop_state(sp, new_st)
+        except OSError:
+            pass
+        self.store.set_meta(meta_key, now_str)
+        self.store.refresh_topic_dispatched(tid, now_str)
+        self.store.set_meta(duty_reset_key(tid), now_str)
+        log.info("topic %s 批次 %s 检测到在途停机满 60 秒，已发送自动续跑唤醒", tid, batch)
+        return True
 
     def _record_active_since(self, t, since: datetime) -> bool:
         """从 since 起会话记录里有没有新动作（7.50#6）。"""
@@ -5745,6 +5834,8 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
         p = d / f"{batch_id}.json"
         receipt = {**receipt, "received_at": now_iso()}
         p.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+        from . import hook
+        hook.clear_stop_state(cfg.state_dir, topic_id)
         anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
         has_lamb_anchor = any(isinstance(a, str) and a.startswith("lamb:") for a in anchors)
         if store is not None and (status == "waiting" or has_lamb_anchor):

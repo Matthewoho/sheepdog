@@ -246,4 +246,8 @@
 | 7.49 | 主会话繁忙时无关新消息被主会话锁死排队，未路由给空闲副会话或自动按需扩出 `tp_<key>#2..#N`，或羊圈满额时未按最少待处理消息排队 | `test_session_group.SessionGroupTest.test_749_group_busy_primary_spawns_or_routes_to_secondary` |
 | 7.49 | 羊圈存在活跃同侪时批次提示词前未注入 `## 🏠 羊圈同侪状态`（或超过 10 行上限），或看板未展示 `[羊圈: <group_id> · <N>会话]` | `test_session_group.SessionGroupTest.test_749_group_peer_status_injected_in_prompt` |
 | 7.49 | 名册 `max_sessions` / `group` 默认值改变了老名册 `content_hash`，或 `[[group]]` 语法糖、副会话合成与 `known` 模式校验异常 | `test_session_group.SessionGroupTest.test_749_roster_group_syntax_and_content_hash_invariance` |
+| 7.64 | 宿主重登/退出时 10 秒内连环触发 Stop Hook 把 2 次拦截额度烧光并停机，或正常达到拦截上限放行时删掉状态文件导致引擎不知道会话已停机 | `test_stop_hook.AutoResume764Test.test_regression_764_rapid_stop_under_10s_marks_interrupted_and_passes_without_burning_quota`、`test_stop_hook.AutoResume764Test.test_regression_764_max_blocks_pass_keeps_stop_state_with_passed_at_until_receipt` |
+| 7.64 | 在途会话因重登/断连被 Stop Hook 放行停机后引擎干等 20 分钟才解锁，未在静止满 60 秒后自动发送断点续跑唤醒，或 `sheepdog session-reset` 拒绝将 `running` 会话复位为 `active` | `test_stop_hook.AutoResume764Test.test_regression_764_engine_auto_resumes_once_after_60s_and_unlocks_on_second_pass`、`test_stop_hook.AutoResume764Test.test_regression_764_session_reset_supports_running_to_active` |
+| 7.65 | VIP 消息命中 `action=tag` 安全规则时仍渲染普通人「必须回对方等 Matthew 确认并私聊 Matthew」死命令，或 `vip.md` 未将合理生产操作并入直办并把底线收紧为 3 条 | `test_vip.VipBranch765Test.test_regression_765_vip_rules_include_prod_authorization_and_three_floors`、`test_vip.VipBranch765Test.test_regression_765_vip_with_security_tag_renders_merged_vip_banner_not_mandatory_ask` |
+| 7.65 | 总线 `tp_bus` 把消息 `forward` 转交给专属会话后，又越俎代庖对该消息调用 `sheepdog ask` 或 `sheepdog reply` | `test_vip.VipBranch765Test.test_regression_765_bus_cannot_ask_or_reply_for_forwarded_message` |
 

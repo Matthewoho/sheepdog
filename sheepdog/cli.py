@@ -1595,6 +1595,7 @@ def cmd_close_session(args) -> int:
 
 
 def cmd_session_reset(args) -> int:
+    from . import hook
     cfg = _load_cfg()
     store = Store(cfg.db_path)
     t = store.get_topic(args.topic)
@@ -1603,14 +1604,22 @@ def cmd_session_reset(args) -> int:
         return 2
     # 在岗表（7.20）：在这之前送出、会话没碰过的批次不再算中断 / 失联，排队的信号下一轮照常投
     store.set_meta(duty_reset_key(args.topic), now_iso())
+    has_stop_state = hook.count_path(cfg, args.topic).exists()
+    hook.clear_stop_state(cfg.state_dir, args.topic)
     card = store.get_card(args.topic)
-    if card is not None and card["run_state"] in duty.STUCK:
+    was_stuck = card is not None and card["run_state"] in duty.STUCK
+    if was_stuck:
         store.upsert_card(args.topic, run_state=None, detail="session-reset 清掉了中断 / 失联判定，下一轮重算",
                           stuck_since=None)
         print("已清掉羊群看板的中断 / 失联判定")
-    if not sm.can(t["state"], "reset"):
+    if not sm.can(t["state"], "reset") or (t["state"] == sm.RUNNING and was_stuck and not has_stop_state):
         print(f"当前状态 {t['state']} 无需复位")
         return 0
+    if t["state"] == sm.RUNNING and t["pending_batch_id"]:
+        old_bid = t["pending_batch_id"]
+        old_d = store.get_dispatch(old_bid)
+        if old_d is not None and old_d["state"] == "sent":
+            store.set_dispatch_state(old_bid, "missed", error="session-reset 手动复位")
     store.update_topic(args.topic, state=sm.transition(t["state"], "reset"), retries=0, pending_batch_id=None,
                        attention_at=None, attention_reason=None)
     store.set_meta(attention_notice_key(args.topic), "")
@@ -1930,6 +1939,7 @@ def cmd_reply(args) -> int:
             return outbound.EXIT_INVALID
         target = store.get_message((args.to or "").strip())
         try:
+            outbound.check_bus_not_forwarded_reply(store, tid, (args.to or "").strip())
             if target is not None:
                 outbound.reject_owner_chat(cfg, tid, target["chat_id"])
         except outbound.OutboundError as e:

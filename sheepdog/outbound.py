@@ -228,10 +228,47 @@ def vip_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | Non
     return out
 
 
+def check_bus_not_forwarded_ask(cfg: Config, store: Store, topic_id: str, about: list[str] | None,
+                                batch: str = "") -> None:
+    """7.65：禁止总线 tp_bus 对已 forward 转交给专属会话的消息调用 sheepdog ask（交由承接会话判断与处理）。"""
+    if topic_id != BUS_TOPIC_ID:
+        return
+    if about and any((a or "").strip() for a in about):
+        try:
+            ids = [mid for mid, _ in pend.about_sources(cfg, store, about)]
+        except ValueError as e:
+            raise OutboundError(EXIT_INVALID, str(e))
+    else:
+        ids = [mid for mid, _ in pend.batch_sources(cfg, store, batch or current_batch(store, topic_id))]
+    forwarded = store.forwarded_message_targets(ids)
+    if forwarded:
+        pairs = "、".join(f"{mid} -> {dst}" for mid, dst in forwarded.items())
+        raise OutboundError(
+            EXIT_INVALID,
+            f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog ask（已转交：{pairs}）："
+            "请交由承接该消息的专属会话按职责与 VIP 规则判断处理，没有发送",
+        )
+
+
+def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -> None:
+    """7.65：禁止总线 tp_bus 对已 forward 转交给专属会话的消息调用 sheepdog reply。"""
+    if topic_id != BUS_TOPIC_ID:
+        return
+    forwarded = store.forwarded_message_targets([target_id])
+    if target_id in forwarded:
+        dst = forwarded[target_id]
+        raise OutboundError(
+            EXIT_INVALID,
+            f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog reply（{target_id} 已转交给 {dst}）："
+            "请交由承接该消息的专属会话处理与回复，没有发送",
+        )
+
+
 def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
                     floor: str, batch: str = "") -> list[tuple[str, str]]:
-    """7.61：ask 关联的来源里有 VIP 本人发的消息，就必须带非空 --floor，否则拒绝（退出码 2，什么都不发、不写账本）。
-    只读。send_to_owner 发之前调它；测试环境（不发飞书）那条路由 cli 直接调。返回关联到的 VIP 消息。"""
+    """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息时必须带非空 --floor，
+    否则拒绝（退出码 2，什么都不发、不写账本）。只读。"""
+    check_bus_not_forwarded_ask(cfg, store, topic_id, about, batch)
     hits = vip_sources(cfg, store, topic_id, about, vips, batch)
     if hits and not _one_line(floor):
         who = "、".join(f"{name}（{mid}）" for mid, name in hits)
@@ -740,6 +777,7 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     target_id = (target_id or "").strip()
     if not target_id.startswith("om_"):
         raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号，收到 {target_id!r}")
+    check_bus_not_forwarded_reply(store, topic_id, target_id)
     enabled = cfg.identity.enabled
     target = store.get_message(target_id)
     if target is not None and ((text or "").strip() or (card_text or "").strip()):

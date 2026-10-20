@@ -46,7 +46,7 @@ TRANSITIONS: dict[str, dict[str, str]] = {
     "human_detach": {HUMAN_ATTACHED: ACTIVE},
     "go_idle": {ACTIVE: IDLE},
     "close": {ACTIVE: CLOSED, IDLE: CLOSED, WAITING_HUMAN: CLOSED, BLOCKED: CLOSED, ATTENTION: CLOSED},
-    "reset": {ATTENTION: ACTIVE, FAILED: ACTIVE},
+    "reset": {ATTENTION: ACTIVE, FAILED: ACTIVE, RUNNING: ACTIVE},
 }
 
 # 可以直接投递的状态

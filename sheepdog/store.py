@@ -908,6 +908,29 @@ class Store:
                 (topic_id, json.dumps(tags, ensure_ascii=False), message_id),
             )
 
+    def forwarded_message_targets(self, message_ids: list[str]) -> dict[str, str]:
+        """7.65：查给定的消息 ID 里哪些已经被 forward 转交给专属会话（返回 {message_id: target_topic_id}）。"""
+        ids = [i.strip() for i in (message_ids or []) if i and i.strip()]
+        if not ids:
+            return {}
+        marks = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"SELECT message_id, topic_id, tags_json FROM messages WHERE message_id IN ({marks})",
+            ids,
+        ).fetchall()
+        out: dict[str, str] = {}
+        for r in rows:
+            tid = (r["topic_id"] or "").strip()
+            if not tid or tid == "tp_bus":
+                continue
+            try:
+                tags = json.loads(r["tags_json"] or "[]")
+            except (TypeError, ValueError):
+                tags = []
+            if "forwarded" in tags or tid != "tp_bus":
+                out[r["message_id"]] = tid
+        return out
+
     def add_system_message(self, topic_id: str, reason: str, content: str, tags: list[str] | None = None) -> str:
         """sheepdog 自己生成的待推消息，和 IM 消息一起按 topic 成批投递（同样受人类接管、排队约束）。"""
         ts = datetime.now().astimezone()
@@ -1072,6 +1095,11 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.tx() as c:
             c.execute(f"UPDATE topics SET {cols} WHERE topic_id=?", (*fields.values(), topic_id))
+
+    def refresh_topic_dispatched(self, topic_id: str, dispatched_at: str | None = None) -> None:
+        """7.64：自动续跑唤醒成功后刷新会话 dispatched_at 与 last_active。"""
+        ts = dispatched_at or now_iso()
+        self.update_topic(topic_id, dispatched_at=ts, last_active=ts)
 
     def upsert_topic(self, topic_id: str, **fields) -> None:
         existing = self.get_topic(topic_id)

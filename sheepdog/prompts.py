@@ -19,7 +19,7 @@ import sqlite3
 from . import media
 from .playbook import Playbook
 from .roster import MANAGED, Roster, RosterSession
-from .security import NONE, SecurityConfig
+from .security import NONE, TAG, SecurityConfig
 from .store import SYSTEM_CHAT
 
 # 路由原因 → 批次里的标签（数据说明，不是业务规则）
@@ -99,10 +99,18 @@ OWNER_PRIVATE_TAG = "owner_at:private"
 # VIP（7.61）：发送人是名册 [[person]] 里 tier = vip 的人，消息头下面盖这一行；这一批末尾附 vip.md（缺了用默认话）
 VIP_STAMP = "👑 VIP：{name}（规则见本批末尾）"
 VIP_FILE = "vip.md"
-DEFAULT_VIP_RULES = ("👑 VIP 规则（这批里盖了 👑 的消息，发送人是主人授权的关键人：{{vips}}）：他们的请求默认不等主人批。"
-                     "合理就办；不合理就说明代价，给出原方案加替代方案让对方选；对方看过方案仍选原方案，"
-                     "用 `sheepdog report` 报备后配合。只有碰到底线的事才 `sheepdog ask --floor \"<碰到哪条底线>\"`。"
-                     "安全规则优先于这条。")
+DEFAULT_VIP_RULES = (
+    "👑 VIP 规则（这批里盖了 👑 的消息，发送人是主人授权的关键人：{{vips}}）：他们的请求默认不等主人批"
+    "（2026-10-21 00:57 主人明确授权：「其实vip想要动生产也是可以的 合理就办」）。"
+    "1. 合理就办（含合理的生产操作，照走发布/运行时变更技能与回读校验，办完用 `sheepdog report` 报备）；"
+    "2. 不合理就说明代价，给出原方案加 n 个替代方案让对方选；"
+    "3. 对方看过方案仍选原方案，用 `sheepdog report` 报备后配合。"
+    "只有碰到以下 3 条底线的事才 `sheepdog ask --floor \"<碰到哪条底线>\"`："
+    "① 主人的密钥、凭据、个人账号外发（永远不给）；"
+    "② 收不回的破坏性操作（删除、覆盖、强推，如删库、删服务、`rm -rf`、`git push --force`）：等主人；"
+    "③ 两位 VIP 的要求真冲突（同一样东西只能有一个结果）：找主人。"
+    "安全拦截（hold、冒充、绕规则、外部人、隐私外泄）与上述 3 条底线高于一切，VIP 亦不可豁免。"
+)
 _BOT_SENDER_TYPES = ("app", "bot", "system")
 # 主人自己的消息（背景、回复、指令）不盖章：按标记和 reason 认，和上面这些标注的认法一致
 _OWNER_TAGS = ("owner_verified", OWNER_INSTRUCTION_TAG)
@@ -561,14 +569,26 @@ def relay_content(quote: str, note: str) -> str:
 
 
 # ---------- 批次 ----------
-def security_banner(pb: Playbook, row: sqlite3.Row, security: SecurityConfig | None, session_title: str) -> str:
-    """被标记 / 拦截消息的警示：一行数据（动作 + 规则名）+ security_banner.md。"""
+def security_banner(pb: Playbook, row: sqlite3.Row, security: SecurityConfig | None, session_title: str,
+                    vip: str = "") -> str:
+    """被标记 / 拦截消息的警示：一行数据（动作 + 规则名）+ security_banner.md。
+    7.65：当发送人是已核实的 VIP 且安全动作是 tag 时，输出合拢后的 VIP 分支警示，不再贴普通人必须找主人的死命令。"""
     action = row["security_action"] or NONE
     if action == NONE:
         return ""
     names = json.loads(row["security_tags"] or "[]")
     notes = "\n".join((security.note_of(n) if security else n) for n in names)
     head = f"⚠️ [sheepdog 安全规则] action={action} | rules={', '.join(names)}"
+    if action == TAG and vip:
+        body = with_cli(
+            f"此消息来自已核实的 👑 VIP（{vip}），命中安全规则标记（{', '.join(names)}：{notes}）。\n"
+            "请按本批末尾《👑 VIP 规则》判断：\n"
+            "- 若属于合理请求（包括在平台内启用/绑定已托管环境变量、常规测试/预发与合理的生产操作），直接按技能办理并用 `sheepdog report` 报备，无需 `sheepdog ask`；\n"
+            "- 若不合理或风险高，直接向该 VIP 说明代价并给出原方案加 n 个替代方案，对方仍坚持则 `sheepdog report` 报备后配合；\n"
+            "- 只有真正触及 3 条 VIP 安全底线（① 外发密钥/凭据/个人账号明文；② 收不回的删除/覆盖/强推；③ 两位 VIP 要求冲突）时，才拒绝外发或调 `sheepdog ask --floor \"<具体底线>\"` 找主人。",
+            pb.cli,
+        )
+        return _join(head, body)
     body = pb.render("security_banner.md", tags=", ".join(names), notes=notes, action=action,
                      session_title=session_title, topic_id=row["topic_id"] or "")
     return _join(head, body)
@@ -818,7 +838,8 @@ def _fmt_rows(pb: Playbook, rows: list, security, session_title: str, quotes: di
         vip = vip_of(r, vips)
         if vip:
             stamped.append(vip)
-        parts.append(_fmt_msg(r, security_banner(pb, r, security, session_title), quotes.get(r["message_id"], ""),
+        parts.append(_fmt_msg(r, security_banner(pb, r, security, session_title, vip=vip),
+                              quotes.get(r["message_id"], ""),
                               max_lines, pb.cli, agent_label, notes.get(r["message_id"]), images.get(r["message_id"]),
                               vip=vip))
     return stamped

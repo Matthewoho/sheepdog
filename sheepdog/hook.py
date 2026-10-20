@@ -33,6 +33,8 @@ MANAGED_KINDS = ("adopted", "dynamic")
 OCCUPIED = "occupied"
 # 同一批最多拦几次（7.37）：拦两次还不交，就放它停，交给回执超时
 STOP_MAX_BLOCKS = 2
+# 两次 Stop 触发间隔小于这么多秒（7.64）：视为宿主退出/断连瞬时连环报错，不累加正常拦截次数，标记 interrupted 并放行
+STOP_RAPID_SECONDS = 10
 # 拦过几次的计数：<状态目录>/hooks/stop/<topic>.json，{"batch": 批次号, "count": 次数}；换了批次从 0 算
 STOP_COUNT_DIR = ("hooks", "stop")
 STOP_TEMPLATE = "stop_receipt.md"
@@ -87,25 +89,39 @@ def count_path(cfg: Config, topic_id: str) -> Path:
     return cfg.state_dir.joinpath(*STOP_COUNT_DIR, f"{topic_id}.json")
 
 
-def _blocked_count(p: Path, batch_id: str) -> int:
-    """这一批已经拦过几次。文件不在、坏了、记的是别的批次：0。"""
+def clear_stop_state(state_dir: Path, topic_id: str) -> None:
+    """7.64：清掉这个会话的 Stop hook 状态文件（回执已交或人工复位时调用）。"""
+    try:
+        Path(state_dir).joinpath(*STOP_COUNT_DIR, f"{topic_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_stop_state(p: Path, batch_id: str) -> dict:
+    """读取当前批次的 Stop hook 状态记录；文件不在、坏了、或记的是别的批次则返回空字典。"""
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return 0
+        return {}
     if not isinstance(d, dict) or d.get("batch") != batch_id:
-        return 0
+        return {}
+    return d
+
+
+def _blocked_count(p: Path, batch_id: str) -> int:
+    """这一批已经拦过几次。文件不在、坏了、记的是别的批次：0。"""
+    d = _read_stop_state(p, batch_id)
     n = d.get("count")
     return n if isinstance(n, int) and n > 0 else 0
 
 
-def _write_count(p: Path, batch_id: str, count: int) -> None:
+def _write_stop_state(p: Path, payload: dict) -> None:
     """先写临时文件再改名：Antigravity 超时杀掉进程时不会留下半个文件。写不了就抛错（调用方兜成不拦）。"""
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=p.name, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"batch": batch_id, "count": count}, f)
+            json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, p)
     except BaseException:
         try:
@@ -113,6 +129,13 @@ def _write_count(p: Path, batch_id: str, count: int) -> None:
         except OSError:
             pass
         raise
+
+
+def _write_count(p: Path, batch_id: str, count: int, **extra) -> None:
+    """写当前批次的拦截次数与附加时间戳。"""
+    payload = {"batch": batch_id, "count": count}
+    payload.update(extra)
+    _write_stop_state(p, payload)
 
 
 def _json_line(line: bytes):
@@ -277,9 +300,12 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None,
         tid, batch = t["topic_id"], t["pending_batch_id"]
         info["batch"] = batch
         if (cfg.receipts_dir / tid / f"{batch}.json").exists():
+            clear_stop_state(cfg.state_dir, tid)
             return why("回执已交")  # 回执交了，下一轮 sheepdog 收
         d = conn.execute("SELECT state FROM dispatches WHERE batch_id=?", (batch,)).fetchone()
         if d is None or d["state"] != "sent":
+            if d is not None and d["state"] in ("acked", "acked_late", "missed", "failed"):
+                clear_stop_state(cfg.state_dir, tid)
             return why(f"批次状态 {d['state'] if d is not None else '查不到'}")
         card = conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (tid,)).fetchone()
         if _occupied(card, cfg, now):
@@ -297,10 +323,36 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None,
     if typed:
         return why("这批送达以后主人亲自打过字")
     p = count_path(cfg, tid)
-    n = _blocked_count(p, batch) + 1
+    st = _read_stop_state(p, batch)
+    prev_count = st.get("count") if isinstance(st.get("count"), int) and st.get("count") > 0 else 0
+    now_iso_str = now.isoformat(timespec="seconds")
+    last_blocked = _parse(str(st.get("last_blocked_at") or ""))
+    if prev_count > 0 and last_blocked is not None and 0 <= (now - last_blocked).total_seconds() < STOP_RAPID_SECONDS:
+        try:
+            _write_stop_state(p, {
+                **st,
+                "batch": batch,
+                "count": prev_count,
+                "interrupted": True,
+                "passed_at": now_iso_str,
+            })
+        except OSError:
+            pass
+        return why("宿主断连/重登瞬时连续触发（间隔 <10s），标记 interrupted 并放行等待自动续跑")
+    n = prev_count + 1
     if n > STOP_MAX_BLOCKS:
+        try:
+            _write_stop_state(p, {
+                **st,
+                "batch": batch,
+                "count": prev_count,
+                "passed_at": st.get("passed_at") or now_iso_str,
+            })
+        except OSError:
+            pass
         return why(f"这一批已经拦过 {STOP_MAX_BLOCKS} 次")
-    _write_count(p, batch, n)  # 记不下次数就不拦：宁可放它停，也不能拦个没完
+    kept = {k: st[k] for k in ("auto_resumed", "auto_resumed_at") if k in st}
+    _write_count(p, batch, n, last_blocked_at=now_iso_str, **kept)  # 记不下次数就不拦：宁可放它停，也不能拦个没完
     info["reason"] = f"没交回执，第 {n} 次拦"
     cli = cfg.cli_command
     receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
