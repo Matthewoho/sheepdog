@@ -261,7 +261,4 @@
 | 7.69 | 代回卡片右下角签名未升级为动态 `🐕SheepDog v0.7.69`，或跨版本升级后旧版 `[🐕Sheepdog Reply]` 与新版 `🐕SheepDog vX.Y.Z` 在 `is_agent_reply` / `_agent_reply_text` / `outbound` 发前检查 / `pending.is_agent_text` 中不能互认导致把代回卡片误判为主人发言（REG-006） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_006_reply_card_version_signature_and_legacy_anti_echo` |
 | 7.69 | 新版提醒卡片缺标题行或未引导主人回复「你来升级」/ 运行 `sheepdog upgrade`，或主人在飞书回复「你来升级 / 升级 / 重启生效」被当成普通消息送进 `tp_bus` 而未入队 `upgrade` 动作触发常驻进程原地 `os.execv` 热重启（REG-007） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_007_version_notice_guidance_and_owner_upgrade_shortcut_execv` |
 | 7.69 | `sheepdog run` 缺少 `sheepdog.run.lock` 内核级 `flock` 非阻塞排他锁导致双常驻进程脑裂，或 `Store.upsert_message` 并发写入同一 `message_id` 抛出 `sqlite3.IntegrityError: UNIQUE constraint failed: messages.message_id`（REG-008） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_008_single_instance_flock_and_idempotent_upsert_message` |
-| 7.70 | 代回卡片首屏（`reply` / `reply-card`）把全文技术细节浓缩成高密度黑话或超过 3 行 / 100 字，或首屏外露 Cloud Run revision（如 `00005-5vc`）、Git commit SHA、URL/文件路径、飞书内部 ID（`om_`/`oc_`/`ou_`）、Markdown `1. ... 2. ...` 编号列表未以退出码 2 拦截（REG-009） | `test_more_card.MoreCardTest.test_770_plain_first_screen_reply_limits_and_machine_symbol_guard` |
-
-
-
+| 7.70 | 代回卡片首屏（`reply` / `reply-card`）把全文技术细节浓缩成高密度黑话或超过 3 行 / 100 字，或首屏外露 6 类机器符号（Cloud Run revision 如 `00005-5vc`、Git commit SHA、URL/文件路径、飞书内部 ID `om_`/`oc_`/`ou_`、代码块/行内反引号、Markdown `1. ... 2. ...` 编号列表，含汉字无空格紧贴边界）未以退出码 2 拦截（REG-009） | `test_more_card.MoreCardTest.test_770_plain_first_screen_reply_limits_and_machine_symbol_guard` |

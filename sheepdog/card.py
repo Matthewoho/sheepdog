@@ -46,7 +46,10 @@ _LEADING_AT_PREFIX_RE = re.compile(
     re.I | re.S,
 )
 _MACHINE_SYMBOL_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("Cloud Run revision 编号", re.compile(r"(?:-[0-9]{5}-[a-z0-9]{3}\b|\b[0-9]{5}-[a-z0-9]{3}\b)")),
+    (
+        "Cloud Run revision 编号",
+        re.compile(r"(?:-[0-9]{5}-[a-z0-9]{3}(?![A-Za-z0-9])|(?<![A-Za-z0-9-])[0-9]{5}-[a-z0-9]{3}(?![A-Za-z0-9]))"),
+    ),
     (
         "Git commit SHA",
         re.compile(r"(?<![A-Za-z0-9_-])(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}(?![A-Za-z0-9_-])"),
@@ -54,12 +57,16 @@ _MACHINE_SYMBOL_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "URL 或文件路径",
         re.compile(
-            r"(?:https?://\S+|(?<![A-Za-z0-9])(?:/|\~/|\./)[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+"
-            r"|\b[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.(?:py|go|ts|tsx|js|mjs|json|yaml|yml|toml|md|sh|sql)\b)"
+            r"(?:https?://[A-Za-z0-9_./?=&%#:~+-]+|(?<![A-Za-z0-9_.-])(?:/|~/|\./)[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+"
+            r"|(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+/[A-Za-z0-9_./-]+\.(?:py|go|ts|tsx|js|mjs|json|yaml|yml|toml|md|sh|sql)(?![A-Za-z0-9_.-]))"
         ),
     ),
-    ("飞书内部 ID", re.compile(r"\b(?:om|oc|ou|omt)_[A-Za-z0-9_]{6,}\b")),
-    ("Markdown 编号分点列表", re.compile(r"(?:\A|\n)\s*1\.\s+.+(?:\n\s*2\.\s+|\s+2\.\s+)")),
+    ("飞书内部 ID", re.compile(r"(?<![A-Za-z0-9_])(?:om|oc|ou|omt)_[A-Za-z0-9_]{6,}(?![A-Za-z0-9_])")),
+    ("反引号代码", re.compile(r"`[^`\n]+`")),
+    (
+        "Markdown 编号分点列表",
+        re.compile(r"(?:(?:\A|\n)\s*|(?<![0-9A-Za-z.]))1\.\s+\S.*?(?:\n\s*|[；;，,\s]+)2\.\s+\S", re.S),
+    ),
 )
 SUMMARY_REQUIRED_GUIDE = (
     '原文不需要改，只需要增加白话总结（当面日常大白话回话）：加 --summary "<1~2句当面日常大白话：reply ≤3行/≤100字，只答问题、不括技术亮点与机器编号>"'
@@ -67,6 +74,8 @@ SUMMARY_REQUIRED_GUIDE = (
     '反例 ❌：模型服务体系下的model-manager-decision-service已上线Ready(00005-5vc)，含三级容灾+无锁熔断，今晚可上生产。\n'
     '正例 ✅：我们是根据模型服务V2的代码，单独创建一个独立服务，不混在旧模型服务里。'
 )
+_MACHINE_TOKEN_PATTERNS = _MACHINE_SYMBOL_RULES
+_PLAIN_SPEAK_GUIDANCE = SUMMARY_REQUIRED_GUIDE
 
 
 def _strip_code_spans(text: str) -> str:
@@ -144,7 +153,7 @@ def split_more(text: str) -> tuple[str, str]:
 
 
 def _find_machine_symbol(text: str) -> tuple[str, str] | None:
-    """7.70：先剥离合法 <at> 标签，再匹配 5 类绝对不属于人类日常口语的机器符号。"""
+    """7.70：先剥离合法 <at> 标签，再匹配 6 类绝对不属于人类日常口语的机器符号。"""
     cleaned = _AT_TAG_RE.sub("", text or "")
     for label, rx in _MACHINE_SYMBOL_RULES:
         if m := rx.search(cleaned):
@@ -170,7 +179,7 @@ def is_short_message(text: str, *, for_reply: bool = False) -> bool:
 
 
 def validate_summary(summary: str, *, for_reply: bool = True) -> str:
-    """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 5 类机器符号；ask/report 为 ≤6 行、≤220 字）。"""
+    """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 6 类机器符号；ask/report 为 ≤6 行、≤220 字）。"""
     s = (summary or "").strip("\n")
     if not s.strip():
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")

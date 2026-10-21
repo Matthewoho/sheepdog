@@ -12,7 +12,7 @@ from test_threads import ALICE, ALPHA_P2P, ESC_CHAT, MARK, ThreadsBase, _card_te
 SUMMARY = (
     "**已切 10% 灰度并稳住，生产全量等你拍板。**\n"
     "老客户端重试风暴已熔断；代价是旧版超时缩短 2 秒。\n"
-    "要你定：回 `A` 今晚全量，回 `B` 保持 10% 观察。"
+    "要你定：回 A 今晚全量，回 B 保持 10% 观察。"
 )
 
 LONG_DETAIL = (
@@ -59,12 +59,7 @@ class MoreCardTest(ThreadsBase):
         self._assert_more_panel(elements[1], expected_detail)
         self.assertEqual(
             elements[2],
-            {
-                "tag": "markdown",
-                "content": f"<font color='grey'>{MARK}</font>",
-                "text_align": "right",
-                "text_size": "notation",
-            },
+            {"tag": "markdown", "content": f"<font color='grey'>{MARK}</font>", "text_align": "right", "text_size": "notation"},
         )
         self.assertNotIn('"column_set"', json.dumps(elements, ensure_ascii=False))
 
@@ -271,19 +266,24 @@ class MoreCardTest(ThreadsBase):
         ):
             rc, out, err = self.cli(*argv)
             self.assertEqual(rc, 2, out + err)
-            self.assertIn("00005-5vc", err)
-            self.assertIn("原文不需要改，只需要增加白话总结", err)
-            self.assertIn("反例 ❌", err)
-            self.assertIn("正例 ✅", err)
+            for token in ("00005-5vc", "原文不需要改，只需要增加白话总结", "反例 ❌", "正例 ✅"):
+                self.assertIn(token, err)
 
-        # 2) 5 类确定性机器符号（revision / Git SHA / URL或路径 / 飞书ID / Markdown 1. 2. 编号列表）在 reply 首屏全部退码 2 拦截
+        # 2) 6 类确定性机器符号（含行内反引号、汉字紧贴无空格、裸 om_/ou_ ID）在 reply 首屏全部退码 2 拦截
         for label_hint, bad_sum in (
             ("Cloud Run revision", "已在测试环境上线 tap-prism-00136-jwj，随时可切流。"),
             ("Git commit SHA", "代码已合入 a1b2c3d4 并完成测试验证。"),
             ("URL", "详情见 https://example.com/pr/42 ，已验证通过。"),
             ("文件路径", "已修改 sheepdog/card.py 并跑通单测。"),
             ("飞书内部 ID", "已在群 oc_test_group_123456 同步结论。"),
+            ("飞书裸 om/ou ID", "消息 om_x100b62a41a73f0a 由 ou_f7c171b535ffd721 发起。"),
+            ("反引号代码", "已部署 `model-manager-decision-service` 到测试环境。"),
             ("Markdown 编号分点列表", "结论如下：\n1. 独立创建新服务\n2. 不混入旧模型服务"),
+            ("CJK紧贴revision", "刚上线00005-5vc版本"),
+            ("CJK紧贴SHA", "已合入a1b2c3d4代码"),
+            ("CJK紧贴路径", "已修改sheepdog/card.py文件"),
+            ("CJK紧贴飞书ID", "已在群oc_test_group_123456同步"),
+            ("CJK同行编号列表", "结论：1. 独立新服务 2. 不塞旧服务"),
         ):
             with self.subTest(symbol=label_hint):
                 rc, out, err = self.cli(
@@ -292,9 +292,8 @@ class MoreCardTest(ThreadsBase):
                 self.assertEqual(rc, 2, out + err)
                 self.assertIn("原文不需要改，只需要增加白话总结", err)
 
-        # 3) reply 首屏物理上限收紧为 <=3 行、<=100 字（扣除 <at> 后）；超过即退码 2，而 ask/report 仍允许 4~6 行 / <=220 字
-        four_lines = "第一句答复\n第二句补充\n第三句说明\n第四句超限"
-        over_100_chars = "字" * 101
+        # 3) reply 首屏物理上限 <=3 行、<=100 字；ask/report 仍允许 4~6 行 / <=220 字；短消息直通同步收紧
+        four_lines, over_100_chars = "第一句答复\n第二句补充\n第三句说明\n第四句超限", "字" * 101
         for bad_limit in (four_lines, over_100_chars):
             rc, out, err = self.cli(
                 "reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", bad_limit, "--card-text", LONG_DETAIL
@@ -302,14 +301,12 @@ class MoreCardTest(ThreadsBase):
             self.assertEqual(rc, 2, out + err)
         rc_rep, out_rep, err_rep = self.ask("--summary", four_lines, kind="report", title="四行汇报", text=LONG_DETAIL)
         self.assertEqual(rc_rep, 0, out_rep + err_rep)
-
-        # 4) reply 短消息直通同步收紧：>3 行、>100 字或含机器符号但未传 --summary 时，退码 2 强制要求提供大白话首屏
-        for non_short in (four_lines, over_100_chars, "已在 00005-5vc 验证通过", "1. 第一点\n2. 第二点"):
+        for non_short in (four_lines, over_100_chars, "已在 00005-5vc 验证通过", "1. 第一点\n2. 第二点", "已发 `svc` 测试"):
             rc, out, err = self.cli("reply", "--topic", "tp_alpha", "--to", m_alice, "--card-text", non_short)
             self.assertEqual(rc, 2, out + err)
-        self.assertEqual(len(self.lark.sent()), before_sent + 1)  # 仅第 3 步 report 发出 1 条
+        self.assertEqual(len(self.lark.sent()), before_sent + 1)
 
-        # 5) Matthew 真实大白话正例（含合法 <at id=ou_...></at> 不误判为飞书 ID，<=3 行且 <=100 字）退码 0 正常发出
+        # 4) Matthew 大白话正例、合法 <at id=ou_...> 及普通英文词（deadbeef/cafe/feedback/decade/20261022）零误伤放行
         good_matthew = (
             f"<at id={ALICE}></at> 我用大白话解释：我们是根据模型服务V2的代码，"
             "单独创建一个独立服务，相当于不走过渡工程架构拆分，除非有必要再做。"
@@ -318,7 +315,9 @@ class MoreCardTest(ThreadsBase):
             "reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", good_matthew, "--card-text", LONG_DETAIL
         )
         self.assertEqual(rc_ok, 0, out_ok + err_ok)
-        sent_card = card_of(self.lark.sent("+messages-reply")[-1])
-        self._assert_reply_full_width_more(sent_card["body"]["elements"], good_matthew, LONG_DETAIL)
-
-
+        self._assert_reply_full_width_more(
+            card_of(self.lark.sent("+messages-reply")[-1])["body"]["elements"], good_matthew, LONG_DETAIL
+        )
+        plain_words = "<at id=ou_f7c171b535ffd721>Ren Ryan</at> 收到 feedback，我们在 cafe 聊过 deadbeef 和 decade 方案，20261022 前搞定。"
+        rc_pw, out_pw, err_pw = self.cli("reply-card", "--summary", plain_words, "--text", LONG_DETAIL)
+        self.assertEqual(rc_pw, 0, err_pw)
