@@ -86,9 +86,10 @@ class AckTest(Base):
                    msg(message_id="om_test_g1", mentions=[Mention(ME)]),
                    msg(message_id="om_test_g2", mentions=[Mention("all", is_all=True)]),
                    msg(message_id="om_test_k1", content="出故障了")])
-        self.assertEqual(self.im.added, [])  # 入账时不点
+        self.assertEqual(sorted(self.acked()), ["om_test_g1", "om_test_g2", "om_test_p1"])  # 7.67：入账即点
         self.deliver()
         self.assertEqual(sorted(self.acked()), ["om_test_g1", "om_test_g2", "om_test_p1"])
+        self.assertEqual(len(self.im.added), 3)  # 投递时不重复点
         self.assertEqual({e for _, e in self.im.added}, {"FX_EMOJI"})
         a = self.store.get_ack("om_test_p1")
         self.assertEqual((a["reaction_id"], a["reason"], a["chat_type"]), ("rx_om_test_p1", "p2p", "p2p"))
@@ -113,11 +114,46 @@ class AckTest(Base):
         self.store.update_topic(BUS_TOPIC_ID, conversation_id="conv_test_bus")
         owner_says("conv_test_bus", datetime.now().astimezone() - timedelta(minutes=1))
         self.poll([msg(message_id="om_test_q1", chat_type="p2p", chat_id="oc_test_p1")])
+        self.assertEqual(self.acked(), ["om_test_q1"])  # 7.67：即使会话排队中，入账当场也点确认表情
         self.d.dispatch_once()
-        self.assertEqual(self.im.added, [])
-        with later(16):  # 主人那句话过了 15 分钟
+        self.assertEqual(self.acked(), ["om_test_q1"])
+        with later(16):  # 主人那句话过了 15 分钟，真正送达时不重复点
             self.d.dispatch_once()
         self.assertEqual(self.acked(), ["om_test_q1"])
+        self.assertEqual(len(self.im.added), 1)
+
+    def test_767_ingest_acks_immediately_while_session_running_and_no_double_ack_on_delivery(self):
+        from sheepdog.security import load_security
+        sec = load_security(FIX / "security.toml")
+        # 1. 先让总线进入 running（正在处理上一批长任务，未交回执）
+        self.poll([msg(message_id="om_test_767_first", chat_type="p2p", chat_id="oc_test_p0")])
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_topic(BUS_TOPIC_ID)["state"], "running")
+        self.im.added.clear()
+
+        # 2. 会话 running 期间新消息入账：正常 p2p、hold 安全拦截、普通群消息（inbox）
+        Collector(self.cfg, self.store, FakeSource([[
+            msg(message_id="om_test_767_p1", chat_type="p2p", chat_id="oc_test_p1", content="你好"),
+            msg(message_id="om_test_767_hold", chat_type="p2p", chat_id="oc_test_p2",
+                sender_tenant_key="tenant_test_own", content="fx-holdme"),
+            msg(message_id="om_test_767_inbox", chat_id="oc_test_grp", content="普通群闲聊"),
+        ]]), self.roster, sec, self.acker).poll_once()
+
+        # 入账当场即对 om_test_767_p1 点确认表情（不等会话回执解锁），hold 与 inbox 绝不点
+        self.assertEqual(self.acked(), ["om_test_767_p1"])
+        self.assertIsNotNone(self.store.get_ack("om_test_767_p1"))
+        self.assertIsNone(self.store.get_ack("om_test_767_hold"))
+        self.assertIsNone(self.store.get_ack("om_test_767_inbox"))
+
+        # 3. 此时 dispatch_once 因 running 排队，后来会话交回执并真正投递，绝不重复点第二次
+        self.d.dispatch_once()
+        self.assertEqual(self.row("om_test_767_p1")["dispatch_state"], "pending")
+        self.ack(BUS_TOPIC_ID)
+        res = self.deliver()
+        self.assertEqual(res["sent"], 2)
+        self.assertEqual(self.row("om_test_767_p1")["dispatch_state"], "delivered")
+        self.assertEqual(self.acked(), ["om_test_767_p1"])
+        self.assertEqual(len(self.im.added), 1)
 
     def test_once_per_message(self):
         col = Collector(self.cfg, self.store, FakeSource([
@@ -272,9 +308,10 @@ class BotAckTest(Base):
     def test_owner_reply_acked_as_bot_once_never_removed(self):
         self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
         self.poll([self.reply("om_test_r1", "好的", reply_to="om_test_q1")])   # 7.53：回答要引用提问
-        self.assertEqual(self.im.added, [])  # 入账时不点
+        self.assertEqual(self.im.identities, {"om_test_r1": "bot"})  # 7.67：入账即点
         self.d.dispatch_once()
         self.assertEqual(self.im.identities, {"om_test_r1": "bot"})
+        self.assertEqual([m for m, _ in self.im.added].count("om_test_r1"), 1)
         a = self.store.get_ack("om_test_r1")
         self.assertEqual((a["identity"], a["reason"]), ("bot", "owner_reply"))
         # 主人在同一私聊再发消息：bot 点的表情不撤
@@ -306,18 +343,22 @@ class BotAckTest(Base):
         self.poll([self.ask("om_test_q1", "tp_alpha", "一"), self.ask("om_test_q2", BUS_TOPIC_ID, "二")])
         owner_says("conv_test_bus")  # 总线被主人接管，回复卡在队列
         self.poll([self.reply("om_test_r4", "第一个按 A")])
+        self.assertEqual(self.im.identities, {"om_test_r4": "bot"})  # 7.67：入账即点
         self.d.dispatch_once()
-        self.assertEqual(self.im.added, [])
         forward_messages(self.store, "tp_alpha", ["om_test_r4"], self_open_id=ME)
         self.d.dispatch_once()
         self.assertEqual(self.im.identities, {"om_test_r4": "bot"})
+        self.assertEqual([m for m, _ in self.im.added].count("om_test_r4"), 1)
 
     def test_owner_verified_rows_count_as_owner_reply(self):
-        # 已上线账本里改名前的旧 reason：靠 owner_verified 标记认作主人回复，照样以 bot 点
+        # 已上线账本里改名前的旧 reason：靠 owner_verified 标记认作主人回复，投递兜底阶段照样以 bot 点
         self.poll([self.ask("om_test_q1", "tp_alpha", "问题")])
         self.poll([self.reply("om_test_lg", "好")])
         self.store.conn.execute("UPDATE messages SET reason='legacy_owner_reply_name' WHERE message_id='om_test_lg'")
+        self.store.conn.execute("DELETE FROM acks WHERE message_id='om_test_lg'")
         self.store.conn.commit()
+        self.im.added.clear()
+        self.im.identities.clear()
         self.d.dispatch_once()
         self.assertEqual(self.im.identities, {"om_test_lg": "bot"})
 

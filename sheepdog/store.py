@@ -1219,6 +1219,18 @@ class Store:
             ).fetchone()
             if row is not None:
                 return row["topic_id"]
+            row = self.conn.execute(
+                """SELECT m.topic_id FROM messages m
+                   JOIN topics t ON t.topic_id = m.topic_id
+                   WHERE t.group_id = ? AND t.state = 'active'
+                     AND m.route = 'dispatch' AND m.dispatch_state = 'pending'
+                     AND m.chat_id = ? AND m.sender_id = ?
+                     AND m.first_seen >= ?
+                   ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
+                (gid, chat_id, sender_id, cutoff),
+            ).fetchone()
+            if row is not None:
+                return row["topic_id"]
         return None
 
     # ---------- dispatches ----------

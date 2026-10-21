@@ -42,7 +42,7 @@
 | 7.8 | 主人引用回复某条「需要你定」，送回提问的会话 | `test_escalation.EscalationTest.test_quoted_reply_goes_to_that_topic` |
 | 7.8 | 主人本人的消息（含编辑后重新判定）不走安全闸 | `test_escalation.EscalationTest.test_owner_reply_edit_also_skips_security_gate` |
 | 7.8 | 总线 forward 主人本人在别处的发言（本来没带已核对标记），送到时要补「✅ 已核对」标注 | `test_regress_routing.ForwardOwnerWordsRegressionTest.test_regression_7_8_forward_owner_background_gets_verified_label` |
-| 7.9 | Get 表情只在消息真正送达会话后点、只点配置的原因，排队时（主人接管）不点 | `test_ack.AckTest.test_only_configured_reasons_after_delivery`、`test_ack.AckTest.test_queued_not_acked_until_delivered` |
+| 7.9 | Get 表情在消息入账归属（通过安全闸）后当场点、只点配置的原因，投递时不重复点 | `test_ack.AckTest.test_only_configured_reasons_after_delivery`、`test_ack.AckTest.test_queued_not_acked_until_delivered` |
 | 7.9 | 每条消息只点一次（编辑重投、超时重投都不再点） | `test_ack.AckTest.test_once_per_message` |
 | 7.9 | 主人回复后撤表情：私聊撤同一聊天里更早的；群里只撤 reply_to 或 @ 了发送人的那条；at_all 不撤 | `test_ack.AckTest.test_p2p_own_message_removes_earlier_in_same_chat`、`test_ack.AckTest.test_group_reply_or_mention_removes`、`test_ack.AckTest.test_at_all_not_removed` |
 | 7.9 | 点失败只记 error、不重试；dry-run 不调接口；没有 [ack] 段完全不动 | `test_ack.AckTest.test_failures_do_not_block_and_are_not_retried`、`test_ack.AckTest.test_dry_run_does_not_call`、`test_ack.AckTest.test_config_section_switch_and_cli` |
@@ -251,4 +251,8 @@
 | 7.65 | VIP 消息命中 `action=tag` 安全规则时仍渲染普通人「必须回对方等 Matthew 确认并私聊 Matthew」死命令，或 `vip.md` 未将合理生产操作、内部脱敏只读查询/导出及多选项直办并入直办并把底线收紧为 3 条 | `test_vip.VipBranch765Test.test_regression_765_vip_rules_include_prod_authorization_and_three_floors`、`test_vip.VipBranch765Test.test_regression_765_vip_with_security_tag_renders_merged_vip_banner_not_mandatory_ask`、`test_vip.VipBranch765Test.test_regression_765_jessie_desensitized_export_and_multi_option_prompt` |
 | 7.65 | 会话编造非底线理由（如「涉及生产数据库访问权限与跨系统数据导出」「生产环境常规部署确认」「脱敏/只读」）或未同时带合法 `--floor-type`（`credentials` \| `destructive` \| `vip_conflict`）与非空 `--floor` 自由造句绕过 `check_vip_floor` 调用 `sheepdog ask` 挂起 VIP 请求，或带了合法 `--floor-type` 的正常自由造句被误伤拦截 | `test_vip.VipBranch765Test.test_regression_765_non_floor_excuses_rejected_with_direct_handle_and_report_hint`、`test_vip.VipBranch765Test.test_regression_765_floor_requires_valid_floor_type_and_allows_free_sentence` |
 | 7.65 | 总线 `tp_bus` 把消息 `forward` 转交给专属会话后，又越俎代庖对该消息调用 `sheepdog ask` 或 `sheepdog reply`，或 `bus.md` 未收紧为纯分流路由（禁自己干业务/起草文档/建改飞书云文档/写记忆/用 `report --topic tp_bus` 锁死话题） | `test_vip.VipBranch765Test.test_regression_765_bus_cannot_ask_or_reply_for_forwarded_message`、`test_vip.VipBranch765Test.test_regression_765_bus_playbook_forbids_self_work_and_forwarded_reply` |
+| 7.67 | 目标会话处于 `running` 长批次期间，新入账 `dispatch` 消息迟迟不点 `[Get]` 表情，或安全闸 `hold` / `inbox` 误点表情、投递时重复点第二次 | `test_ack.AckTest.test_767_ingest_acks_immediately_while_session_running_and_no_double_ack_on_delivery` |
+| 7.67 | 主人在别人私聊/群聊里直接文字点名 `sheepdog` 被当成纯背景 `owner_context` 排队、未升格为 `owner_instruction` 走 `_dispatch_priority` 插话直达，或代码块/路径/代回前缀里的 `sheepdog` 被误升格、提示词仍渲染 `OWNER_CONTEXT_LABEL` | `test_owner_context.OwnerContextTest.test_767_owner_named_sheepdog_in_p2p_upgrades_to_instruction_and_jumps_running_queue` |
+| 7.67 | 羊圈（`max_sessions > 1`）合成 `#2..#N` 副会话时继承了主槽位一次性 `predecessor_conversation_id` / `self_polling`，或同一发送人在窗口期内连发多条未投递消息被拆散到不同槽位 | `test_session_group.SessionGroupTest.test_767_laohu_group_max_sessions_spawns_clean_secondary_and_coalesces_burst` |
+
 

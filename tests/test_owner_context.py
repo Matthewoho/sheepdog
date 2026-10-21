@@ -145,6 +145,63 @@ class OwnerContextTest(_OwnerBase):
         self.d.dispatch_once()
         self.assertIn("主人最近发言", self.sink.to("conv_test_bus")[-1])
 
+    def test_767_owner_named_sheepdog_in_p2p_upgrades_to_instruction_and_jumps_running_queue(self):
+        import json
+        from sheepdog.prompts import OWNER_INSTRUCTION_LABEL, OWNER_INSTRUCTION_TAG
+        self.acker.cfg.bot_reasons = ["owner_reply"]
+
+        # 1. 先让 tp_alpha 进入 running（未交回执）
+        self.poll([msg(message_id="om_test_767_a1", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                       sender_id="ou_test_alice", content="帮我查下配置")])
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_topic("tp_alpha")["state"], sm.RUNNING)
+
+        # 2. 代码块、行内代码、路径、代回前缀里的 sheepdog 不误升格；真实点名 Sheepdog 升格为 owner_instruction
+        self.poll([
+            mine("om_test_767_code", "oc_test_alpha_p2p",
+                 "你先看下 `sheepdog status` 和 /tmp/sheepdog/a.py 以及\n```bash\nsheepdog doctor\n```",
+                 chat_type="p2p"),
+            mine("om_test_767_agent", "oc_test_alpha_p2p", PREFIX + "sheepdog 已收到", chat_type="p2p"),
+            mine("om_test_767_call", "oc_test_alpha_p2p", "Sheepdog 你看下为什么半天没动静", chat_type="p2p"),
+            mine("om_test_767_unowned", "oc_test_unowned_p2p", "sheepdog 帮我跟进这个私聊", chat_type="p2p"),
+        ])
+
+        r_code = self.row("om_test_767_code")
+        self.assertEqual((r_code["route"], r_code["reason"], r_code["topic_id"]),
+                         ("dispatch", "owner_context", "tp_alpha"))
+        self.assertEqual(self.row("om_test_767_agent")["route"], "self")
+
+        r_call = self.row("om_test_767_call")
+        self.assertEqual((r_call["route"], r_call["reason"], r_call["topic_id"]),
+                         ("dispatch", "owner_instruction", "tp_alpha"))
+        tags = json.loads(r_call["tags_json"] or "[]")
+        self.assertIn(OWNER_INSTRUCTION_TAG, tags)
+        self.assertIn("owner_at:mention", tags)
+        # 入账当场以 bot 点确认表情并记入回音账本
+        self.assertEqual(self.im.identities.get("om_test_767_call"), "bot")
+        echo_row = self.store.conn.execute(
+            "SELECT * FROM owner_echoes WHERE message_id='om_test_767_call'"
+        ).fetchone()
+        self.assertIsNotNone(echo_row)
+        self.assertEqual((echo_row["kind"], echo_row["stage"], echo_row["topic_id"]),
+                         ("owner_instruction", "queued", "tp_alpha"))
+
+        # 无人负责的私聊里点名 sheepdog 兜底进总线并带转交提示
+        r_unowned = self.row("om_test_767_unowned")
+        self.assertEqual((r_unowned["route"], r_unowned["reason"], r_unowned["topic_id"]),
+                         ("dispatch", "owner_instruction", BUS_TOPIC_ID))
+        self.assertIn("forward", r_unowned["note"] or "")
+
+        # 3. tp_alpha 处于 running 时，点名指令走 _dispatch_priority 插话直达，纯背景继续排队
+        res = self.d.dispatch_once()
+        self.assertTrue(res["topics"]["tp_alpha"].get("priority", "").startswith("p"))
+        self.assertEqual(self.row("om_test_767_call")["dispatch_state"], "acked")
+        self.assertEqual(self.row("om_test_767_code")["dispatch_state"], "pending")
+        prio_prompt = self.sink.to("conv_test_alpha")[-1]
+        self.assertIn(OWNER_INSTRUCTION_LABEL, prio_prompt)
+        self.assertNotIn(OWNER_CONTEXT_LABEL, prio_prompt)
+        self.assertIn("Sheepdog 你看下为什么半天没动静", prio_prompt)
+
 
 class ReactSource(FakeSource):
     """FakeSource 加上 reactions_of：返回预设的表情，并记下查了哪些消息。"""

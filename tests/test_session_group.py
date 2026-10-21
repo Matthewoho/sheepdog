@@ -228,6 +228,68 @@ class SessionGroupTest(Base):
                 )
             )
 
+    def test_767_laohu_group_max_sessions_spawns_clean_secondary_and_coalesces_burst(self):
+        r_laohu = parse_roster(
+            tomllib.loads(
+                """
+                [[session]]
+                key = "laohu"
+                mode = "managed"
+                conversation_id = ""
+                predecessor_conversation_id = "conv_test_laohu_old"
+                retire_predecessor = true
+                self_polling = "sp_test_old"
+                retire_self_polling = true
+                title = "人·老胡"
+                duty = "负责老胡私聊与需求跟进"
+                max_sessions = 2
+                chats = [{ chat_id = "oc_test_laohu_p2p", name = "老胡私聊", all_messages = true }]
+                """
+            )
+        )
+        # 1. 合成的 #2 副会话绝不继承主槽位一次性前任与自轮询接手属性
+        s2 = r_laohu.by_topic("tp_laohu#2")
+        self.assertIsNotNone(s2)
+        self.assertEqual(s2.predecessor_conversation_id, "")
+        self.assertFalse(s2.retire_predecessor)
+        self.assertEqual(s2.self_polling, "")
+        self.assertFalse(s2.retire_self_polling)
+
+        # 2. 主会话 tp_laohu 处于 running 长任务期间，老胡在私聊连发两条无引用消息
+        d_lh = self.disp(r_laohu)
+        d_lh.sync_roster()
+        self.store.update_topic(
+            "tp_laohu",
+            conversation_id="conv_test_laohu_1",
+            spawned_at="2026-10-20T00:00:00+08:00",
+            onboarded_at="2026-10-20T00:00:00+08:00",
+        )
+        Collector(self.cfg, self.store, FakeSource([[
+            msg(message_id="om_test_767_lh0", chat_type="p2p", chat_id="oc_test_laohu_p2p",
+                sender_id="ou_test_laohu", content="帮我拉一份上月全量报表"),
+        ]]), r_laohu).poll_once()
+        d_lh.dispatch_once()
+        self.assertEqual(self.store.get_topic("tp_laohu")["state"], sm.RUNNING)
+
+        Collector(self.cfg, self.store, FakeSource([[
+            msg(message_id="om_test_767_lh1", chat_type="p2p", chat_id="oc_test_laohu_p2p",
+                sender_id="ou_test_laohu", content="另外看下这个报错"),
+            msg(message_id="om_test_767_lh2", chat_type="p2p", chat_id="oc_test_laohu_p2p",
+                sender_id="ou_test_laohu", content="截图刚发你了"),
+        ]]), r_laohu).poll_once()
+
+        # 两条连发消息聚拢进同一个空闲副会话 tp_laohu#2，不把第 2 条拆回繁忙的 #1
+        self.assertEqual(self.store.get_message("om_test_767_lh1")["topic_id"], "tp_laohu#2")
+        self.assertEqual(self.store.get_message("om_test_767_lh2")["topic_id"], "tp_laohu#2")
+
+        res = d_lh.dispatch_once()
+        self.assertEqual(res["topics"]["tp_laohu#2"]["sent"], 2)
+        t2 = self.store.get_topic("tp_laohu#2")
+        self.assertEqual(t2["state"], sm.RUNNING)
+        prompt_text = self.sink.to(t2["conversation_id"])[-1]
+        self.assertIn("另外看下这个报错", prompt_text)
+        self.assertIn("截图刚发你了", prompt_text)
+
 
 if __name__ == "__main__":
     unittest.main()

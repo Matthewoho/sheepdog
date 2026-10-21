@@ -646,7 +646,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     read = " | ✓已读" if row["is_read"] == 1 else ""
     label = REASON_LABEL.get(row["reason"], row["reason"])
     tags = json.loads(row["tags_json"] or "[]")
-    instruction = OWNER_INSTRUCTION_TAG in tags
+    instruction = OWNER_INSTRUCTION_TAG in tags or row["reason"] == "owner_instruction"
     private = OWNER_PRIVATE_TAG in tags
     if instruction:
         # 7.45 A 类：按标记认（被总线 forward 转交以后 reason 不变，标记也还在）；7.53 私聊里没引用的话措辞不同
@@ -669,7 +669,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         lines.append(OWNER_PRIVATE_INSTRUCTION_LABEL if private else OWNER_INSTRUCTION_LABEL)
     elif "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
-    if row["reason"] == "owner_context":
+    if row["reason"] == "owner_context" and not instruction:
         lines.append(OWNER_CONTEXT_LABEL)
     if "agent_sender" in tags:
         lines.append(agent_label)

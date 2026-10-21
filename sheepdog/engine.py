@@ -70,7 +70,25 @@ OWNER_REPLY = "owner_reply"
 # 7.45 A 类：主人本人账号在群里 @ 机器人 = 给助理的指令。和 owner_reply 一样会插队、机器人身份点确认表情，但不当成回答
 # 哪条「需要你定」。tags 里带 owner_instruction（被 forward 以后也认得出）和 owner_at:<去向依据>
 OWNER_INSTRUCTION = "owner_instruction"
+OWNER_INSTRUCTION_TAG = "owner_instruction"
 OWNER_AT_TAG_PREFIX = "owner_at:"
+OWNER_MENTION_TAG = "owner_at:mention"
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_SHEEPDOG_CALL_RE = re.compile(r"(?<![A-Za-z0-9_./-])sheepdog(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _has_owner_instruction_tag(r) -> bool:
+    try:
+        tags = json.loads(r["tags_json"] or "[]")
+    except (TypeError, ValueError, KeyError, IndexError):
+        tags = []
+    return OWNER_INSTRUCTION_TAG in tags
+
+
+def _is_pure_owner_context(r) -> bool:
+    return r["reason"] == OWNER_CONTEXT and not _has_owner_instruction_tag(r)
+
 # 7.45 C 类：别人在群里的话题回复按话题归属直达。路由器本来判 inbox / drop 的改成这个原因；本来就 dispatch 的（@主人等）
 # 原因不变。tags 里带 group_thread:<依据>
 THREAD_OWNER = "thread_owner"
@@ -687,6 +705,8 @@ class Collector:
                 d = self._escalation_message(m)
                 if rb:
                     self.store.set_received_by(m.message_id, rb)
+                if d.route == DISPATCH:
+                    self._ack_ingested(m.message_id)
                 stats["new"] += 1
                 stats[d.route] = stats.get(d.route, 0) + 1
             elif existing is None and enabled and received_by == identity.BOT and self._is_bot_dm(m):
@@ -700,13 +720,17 @@ class Collector:
                 self._write_note(m.message_id)
                 if d.route == DISPATCH:
                     self._close_watch(w, m.message_id, self._secure(m.message_id))
+                    self._ack_ingested(m.message_id)
                 elif d.route == SELF and me and m.sender_id == me:
                     self._loop_check(m)
                     if self._owner_instruction(m):       # 7.45 A 类：@ 机器人 = 指令；否则照旧当背景（B 类）
                         self._echo_record(m, OWNER_INSTRUCTION)
+                        self._ack_ingested(m.message_id)
                     else:
-                        self._owner_context(m)
-                        if self._owner_at_bot(m):            # 7.52：@ 了机器人却没当成指令：记账，当场报没送到
+                        if self._owner_context(m):       # 7.67：点名 sheepdog 升格为 owner_instruction
+                            self._echo_record(m, OWNER_INSTRUCTION)
+                            self._ack_ingested(m.message_id)
+                        elif self._owner_at_bot(m):      # 7.52：@ 了机器人却没当成指令：记账，当场报没送到
                             self._echo_record(m, OWNER_INSTRUCTION)
                     self._learn_source_thread(m)
                 elif d.route == SELF and d.reason == "self_bot":
@@ -937,6 +961,21 @@ class Collector:
         except Exception as e:
             log.warning("处理确认表情失败 %s: %s", m.message_id, e)
 
+    def _ack_ingested(self, message_id: str) -> None:
+        """7.67：消息入账且 route='dispatch'、有明确 topic_id、通过安全闸（非 hold）时当场点确认表情。
+        幂等由 acks 表（store.get_ack）保证，后续 Dispatcher 投递时不会重复点。"""
+        if self.acker is None:
+            return
+        row = self.store.get_message(message_id)
+        if row is None or row["route"] != DISPATCH or not row["topic_id"]:
+            return
+        if row["security_action"] == HOLD:
+            return
+        try:
+            self.acker.on_delivered([row])
+        except Exception as e:
+            log.warning("入账点确认表情失败（%s）: %s", message_id, e)
+
     def _partial_round(self, start: datetime) -> None:
         """本轮没拉完（7.16）：不推进水位线，下一轮从原 start 重拉；同一缺口只提示总线一次。"""
         streak = int(self.store.get_meta("partial_streak", "0") or 0) + 1
@@ -994,16 +1033,46 @@ class Collector:
             return None
         return tid
 
-    def _owner_context(self, m: Message) -> None:
+    def _owner_sheepdog_call(self, m: Message) -> bool:
+        """7.67：主人在非找主人聊天里点名 `sheepdog`（大小写不敏感、独立词、不在代码块或行内代码里、且不是会话代回）。"""
+        raw = m.content or ""
+        if not raw.strip():
+            return False
+        if self._agent_reply_text(raw) or is_agent_reply(raw, self.cfg.owner_context):
+            return False
+        text = plain_text(raw)
+        for body in message_bodies(text):
+            cleaned = _INLINE_CODE_RE.sub(" ", _FENCED_CODE_RE.sub(" ", body))
+            if _SHEEPDOG_CALL_RE.search(cleaned):
+                return True
+        return False
+
+    def _owner_context(self, m: Message) -> bool:
         if not self._owner_context_wanted(m):
-            return
+            return False
+        called = self._owner_sheepdog_call(m)
         topic_id = self._owner_context_target(m)
         note = self._notes.pop(m.message_id, "")
+        if called:
+            if not topic_id:
+                topic_id = BUS_TOPIC_ID
+                note = with_cli(
+                    "📮 主人在没有固定归属会话的聊天里点名了 sheepdog。"
+                    f"判断该谁处理后用 `sheepdog forward --topic <会话> --message-ids {m.message_id}` 转交"
+                    "（没有合适的就新开）；主人明说让总线自己做才自己做。",
+                    self.cfg.cli_command,
+                )
+            self.store.route_owner_instruction(
+                m.message_id, topic_id, [OWNER_INSTRUCTION, OWNER_MENTION_TAG], note
+            )
+            log.info("主人在聊天里点名 sheepdog %s：升格为指令送给 %s", m.message_id, topic_id)
+            return True
         if not topic_id:
-            return
+            return False
         # 回复的是哪条由投递时统一附的「↪ 回复的是」说明（7.15）
         self.store.route_owner_context(m.message_id, topic_id, note)
         log.info("主人的发言 %s 作为背景送给 %s%s", m.message_id, topic_id, "（话题 / 引用归属）" if note else "")
+        return False
 
     # ---------- 主人在群里 @ 机器人 = 指令（7.45 A 类） ----------
     # ---------- 回音账本（7.52）：主人需要回应的话记一笔欠账 ----------
@@ -1019,7 +1088,7 @@ class Collector:
             r = self.store.get_message(m.message_id)
             if r is None:
                 return
-            if r["route"] == DISPATCH and r["reason"] in ECHO_REQUEST_REASONS and r["topic_id"]:
+            if r["route"] == DISPATCH and (r["reason"] in ECHO_REQUEST_REASONS or _has_owner_instruction_tag(r)) and r["topic_id"]:
                 stage, why = ECHO_QUEUED, ""
             elif r["route"] == DISPATCH and r["reason"] == OWNER_CONTEXT and r["topic_id"]:
                 stage, why = ECHO_UNDELIVERED, f"当成背景送给了 {r['topic_id']}，不算交办（[routing] owner_at_assistant 关着）"
@@ -2181,6 +2250,7 @@ class Collector:
                 self.store.update_content(m.message_id, m, DISPATCH, d.reason, "pending", d.tags, topic_id)
                 self._write_note(m.message_id)
                 self._close_watch(w, m.message_id, self._secure(m.message_id))
+                self._ack_ingested(m.message_id)
             else:
                 self._notes.pop(m.message_id, None)
                 self.store.update_content(m.message_id, m)
@@ -3097,8 +3167,8 @@ class Dispatcher:
                                                  closed_dynamic_topics(self.store, self.roster))
             batch_id = self._new_batch_id("b", t["topic_id"])
             # 主人本人的发言（背景）与信号同批；只有背景时不要求回执、不改状态（7.13）
-            signals = [r for r in rows if r["reason"] != OWNER_CONTEXT]
-            context = [r for r in rows if r["reason"] == OWNER_CONTEXT]
+            signals = [r for r in rows if not _is_pure_owner_context(r)]
+            context = [r for r in rows if _is_pure_owner_context(r)]
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
             # Inbox 摘要只给总线；adopted 会话只管自己的聊天
             inbox = [] if adopted else self.store.inbox_summary(self.cfg.self_open_id)
@@ -3149,7 +3219,7 @@ class Dispatcher:
             return res
 
         self.store.set_dispatch_state(batch_id, "sent")
-        self._send_ok(t, len([r for r in rows if r["reason"] != OWNER_CONTEXT]))
+        self._send_ok(t, len([r for r in rows if not _is_pure_owner_context(r)]))
         if roster_update:
             self.store.set_meta("roster_notify_bus", "0")
         if digest_fp:
@@ -3175,11 +3245,14 @@ class Dispatcher:
                 and r["chat_id"] in self.cfg.owner_side_chat_ids)
 
     def _priority_rows(self, rows) -> list:
-        """插队的消息：主人在找主人聊天里的回复、主人在群里 @ 机器人的指令（7.45 A 类）、主人在找主人聊天里撤回 / 编辑自己
-        发过的话（7.47 第 2 条），加上引用了这些编号的
+        """插队的消息：主人在找主人聊天里的回复、主人在群里 @ 机器人的指令（7.45 A 类）、主人在聊天里点名 sheepdog 的指令（7.67）、
+        主人在找主人聊天里撤回 / 编辑自己发过的话（7.47 第 2 条），加上引用了这些编号的
         escalation_list 系统消息（回复认不出回答哪条时给总线的未结列表 / 认不出来源的说明，7.38 第 5 条），保持原来的先后。
         没有主人的这两种消息就是空表。"""
-        own = [r for r in rows if r["reason"] in (OWNER_REPLY, OWNER_INSTRUCTION) or self._owner_correction(r)]
+        own = [
+            r for r in rows
+            if r["reason"] in (OWNER_REPLY, OWNER_INSTRUCTION) or _has_owner_instruction_tag(r) or self._owner_correction(r)
+        ]
         if not own:
             return []
         keep = {r["message_id"] for r in own}
@@ -3603,8 +3676,8 @@ class Dispatcher:
         if d["batch_id"].startswith(PRIORITY_PREFIX):
             self._complete_priority(t, d["batch_id"], rows, d["sent_at"])
         else:
-            self._complete_delivery(t, d["batch_id"], [r for r in rows if r["reason"] != OWNER_CONTEXT],
-                                    [r for r in rows if r["reason"] == OWNER_CONTEXT], d["sent_at"])
+            self._complete_delivery(t, d["batch_id"], [r for r in rows if not _is_pure_owner_context(r)],
+                                    [r for r in rows if _is_pure_owner_context(r)], d["sent_at"])
 
     def _recover_sending(self) -> None:
         """上一轮「正在发」就中断（或发送超时，7.47 第 7 条）的批次（7.16）：到会话 transcript 里找批次号——找到就补记

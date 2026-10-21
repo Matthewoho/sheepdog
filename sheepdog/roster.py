@@ -208,6 +208,10 @@ class Roster:
             title=f"{base.display_title} #{idx}",
             conversation_id="",
             group=base.group_id,
+            predecessor_conversation_id="",
+            retire_predecessor=False,
+            self_polling="",
+            retire_self_polling=False,
         )
 
     def by_topic(self, topic_id: str) -> RosterSession | None:
