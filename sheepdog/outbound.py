@@ -203,6 +203,28 @@ def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | Non
 
 VIP_FLOOR_REFUSAL = ("VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合；只有底线里的事才 ask，"
                      "并用 --floor 写明碰到哪条底线")
+VIP_NON_FLOOR_PATTERNS = ("脱敏", "只读")
+VIP_FLOOR_CREDENTIAL_WORDS = ("密钥", "凭据", "密码", "个人账号", "私钥", "助记词", "secret", "token")
+VIP_FLOOR_DESTRUCTIVE_WORDS = (
+    "删除", "删掉", "删库", "删表", "删服务", "覆盖", "强推", "清空", "销毁", "不可逆", "回滚", "下线", "停服", "drop", "rm",
+)
+VIP_FLOOR_CONFLICT_WORDS = ("冲突", "两位", "矛盾")
+_NEGATED_CREDENTIAL_RE = re.compile(
+    r"(不要|不含|不用|无需|不涉及|剔除)[^，。；\n]{0,15}(密钥|凭据|密码|个人账号|私钥|secret|token)",
+    re.I,
+)
+
+
+def _is_valid_vip_floor(floor: str) -> bool:
+    low = floor.lower()
+    if any(p in low for p in VIP_NON_FLOOR_PATTERNS):
+        return False
+    if _NEGATED_CREDENTIAL_RE.search(floor):
+        return False
+    return any(
+        w in low
+        for w in (*VIP_FLOOR_CREDENTIAL_WORDS, *VIP_FLOOR_DESTRUCTIVE_WORDS, *VIP_FLOOR_CONFLICT_WORDS)
+    )
 
 
 def vip_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
@@ -266,13 +288,23 @@ def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -
 
 def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
                     floor: str, batch: str = "") -> list[tuple[str, str]]:
-    """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息时必须带非空 --floor，
+    """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息时必须带非空且命中 3 条真底线的 --floor，
     否则拒绝（退出码 2，什么都不发、不写账本）。只读。"""
     check_bus_not_forwarded_ask(cfg, store, topic_id, about, batch)
     hits = vip_sources(cfg, store, topic_id, about, vips, batch)
-    if hits and not _one_line(floor):
+    if not hits:
+        return hits
+    clean_floor = _one_line(floor)
+    if not clean_floor:
         who = "、".join(f"{name}（{mid}）" for mid, name in hits)
         raise OutboundError(EXIT_INVALID, f"{VIP_FLOOR_REFUSAL}。这次关联的来源里有 VIP 本人发的消息：{who}。没有发送")
+    if not _is_valid_vip_floor(clean_floor):
+        raise OutboundError(
+            EXIT_INVALID,
+            f"VIP 只有 3 条底线才允许 ask：(1) 索要主人的密钥/凭据/个人账号；(2) 删除/覆盖/强推等不可逆破坏操作；"
+            f"(3) 两位 VIP 要求真冲突。当前 --floor「{clean_floor}」（如生产操作、只读查询、脱敏数据导出、常规权限/配置）"
+            "不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！",
+        )
     return hits
 
 

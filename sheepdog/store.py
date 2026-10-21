@@ -927,7 +927,7 @@ class Store:
                 tags = json.loads(r["tags_json"] or "[]")
             except (TypeError, ValueError):
                 tags = []
-            if "forwarded" in tags or tid != "tp_bus":
+            if any(t == "forwarded" or t.startswith("forwarded_from:") for t in tags):
                 out[r["message_id"]] = tid
         return out
 

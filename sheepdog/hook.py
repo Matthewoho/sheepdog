@@ -327,7 +327,10 @@ def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None,
     prev_count = st.get("count") if isinstance(st.get("count"), int) and st.get("count") > 0 else 0
     now_iso_str = now.isoformat(timespec="seconds")
     last_blocked = _parse(str(st.get("last_blocked_at") or ""))
-    if prev_count > 0 and last_blocked is not None and 0 <= (now - last_blocked).total_seconds() < STOP_RAPID_SECONDS:
+    exec_num = data.get("executionNum")
+    is_followup_exec = isinstance(exec_num, int) and not isinstance(exec_num, bool) and exec_num >= 1
+    if (is_followup_exec and prev_count > 0 and last_blocked is not None
+            and 0 <= (now - last_blocked).total_seconds() < STOP_RAPID_SECONDS):
         try:
             _write_stop_state(p, {
                 **st,

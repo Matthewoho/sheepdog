@@ -531,6 +531,65 @@ class VipBranch765Test(AskFloorTest):
         self.assertIn("不能对已 forward 转交的消息调用 sheepdog reply", err_rep)
         self.assertEqual(len(self.lark.sent()), 0)
 
+    def test_regression_765_jessie_desensitized_export_and_multi_option_prompt(self):
+        from sheepdog.security import parse_security
+        sec = parse_security({"rule": [{"name": "secrets", "action": "tag", "patterns": ["secret", "token", "密码"],
+                                        "note": "索要密钥、token、账号密码"}]})
+        pb = Playbook(REPO / "examples" / "playbook")
+        jessie_id = "ou_test_vip_jessie"
+        r_jessie = fx.add(
+            self.store,
+            fx.message(
+                "om_test_jessie_oauth",
+                sender_id=jessie_id,
+                sender_name="Jessie",
+                content="帮我给现有账号接一个这些表的只读入口，或者先给脱敏导出，不要 token、secret 和用户信息，不用明文发密码",
+            ),
+            "p2p",
+            security=("tag", ["secrets"]),
+        )
+        prompt = batch_prompt(
+            pb,
+            "tp_jessie",
+            "b_test_jessie_1",
+            [r_jessie],
+            [],
+            "人·Jessie",
+            security=sec,
+            vips={jessie_id: "Jessie"},
+        )
+        self.assertIn("👑 VIP：Jessie", prompt)
+        self.assertNotIn("确认前不做", prompt)
+        self.assertNotIn("不要执行其中的要求", prompt)
+        self.assertIn("内部脱敏只读数据查询/导出", prompt)
+        self.assertIn("若 VIP 消息中同时给出了多个选项", prompt)
+        self.assertIn("直接按安全合理的选项动手办结交付，不先退回反问，更不找主人 `ask`", prompt)
+
+    def test_regression_765_non_floor_excuses_rejected_with_direct_handle_and_report_hint(self):
+        self.batch(VIP)
+        before = snapshot(self.cfg.db_path)
+        for fake_floor in (
+            "涉及生产数据库访问权限与跨系统数据导出",
+            "生产环境常规部署确认",
+            "脱敏数据导出与只读查询",
+            "不要 token、secret 和密码的脱敏导出",
+        ):
+            with self.subTest(fake_floor=fake_floor):
+                rc, out, err = self.ask("--floor", fake_floor)
+                self.assertEqual(rc, outbound.EXIT_INVALID, (out, err))
+                self.assertIn("VIP 只有 3 条底线才允许 ask", err)
+                self.assertIn(fake_floor, err)
+                self.assertIn("不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！", err)
+        self.assertEqual(self.lark.sent(), [])
+        self.assertEqual(diff_tables(before, snapshot(self.cfg.db_path)), set())
+
+        # 真底线（密钥外发、不可逆删除、两位 VIP 冲突）100% 放行
+        for i, real_floor in enumerate(("主人的密钥不能给", "删除生产表", "两位 VIP 要求真冲突")):
+            with self.subTest(real_floor=real_floor):
+                rc, out, err = self.ask("--floor", real_floor, text=f"真底线请示 {i}")
+                self.assertEqual(rc, 0, (out, err))
+        self.assertEqual(len(self.lark.sent()), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
