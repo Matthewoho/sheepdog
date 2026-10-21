@@ -28,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from sheepdog import cli, outbound
-from sheepdog.config import EscalationConfig, OwnerContextConfig, ThreadsConfig
+from sheepdog.config import EscalationConfig, OwnerContextConfig, SessionConfig, ThreadsConfig
 from sheepdog.engine import BUS_TOPIC_ID, SEEN_BEFORE_SEND_NOTE, Collector
 from sheepdog.source.lark import LarkCliSource, parse_message
 from sheepdog.store import Store
@@ -40,7 +40,7 @@ ESC_CHAT = "oc_test_esc"
 BOT = "ou_test_bot"
 ALICE = "ou_test_alice"
 ALPHA_P2P = "oc_test_alpha_p2p"
-MARK = "[🐕Sheepdog Reply]"
+MARK = SessionConfig().reply_suffix
 HEADER_RX = r"^🐕 需要你定 · [^\n]*\[(?P<topic>tp_[a-z0-9_.-]+)\]"
 ATTR_RX = r"\[(?P<topic>tp_[a-z0-9_.-]+)\]"
 WRITE_CMDS = ("+messages-send", "+messages-reply")

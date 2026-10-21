@@ -48,7 +48,7 @@ _SHEEPDOG_SUBCMDS = frozenset({
     "forward", "spawn", "new-session", "watch", "watches", "watch-done", "unwatch",
     "receipt", "ask", "report", "reply", "reply-card", "show", "sessions", "work",
     "thread", "board", "escalations", "pending", "resolve", "tell", "track",
-    "topic-group", "lamb", "inbox", "inbox-clear", "doctor", "version", "observe",
+    "topic-group", "lamb", "inbox", "inbox-clear", "doctor", "version", "upgrade", "observe",
     "acks", "notices", "actions", "loops", "redeliver", "push-rules", "retire",
     "close-session", "session-reset", "security-log", "poll", "run", "init", "inject", "hook",
 })

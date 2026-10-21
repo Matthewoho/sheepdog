@@ -61,6 +61,7 @@ spawn / new-session / push-rules / init / retire 要调 agentapi：只有常驻�
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -609,8 +610,10 @@ def _check_version_update(
         mem_disp = mem.get("display") or mem.get("version") or "?"
         pid = mem.get("pid") or os.getpid()
         text = (
-            f"🔔 检测到本机代码已更新至 {disk['display']}，但当前常驻进程仍运行在 "
-            f"{mem_disp}（PID {pid}），请重启常驻进程使其生效。"
+            f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
+            f"🔔 检测到本机代码已更新至 **{disk['display']}**，当前常驻进程仍运行在 **{mem_disp}**（PID {pid}）。\n"
+            "💡 直接回复「**你来升级**」（或「**升级**」「**重启生效**」），我会自动原地重启常驻进程使其生效；"
+            "也可在终端运行 `sheepdog upgrade`。"
         )
         _emit(local_key, text)
 
@@ -668,7 +671,12 @@ def _check_version_update(
                         else f"origin/main ({remote_main_sha[:7]})"
                     )
                     remote_key = f"remote:{remote_id}"
-                    text = f"🔔 检测到远端 origin 有新版本 {remote_desc}（当前本机为 {disk['display']}），可拉取更新。"
+                    text = (
+                        f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
+                        f"🔔 检测到远端 origin 有新版本 **{remote_desc}**（当前本机为 **{disk['display']}**）。\n"
+                        "💡 直接回复「**你来升级**」（或「**升级**」），我会自动拉取最新代码并重启常驻进程使其生效；"
+                        "也可在终端运行 `sheepdog upgrade`。"
+                    )
                     _emit(remote_key, text)
 
     return sent_texts
@@ -682,12 +690,102 @@ def cmd_version(args) -> int:
             store = Store(cfg.db_path)
     except Exception:
         store = None
-    status = get_version_status(store)
-    if getattr(args, "json", False):
-        print(json.dumps(status, ensure_ascii=False, indent=2))
-    else:
-        print(status["summary_line"])
-    return 0
+    try:
+        status = get_version_status(store)
+        if getattr(args, "json", False):
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(status["summary_line"])
+        return 0
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
+    cfg = _load_cfg()
+    root = (repo_dir or default_repo_dir()).resolve()
+    no_pull = bool(getattr(args, "no_pull", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    disk_before = version_info(root, prefer_disk_version=True)
+    if dry_run:
+        store = Store(cfg.db_path) if cfg.db_path.exists() else None
+        try:
+            st = get_version_status(store, root)
+        finally:
+            if store is not None:
+                store.close()
+        pull_plan = "跳过 git pull" if (no_pull or disk_before["dirty"]) else f"git -C {root} pull --ff-only"
+        print(f"[dry-run] upgrade: {pull_plan}；{st['summary_line']}")
+        return 0
+
+    if not no_pull and (root / ".git").exists():
+        if not disk_before["dirty"]:
+            r = _git_run(["git", "-C", str(root), "pull", "--ff-only"], timeout=15)
+            if r is not None and r.returncode != 0:
+                err_msg = ((r.stderr or "") or (r.stdout or "")).strip()
+                print(f"git pull --ff-only 失败：{err_msg}", file=sys.stderr)
+                return 1
+        else:
+            print("提示：工作区有未提交改动（dirty），跳过 git pull，直接按本机当前代码触发重启。")
+
+    store = Store(cfg.db_path)
+    try:
+        st = get_version_status(store, root)
+        if st["daemon_alive"]:
+            existing = [a for a in store.pending_actions() if a["kind"] == "upgrade"]
+            if existing:
+                aid = existing[0]["id"]
+            else:
+                aid = actions.enqueue(store, "upgrade", {"no_pull": True, "command": "sheepdog upgrade"})
+            print(f"已提交常驻进程原地热重启（动作 #{aid}，目标版本 {st['cli']['display']}，当前常驻 {st['daemon_display']}）")
+            return 0
+        print(f"代码已就绪：{st['cli']['display']}（当前无运行中的常驻进程，将由 sidecar supervisor 自动拉起或运行 `sheepdog run`）")
+        return 0
+    finally:
+        store.close()
+
+
+def _acquire_daemon_lock(state_dir: Path):
+    """常驻进程单实例内核级排他锁（7.69 REG-008）：
+    对 state_dir / 'sheepdog.run.lock' 加非阻塞 LOCK_EX | LOCK_NB。
+    若已被另一个常驻进程持有，返回 None；成功则返回打开的文件对象（随进程生命周期保持打开）。
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "sheepdog.run.lock"
+    f = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        f.close()
+        return None
+    try:
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({"pid": os.getpid(), "ppid": os.getppid(), "started_at": now_iso()}, ensure_ascii=False) + "\n")
+        f.flush()
+    except OSError:
+        pass
+    return f
+
+
+def _release_daemon_lock(lock_file) -> None:
+    if lock_file is None:
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        lock_file.close()
+    except OSError:
+        pass
+
+
+def _exec_restart() -> None:
+    """常驻进程原地热换像（7.69 REG-007）：保留原 PID、PPID（如 Antigravity sidecar 18900）与全部环境变量。"""
+    logging.info("sheepdog 常驻进程原地重启（os.execv）: %s %s", sys.executable, sys.argv)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def cmd_observe(args) -> int:
@@ -929,6 +1027,9 @@ def _mini_cycle(collector: Collector, dispatcher: Dispatcher | None) -> dict | N
     if dispatcher:
         res = dispatcher.deliver_only()
         logging.info("机器人事件小轮次投递: %s", res)
+        if dispatcher.store.pending_actions():
+            if n := actions.run_pending(dispatcher):
+                logging.info("机器人事件小轮次执行动作 %d 条", n)
     return stats
 
 
@@ -942,6 +1043,8 @@ def _wait_next(args, collector: Collector, dispatcher: Dispatcher | None, clock=
     consumer = collector.bot_events
     n = 0
     while True:
+        if getattr(dispatcher, "restart_requested", False):
+            return n
         left = deadline - clock()
         if left <= 0:
             return n
@@ -956,6 +1059,8 @@ def _wait_next(args, collector: Collector, dispatcher: Dispatcher | None, clock=
         except Exception as e:  # 小轮次失败不挡下一轮
             logging.error("机器人事件小轮次失败: %s: %s", type(e).__name__, e)
         n += 1
+        if getattr(dispatcher, "restart_requested", False):
+            return n
 
 
 def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
@@ -964,6 +1069,9 @@ def _cycle(collector: Collector, dispatcher: Dispatcher | None) -> None:
     if dispatcher:
         res = dispatcher.dispatch_once()
         logging.info("dispatch: %s", res)
+        if dispatcher.store.pending_actions():
+            if n := actions.run_pending(dispatcher):
+                logging.info("执行动作 %d 条", n)
 
 
 def cmd_poll(args) -> int:
@@ -1037,25 +1145,46 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
 
 def cmd_run(args) -> int:
     # 本进程是常驻进程：只有它能跨项目调 agentapi，会话里发起的动作由它执行
-    actions.mark_resident()
+    was_resident = actions.is_resident()
     cfg, store, source, sink, roster, security = _build(args)
-    _save_last_good(cfg)   # 启动时三样都加载成功了：存一份给会话侧命令兜底
-    acker = _acker(cfg, store, source, args)
-    collector = Collector(cfg, store, source, roster, security, acker)
-    collector.dry_run = bool(getattr(args, "dry_run", False))
-    dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args),
-                            _group_source(source, args))
-    _wire_images(dispatcher, source, args)
-    logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
-                 "、".join(f"{h}={s.name}" for h, s in sink.items()))
-    runtime_info = version_info() if getattr(args, "dry_run", False) else _record_daemon_runtime(store)
-    consumer = _start_bot_events(cfg, store, source, args)
-    collector.bot_events = consumer
+    lock_file = None
+    if not getattr(args, "dry_run", False):
+        lock_file = _acquire_daemon_lock(cfg.state_dir)
+        if lock_file is None:
+            store.close()
+            msg = f"已有 sheepdog run 常驻进程持有单实例锁（{cfg.state_dir / 'sheepdog.run.lock'}），本实例安全退出"
+            logging.warning(msg)
+            print(msg, file=sys.stderr)
+            return 0
+    actions.mark_resident()
+    consumer = None
+    dispatcher = None
     try:
+        _save_last_good(cfg)   # 启动时三样都加载成功了：存一份给会话侧命令兜底
+        acker = _acker(cfg, store, source, args)
+        collector = Collector(cfg, store, source, roster, security, acker)
+        collector.dry_run = bool(getattr(args, "dry_run", False))
+        dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args),
+                                _group_source(source, args))
+        _wire_images(dispatcher, source, args)
+        logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
+                     "、".join(f"{h}={s.name}" for h, s in sink.items()))
+        runtime_info = version_info() if getattr(args, "dry_run", False) else _record_daemon_runtime(store)
+        dispatcher.runtime_info = runtime_info
+        consumer = _start_bot_events(cfg, store, source, args)
+        collector.bot_events = consumer
         return _run_loop(args, cfg, store, source, collector, dispatcher, runtime_info=runtime_info)
     finally:
+        actions._resident = was_resident
         if consumer is not None:
             consumer.stop()
+        _release_daemon_lock(lock_file)
+        try:
+            store.close()
+        except Exception:
+            pass
+        if dispatcher is not None and getattr(dispatcher, "restart_requested", False) and not getattr(args, "dry_run", False):
+            _exec_restart()
 
 
 def _start_bot_events(cfg, store: Store, source, args):
@@ -1095,10 +1224,14 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 _save_last_good(cfg, (lastgood.SECURITY,))
             except SecurityError as e:
                 logging.error("安全规则无效，沿用上一份: %s", e)
-            # 先执行会话发起的动作（spawn / new-session / push-rules / init / retire），再拉取和投递
+            # 先执行会话发起的动作（spawn / new-session / push-rules / init / retire / upgrade），再拉取和投递
             if n := actions.run_pending(dispatcher):
                 logging.info("执行动作 %d 条", n)
+            if getattr(dispatcher, "restart_requested", False):
+                return 0
             _cycle(collector, dispatcher)
+            if getattr(dispatcher, "restart_requested", False):
+                return 0
             if cfg.version.enabled:
                 _check_version_update(cfg, store, dispatcher, runtime_info=runtime_info)
             if time.time() - last_prune > 3600:
@@ -1115,6 +1248,8 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
             else:
                 logging.error("本轮失败（下一轮从水位线续跑）: %s: %s", type(e).__name__, e)
         _wait_next(args, collector, dispatcher)
+        if getattr(dispatcher, "restart_requested", False):
+            return 0
 
 
 def cmd_inbox(args) -> int:
@@ -2395,6 +2530,11 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("version", help="显示 CLI 代码版本与常驻进程内存版本")
     sp.add_argument("--json", action="store_true", help="输出 JSON")
     sp.set_defaults(func=cmd_version)
+
+    sp = sub.add_parser("upgrade", help="拉取最新代码并通知常驻进程原地热重启（os.execv，保留 sidecar 环境）")
+    sp.add_argument("--no-pull", action="store_true", help="不执行 git pull，仅通知常驻进程原地重启")
+    sp.add_argument("--dry-run", action="store_true", help="只打印将要执行的升级动作，不拉代码、不入队")
+    sp.set_defaults(func=cmd_upgrade)
 
     sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
     obs.add_observe_arguments(sp)

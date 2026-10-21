@@ -18,7 +18,7 @@ from .store import Store
 
 log = logging.getLogger("sheepdog")
 
-KINDS = ("init", "spawn", "new_session", "push_rules", "retire")
+KINDS = ("init", "spawn", "new_session", "push_rules", "retire", "upgrade")
 QUEUED_HINT = "已提交，sheepdog 下一轮执行，结果见 `sheepdog actions`"
 
 _resident = False
@@ -49,6 +49,12 @@ def execute(dispatcher, kind: str, args: dict) -> object:
     d = dispatcher
     if kind == "init":
         return d.init()
+    if kind == "upgrade":
+        return d.upgrade(
+            reply_to=args.get("reply_to", ""),
+            command=args.get("command", ""),
+            no_pull=bool(args.get("no_pull", False)),
+        )
     d.sync_roster()
     if kind == "spawn":
         return d.spawn(args["key"])

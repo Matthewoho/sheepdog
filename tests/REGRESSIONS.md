@@ -258,6 +258,9 @@
 | 7.68 | `sheepdog observe` 四阶段水流 SLA 漏报：入账超 90s 未点 `[Get]` 表情（Ingest Ack SLA）、主人指令/回复超 90s 未插话（Priority SLA）、普通消息排队超 5 分钟队头阻塞（Queue Head-of-Line SLA 含阻塞批次号）、主人说话回音超 15 分钟未结清（Owner Echo SLA）（REG-003） | `test_version_and_observe.ObserveWaterflowSlaTest.test_l2_ack_90s_priority_90s_and_hol_5m_sla_alerts` |
 | 7.68 | 宿主 Transcript 深度探针漏检 `The prompt could not be submitted` 投递拦截、做完活忘交回执假 `running` 僵尸锁（>180s 且 DONE 静默 >90s），或 `--self-heal` 未写 `hooks/stop/<topic>.json` 驱动常驻进程 7.64 自动催交与解锁（REG-004） | `test_version_and_observe.ObserveTranscriptProbesTest.test_l3_prompt_filter_and_zombie_running_self_heal` |
 | 7.68 | 总线 `tp_bus` 超 150s 或越权调用 `write_file`/`edit_file`/`gcloud`/`lark-cli docs` 未被 `tp_bus Boundary Guard` 揪出，或已正常答复结案的提问误触发 `ask_jumps` 噪音告警、持续故障因秒数跳动穿透指纹冷却（REG-005） | `test_version_and_observe.ObserveBusBoundaryAndNoiseTest.test_l3_bus_overreach_and_l4_ask_jumps_noise_razor` |
+| 7.69 | 代回卡片右下角签名未升级为动态 `🐕SheepDog v0.7.69`，或跨版本升级后旧版 `[🐕Sheepdog Reply]` 与新版 `🐕SheepDog vX.Y.Z` 在 `is_agent_reply` / `_agent_reply_text` / `outbound` 发前检查 / `pending.is_agent_text` 中不能互认导致把代回卡片误判为主人发言（REG-006） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_006_reply_card_version_signature_and_legacy_anti_echo` |
+| 7.69 | 新版提醒卡片缺标题行或未引导主人回复「你来升级」/ 运行 `sheepdog upgrade`，或主人在飞书回复「你来升级 / 升级 / 重启生效」被当成普通消息送进 `tp_bus` 而未入队 `upgrade` 动作触发常驻进程原地 `os.execv` 热重启（REG-007） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_007_version_notice_guidance_and_owner_upgrade_shortcut_execv` |
+| 7.69 | `sheepdog run` 缺少 `sheepdog.run.lock` 内核级 `flock` 非阻塞排他锁导致双常驻进程脑裂，或 `Store.upsert_message` 并发写入同一 `message_id` 抛出 `sqlite3.IntegrityError: UNIQUE constraint failed: messages.message_id`（REG-008） | `test_version_and_observe.Version769SignatureAndUpgradeTest.test_reg_008_single_instance_flock_and_idempotent_upsert_message` |
 
 
 

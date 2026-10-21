@@ -239,7 +239,7 @@ class Hit:
 
 def is_agent_text(cfg, content: str) -> bool:
     suffix = cfg.session.reply_suffix
-    return eng.is_agent_reply(content, cfg.owner_context) or bool(suffix and suffix in (content or ""))
+    return eng.is_agent_reply(content, cfg.owner_context) or eng.has_reply_suffix(content, suffix)
 
 
 def _before(dt: datetime | None, until: datetime | None) -> bool:

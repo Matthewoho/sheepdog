@@ -15,8 +15,16 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import __version__
+
 
 log = logging.getLogger(__name__)
+LEGACY_REPLY_SUFFIX = "[🐕Sheepdog Reply]"
+BUILTIN_REPLY_SUFFIX_RE = re.compile(r"🐕SheepDog\s+v?\d+\.\d+\.\d+|\[🐕Sheepdog Reply\]")
+
+
+def default_reply_suffix() -> str:
+    return f"🐕SheepDog v{__version__}"
 # prompt_overlay 文件上一次读成功的内容（常驻进程内有效）：读不了 / 不是 UTF-8 时沿用它并 WARNING，不让投递那一轮失败
 _OVERLAY_LAST_GOOD: dict[Path, str] = {}
 
@@ -116,8 +124,8 @@ class SessionConfig:
     max_message_lines: int = 200
     # 代回前缀：作为 playbook 的 {{reply_prefix}} 占位符（7.17 起改用卡片 + 后缀，保留兼容）
     reply_prefix: str = "🐕 [Agent 代回] "
-    # 代回卡片右下角的标记（7.17）：playbook 的 {{reply_suffix}}，sheepdog reply-card 用它
-    reply_suffix: str = "[🐕Sheepdog Reply]"
+    # 代回卡片右下角的标记（7.17 / 7.69）：playbook 的 {{reply_suffix}}，sheepdog reply-card 用它（默认 🐕SheepDog vX.Y.Z）
+    reply_suffix: str = field(default_factory=default_reply_suffix)
     # 代回卡片宽度：compact（400px）| default（≤600px）| fill（撑满）
     reply_card_width: str = "compact"
     # 7.40 开关（热加载）：会话在跑上一批时，主人在找主人聊天里的回复当轮单独插队送到（7.37 第 4 件）。
@@ -944,7 +952,10 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     """把整份配置文件（tomllib 的输出）写进 cfg；值的合法性由各节的 validate() 管。"""
     _apply(cfg, data)
     _apply(cfg.routing, data.get("routing", {}))
-    _apply(cfg.session, data.get("session", {}))
+    session_data = dict(data.get("session", {}))
+    if session_data.get("reply_suffix") == LEGACY_REPLY_SUFFIX:
+        session_data["reply_suffix"] = default_reply_suffix()
+    _apply(cfg.session, session_data)
     _apply(cfg.watch, data.get("watch", {}))
     _apply(cfg.escalation, data.get("escalation", {}))
     if "aliases" in data.get("escalation", {}):

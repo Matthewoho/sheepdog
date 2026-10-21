@@ -14,7 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import session as sm
-from .config import ANTIGRAVITY, NORMAL, OWNER_SIDE, Config, DutyConfig, RoutingConfig
+from .config import (ANTIGRAVITY, BUILTIN_REPLY_SUFFIX_RE, LEGACY_REPLY_SUFFIX, NORMAL, OWNER_SIDE, Config, DutyConfig,
+                     RoutingConfig)
 from .models import Message
 from . import duty
 from . import media
@@ -188,13 +189,47 @@ def escalation_note(e) -> str:
     return f"回复的问题（topic `{e['topic_id']}`，{e['asked_at']}，message_id `{e['message_id']}`）：{escalation_summary(e)}"
 
 
+def has_reply_suffix(content: str, suffix: str = "") -> bool:
+    """正文是否包含代回卡片右下角签名（当前配置的 reply_suffix，或内置跨版本签名 🐕SheepDog vX.Y.Z / [🐕Sheepdog Reply]）。"""
+    text = content or ""
+    if suffix and suffix in text:
+        return True
+    return bool(BUILTIN_REPLY_SUFFIX_RE.search(text))
+
+
 def is_agent_reply(content: str, oc) -> bool:
-    """这条主人身份的消息是不是会话代回的（7.13 / 7.17）：正文以 skip_prefixes 之一开头，或任意位置包含
-    agent_markers 之一（代回卡片的右下角标记；卡片按账本里的 content 匹配）。"""
+    """这条主人身份的消息是不是会话代回的（7.13 / 7.17 / 7.69）：正文以 skip_prefixes 之一开头，或任意位置包含
+    agent_markers 之一（代回卡片的右下角标记；卡片按账本里的 content 匹配）。当 agent_markers 含有官方标记（如
+    [🐕Sheepdog Reply] 或 🐕SheepDog）时，自动兼容任意版本的 🐕SheepDog vX.Y.Z 与旧版 [🐕Sheepdog Reply]。"""
     bodies = message_bodies(content)
     if any(b.startswith(p) for b in bodies for p in oc.skip_prefixes):
         return True
-    return any(mk in b for b in [content or "", *bodies] for mk in oc.agent_markers)
+    haystacks = [content or "", *bodies]
+    if any(mk in b for b in haystacks for mk in oc.agent_markers):
+        return True
+    if any(mk == LEGACY_REPLY_SUFFIX or "🐕SheepDog" in mk or "🐕Sheepdog" in mk for mk in oc.agent_markers):
+        return any(bool(BUILTIN_REPLY_SUFFIX_RE.search(b)) for b in haystacks)
+    return False
+
+
+UPGRADE_WORDS = frozenset({
+    "升级", "你来升级", "立即升级", "更新", "你来更新",
+    "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade",
+})
+_UPGRADE_AT_TAG_RE = re.compile(r"<at\b[^>]*>.*?</at>", re.I | re.S)
+_UPGRADE_TRAIL_PUNCT = " \t\r\n。！!~～？?，,、.·\"'”’」』】"
+
+
+def is_upgrade_command(content: str) -> bool:
+    """主人在找主人聊天里发的「你来升级 / 升级 / 重启生效」快捷口令（7.69）：
+    剥离 <at> 标签、首尾空白及末尾标点后大小写不敏感匹配 UPGRADE_WORDS。"""
+    raw = _UPGRADE_AT_TAG_RE.sub(" ", content or "")
+    for b in message_bodies(plain_text(raw)):
+        cleaned = _UPGRADE_AT_TAG_RE.sub(" ", b or "")
+        cleaned = " ".join(cleaned.split()).strip(_UPGRADE_TRAIL_PUNCT).lower()
+        if cleaned in UPGRADE_WORDS:
+            return True
+    return False
 
 
 # 话题里开头那条的序号（thread_message_position）：开头那条 "-1"、回复从 "0" 起。7.22 时（10-12 22:5x）按一个样本以为
@@ -1468,6 +1503,14 @@ class Collector:
                 self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
                 self._pending_reply(m)
                 return d
+            if (self.cfg.escalation.owner_shortcut and is_upgrade_command(m.content)
+                    and not self._is_answering_open_escalation(m)):
+                # 7.69：主人在找主人聊天里发「你来升级 / 升级 / 重启生效」（顶层或引用新版提醒卡片）：入队 upgrade 动作，
+                # 由常驻进程拉取最新代码并原地 os.execv 重启，不进 tp_bus、不记回音欠账
+                d = RouteDecision(DROP, "upgrade_command", [OWNER_VERIFIED_TAG])
+                self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
+                self._upgrade_shortcut(m)
+                return d
             d = self._owner_reply(m)
             self._echo_record(m, d.reason)      # 7.52：主人在找主人聊天里的话，记一笔欠账（7.53：没引用的记成指令）
             return d
@@ -1550,11 +1593,43 @@ class Collector:
                             identity=identity.BOT if self.cfg.identity.enabled else None)
         log.info("主人发了「待办」%s，已回清单 %s", m.message_id, res.get("message_id", ""))
 
+    def _is_answering_open_escalation(self, m: Message) -> bool:
+        """主人这条消息是不是在回答某条未结的「需要你定」提问（引用了未结提问，或在含未结提问的话题里回复）。"""
+        open_ids = {e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)}
+        if not open_ids:
+            return False
+        if m.reply_to and m.reply_to in open_ids:
+            return True
+        if m.root_id and m.root_id in open_ids:
+            return True
+        if m.thread_id and not is_thread_root(m):
+            thr = self.store.thread_by_thread_id(m.thread_id)
+            if thr is not None:
+                if thr["root_message_id"] in open_ids:
+                    return True
+                for s in self.store.sends_in_thread(thr["root_message_id"]):
+                    if s["message_id"] in open_ids:
+                        return True
+            for r in self.store.thread_messages_in_ledger(m.thread_id):
+                if r["message_id"] in open_ids:
+                    return True
+        return False
+
+    def _upgrade_shortcut(self, m: Message) -> None:
+        """主人在找主人聊天里发「你来升级 / 升级 / 重启生效」（7.69）：入队 upgrade 动作，由常驻进程原地拉取并 os.execv 重启。"""
+        from . import actions
+        if any(a["kind"] == "upgrade" for a in self.store.pending_actions()):
+            log.info("主人发了升级口令 %s，队列里已有待执行的 upgrade 动作，不重复入队", m.message_id)
+            return
+        cmd_text = " ".join(plain_text(m.content or "").split()).strip()
+        aid = actions.enqueue(self.store, "upgrade", {"reply_to": m.message_id, "command": cmd_text})
+        log.info("主人发了升级口令 %s（%r），已入队动作 #%d（upgrade）", m.message_id, cmd_text, aid)
+
     def _agent_reply_text(self, content: str) -> bool:
-        """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix（代回卡片右下角的
-        标记；没配 agent_markers 时也认得出）。"""
+        """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix / 内置跨版本签名
+        （代回卡片右下角的标记；没配 agent_markers 时也认得出）。"""
         suffix = self.cfg.session.reply_suffix
-        return is_agent_reply(content, self.cfg.owner_context) or bool(suffix and suffix in (content or ""))
+        return is_agent_reply(content, self.cfg.owner_context) or has_reply_suffix(content, suffix)
 
     # 机器人消息第一行里的 [..] 标签（7.15）：按「·」拆开逐段和 aliases、会话标题比
     _BRACKET = re.compile(r"\[([^\[\]]+)\]")
@@ -2294,6 +2369,8 @@ class Dispatcher:
         # 正文后面写明原因和会话自己去取的命令；常驻进程和 poll 由 cli 设上
         self.image_binary = ""
         self.image_off_reason = "这个进程不下载图片"
+        self.restart_requested: bool = False
+        self.runtime_info: dict | None = None
 
     def _images(self, rows) -> dict[str, dict]:
         """这一批里每条消息的图片下载结果（7.54）：message_id → {钥匙: media.ImageResult}。[media] 每批现读（热加载）。
@@ -5566,6 +5643,65 @@ class Dispatcher:
             except SinkError as e:
                 report["onboarding"][s.topic_id] = f"发送失败: {e}"
         return report
+
+    def upgrade(self, *, reply_to: str = "", command: str = "", no_pull: bool = False,
+                repo_dir: Path | None = None) -> dict:
+        """7.69：执行常驻进程热升级动作——工作区干净时 git pull --ff-only，发升级完成确认卡片，并标记 restart_requested=True
+        由常驻循环收尾后原地 os.execv 重启（100% 保留原 PID 与 sidecar 环境）。"""
+        from . import _git_run, default_repo_dir, version_info
+        root = (repo_dir or default_repo_dir()).resolve()
+        mem = self.runtime_info
+        if not isinstance(mem, dict):
+            raw_rt = self.store.get_meta("daemon_runtime")
+            if raw_rt:
+                try:
+                    mem = json.loads(raw_rt)
+                except json.JSONDecodeError:
+                    mem = None
+        if not isinstance(mem, dict):
+            mem = version_info(root, prefer_disk_version=False)
+        mem_disp = mem.get("display") or mem.get("version") or "?"
+        pid = mem.get("pid") or os.getpid()
+
+        disk_before = version_info(root, prefer_disk_version=True)
+        pulled = False
+        pull_output = ""
+        if not no_pull and (root / ".git").exists():
+            if not disk_before["dirty"]:
+                r = _git_run(["git", "-C", str(root), "pull", "--ff-only"], timeout=15)
+                if r is not None:
+                    pulled = (r.returncode == 0)
+                    pull_output = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[:300]
+            else:
+                pull_output = "工作区有未提交改动（dirty），跳过 git pull，直接按本机当前代码重启"
+
+        disk_after = version_info(root, prefer_disk_version=True)
+        self.restart_requested = True
+
+        if disk_after["display"] != mem_disp:
+            text = (
+                f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n"
+                f"✅ 已更新至 **{disk_after['display']}**（原常驻进程 **{mem_disp}**，PID {pid}），"
+                "正在原地重启常驻进程使其立即生效。"
+            )
+        else:
+            text = (
+                f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n"
+                f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），"
+                "正在原地重启常驻进程刷新运行态。"
+            )
+        self._notify_owner(text, "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
+        log.info("已执行 upgrade 动作（%s -> %s，pulled=%s，command=%r），标记原地重启",
+                 mem_disp, disk_after["display"], pulled, command)
+        return {
+            "from": mem_disp,
+            "to": disk_after["display"],
+            "version": disk_after["version"],
+            "git_sha": disk_after["git_sha"],
+            "pulled": pulled,
+            "pull_output": pull_output,
+            "restart_requested": True,
+        }
 
 
 def _check_target(store: Store, topic_id: str, verb: str):

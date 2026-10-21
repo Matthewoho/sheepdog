@@ -33,8 +33,8 @@ from . import pending as pend
 from . import session as sm
 from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes, resolve_summary_and_body
 from .config import Config
-from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, is_agent_reply, open_escalations,
-                     order_thread_items, root_position)
+from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, has_reply_suffix, is_agent_reply,
+                     open_escalations, order_thread_items, root_position)
 from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
@@ -756,7 +756,7 @@ def owner_spoke_since(cfg: Config, store: Store, source, target: sqlite3.Row) ->
             at = _parse(m.create_time)
             if at is None or at.tzinfo is None or at < start:
                 continue  # 没有序号才按时间比：只到分钟，同一分钟里的一律算「之后」（偏保守）
-        if is_agent_reply(m.content, cfg.owner_context) or (suffix and suffix in (m.content or "")):
+        if is_agent_reply(m.content, cfg.owner_context) or has_reply_suffix(m.content, suffix):
             continue  # 会话以主人身份代回的
         seen.add(m.message_id)
         hits.append(m)

@@ -751,7 +751,8 @@ class Store:
                        sender_tenant_key,content,msg_type,create_time,mentions_json,reply_to,thread_id,link,deleted,
                        updated,update_time,route,reason,tags_json,topic_id,dispatch_state,first_seen,last_seen,
                        message_position,thread_position,received_by,root_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(message_id) DO UPDATE SET last_seen=excluded.last_seen""",
                 (m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name, m.sender_type,
                  m.sender_tenant_key,
                  m.content, m.msg_type, m.create_time, mentions, m.reply_to, m.thread_id, m.link,

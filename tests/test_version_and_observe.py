@@ -53,8 +53,9 @@ REG_768 = """# 回归
 class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
-        self.assertEqual(sheepdog.__version__, "0.7.68")
-        self.assertEqual(sheepdog.parse_version_tuple(sheepdog.__version__), (0, 7, 68))
+        cur_ver = sheepdog.__version__
+        self.assertEqual(cur_ver, "0.7.69")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 69))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -103,16 +104,19 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             self.assertEqual(problems_ok, [])
 
             # 3. daemon_runtime 登记、get_version_status 与 CLI --version 输出
+            (repo / "sheepdog" / "__init__.py").write_text(f'__version__ = "{cur_ver}"\n', encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "sync-cur-ver")
             cfg = Config(state_dir=tmp_path / "state")
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
             store = Store(cfg.db_path)
             self.addCleanup(store.close)
             rt = cli._record_daemon_runtime(store, repo_dir=repo)
-            self.assertEqual(rt["version"], "0.7.68")
+            self.assertEqual(rt["version"], cur_ver)
 
             st_sync = cli.get_version_status(store, repo_dir=repo)
             self.assertTrue(st_sync["in_sync"])
-            self.assertIn("0.7.68", st_sync["summary_line"])
+            self.assertIn(cur_ver, st_sync["summary_line"])
             self.assertIn("一致", st_sync["summary_line"])
 
             with mock.patch("sheepdog.cli._load_cfg", return_value=cfg):
@@ -120,10 +124,10 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 with mock.patch("sys.stdout", buf):
                     rc = cli.main(["--version"])
                 self.assertEqual(rc, 0)
-                self.assertIn("0.7.68", buf.getvalue())
+                self.assertIn(cur_ver, buf.getvalue())
 
             # 4. 常驻进程 _check_version_update：本机磁盘升版提醒 + 远端 tag 提醒 + 幂等防重
-            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.69"\n', encoding="utf-8")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.70"\n', encoding="utf-8")
             fake_dispatcher = mock.MagicMock()
             now_dt = datetime(2026, 10, 21, 20, 0, 0, tzinfo=observe.TZ)
             real_run = subprocess.run
@@ -138,8 +142,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt
                 )
                 self.assertEqual(len(sent1), 1)
-                self.assertIn("0.7.69", sent1[0])
-                self.assertIn("0.7.68", sent1[0])
+                self.assertIn("0.7.70", sent1[0])
+                self.assertIn(cur_ver, sent1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
                 # 同一版本第二次调用不重复发通知
@@ -149,8 +153,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertEqual(sent2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
-            # 远端出现更高版本 v0.7.70 时单次提醒
-            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.70\n"
+            # 远端出现更高版本 v0.7.71 时单次提醒
+            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.71\n"
 
             def has_remote_tag(cmd, *a, **kw):
                 if isinstance(cmd, list) and "ls-remote" in cmd:
@@ -167,7 +171,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     now=now_dt + timedelta(minutes=35),
                 )
                 self.assertEqual(len(sent_remote1), 1)
-                self.assertIn("v0.7.70", sent_remote1[0])
+                self.assertIn("v0.7.71", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
                 sent_remote2 = cli._check_version_update(
@@ -618,6 +622,370 @@ class ObserveBusBoundaryAndNoiseTest(unittest.TestCase):
             fp_a = observe._fingerprint_warns(["消息排队超 5 分钟：tp_hol 1 条 最久 6 分钟 (360s)"])
             fp_b = observe._fingerprint_warns(["消息排队超 5 分钟：tp_hol 1 条 最久 12 分钟 (720s)"])
             self.assertEqual(fp_a, fp_b)
+
+
+class Version769SignatureAndUpgradeTest(unittest.TestCase):
+    """规格 7.69（REG-006 / REG-007 / REG-008）回归测试。"""
+
+    def tearDown(self):
+        from sheepdog import actions
+
+        actions._resident = False
+
+    def test_reg_006_reply_card_version_signature_and_legacy_anti_echo(self):
+        from sheepdog.card import build_reply_card
+        from sheepdog.config import (
+            LEGACY_REPLY_SUFFIX,
+            OwnerContextConfig,
+            SessionConfig,
+            default_reply_suffix,
+            load_config,
+        )
+        from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
+        from sheepdog.pending import is_agent_text
+
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.69）
+        expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.69")
+        self.assertEqual(default_reply_suffix(), expected_sig)
+        self.assertEqual(SessionConfig().reply_suffix, expected_sig)
+
+        card = build_reply_card("收到，马上处理", SessionConfig().reply_suffix)
+        self.assertEqual(
+            card["body"]["elements"][-1],
+            {
+                "tag": "markdown",
+                "content": f"<font color='grey'>{expected_sig}</font>",
+                "text_align": "right",
+                "text_size": "notation",
+            },
+        )
+
+        # 2. 旧配置文件写死 [🐕Sheepdog Reply] 自动升级为动态版本签名；自定义标记原样保留
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_legacy = tmp_path / "legacy.toml"
+            cfg_legacy.write_text(
+                f'self_open_id = "ou_test_me"\nstate_dir = "{tmp_path / "s1"}"\n'
+                f'[session]\nreply_suffix = "{LEGACY_REPLY_SUFFIX}"\n',
+                encoding="utf-8",
+            )
+            loaded_legacy = load_config(cfg_legacy)
+            self.assertEqual(loaded_legacy.session.reply_suffix, expected_sig)
+
+            cfg_custom = tmp_path / "custom.toml"
+            cfg_custom.write_text(
+                f'self_open_id = "ou_test_me"\nstate_dir = "{tmp_path / "s2"}"\n'
+                '[session]\nreply_suffix = "[FX-Reply]"\n',
+                encoding="utf-8",
+            )
+            loaded_custom = load_config(cfg_custom)
+            self.assertEqual(loaded_custom.session.reply_suffix, "[FX-Reply]")
+
+            # 3. 跨版本防回声识别：新版本卡片、未来版本卡片、旧版 [🐕Sheepdog Reply] 全链路互认
+            new_card_text = f"<card>\n好的，已经安排\n{expected_sig}\n</card>"
+            future_card_text = "<card>\n好的，已经安排\n🐕SheepDog v0.8.2\n</card>"
+            legacy_card_text = f"<card>\n好的，已经安排\n{LEGACY_REPLY_SUFFIX}\n</card>"
+            human_text = "我自己亲口说的话"
+
+            for sample in (new_card_text, future_card_text, legacy_card_text):
+                self.assertTrue(has_reply_suffix(sample, expected_sig), sample)
+            self.assertFalse(has_reply_suffix(human_text, expected_sig))
+
+            # 即使个人配置里的 agent_markers 仍停留在旧版 ["[🐕Sheepdog Reply]"]，也能认出新版签名
+            oc_old_marker = OwnerContextConfig(agent_markers=[LEGACY_REPLY_SUFFIX])
+            self.assertTrue(is_agent_reply(new_card_text, oc_old_marker))
+            self.assertTrue(is_agent_reply(future_card_text, oc_old_marker))
+            self.assertTrue(is_agent_reply(legacy_card_text, oc_old_marker))
+            self.assertFalse(is_agent_reply(human_text, oc_old_marker))
+
+            # 新配置 agent_markers = ["🐕SheepDog v"] 同样认出旧版 [🐕Sheepdog Reply]
+            oc_new_marker = OwnerContextConfig(agent_markers=["🐕SheepDog v"])
+            self.assertTrue(is_agent_reply(legacy_card_text, oc_new_marker))
+            self.assertTrue(is_agent_reply(new_card_text, oc_new_marker))
+
+            # 空 agent_markers 时对非内置合成标记 [FX-Reply] 保持 False（不破坏历史单测）
+            self.assertFalse(is_agent_reply("<card>\nx\n[FX-Reply]\n</card>", OwnerContextConfig()))
+
+            # Collector._agent_reply_text 与 pending.is_agent_text 均同时识别新旧签名
+            store = Store(loaded_legacy.db_path)
+            try:
+                col = Collector(loaded_legacy, store, mock.MagicMock(), Roster(), SecurityConfig())
+                for sample in (new_card_text, future_card_text, legacy_card_text):
+                    self.assertTrue(col._agent_reply_text(sample))
+                    self.assertTrue(is_agent_text(loaded_legacy, sample))
+                self.assertFalse(col._agent_reply_text(human_text))
+                self.assertFalse(is_agent_text(loaded_legacy, human_text))
+            finally:
+                store.close()
+
+    def test_reg_007_version_notice_guidance_and_owner_upgrade_shortcut_execv(self):
+        from sheepdog import actions
+        from sheepdog.config import EscalationConfig
+        from sheepdog.engine import BUS_TOPIC_ID, Collector, is_upgrade_command
+        from sheepdog.models import Message
+
+        # 1. 升级口令识别（剥离 <at> 标签、标点、大小写不敏感）
+        for valid_cmd in (
+            "你来升级",
+            "升级！",
+            "重启生效。",
+            "<at id=ou_bot>@牧羊犬</at> 你来升级~",
+            "  SHEEPDOG UPGRADE ",
+        ):
+            self.assertTrue(is_upgrade_command(valid_cmd), valid_cmd)
+        for non_cmd in ("生产服务刚完成了升级", "帮我看看升级方案", "待办"):
+            self.assertFalse(is_upgrade_command(non_cmd), non_cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            (repo / "sheepdog").mkdir(parents=True)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    [
+                        "git", "-C", str(repo),
+                        "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        *args,
+                    ],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.68"\n', encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "v0.7.68")
+
+            cfg = Config(self_open_id="ou_test_owner", state_dir=tmp_path / "state")
+            cfg.escalation = EscalationConfig(
+                chat_ids=["oc_owner_dm"],
+                header_regex=r"^🐕 需要你定 · [^\n]*\[(?P<topic>tp_[a-z0-9_.-]+)\]",
+                attribution_regex=r"\[(?P<topic>tp_[a-z0-9_.-]+)\]",
+                owner_shortcut=True,
+            )
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            try:
+                # 2. _check_version_update 新版提醒文案带标题行与「你来升级」/ sheepdog upgrade 指引
+                rt = {
+                    "version": "0.7.68",
+                    "git_sha": git("rev-parse", "HEAD"),
+                    "display": "0.7.68 (oldsha)",
+                    "pid": 12345,
+                }
+                store.set_meta("daemon_runtime", json.dumps(rt, ensure_ascii=False))
+                (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.69"\n', encoding="utf-8")
+                git("add", "-A")
+                git("commit", "-q", "-m", "v0.7.69")
+
+                notified_cards: list[tuple[str, str, str, str]] = []
+                disp = Dispatcher(cfg, store, DryRunSink(), Roster(), SecurityConfig())
+                disp.runtime_info = rt
+                disp._notify_owner = lambda text, what, topic_id="", reply_to="", **kw: (
+                    notified_cards.append((text, what, topic_id, reply_to)) or True
+                )
+
+                now_dt = datetime(2026, 10, 21, 22, 0, 0, tzinfo=observe.TZ)
+                real_run = subprocess.run
+                ls_remote_out = "8888888888888888888888888888888888888888\trefs/tags/v0.7.70\n"
+
+                def fake_git(cmd, *a, **kw):
+                    if isinstance(cmd, list) and "ls-remote" in cmd:
+                        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=ls_remote_out, stderr="")
+                    if isinstance(cmd, list) and "pull" in cmd:
+                        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Already up to date.\n", stderr="")
+                    return real_run(cmd, *a, **kw)
+
+                with mock.patch("subprocess.run", side_effect=fake_git):
+                    notices = cli._check_version_update(
+                        cfg, store, disp, runtime_info=rt, repo_dir=repo, now=now_dt
+                    )
+                self.assertEqual(len(notices), 2)
+                self.assertTrue(notices[0].startswith(f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"))
+                self.assertIn("你来升级", notices[0])
+                self.assertIn("sheepdog upgrade", notices[0])
+                self.assertTrue(notices[1].startswith(f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"))
+                self.assertIn("你来升级", notices[1])
+
+                # 3. 主人在找主人聊天引用「新版提醒」卡片回复「你来升级」：直接拦截为 upgrade_command 并入队 actions('upgrade')
+                store.add_bot_outbox("om_notice_card_1", BUS_TOPIC_ID, False, notices[0], observe.iso(now_dt))
+                col = Collector(cfg, store, mock.MagicMock(), Roster(), SecurityConfig())
+                m_upgrade = Message(
+                    message_id="om_owner_upg_1",
+                    chat_id="oc_owner_dm",
+                    chat_name="私聊",
+                    chat_type="p2p",
+                    sender_id="ou_test_owner",
+                    sender_name="Matthew",
+                    sender_type="user",
+                    content="你来升级",
+                    msg_type="text",
+                    create_time=observe.iso(now_dt + timedelta(seconds=5)),
+                    reply_to="om_notice_card_1",
+                )
+                d = col._escalation_message(m_upgrade)
+                self.assertEqual((d.route, d.reason), ("drop", "upgrade_command"))
+                self.assertEqual(store.echo_open(), [])  # 不记 owner_echoes 欠账
+                pending_acts = store.pending_actions()
+                self.assertEqual(len(pending_acts), 1)
+                self.assertEqual(pending_acts[0]["kind"], "upgrade")
+                self.assertEqual(json.loads(pending_acts[0]["args_json"])["reply_to"], "om_owner_upg_1")
+
+                # 队列中已有待执行 upgrade 时重复发「升级」不重复入队
+                m_upgrade_dup = Message(
+                    message_id="om_owner_upg_2",
+                    chat_id="oc_owner_dm",
+                    chat_name="私聊",
+                    chat_type="p2p",
+                    sender_id="ou_test_owner",
+                    sender_name="Matthew",
+                    sender_type="user",
+                    content="升级",
+                    msg_type="text",
+                    create_time=observe.iso(now_dt + timedelta(seconds=6)),
+                )
+                col._escalation_message(m_upgrade_dup)
+                self.assertEqual(len(store.pending_actions()), 1)
+
+                # 对照：若主人引用的是未结 escalation 提问回答「升级」，则正常走 owner_reply 回答提问，不误判为自升级
+                store.add_escalation("om_esc_ask_1", "tp_alpha", "oc_owner_dm", "🐕 需要你定 · 升级数据库 [tp_alpha]\n要升级吗？", observe.iso(now_dt))
+                m_answer_esc = Message(
+                    message_id="om_owner_ans_1",
+                    chat_id="oc_owner_dm",
+                    chat_name="私聊",
+                    chat_type="p2p",
+                    sender_id="ou_test_owner",
+                    sender_name="Matthew",
+                    sender_type="user",
+                    content="升级",
+                    msg_type="text",
+                    create_time=observe.iso(now_dt + timedelta(seconds=7)),
+                    reply_to="om_esc_ask_1",
+                )
+                d_ans = col._escalation_message(m_answer_esc)
+                self.assertEqual((d_ans.route, d_ans.reason), ("dispatch", "owner_reply"))
+
+                # 4. 常驻进程执行 pending upgrade 动作：发送「升级完成」确认卡片并置 restart_requested = True
+                notified_cards.clear()
+                with mock.patch("subprocess.run", side_effect=fake_git), \
+                        mock.patch("sheepdog.default_repo_dir", return_value=repo):
+                    ran_n = actions.run_pending(disp)
+                self.assertEqual(ran_n, 1)
+                self.assertTrue(disp.restart_requested)
+                self.assertEqual(len(notified_cards), 1)
+                card_text, card_what, card_topic, card_reply_to = notified_cards[0]
+                self.assertEqual(card_what, "升级完成")
+                self.assertEqual(card_topic, BUS_TOPIC_ID)
+                self.assertEqual(card_reply_to, "om_owner_upg_1")
+                self.assertTrue(card_text.startswith(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n"))
+                self.assertIn("0.7.69", card_text)
+                self.assertIn("原地重启", card_text)
+
+                # 5. CLI `sheepdog upgrade` 在常驻进程在线时入队 upgrade 动作；cmd_run 检测到 restart_requested 调用 os.execv
+                store.set_meta(
+                    "daemon_runtime",
+                    json.dumps({**rt, "pid": os.getpid()}, ensure_ascii=False),
+                )
+                with mock.patch("sheepdog.cli._load_cfg", return_value=cfg), \
+                        mock.patch("sheepdog.cli.default_repo_dir", return_value=repo), \
+                        mock.patch("subprocess.run", side_effect=fake_git):
+                    buf = io.StringIO()
+                    with mock.patch("sys.stdout", buf):
+                        rc_upg = cli.main(["upgrade", "--no-pull"])
+                    self.assertEqual(rc_upg, 0)
+                    self.assertIn("已提交常驻进程原地热重启", buf.getvalue())
+                self.assertEqual(len(store.pending_actions()), 1)
+
+                # 验证 cmd_run 执行完 pending upgrade 后释放锁并在 finally 中触发 _exec_restart (os.execv)
+                cfg_file = tmp_path / "config.toml"
+                cfg_file.write_text(
+                    f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{cfg.state_dir}"\n'
+                    '[source]\nenabled = false\n[identity]\nenabled = false\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    "SHEEPDOG_CONFIG": str(cfg_file),
+                    "SHEEPDOG_STATE_DIR": str(cfg.state_dir),
+                    "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+                }
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch("sheepdog.default_repo_dir", return_value=repo), \
+                        mock.patch("subprocess.run", side_effect=fake_git), \
+                        mock.patch("os.execv") as mock_execv:
+                    rc_run = cli.main(["run"])
+                self.assertEqual(rc_run, 0)
+                mock_execv.assert_called_once_with(sys.executable, [sys.executable, *sys.argv])
+            finally:
+                store.close()
+                actions._resident = False
+
+    def test_reg_008_single_instance_flock_and_idempotent_upsert_message(self):
+        from sheepdog import actions
+        from sheepdog.models import Message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_dir = tmp_path / "state"
+            cfg_file = tmp_path / "config.toml"
+            cfg_file.write_text(
+                f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{state_dir}"\n'
+                '[source]\nenabled = false\n[identity]\nenabled = false\n',
+                encoding="utf-8",
+            )
+            env = {
+                "SHEEPDOG_CONFIG": str(cfg_file),
+                "SHEEPDOG_STATE_DIR": str(state_dir),
+                "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+            }
+
+            # 1. 第一个常驻进程持有 sheepdog.run.lock 排他锁时，第二个常驻进程拿锁失败立即退出 0，绝不覆盖 daemon_runtime 或进 _run_loop
+            lock1 = cli._acquire_daemon_lock(state_dir)
+            self.assertIsNotNone(lock1)
+            try:
+                lock2 = cli._acquire_daemon_lock(state_dir)
+                self.assertIsNone(lock2)
+
+                err_buf = io.StringIO()
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch("sys.stderr", err_buf), \
+                        mock.patch("sheepdog.cli._run_loop") as mock_loop:
+                    rc_dup = cli.main(["run"])
+                self.assertEqual(rc_dup, 0)
+                mock_loop.assert_not_called()
+                self.assertIn("已有 sheepdog run 常驻进程持有单实例锁", err_buf.getvalue())
+            finally:
+                cli._release_daemon_lock(lock1)
+                actions._resident = False
+
+            # 释放后可正常再次获取
+            lock3 = cli._acquire_daemon_lock(state_dir)
+            self.assertIsNotNone(lock3)
+            cli._release_daemon_lock(lock3)
+
+            # 2. Store.upsert_message 对相同 message_id 并发/重复写入完全幂等，不抛 sqlite3.IntegrityError
+            store = Store(state_dir / "sheepdog.sqlite3")
+            try:
+                m = Message(
+                    message_id="om_concurrent_dup_1",
+                    chat_id="oc_test_chat",
+                    chat_name="测试群",
+                    chat_type="group",
+                    sender_id="ou_alice",
+                    sender_name="Alice",
+                    sender_type="user",
+                    content="同一毫秒被双通道扫到的消息",
+                    msg_type="text",
+                    create_time="2026-10-21T22:00:00+08:00",
+                )
+                store.upsert_message(m, "dispatch", "at_me", ["at_me"], "tp_bus", received_by="bot")
+                # 第二次以相同 message_id 写入绝不抛 IntegrityError
+                store.upsert_message(m, "dispatch", "at_me", ["at_me"], "tp_bus", received_by="user")
+                row = store.get_message("om_concurrent_dup_1")
+                self.assertIsNotNone(row)
+                self.assertEqual(row["message_id"], "om_concurrent_dup_1")
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
