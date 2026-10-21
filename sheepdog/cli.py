@@ -2647,7 +2647,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--text", help="原有完整回复（长消息自动收进 more 默认折叠区）")
     g.add_argument("--text-file", help="正文文件；- 表示标准输入")
     sg = sp.add_mutually_exclusive_group()
-    sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+    sg.add_argument("--summary", default="", help="当面日常大白话回话（7.70：展示在卡片首屏，≤3 行、≤100 字，只答问题、不括技术亮点、不露修订号/SHA/路径/分点列表）")
     sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.set_defaults(func=cmd_reply_card)
 
@@ -2745,7 +2745,7 @@ def main(argv: list[str] | None = None) -> int:
         g.add_argument("--text", help="正文（长消息原文不需要改，配合 --summary 自动收进 more 折叠区）")
         g.add_argument("--file", help="正文文件；- 表示标准输入")
         sg = sp.add_mutually_exclusive_group()
-        sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+        sg.add_argument("--summary", default="", help="卡片首屏白话总结（7.62/7.70：ask/report ≤6 行、≤220 字、不含代码块；原文自动收进 more 折叠区）")
         sg.add_argument("--summary-file", default="", help="白话总结文件")
         sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
         sp.add_argument("--batch", default="",
@@ -2785,7 +2785,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--card-file", help="卡片正文文件，- 表示标准输入（同 reply-card --text-file）")
     g.add_argument("--text", help="代回正文（同 --card-text，一律发成卡片）")
     sg = sp.add_mutually_exclusive_group()
-    sg.add_argument("--summary", default="", help="四刀法白话总结（7.62：展示在卡片首屏，≤6 行、≤220 字、不含代码块）")
+    sg.add_argument("--summary", default="", help="当面日常大白话回话（7.70：展示在卡片首屏，≤3 行、≤100 字，只答问题、不括技术亮点、不露修订号/SHA/路径/分点列表）")
     sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.add_argument("--even-if-owner-replied", action="store_true",
                     help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")

@@ -21,7 +21,7 @@ import json
 import re
 
 
-# ======================= 四刀法白话总结 + more 默认折叠区（7.62） =======================
+# ======================= 当面日常大白话首屏（7.70）+ 白话总结与 more 默认折叠区（7.62） =======================
 MORE_PANEL_TITLE = "more"
 MORE_DELIMITER = "---more---"
 LEGACY_MORE_DELIMITER = "---agent-read---"
@@ -29,6 +29,10 @@ SUMMARY_MAX_LINES = 6
 SUMMARY_MAX_CHARS = 220
 SHORT_MESSAGE_MAX_LINES = 4
 SHORT_MESSAGE_MAX_CHARS = 160
+REPLY_SUMMARY_MAX_LINES = 3
+REPLY_SUMMARY_MAX_CHARS = 100
+REPLY_SHORT_MESSAGE_MAX_LINES = 3
+REPLY_SHORT_MESSAGE_MAX_CHARS = 100
 _MORE_SPLIT_RE = re.compile(r"^[ \t]*---(?:more|agent-read)---[ \t]*$", re.M)
 _CODE_FENCE_RE = re.compile(r"```")
 _FENCED_BLOCK_RE = re.compile(r"```.*?```", re.S)
@@ -41,10 +45,27 @@ _LEADING_AT_PREFIX_RE = re.compile(
     r"^\s*(?:<at\s+(?:id|user_id)=[\"']?(?:ou_[A-Za-z0-9_]+|all)[\"']?\s*>.*?</at>[ \t]*)+",
     re.I | re.S,
 )
+_MACHINE_SYMBOL_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("Cloud Run revision 编号", re.compile(r"(?:-[0-9]{5}-[a-z0-9]{3}\b|\b[0-9]{5}-[a-z0-9]{3}\b)")),
+    (
+        "Git commit SHA",
+        re.compile(r"(?<![A-Za-z0-9_-])(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "URL 或文件路径",
+        re.compile(
+            r"(?:https?://\S+|(?<![A-Za-z0-9])(?:/|\~/|\./)[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+"
+            r"|\b[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.(?:py|go|ts|tsx|js|mjs|json|yaml|yml|toml|md|sh|sql)\b)"
+        ),
+    ),
+    ("飞书内部 ID", re.compile(r"\b(?:om|oc|ou|omt)_[A-Za-z0-9_]{6,}\b")),
+    ("Markdown 编号分点列表", re.compile(r"(?:\A|\n)\s*1\.\s+.+(?:\n\s*2\.\s+|\s+2\.\s+)")),
+)
 SUMMARY_REQUIRED_GUIDE = (
-    '原文不需要改，只需要增加白话总结：加 --summary "<四刀法白话总结：≤6行、≤220字、不含代码块>"'
-    '（或在原文最前面写白话总结并用一行 ---more--- 隔开），原有回复会原封不动收进 more 折叠区。'
-    '四刀法：①终态与边界（做成什么、哪没动）②异动/意外 ③决策或下一步开关 ④证据锚点'
+    '原文不需要改，只需要增加白话总结（当面日常大白话回话）：加 --summary "<1~2句当面日常大白话：reply ≤3行/≤100字，只答问题、不括技术亮点与机器编号>"'
+    '（或在原文最前面写大白话并用一行 ---more--- 隔开），修订号/路径/分点清单留在原文里会自动收进 more 折叠区。\n'
+    '反例 ❌：模型服务体系下的model-manager-decision-service已上线Ready(00005-5vc)，含三级容灾+无锁熔断，今晚可上生产。\n'
+    '正例 ✅：我们是根据模型服务V2的代码，单独创建一个独立服务，不混在旧模型服务里。'
 )
 
 
@@ -122,46 +143,69 @@ def split_more(text: str) -> tuple[str, str]:
     return s[:m.start()].strip("\n"), s[m.end():].strip("\n")
 
 
-def is_short_message(text: str) -> bool:
-    """短消息（≤4 行、≤160 字、不含 ``` 代码块）：不传 --summary 时直接平铺，无需套 more 折叠框。"""
+def _find_machine_symbol(text: str) -> tuple[str, str] | None:
+    """7.70：先剥离合法 <at> 标签，再匹配 5 类绝对不属于人类日常口语的机器符号。"""
+    cleaned = _AT_TAG_RE.sub("", text or "")
+    for label, rx in _MACHINE_SYMBOL_RULES:
+        if m := rx.search(cleaned):
+            return label, m.group(0).strip()
+    return None
+
+
+def is_short_message(text: str, *, for_reply: bool = False) -> bool:
+    """短消息：不传 --summary 时直接平铺，无需套 more 折叠框。7.70：reply 收紧为 ≤3 行、≤100 字且禁含机器符号。"""
     s = (text or "").strip()
     if not s:
         return True
     if _CODE_FENCE_RE.search(s):
         return False
+    if for_reply:
+        vis_len = len(_AT_TAG_RE.sub("", s).strip())
+        return (
+            len(s.splitlines()) <= REPLY_SHORT_MESSAGE_MAX_LINES
+            and vis_len <= REPLY_SHORT_MESSAGE_MAX_CHARS
+            and _find_machine_symbol(s) is None
+        )
     return len(s.splitlines()) <= SHORT_MESSAGE_MAX_LINES and len(s) <= SHORT_MESSAGE_MAX_CHARS
 
 
-def validate_summary(summary: str) -> str:
-    """校验四刀法白话总结：非空、≤6 行、≤220 字（不含 <at> 标签本身长度）、不含 ``` 代码块。不合格抛 ValueError（带明确指引）。"""
+def validate_summary(summary: str, *, for_reply: bool = True) -> str:
+    """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 5 类机器符号；ask/report 为 ≤6 行、≤220 字）。"""
     s = (summary or "").strip("\n")
     if not s.strip():
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
     if _CODE_FENCE_RE.search(s):
         raise ValueError(f"白话总结不能含代码块（代码块请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
+    max_lines = REPLY_SUMMARY_MAX_LINES if for_reply else SUMMARY_MAX_LINES
+    max_chars = REPLY_SUMMARY_MAX_CHARS if for_reply else SUMMARY_MAX_CHARS
     lines = s.splitlines()
-    if len(lines) > SUMMARY_MAX_LINES:
-        raise ValueError(f"白话总结超过 {SUMMARY_MAX_LINES} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
+    if len(lines) > max_lines:
+        raise ValueError(f"白话总结超过 {max_lines} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
     visible_len = len(_AT_TAG_RE.sub("", s).strip())
-    if visible_len > SUMMARY_MAX_CHARS:
-        raise ValueError(f"白话总结超过 {SUMMARY_MAX_CHARS} 字（当前 {visible_len} 字）。{SUMMARY_REQUIRED_GUIDE}")
+    if visible_len > max_chars:
+        raise ValueError(f"白话总结超过 {max_chars} 字（当前 {visible_len} 字）。{SUMMARY_REQUIRED_GUIDE}")
+    if for_reply and (hit := _find_machine_symbol(s)) is not None:
+        raise ValueError(f"白话总结不能含{hit[0]}（{hit[1]!r} 请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
     return s
 
 
 def resolve_summary_and_body(
-    body: str, summary: str = "", *, require_summary: bool = True, hoist_at: bool = True
+    body: str,
+    summary: str = "",
+    *,
+    require_summary: bool = True,
+    hoist_at: bool = True,
+    for_reply: bool | None = None,
 ) -> tuple[str, str, str]:
-    """7.62：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。
-    - 传了 --summary 或正文含 ---more--- 分隔线：校验白话总结；hoist_at=True（代回卡片）时把原文里的 @人自动提到外层白话总结开头，返回 (summary, detail, "summary\\n---more---\\ndetail")；
-    - 未传且是短消息（≤4 行、≤160 字、无代码块）：直接平铺，返回 ("", detail, detail)；
-    - 未传且是长消息：require_summary=True 时抛 ValueError 拒绝并提示「原文不需要改，只需要增加白话总结」。"""
+    """7.62 / 7.70：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。"""
     raw = (body or "").strip("\n")
     if not raw.strip():
         raise ValueError("正文为空")
+    is_reply = hoist_at if for_reply is None else for_reply
     inline_sum, inline_det = split_more(raw)
     has_delim = _MORE_SPLIT_RE.search(raw) is not None
     if (summary or "").strip():
-        s = validate_summary(summary)
+        s = validate_summary(summary, for_reply=is_reply)
         d = inline_det if has_delim and inline_det.strip() else raw
         if not d.strip():
             raise ValueError(f"more 折叠区原文为空。{SUMMARY_REQUIRED_GUIDE}")
@@ -169,18 +213,18 @@ def resolve_summary_and_body(
             s, d = _hoist_at_tags(s, d)
         return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
     if has_delim:
-        s = validate_summary(inline_sum)
+        s = validate_summary(inline_sum, for_reply=is_reply)
         if not inline_det.strip():
             raise ValueError(f"more 折叠区原文为空（---more--- 下面要有原有完整回复）。{SUMMARY_REQUIRED_GUIDE}")
         d = inline_det
         if hoist_at:
             s, d = _hoist_at_tags(s, d)
         return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
-    if is_short_message(raw) or not require_summary:
+    if is_short_message(raw, for_reply=is_reply) or not require_summary:
         return "", body, body
-    n_lines = len(raw.splitlines())
-    n_chars = len(raw)
-    why = "含代码块" if _CODE_FENCE_RE.search(raw) else f"{n_lines} 行 / {n_chars} 字"
+    n_lines, n_chars = len(raw.splitlines()), len(raw)
+    hit = _find_machine_symbol(raw) if is_reply else None
+    why = "含代码块" if _CODE_FENCE_RE.search(raw) else (f"含{hit[0]} {hit[1]!r}" if hit else f"{n_lines} 行 / {n_chars} 字")
     raise ValueError(f"正文较长（{why}）但未提供白话总结。{SUMMARY_REQUIRED_GUIDE}")
 
 

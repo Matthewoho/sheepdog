@@ -235,8 +235,8 @@ class MoreCardTest(ThreadsBase):
         )
 
         # 2) --text 里写了文本格式 <at user_id="ou_alice">Alice</at> + 代码块里的 `<at id=ou_fake></at>`：
-        #    真 @ 转成 <at id=ou_alice></at> 提到外层；代码块/反引号里的示例不提；<at> 标签长度不占 220 字额度
-        near_limit_sum = f'<at user_id="{ALICE}">Alice</at> ' + ("字" * 215)
+        #    真 @ 转成 <at id=ou_alice></at> 提到外层；代码块/反引号里的示例不提；<at> 标签长度不占 100 字额度
+        near_limit_sum = f'<at user_id="{ALICE}">Alice</at> ' + ("字" * 95)
         detail_with_code_at = "说明：写法如 `<at id=ou_code_only></at>`\n" + LONG_DETAIL
         rc2, out2, err2 = self.cli("reply-card", "--summary", near_limit_sum, "--text", detail_with_code_at)
         self.assertEqual(rc2, 0, err2)
@@ -244,7 +244,7 @@ class MoreCardTest(ThreadsBase):
         els2 = c2["body"]["elements"]
         self.assertNotIn("ou_code_only", els2[0]["content"])
         self._assert_reply_full_width_more(
-            els2, f"<at id={ALICE}></at> " + ("字" * 215), detail_with_code_at
+            els2, f"<at id={ALICE}></at> " + ("字" * 95), detail_with_code_at
         )
 
         # 3) 发给主人的 ask / report：原文里引用了同事的 <at id=ou_alice></at>，不误提到给主人的白话总结开头
@@ -253,5 +253,72 @@ class MoreCardTest(ThreadsBase):
         c3 = card_of(self.lark.sent()[-1])
         self.assertEqual(c3["body"]["elements"][0], {"tag": "markdown", "content": SUMMARY})
         self._assert_more_panel(c3["body"]["elements"][1], detail_with_at)
+
+    def test_770_plain_first_screen_reply_limits_and_machine_symbol_guard(self):
+        m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="类似模型服务，还是放模型服务里面？")
+        self.pull(m_alice)
+        self.deliver()
+        before_sent = len(self.lark.sent())
+
+        # 1) Ren Ryan 真实误导反例（含 Cloud Run revision 00005-5vc 等）：reply 与 reply-card 均以退出码 2 拒发，并带正反例引导
+        bad_ryan = (
+            f"<at id={ALICE}></at> 模型服务体系下的model-manager-decision-service已开发完成且刚在测试环境"
+            "上线Ready(00005-5vc)，含三级容灾降级+无锁快速熔断+三端零改造兼容，今晚验收后即可上生产。"
+        )
+        for argv in (
+            ("reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", bad_ryan, "--card-text", LONG_DETAIL),
+            ("reply-card", "--summary", bad_ryan, "--text", LONG_DETAIL),
+        ):
+            rc, out, err = self.cli(*argv)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("00005-5vc", err)
+            self.assertIn("原文不需要改，只需要增加白话总结", err)
+            self.assertIn("反例 ❌", err)
+            self.assertIn("正例 ✅", err)
+
+        # 2) 5 类确定性机器符号（revision / Git SHA / URL或路径 / 飞书ID / Markdown 1. 2. 编号列表）在 reply 首屏全部退码 2 拦截
+        for label_hint, bad_sum in (
+            ("Cloud Run revision", "已在测试环境上线 tap-prism-00136-jwj，随时可切流。"),
+            ("Git commit SHA", "代码已合入 a1b2c3d4 并完成测试验证。"),
+            ("URL", "详情见 https://example.com/pr/42 ，已验证通过。"),
+            ("文件路径", "已修改 sheepdog/card.py 并跑通单测。"),
+            ("飞书内部 ID", "已在群 oc_test_group_123456 同步结论。"),
+            ("Markdown 编号分点列表", "结论如下：\n1. 独立创建新服务\n2. 不混入旧模型服务"),
+        ):
+            with self.subTest(symbol=label_hint):
+                rc, out, err = self.cli(
+                    "reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", bad_sum, "--card-text", LONG_DETAIL
+                )
+                self.assertEqual(rc, 2, out + err)
+                self.assertIn("原文不需要改，只需要增加白话总结", err)
+
+        # 3) reply 首屏物理上限收紧为 <=3 行、<=100 字（扣除 <at> 后）；超过即退码 2，而 ask/report 仍允许 4~6 行 / <=220 字
+        four_lines = "第一句答复\n第二句补充\n第三句说明\n第四句超限"
+        over_100_chars = "字" * 101
+        for bad_limit in (four_lines, over_100_chars):
+            rc, out, err = self.cli(
+                "reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", bad_limit, "--card-text", LONG_DETAIL
+            )
+            self.assertEqual(rc, 2, out + err)
+        rc_rep, out_rep, err_rep = self.ask("--summary", four_lines, kind="report", title="四行汇报", text=LONG_DETAIL)
+        self.assertEqual(rc_rep, 0, out_rep + err_rep)
+
+        # 4) reply 短消息直通同步收紧：>3 行、>100 字或含机器符号但未传 --summary 时，退码 2 强制要求提供大白话首屏
+        for non_short in (four_lines, over_100_chars, "已在 00005-5vc 验证通过", "1. 第一点\n2. 第二点"):
+            rc, out, err = self.cli("reply", "--topic", "tp_alpha", "--to", m_alice, "--card-text", non_short)
+            self.assertEqual(rc, 2, out + err)
+        self.assertEqual(len(self.lark.sent()), before_sent + 1)  # 仅第 3 步 report 发出 1 条
+
+        # 5) Matthew 真实大白话正例（含合法 <at id=ou_...></at> 不误判为飞书 ID，<=3 行且 <=100 字）退码 0 正常发出
+        good_matthew = (
+            f"<at id={ALICE}></at> 我用大白话解释：我们是根据模型服务V2的代码，"
+            "单独创建一个独立服务，相当于不走过渡工程架构拆分，除非有必要再做。"
+        )
+        rc_ok, out_ok, err_ok = self.cli(
+            "reply", "--topic", "tp_alpha", "--to", m_alice, "--summary", good_matthew, "--card-text", LONG_DETAIL
+        )
+        self.assertEqual(rc_ok, 0, out_ok + err_ok)
+        sent_card = card_of(self.lark.sent("+messages-reply")[-1])
+        self._assert_reply_full_width_more(sent_card["body"]["elements"], good_matthew, LONG_DETAIL)
 
 
