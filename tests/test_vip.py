@@ -648,6 +648,16 @@ class VipBranch765Test(AskFloorTest):
                 self.assertEqual(rc, 0, (out, err))
         self.assertEqual(len(self.lark.sent()), 2)
 
+    def test_regression_765_bus_playbook_forbids_self_work_and_forwarded_reply(self):
+        bus_text = (REPO / "examples" / "playbook" / "bus.md").read_text(encoding="utf-8")
+        self.assertIn("纯路由动作", bus_text)
+        self.assertIn("严禁自己用", bus_text)
+        self.assertIn("report --topic tp_bus", bus_text)
+        self.assertIn("lark-cli docs", bus_text)
+        self.assertIn("严禁再调", bus_text)
+        self.assertIn("reply", bus_text)
+        self.assertIn("ask", bus_text)
+
 
 if __name__ == "__main__":
     unittest.main()
