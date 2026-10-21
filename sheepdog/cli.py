@@ -74,8 +74,9 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import __version__
+from . import __version__, _git_run, default_repo_dir, parse_version_tuple, version_info
 from . import actions
+from . import observe as obs
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
@@ -337,7 +338,7 @@ def cmd_doctor(args) -> int:
         bad_cfg = (f"配置文件: ✗ 当前无效：{e}\n  会话命令在用 {saved.label(lastgood.CONFIG)} 最后好用的那份"
                    f"（{saved.directory / lastgood.CONFIG}）；常驻进程沿用它上一份；下面按那份检查")
         ok = False
-    print(f"sheepdog {__version__}")
+    print(get_version_status(Store(cfg.db_path))["summary_line"])
     if bad_cfg:
         print(bad_cfg)
     # 开头先说有没有给主人的通知没发出去（还在重试的、放弃了没人处理的），直到人工处理
@@ -496,9 +497,219 @@ def switches_report(cfg) -> list[str]:
 def _pid_alive(pid) -> bool:
     try:
         os.kill(int(pid), 0)
+    except PermissionError:
+        return True
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+def _record_daemon_runtime(store: Store, repo_dir: Path | None = None) -> dict:
+    info = version_info(repo_dir)
+    runtime_payload = {
+        "version": info["version"],
+        "git_sha": info["git_sha"],
+        "git_short": info["git_short"],
+        "dirty": info["dirty"],
+        "display": info["display"],
+        "repo_dir": info["repo_dir"],
+        "pid": os.getpid(),
+        "started_at": now_iso(),
+    }
+    store.set_meta("daemon_runtime", json.dumps(runtime_payload, ensure_ascii=False))
+    return runtime_payload
+
+
+def get_version_status(store: Store | None = None, repo_dir: Path | None = None) -> dict:
+    cli_info = version_info(repo_dir, prefer_disk_version=True)
+    daemon = None
+    if store is not None:
+        raw = store.get_meta("daemon_runtime")
+        if raw:
+            try:
+                daemon = json.loads(raw)
+            except json.JSONDecodeError:
+                daemon = None
+    pid = daemon.get("pid") if isinstance(daemon, dict) else None
+    daemon_alive = bool(pid and _pid_alive(pid))
+    in_sync = bool(
+        isinstance(daemon, dict)
+        and daemon_alive
+        and daemon.get("version") == cli_info["version"]
+        and (not cli_info["git_sha"] or not daemon.get("git_sha") or daemon.get("git_sha") == cli_info["git_sha"])
+    )
+    if not isinstance(daemon, dict):
+        daemon_display = "未记录"
+    elif not daemon_alive:
+        daemon_display = f"{daemon.get('display', daemon.get('version', '?'))} [PID {pid} 未运行]"
+    elif in_sync:
+        daemon_display = f"{daemon.get('display')} PID {pid} 一致"
+    else:
+        daemon_display = f"{daemon.get('display')} PID {pid} ≠ 磁盘 {cli_info['display']}（待重启）"
+    summary_line = f"sheepdog {cli_info['display']}（常驻进程: {daemon_display}）"
+    return {
+        "cli": cli_info,
+        "daemon": daemon,
+        "daemon_alive": daemon_alive,
+        "in_sync": in_sync,
+        "daemon_display": daemon_display,
+        "summary_line": summary_line,
+    }
+
+
+def _check_version_update(
+    cfg,
+    store: Store,
+    dispatcher: Dispatcher | None,
+    *,
+    runtime_info: dict | None = None,
+    repo_dir: Path | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """常驻进程版本巡检（7.68）：
+    A. 秒级本机检测：磁盘代码版本/SHA 与常驻进程内存 runtime_info 不一致时单次提醒；
+    B. 周期远端检测：每 check_interval_minutes 调 git ls-remote origin 检查是否有新版本 tag 或新 main 提交，单次提醒。
+    返回本次新触发的通知文案列表。
+    """
+    if not cfg.version.enabled:
+        return []
+    ref_now = now or datetime.now().astimezone()
+    root = (repo_dir or default_repo_dir()).resolve()
+    disk = version_info(root, prefer_disk_version=True)
+    mem = runtime_info
+    if mem is None:
+        raw_rt = store.get_meta("daemon_runtime")
+        if raw_rt:
+            try:
+                mem = json.loads(raw_rt)
+            except json.JSONDecodeError:
+                mem = None
+    if not isinstance(mem, dict):
+        mem = version_info(root, prefer_disk_version=False)
+
+    try:
+        notified: set[str] = set(json.loads(store.get_meta("version_notified") or "[]"))
+    except json.JSONDecodeError:
+        notified = set()
+    sent_texts: list[str] = []
+
+    def _emit(key: str, text: str) -> None:
+        if key in notified:
+            return
+        if dispatcher is not None:
+            dispatcher._notify_owner(text, "新版提醒", BUS_TOPIC_ID)
+        notified.add(key)
+        store.set_meta("version_notified", json.dumps(sorted(notified), ensure_ascii=False))
+        sent_texts.append(text)
+
+    ver_changed = bool(disk["version"] != mem.get("version"))
+    sha_changed = bool(disk["git_sha"] and mem.get("git_sha") and disk["git_sha"] != mem.get("git_sha"))
+    if ver_changed or sha_changed:
+        local_key = f"local:{disk['version']}:{disk['git_sha'][:12]}"
+        mem_disp = mem.get("display") or mem.get("version") or "?"
+        pid = mem.get("pid") or os.getpid()
+        text = (
+            f"🔔 检测到本机代码已更新至 {disk['display']}，但当前常驻进程仍运行在 "
+            f"{mem_disp}（PID {pid}），请重启常驻进程使其生效。"
+        )
+        _emit(local_key, text)
+
+    interval_min = cfg.version.check_interval_minutes
+    if interval_min > 0:
+        last_checked_raw = store.get_meta("version_remote_checked_at")
+        should_check = True
+        if last_checked_raw:
+            try:
+                last_dt = datetime.fromisoformat(last_checked_raw)
+                if (ref_now - last_dt).total_seconds() < interval_min * 60.0:
+                    should_check = False
+            except ValueError:
+                should_check = True
+        if should_check:
+            store.set_meta("version_remote_checked_at", ref_now.isoformat(timespec="seconds"))
+            r = _git_run(
+                ["git", "-C", str(root), "ls-remote", "origin", "refs/heads/main", "refs/tags/v*"],
+                timeout=10,
+            )
+            if r is not None and r.returncode == 0 and r.stdout:
+                disk_tuple = parse_version_tuple(disk["version"])
+                best_tag_tuple: tuple[int, ...] = disk_tuple
+                best_tag_name = ""
+                best_tag_sha = ""
+                remote_main_sha = ""
+                for line in r.stdout.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) < 2:
+                        continue
+                    sha, ref = parts[0], parts[1]
+                    if ref.endswith("^{}"):
+                        ref = ref[:-3]
+                    if ref == "refs/heads/main":
+                        remote_main_sha = sha
+                    elif ref.startswith("refs/tags/v"):
+                        tag_name = ref.removeprefix("refs/tags/")
+                        t_tuple = parse_version_tuple(tag_name)
+                        if t_tuple and t_tuple > best_tag_tuple:
+                            best_tag_tuple = t_tuple
+                            best_tag_name = tag_name
+                            best_tag_sha = sha
+                remote_ahead_main = False
+                if remote_main_sha and disk["git_sha"] and remote_main_sha != disk["git_sha"]:
+                    anc = _git_run(
+                        ["git", "-C", str(root), "merge-base", "--is-ancestor", remote_main_sha, "HEAD"],
+                        timeout=3,
+                    )
+                    remote_ahead_main = (anc is None or anc.returncode != 0)
+                if best_tag_name or remote_ahead_main:
+                    remote_id = best_tag_name or remote_main_sha[:12]
+                    remote_desc = (
+                        f"{best_tag_name} ({best_tag_sha[:7]})"
+                        if best_tag_name
+                        else f"origin/main ({remote_main_sha[:7]})"
+                    )
+                    remote_key = f"remote:{remote_id}"
+                    text = f"🔔 检测到远端 origin 有新版本 {remote_desc}（当前本机为 {disk['display']}），可拉取更新。"
+                    _emit(remote_key, text)
+
+    return sent_texts
+
+
+def cmd_version(args) -> int:
+    store = None
+    try:
+        cfg = _load_cfg()
+        if cfg.db_path.exists():
+            store = Store(cfg.db_path)
+    except Exception:
+        store = None
+    status = get_version_status(store)
+    if getattr(args, "json", False):
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+    else:
+        print(status["summary_line"])
+    return 0
+
+
+def cmd_observe(args) -> int:
+    try:
+        cfg = _load_cfg()
+    except Exception:
+        cfg = None
+    db_path = Path(args.db).expanduser() if getattr(args, "db", None) else None
+    state_path = Path(args.state).expanduser() if getattr(args, "state", None) else None
+    res = obs.run_observe(
+        cfg,
+        db_path=db_path,
+        state_path=state_path,
+        since_minutes=args.since_minutes,
+        notify_lark=args.notify_lark,
+        notify_chat_id=args.notify_chat_id,
+        alert_cooldown_minutes=args.alert_cooldown_minutes,
+        simulate_warn=args.simulate_warn,
+        self_heal=args.self_heal,
+    )
+    print(obs.render_observe_output(res, as_json=args.json))
+    return 1 if res["warns"] else 0
 
 
 def identity_report(cfg, store: Store) -> list[str]:
@@ -837,10 +1048,11 @@ def cmd_run(args) -> int:
     _wire_images(dispatcher, source, args)
     logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
                  "、".join(f"{h}={s.name}" for h, s in sink.items()))
+    runtime_info = version_info() if getattr(args, "dry_run", False) else _record_daemon_runtime(store)
     consumer = _start_bot_events(cfg, store, source, args)
     collector.bot_events = consumer
     try:
-        return _run_loop(args, cfg, store, source, collector, dispatcher)
+        return _run_loop(args, cfg, store, source, collector, dispatcher, runtime_info=runtime_info)
     finally:
         if consumer is not None:
             consumer.stop()
@@ -864,7 +1076,8 @@ def _prune(store: Store, cfg) -> dict[str, int]:
     return store.prune(cfg.retention_days, cfg.receipts_dir, cfg.runs_dir, cfg.duty.history_days, cfg.media_dir)
 
 
-def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher: Dispatcher) -> int:
+def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher: Dispatcher,
+              *, runtime_info: dict | None = None) -> int:
     last_prune = 0.0
     while True:
         try:
@@ -886,6 +1099,8 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
             if n := actions.run_pending(dispatcher):
                 logging.info("执行动作 %d 条", n)
             _cycle(collector, dispatcher)
+            if cfg.version.enabled:
+                _check_version_update(cfg, store, dispatcher, runtime_info=runtime_info)
             if time.time() - last_prune > 3600:
                 pruned = _prune(store, cfg)
                 last_prune = time.time()
@@ -2172,9 +2387,18 @@ def cmd_hook_stop(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
     p.add_argument("-v", "--verbose", action="store_true")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("-V", "--version", action="store_true", help="显示版本信息（含常驻进程内存版本对比）")
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("version", help="显示 CLI 代码版本与常驻进程内存版本")
+    sp.add_argument("--json", action="store_true", help="输出 JSON")
+    sp.set_defaults(func=cmd_version)
+
+    sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
+    obs.add_observe_arguments(sp)
+    sp.set_defaults(func=cmd_observe)
 
     sp = sub.add_parser("poll")
     sp.add_argument("--dry-run", action="store_true", help="不真正投递，只打印")
@@ -2490,8 +2714,12 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
+    if getattr(args, "version", False):
+        return cmd_version(args)
+    if not getattr(args, "cmd", None):
+        p.error("the following arguments are required: cmd")
     global _FALLBACK
-    _FALLBACK = args.func not in (cmd_run, cmd_init, cmd_doctor, cmd_hook_stop)
+    _FALLBACK = args.func not in (cmd_run, cmd_init, cmd_doctor, cmd_hook_stop, cmd_observe)
     _FALLBACK_NOTED.clear()
     try:
         return args.func(args)

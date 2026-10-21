@@ -19,7 +19,7 @@
 
 | 规格 | 症状 | 守它的测试 |
 | --- | --- | --- |
-| 7.1 | 每批信号末尾附 batch_footer.md（代回提醒），丢了这行，长上下文里会话会忘掉代回标记 | `test_roster.PlaybookTest.test_assembly_order_and_defaults`、`test_guardrails.ReminderTest.test_missing_means_nothing` |
+| 7.1 | 每批信号末尾附 batch_footer.md（代回提醒），丢了这行，长上下文里会话会忘掉代回标记（REG-001） | `test_roster.PlaybookTest.test_assembly_order_and_defaults`、`test_guardrails.ReminderTest.test_missing_means_nothing` |
 | 7.1 | 配置的 session.reply_prefix 替换不进 {{reply_prefix}}，开场里写的代回前缀是空的 | `test_roster.PlaybookTest.test_dispatcher_uses_config_values` |
 | 7.1 | 代回规则所在的 common.md 没拼进总线开场、登记通知、spawn 开场，会话不知道要代回 | `test_handover_watch.EscalationTest.test_common_rules_in_all_prompts` |
 | 7.2 | spawn 先给前任发退休通知、再建接手会话，前任 topic 关掉不再投递；不发或顺序反了，新旧会话会同时对外说话 | `test_handover_watch.SpawnTest.test_retire_before_new_and_predecessor_closed` |
@@ -254,5 +254,10 @@
 | 7.67 | 目标会话处于 `running` 长批次期间，新入账 `dispatch` 消息迟迟不点 `[Get]` 表情，或安全闸 `hold` / `inbox` 误点表情、投递时重复点第二次 | `test_ack.AckTest.test_767_ingest_acks_immediately_while_session_running_and_no_double_ack_on_delivery` |
 | 7.67 | 主人在别人私聊/群聊里直接文字点名 `sheepdog` 被当成纯背景 `owner_context` 排队、未升格为 `owner_instruction` 走 `_dispatch_priority` 插话直达，或代码块/路径/代回前缀里的 `sheepdog` 被误升格、提示词仍渲染 `OWNER_CONTEXT_LABEL` | `test_owner_context.OwnerContextTest.test_767_owner_named_sheepdog_in_p2p_upgrades_to_instruction_and_jumps_running_queue` |
 | 7.67 | 羊圈（`max_sessions > 1`）合成 `#2..#N` 副会话时继承了主槽位一次性 `predecessor_conversation_id` / `self_polling`，或同一发送人在窗口期内连发多条未投递消息被拆散到不同槽位 | `test_session_group.SessionGroupTest.test_767_laohu_group_max_sessions_spawns_clean_secondary_and_coalesces_burst` |
+| 7.68 | 版本号双写漂移、`release_gate.py --specs 7.68` 未校验 `sheepdog.__version__ == "0.7.68"`、常驻进程未写 `daemon_runtime` 或本机/远端新版巡检漏报与重复轰炸提醒（REG-002） | `test_version_and_observe.VersionGateAndNoticeTest.test_release_gate_rejects_version_mismatch_and_daemon_notifies_once` |
+| 7.68 | `sheepdog observe` 四阶段水流 SLA 漏报：入账超 90s 未点 `[Get]` 表情（Ingest Ack SLA）、主人指令/回复超 90s 未插话（Priority SLA）、普通消息排队超 5 分钟队头阻塞（Queue Head-of-Line SLA 含阻塞批次号）、主人说话回音超 15 分钟未结清（Owner Echo SLA）（REG-003） | `test_version_and_observe.ObserveWaterflowSlaTest.test_l2_ack_90s_priority_90s_and_hol_5m_sla_alerts` |
+| 7.68 | 宿主 Transcript 深度探针漏检 `The prompt could not be submitted` 投递拦截、做完活忘交回执假 `running` 僵尸锁（>180s 且 DONE 静默 >90s），或 `--self-heal` 未写 `hooks/stop/<topic>.json` 驱动常驻进程 7.64 自动催交与解锁（REG-004） | `test_version_and_observe.ObserveTranscriptProbesTest.test_l3_prompt_filter_and_zombie_running_self_heal` |
+| 7.68 | 总线 `tp_bus` 超 150s 或越权调用 `write_file`/`edit_file`/`gcloud`/`lark-cli docs` 未被 `tp_bus Boundary Guard` 揪出，或已正常答复结案的提问误触发 `ask_jumps` 噪音告警、持续故障因秒数跳动穿透指纹冷却（REG-005） | `test_version_and_observe.ObserveBusBoundaryAndNoiseTest.test_l3_bus_overreach_and_l4_ask_jumps_noise_razor` |
+
 
 

@@ -748,6 +748,21 @@ class LambConfig:
             raise ConfigError("[lamb] timeout_minutes 必须是正数")
 
 
+@dataclass
+class VersionConfig:
+    """[version]（7.68）：版本巡检与新版提醒配置。"""
+    enabled: bool = True
+    check_interval_minutes: float = 30.0
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("[version].enabled 必须是布尔值")
+        if isinstance(self.check_interval_minutes, bool) or not isinstance(self.check_interval_minutes, (int, float)):
+            raise ConfigError("[version].check_interval_minutes 必须是数字")
+        if self.check_interval_minutes < 0:
+            raise ConfigError("[version].check_interval_minutes 不能小于 0")
+
+
 # 7.56「这个群该不该管」：Config.chat_scope 的三种结果
 OWNER_SIDE = "owner_side"   # 找主人那一侧（找主人聊天、7.51 的话题群）：走自己的分支，先于普通路由，不受 ignore 影响
 IGNORED = "ignored"         # [routing] ignore_chat_ids：不送、不当背景、不当指令、不按话题归属
@@ -799,6 +814,7 @@ class Config:
     run: RunConfig = field(default_factory=RunConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
     lamb: LambConfig = field(default_factory=LambConfig)
+    version: VersionConfig = field(default_factory=VersionConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -947,6 +963,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.run, data.get("run", {}))
     _apply(cfg.media, data.get("media", {}))
     _apply(cfg.lamb, data.get("lamb", {}))
+    _apply(cfg.version, data.get("version", {}))
     hosts = data.get("hosts", {})
     if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
         raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -992,6 +1009,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.run.validate()
     cfg.media.validate()
     cfg.lamb.validate()
+    cfg.version.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

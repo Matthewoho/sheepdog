@@ -334,6 +334,30 @@ def check_specs(repo: Path, sha: str, specs: list[str], python: str) -> list[str
                 want.setdefault(t, [])
                 if s not in want[t]:
                     want[t].append(s)
+    minor_7 = [
+        int(parts[1])
+        for s in specs
+        if len(parts := s.split(".")) >= 2 and parts[0] == "7" and parts[1].isdigit()
+    ]
+    if minor_7:
+        max_minor = max(minor_7)
+        expected_ver = f"0.7.{max_minor}"
+        init_out = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{sha}:sheepdog/__init__.py"],
+            capture_output=True,
+        )
+        if init_out.returncode == 0:
+            init_text = init_out.stdout.decode("utf-8", errors="replace")
+            m_ver = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_text, re.MULTILINE)
+            actual_ver = m_ver.group(1).strip() if m_ver else ""
+            if actual_ver != expected_ver:
+                problems.append(
+                    f"版本号未对齐：--specs 最大规格为 7.{max_minor}，但 sheepdog/__init__.py 的 __version__ 为 {actual_ver or '（未定义）'}（应为 {expected_ver}）"
+                )
+        elif max_minor >= 68:
+            problems.append(
+                f"版本号未对齐：--specs 最大规格为 7.{max_minor}，但 sheepdog/__init__.py 的 __version__ 为 （未定义）（应为 {expected_ver}）"
+            )
     if not want:
         return problems
     work = Path(tempfile.mkdtemp(prefix="sheepdog-gate-specs-"))
