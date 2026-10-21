@@ -36,10 +36,10 @@
   sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
   sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B（默认当前 / 最近一批）]
                [--about om_x ...（为哪条消息问的，可多次；不给 = 这批送到的全部消息）]
-               [--floor 碰到哪条底线（来源里有名册 VIP 本人发的消息时必须写，7.61）]
+               [--floor-type <credentials|destructive|vip_conflict> --floor 碰到哪条底线（来源里有名册 VIP 本人发的消息时必须写，7.61/7.65）]
                                                          经机器人找主人「需要你定」（sheepdog 加开头一行）；带 --key：
                                                          同一把钥匙第一次在主聊天里起一条，之后回到它的话题里（一事一串）
-  sheepdog report ...（参数同 ask，没有 --about / --floor）  经机器人向主人汇报
+  sheepdog report ...（参数同 ask，没有 --about / --floor-type / --floor）  经机器人向主人汇报
   sheepdog resolve --topic T (--message-id om_x | --key K) --why 依据
                                                          会话结案自己名下还开着的「需要你定」；机器人在话题里补一句「已结案」
   sheepdog pending [--json]                              只读：要主人定的、可能已处理的、各会话在等主人的（待办清单）
@@ -1827,6 +1827,7 @@ def cmd_ask(args) -> int:
         print(f"{kind} 没发: 读不了正文文件: {e}", file=sys.stderr)
         return outbound.EXIT_INVALID
     floor = getattr(args, "floor", "") or ""
+    floor_type = getattr(args, "floor_type", None)
     vips = _ask_vips(cfg) if kind == outbound.ASK else {}
     if not cfg.source.enabled:
         if not outbound.target_ok(store, tid):
@@ -1836,7 +1837,8 @@ def cmd_ask(args) -> int:
             try:
                 if getattr(args, "about", None):
                     outbound.ask_sources(cfg, store, tid, args.about)
-                outbound.check_vip_floor(cfg, store, tid, getattr(args, "about", None), vips, floor, args.batch)
+                outbound.check_vip_floor(cfg, store, tid, getattr(args, "about", None), vips, floor, args.batch,
+                                         floor_type=floor_type)
             except outbound.OutboundError as e:
                 print(f"{kind} 没发: {e}", file=sys.stderr)
                 return e.code
@@ -1852,7 +1854,7 @@ def cmd_ask(args) -> int:
     try:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
                                    about=getattr(args, "about", None) or None, track=getattr(args, "track", False),
-                                   floor=floor, vips=vips, summary=summary)
+                                   floor=floor, vips=vips, summary=summary, floor_type=floor_type)
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -2391,9 +2393,12 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--about", action="append", default=[],
                             help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。"
                                  "主人之后在那个聊天里说过话，sheepdog 会提醒你核实")
+            sp.add_argument("--floor-type", default=None,
+                            help="碰到哪类底线（7.65，必填枚举：credentials | destructive | vip_conflict）："
+                                 "为名册 VIP 本人发的消息找主人（或使用 --floor）时必须与 --floor 同时写")
             sp.add_argument("--floor", default="",
-                            help="碰到哪条底线（7.61）：为名册 VIP 本人发的消息找主人时必须写，不写就不发（退出码 2）。"
-                                 "VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
+                            help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，"
+                                 "不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
         sp.set_defaults(func=cmd_ask)
 
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")

@@ -375,13 +375,13 @@ class AskFloorTest(ThreadsBase):
 
     def test_regression_761_ask_with_floor_passes_and_floor_recorded(self):
         v, _ = self.batch(VIP, "ou_test_alice")
-        rc, out, err = self.ask("--floor", "要生产库密码：密钥永不给")
+        rc, out, err = self.ask("--floor-type", "credentials", "--floor", "要生产库密码：密钥永不给")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(len(self.lark.sent()), 1)
         (row,) = self.ask_rows()
         self.assertEqual(row["floor"], "要生产库密码：密钥永不给")
         # 带 --about 也一样过，floor 记在那条上
-        rc, _, _ = self.ask("--about", v, "--floor", "收不回的删除", text="另一件事")
+        rc, _, _ = self.ask("--about", v, "--floor-type", "destructive", "--floor", "收不回的删除", text="另一件事")
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(r["floor"] for r in self.ask_rows()), ["收不回的删除", "要生产库密码：密钥永不给"])
 
@@ -428,7 +428,7 @@ class AskFloorTest(ThreadsBase):
         self.assert_refused()
         self.assert_refused("--floor", "  ")
         self.assertFalse((self.cfg.state_dir / "notices.md").exists())
-        rc, _, _ = self.ask("--floor", "要密钥")
+        rc, _, _ = self.ask("--floor-type", "credentials", "--floor", "要密钥")
         self.assertEqual(rc, 0)
         self.assertTrue((self.cfg.state_dir / "notices.md").exists())
 
@@ -518,8 +518,11 @@ class VipBranch765Test(AskFloorTest):
 
         forward_messages(self.store, "tp_alpha", [mid], note="转交 tp_alpha 跟进")
 
-        # tp_bus 无论是默认按刚送达批次还是显式 --about，哪怕带了 --floor，都被退出码 2 拦截
-        for extra in (("--floor", "密钥底线"), ("--about", mid, "--floor", "密钥底线")):
+        # tp_bus 无论是默认按刚送达批次还是显式 --about，哪怕带了 --floor-type 和 --floor，都被退出码 2 拦截
+        for extra in (
+            ("--floor-type", "credentials", "--floor", "密钥底线"),
+            ("--about", mid, "--floor-type", "credentials", "--floor", "密钥底线"),
+        ):
             rc, out, err = self.cli("ask", "--topic", BUS_TOPIC_ID, "--title", "问主人", "--text", "老胡要配环境变量", *extra)
             self.assertEqual(rc, 2, (out, err))
             self.assertIn("不能对已 forward 转交的消息调用 sheepdog ask", err)
@@ -583,12 +586,67 @@ class VipBranch765Test(AskFloorTest):
         self.assertEqual(self.lark.sent(), [])
         self.assertEqual(diff_tables(before, snapshot(self.cfg.db_path)), set())
 
-        # 真底线（密钥外发、不可逆删除、两位 VIP 冲突）100% 放行
-        for i, real_floor in enumerate(("主人的密钥不能给", "删除生产表", "两位 VIP 要求真冲突")):
+        # 真底线（密钥外发、不可逆删除、两位 VIP 冲突）带合法 --floor-type 100% 放行
+        for i, (ftype, real_floor) in enumerate((
+            ("credentials", "主人的密钥不能给"),
+            ("destructive", "删除生产表"),
+            ("vip_conflict", "两位 VIP 要求真冲突"),
+        )):
             with self.subTest(real_floor=real_floor):
-                rc, out, err = self.ask("--floor", real_floor, text=f"真底线请示 {i}")
+                rc, out, err = self.ask("--floor-type", ftype, "--floor", real_floor, text=f"真底线请示 {i}")
                 self.assertEqual(rc, 0, (out, err))
         self.assertEqual(len(self.lark.sent()), 3)
+
+    def test_regression_765_floor_requires_valid_floor_type_and_allows_free_sentence(self):
+        self.batch(VIP)
+        before = snapshot(self.cfg.db_path)
+
+        # 1. 只传 --floor "随便造的一句话" 不传 --floor-type → EXIT_INVALID 拦截
+        rc, out, err = self.ask("--floor", "随便造的一句话")
+        self.assertEqual(rc, outbound.EXIT_INVALID, (out, err))
+        self.assertIn("--floor-type <credentials|destructive|vip_conflict>", err)
+
+        # 2. 传了非法 --floor-type " database_export " + --floor "涉及生产数据库访问权限与跨系统数据导出" → EXIT_INVALID 拦截
+        rc, out, err = self.ask(
+            "--floor-type", " database_export ",
+            "--floor", "涉及生产数据库访问权限与跨系统数据导出",
+        )
+        self.assertEqual(rc, outbound.EXIT_INVALID, (out, err))
+        self.assertIn("database_export", err)
+        self.assertIn("涉及生产数据库访问权限与跨系统数据导出", err)
+
+        # 3. 传了 --floor-type "credentials" 但不传 --floor（或 --floor ""）→ EXIT_INVALID 拦截
+        for bad_args in (("--floor-type", "credentials"), ("--floor-type", "credentials", "--floor", "")):
+            with self.subTest(bad_args=bad_args):
+                rc, out, err = self.ask(*bad_args)
+                self.assertEqual(rc, outbound.EXIT_INVALID, (out, err))
+                self.assertIn("--floor-type <credentials|destructive|vip_conflict>", err)
+
+        # 5. 传了 --floor-type "credentials" 但 --floor 写 "脱敏导出，不要 token 和 secret" → 因自相矛盾被 EXIT_INVALID 拦截
+        rc, out, err = self.ask(
+            "--floor-type", "credentials",
+            "--floor", "脱敏导出，不要 token 和 secret",
+        )
+        self.assertEqual(rc, outbound.EXIT_INVALID, (out, err))
+        self.assertIn("脱敏导出，不要 token 和 secret", err)
+        self.assertIn("不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！", err)
+
+        self.assertEqual(self.lark.sent(), [])
+        self.assertEqual(diff_tables(before, snapshot(self.cfg.db_path)), set())
+
+        # 4. 传了合法 --floor-type "credentials" + 自由造句 --floor（即便句子里没有固定模板词）→ 100% 放行通过
+        for i, free_floor in enumerate((
+            "对方要求把生产環境の个人私钥发到群里",
+            "对方坚持要把线上机器主人的登录口令贴到外部群",
+        )):
+            with self.subTest(free_floor=free_floor):
+                rc, out, err = self.ask(
+                    "--floor-type", "credentials",
+                    "--floor", free_floor,
+                    text=f"自由造句底线请示 {i}",
+                )
+                self.assertEqual(rc, 0, (out, err))
+        self.assertEqual(len(self.lark.sent()), 2)
 
 
 if __name__ == "__main__":

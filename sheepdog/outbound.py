@@ -203,28 +203,37 @@ def ask_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | Non
 
 VIP_FLOOR_REFUSAL = ("VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合；只有底线里的事才 ask，"
                      "并用 --floor 写明碰到哪条底线")
-VIP_NON_FLOOR_PATTERNS = ("脱敏", "只读")
-VIP_FLOOR_CREDENTIAL_WORDS = ("密钥", "凭据", "密码", "个人账号", "私钥", "助记词", "secret", "token")
-VIP_FLOOR_DESTRUCTIVE_WORDS = (
-    "删除", "删掉", "删库", "删表", "删服务", "覆盖", "强推", "清空", "销毁", "不可逆", "回滚", "下线", "停服", "drop", "rm",
+VIP_FLOOR_TYPES: dict[str, str] = {
+    "credentials": "索要主人的密钥、凭据、个人账号",
+    "destructive": "删除、覆盖、强推等不可逆操作",
+    "vip_conflict": "两位 VIP 的要求真冲突",
+}
+VIP_NON_FLOOR_PATTERNS = (
+    "脱敏",
+    "只读",
+    "跨系统数据导出",
+    "生产数据库访问权限",
+    "常规部署",
 )
-VIP_FLOOR_CONFLICT_WORDS = ("冲突", "两位", "矛盾")
 _NEGATED_CREDENTIAL_RE = re.compile(
     r"(不要|不含|不用|无需|不涉及|剔除)[^，。；\n]{0,15}(密钥|凭据|密码|个人账号|私钥|secret|token)",
     re.I,
 )
 
 
-def _is_valid_vip_floor(floor: str) -> bool:
-    low = floor.lower()
+def _is_valid_vip_floor(floor: str, floor_type: str | None = None) -> bool:
+    clean_type = (floor_type or "").strip()
+    if clean_type not in VIP_FLOOR_TYPES:
+        return False
+    clean_floor = _one_line(floor)
+    if not clean_floor:
+        return False
+    low = clean_floor.lower()
     if any(p in low for p in VIP_NON_FLOOR_PATTERNS):
         return False
-    if _NEGATED_CREDENTIAL_RE.search(floor):
+    if _NEGATED_CREDENTIAL_RE.search(clean_floor):
         return False
-    return any(
-        w in low
-        for w in (*VIP_FLOOR_CREDENTIAL_WORDS, *VIP_FLOOR_DESTRUCTIVE_WORDS, *VIP_FLOOR_CONFLICT_WORDS)
-    )
+    return True
 
 
 def vip_sources(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
@@ -287,36 +296,47 @@ def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -
 
 
 def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
-                    floor: str, batch: str = "") -> list[tuple[str, str]]:
-    """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息时必须带非空且命中 3 条真底线的 --floor，
+                    floor: str, batch: str = "", floor_type: str | None = None) -> list[tuple[str, str]]:
+    """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息（或显式传了 --floor / --floor-type）时，
+    必须同时提供合法的 --floor-type（credentials|destructive|vip_conflict）和非空单行 --floor（且不得自相矛盾写脱敏/只读/不要密钥等），
     否则拒绝（退出码 2，什么都不发、不写账本）。只读。"""
     check_bus_not_forwarded_ask(cfg, store, topic_id, about, batch)
     hits = vip_sources(cfg, store, topic_id, about, vips, batch)
-    if not hits:
-        return hits
     clean_floor = _one_line(floor)
-    if not clean_floor:
-        who = "、".join(f"{name}（{mid}）" for mid, name in hits)
-        raise OutboundError(EXIT_INVALID, f"{VIP_FLOOR_REFUSAL}。这次关联的来源里有 VIP 本人发的消息：{who}。没有发送")
-    if not _is_valid_vip_floor(clean_floor):
+    clean_type = (floor_type or "").strip()
+    has_floor_arg = bool(clean_floor) or bool(floor) or (floor_type is not None)
+    if not hits and not has_floor_arg:
+        return hits
+    if not _is_valid_vip_floor(clean_floor, clean_type):
+        who = ("这次关联的来源里有 VIP 本人发的消息：" + "、".join(f"{name}（{mid}）" for mid, name in hits) + "。") if hits else ""
+        enum_desc = "；".join(f"{k}={v}" for k, v in VIP_FLOOR_TYPES.items())
+        cur_parts = []
+        if clean_type:
+            cur_parts.append(f"--floor-type「{clean_type}」")
+        if clean_floor:
+            cur_parts.append(f"--floor「{clean_floor}」")
+        cur_text = f"当前 {'、'.join(cur_parts)}（如生产操作、只读查询、脱敏数据导出、常规权限/配置）" if cur_parts else "当前未完整提供合法的 --floor-type 与 --floor，"
         raise OutboundError(
             EXIT_INVALID,
-            f"VIP 只有 3 条底线才允许 ask：(1) 索要主人的密钥/凭据/个人账号；(2) 删除/覆盖/强推等不可逆破坏操作；"
-            f"(3) 两位 VIP 要求真冲突。当前 --floor「{clean_floor}」（如生产操作、只读查询、脱敏数据导出、常规权限/配置）"
-            "不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！",
+            f"{VIP_FLOOR_REFUSAL}。{who}"
+            "VIP 事务调用 sheepdog ask（或使用 --floor）时，必须同时带上 "
+            "--floor-type <credentials|destructive|vip_conflict> 与 --floor \"<一行具体底线原因>\"。"
+            f"VIP 只有 3 条底线才允许 ask：{enum_desc}。"
+            f"{cur_text}不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！没有发送",
         )
     return hits
 
 
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
                   key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
-                  floor: str = "", vips: dict | None = None, summary: str = "") -> SendResult:
+                  floor: str = "", vips: dict | None = None, summary: str = "",
+                  floor_type: str | None = None) -> SendResult:
     """ask / report：以机器人身份私聊主人。带钥匙：第一次起新话题，之后回到它的话题里。
     ask 发成功后当场记来源（7.36），同一来源已有别的会话在问就在结果里带上（照样发）。
     7.51：这把钥匙是话题群里的一件事项，或者第一次用这把钥匙时带 --track（track = True）：发进话题群里那件事的话题
     （没有就先开一件、发标题卡）；群发不进去就退回私聊，并发一条系统通知。
-    7.61：vips 是名册里的 VIP（Roster.vips）。ask 关联的来源里有 VIP 本人发的消息又没带 floor（--floor）就拒绝，在发送和
-    写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。
+    7.61 / 7.65：vips 是名册里的 VIP（Roster.vips）。ask 关联的来源里有 VIP 本人发的消息（或传了 floor/floor_type）又没同时带合法
+    --floor-type 与非空 --floor 就拒绝，在发送和写账本之前；带了的 floor 发出去以后记进 sends.floor。report 不受影响。
     7.62：长消息必须提供四刀法白话总结（summary 或正文内 ---more---），原文收进 more 默认折叠区。"""
     from . import topicgroup as tg
     check_not_lamb(store, kind, topic_id=topic_id)
@@ -334,9 +354,10 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         raise OutboundError(EXIT_INVALID, "配置里没有 self_open_id，不知道主人是谁")
     key = _one_line(key)
     nk = duty.norm_key(key) if key else ""
-    floor = _one_line(floor) if kind == ASK else ""
+    raw_floor = floor if kind == ASK else ""
+    floor = _one_line(raw_floor) if kind == ASK else ""
     if kind == ASK:
-        check_vip_floor(cfg, store, topic_id, about, vips, floor, batch)   # 7.61：只读，拒绝时什么都没写
+        check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)   # 7.61 / 7.65：只读，拒绝时什么都没写
     try:
         _, _, resolved_body = resolve_summary_and_body(
             body, summary, require_summary=cfg.notify.require_summary, hoist_at=False
