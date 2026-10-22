@@ -1455,14 +1455,18 @@ class Collector:
 
     # ---------- 「找主人」聊天（7.8） ----------
     def _escalation_message(self, m: Message) -> RouteDecision:
-        """先于普通路由，不受 ignore_chat_ids 影响。三种结果：登记提问 / 主人的回复 / 其他一律 drop。
-        7.51：话题群（[topic_group] chat_id）在入口就分开，走自己的分支（_topic_group_message），不进私聊那套「没引用就猜」。"""
+        """先于普通路由，不受 ignore_chat_ids 影响。话题群（7.51）在入口分开走 _topic_group_message。"""
         me = self.cfg.self_open_id
-        if isinstance(m.raw, dict) and m.raw.get("_sd_card_callback") and m.reply_to:
-            d = self._owner_reply(m)
+        if isinstance(m.raw, dict) and (cb := m.raw.get("_sd_card_callback")) and (m.reply_to or cb.get("kind") == "tg_move"):
             from . import topicgroup as tg
+            if cb.get("kind") == "tg_move":
+                no = f"T-{cb['item_no']}" if cb.get("item_no") else ""
+                d = RouteDecision(DROP, "tg_move", [OWNER_VERIFIED_TAG, "card_callback", *([f"item:{no}"] if no else [])])
+                self.store.upsert_message(m, d.route, d.reason, d.tags, cb.get("topic_id") or None)
+                return d
+            d = self._owner_reply(m)
             s = self.store.send_by_message(m.reply_to)
-            item = self.store.item_by_root(m.reply_to) or (
+            item = (self.store.get_item(int(cb["item_no"])) if cb.get("item_no") else None) or self.store.item_by_root(m.reply_to) or (
                 self.store.item_by_root(s["root_message_id"]) if s and s["root_message_id"] else None)
             if item is not None:
                 tg.touch(self.store, item["item_no"])
@@ -1481,40 +1485,30 @@ class Collector:
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
             if self._agent_reply_text(m.content):
-                # 10-13 热修：会话误用 sheepdog reply 以主人身份把代回卡片发进了找主人聊天。发送人是主人、但带代回标记：
-                # 不是主人亲自回复，不投递（否则会被当成 owner_reply 投回会话，甚至投错会话）
+                # 10-13 热修：会话误用 sheepdog reply 以主人身份把代回卡片发进了找主人聊天，不投递
                 d = RouteDecision(SELF, "agent_reply_in_owner_chat")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
-            from . import topicgroup as tg
+            from . import pending as pend, topicgroup as tg
             if tg.is_command(m.content, tg.CMD_MOVE) and tg.configured(self.cfg) and self.cfg.topic_group.enabled:
-                # 7.51 入口 2：主人在私聊的话题里、或引用某条，整句只回「放群里」：在路由前拦下，不当普通回复送走
                 return self._tg_move(m)
-            from . import pending as pend
-            if (self.cfg.escalation.owner_shortcut and not m.reply_to and (not m.thread_id or is_thread_root(m))
-                    and pend.is_pending_query(m.content)):
-                # 7.36：主人单独发「待办」（顶层消息）：牧羊犬当轮用机器人回清单，不送总线、不当成回答哪条提问
+            if self.cfg.escalation.owner_shortcut and not m.reply_to and (not m.thread_id or is_thread_root(m)) and pend.is_pending_query(m.content):
                 d = RouteDecision(DROP, "pending_query")
                 self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
                 self._pending_reply(m)
                 return d
-            if (self.cfg.escalation.owner_shortcut and is_upgrade_command(m.content)
-                    and not self._is_answering_open_escalation(m)):
-                # 7.69：主人在找主人聊天里发「你来升级 / 升级 / 重启生效」（顶层或引用新版提醒卡片）：入队 upgrade 动作，
-                # 由常驻进程拉取最新代码并原地 os.execv 重启，不进 tp_bus、不记回音欠账
+            if self.cfg.escalation.owner_shortcut and is_upgrade_command(m.content) and not self._is_answering_open_escalation(m):
                 d = RouteDecision(DROP, "upgrade_command", [OWNER_VERIFIED_TAG])
                 self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
                 self._upgrade_shortcut(m)
                 return d
             d = self._owner_reply(m)
-            self._echo_record(m, d.reason)      # 7.52：主人在找主人聊天里的话，记一笔欠账（7.53：没引用的记成指令）
+            self._echo_record(m, d.reason)
             return d
         if m.sender_type in ("app", "bot"):
             self._learn_thread(m)
             own = self.store.send_by_message(m.message_id)
             if own is not None and own["kind"] in OWN_SEND_KINDS:
-                # 7.36：牧羊犬自己的话（结案那一句、待办清单；7.51 私聊旧话题里「已经放进话题群」那一句）：不登记「需要你定」、
-                # 不当成会话的提问、不投给任何会话
                 d = RouteDecision(DROP, f"sheepdog_{own['kind']}")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
@@ -1673,12 +1667,16 @@ class Collector:
         return t["kind"] == DYNAMIC or (self.roster is None and t["kind"] == ADOPTED)
 
     def _owner_reply(self, m: Message) -> RouteDecision:
-        """主人在「找主人」聊天里的回复：引用了哪条就投给哪条的会话；在话题里回复按话题送回。
-        没引用、不在话题里的（7.53）：一律是主人的指令（owner_instruction，🗣，会插队），投总线并附上当前未结的「需要你定」
-        列表，由总线判断转给谁；是在回答某一条就由总线 forward --answers。路由这一层不猜、不关任何提问。
-        不走安全闸（发送人已由 IM 账号核实）。"""
+        """主人在「找主人」聊天里的回复：有引用按引用投；在话题里按话题送回；没引用且不在话题里（7.53）当成主人指令投总线。"""
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
-        tags = [OWNER_VERIFIED_TAG, *(["card_callback"] if isinstance(m.raw, dict) and m.raw.get("_sd_card_callback") else [])]
+        cb = m.raw.get("_sd_card_callback") if isinstance(m.raw, dict) else None
+        tags = [OWNER_VERIFIED_TAG, *(["card_callback"] if cb else [])]
+        if cb and m.reply_to:
+            s = self.store.send_by_message(m.reply_to)
+            it = (self.store.get_item(int(cb["item_no"])) if cb.get("item_no") else None) or self.store.item_by_root(m.reply_to) or (
+                self.store.item_by_root(s["root_message_id"]) if s and s["root_message_id"] else None)
+            if it is not None:
+                tags.append(f"item:T-{it['item_no']}")
         d = RouteDecision(DISPATCH, OWNER_REPLY, tags)
         if not m.reply_to and m.thread_id and not is_thread_root(m):
             # 7.22：在话题里回复（话题里的消息没有 parent_id）：按话题找会话，不当成没引用去猜
@@ -1811,15 +1809,14 @@ class Collector:
             return self._tg_index_reply(m)
         if self._tg_top_level(m):
             return self._tg_new_topic(m)
-        # 在一个认不出的话题里回复（不是事项、不是索引卡）：当主人的指令交给总线
-        d = RouteDecision(DISPATCH, OWNER_REPLY, [*tags, *([f"thread:{m.thread_id}"] if m.thread_id else [])])
-        self.store.upsert_message(m, d.route, d.reason, d.tags, BUS_TOPIC_ID)
-        self.store.set_note(m.message_id, f"🗂 主人在话题群一个认不出是哪件事的话题里说话了（话题 `{m.thread_id or '-'}`），"
-                                          "当成主人的指令处理；判断交给哪个会话后用 "
-                            + with_cli(f"`sheepdog forward --topic <topic> --message-ids {m.message_id}` 转交。",
-                                       self.cfg.cli_command))
-        log.info("主人在话题群认不出的话题 %s 里说话 %s，交给总线", m.thread_id, m.message_id)
-        return d
+        # 7.74：在话题群尚未登记为事项的话题里回复时，自动兜底建档 T-n 绑定该 thread，杜绝悬空无主话题
+        thr_msgs = self.store.thread_messages_in_ledger(m.thread_id) if m.thread_id else []
+        root_mid = m.root_id or m.reply_to or (thr_msgs[0]["message_id"] if thr_msgs else "") or m.message_id
+        s_root = self.store.send_by_message(root_mid) or self.store.get_escalation(root_mid) or self.store.get_bot_outbox(root_mid)
+        owner_tid = (s_root["topic_id"] if s_root is not None and s_root["topic_id"] else "") or BUS_TOPIC_ID
+        title = tg._excerpt(first_line(plain_text(m.content)), 40) or "（主人开的话题）"
+        item = tg.open_item(self.store, title, owner_tid, "owner", tg.ORIGIN_OWNER, m.chat_id, root_message_id=root_mid, thread_id=m.thread_id)
+        return self._tg_reply(m, item)
 
     def _tg_bot_message(self, m: Message) -> RouteDecision:
         """话题群里机器人发的：会话经 ask / report 发进事项话题的照旧登记（按发出时记的正文认，事件里的卡片没有正文）；
@@ -3421,29 +3418,35 @@ class Dispatcher:
         return {"priority": batch_id, "sent": len(ids), "state": self.store.get_topic(t["topic_id"])["state"]}
 
     # ---------- 主人的话一定有回音（7.52）：回音账本推进、按环节报、回执带回 ----------
+    def _echo_reported(self, e, since_iso: str) -> bool:
+        tgid = self.cfg.topic_group.chat_id
+        if not (tgid and e["chat_id"] == tgid):
+            return bool(self.store.owner_sends_since(e["topic_id"], since_iso))
+        if (since := _parse(since_iso or "")) is None or since.tzinfo is None:
+            return False
+        for r in self.store.conn.execute("SELECT message_id, root_message_id, kind, sent_at FROM sends WHERE topic_id=? AND kind IN ('ask','report')", (e["topic_id"],)):
+            if self.store.item_by_root(r["root_message_id"] or r["message_id"]) is None and self.store.item_by_root(r["message_id"]) is None:
+                continue
+            if (at := _parse(r["sent_at"] or "")) is not None and at.tzinfo is not None and (at > since or (at == since and r["kind"] == "report")):
+                return True
+        return False
+
     def _echo_sync(self) -> None:
-        """按账本里消息的现状推进欠账：待推 → queued（跟着转交换会话）；送到了（delivered / acked / missed）→ delivered，
-        记批次的送出时间；送到以后会话发过 ask / report → 还上（report）；会话收掉 / 移出名册 → 结掉（topic_closed，
-        同 7.47 第 6 条：不提醒）。没送进会话的（undelivered）不动。
-        这句重新送了一次（转交换了会话、退回待推、换了批次）：绑过的回执作废（ECHO_UNBOUND），那份回执说的是上一次。"""
-        live = set(self._live_tids())
-        now = _now().isoformat(timespec="seconds")
+        """按账本里消息的现状推进欠账：待推 → queued；送到 → delivered；送到后会话发过 ask/report → report；会话关闭 → topic_closed。"""
+        live, now = set(self._live_tids()), _now().isoformat(timespec="seconds")
         for e in self.store.echo_open():
             if e["stage"] == ECHO_UNDELIVERED:
                 continue
-            r = self.store.get_message(e["message_id"])
-            if r is None:
+            if (r := self.store.get_message(e["message_id"])) is None:
                 self.store.echo_settle([e["message_id"]], "gone")
                 continue
             tid, st = r["topic_id"] or "", r["dispatch_state"]
             if r["route"] != DISPATCH or not tid:
                 continue
             if tid != e["topic_id"]:
-                # 转交了：换会话，报过的清零（对新会话重新起算）；绑过的是原来那个会话的回执，作废
                 self.store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now, **ECHO_UNBOUND)
             if st == "pending" and (e["stage"] != ECHO_QUEUED or tid != e["topic_id"]):
-                self.store.echo_update(e["message_id"], stage=ECHO_QUEUED, stage_at=now, batch_id=None,
-                                       delivered_at=None, **ECHO_UNBOUND)
+                self.store.echo_update(e["message_id"], stage=ECHO_QUEUED, stage_at=now, batch_id=None, delivered_at=None, **ECHO_UNBOUND)
             elif st in ECHO_DELIVERED_STATES and (e["stage"] != ECHO_DELIVERED or e["batch_id"] != r["batch_id"]):
                 d = self.store.get_dispatch(r["batch_id"]) if r["batch_id"] else None
                 self.store.echo_update(e["message_id"], stage=ECHO_DELIVERED, stage_at=now, batch_id=r["batch_id"],
@@ -3455,28 +3458,19 @@ class Dispatcher:
                 continue
             if e["topic_id"] not in live:
                 self.store.echo_settle([e["message_id"]], "topic_closed")
-            elif self.store.owner_sends_since(e["topic_id"], e["delivered_at"] or e["stage_at"] or now):
+            elif self._echo_reported(e, e["delivered_at"] or e["stage_at"] or now):
                 self.store.echo_settle([e["message_id"]], "report")
-            elif (
-                self.cfg.session.owner_receipt_relay
-                and not e["relay_batch"]
-                and e["batch_id"]
-                and not self.store.get_meta(f"owner_relay_skipped:{e['batch_id']}")
-            ):
-                d = self.store.get_dispatch(e["batch_id"])
-                if d is not None and d["state"] in ("acked", ACKED_LATE) and d["receipt"]:
+            elif self.cfg.session.owner_receipt_relay and not e["relay_batch"] and e["batch_id"] and not self.store.get_meta(f"owner_relay_skipped:{e['batch_id']}"):
+                if (d := self.store.get_dispatch(e["batch_id"])) is not None and d["state"] in ("acked", ACKED_LATE) and d["receipt"]:
                     try:
                         rcpt = json.loads(d["receipt"])
                     except json.JSONDecodeError:
                         rcpt = {}
                     if isinstance(rcpt, dict):
-                        t_obj = self.store.get_topic(e["topic_id"])
-                        st_val = str(rcpt.get("status") or "handled")
+                        t_obj, st_val = self.store.get_topic(e["topic_id"]), str(rcpt.get("status") or "handled")
                         if t_obj is not None and is_standing_topic(t_obj) and st_val == "done":
                             st_val = "handled"
-                        sum_val = " ".join(str(rcpt.get("summary") or "").split())
-                        at_val = str(rcpt.get("received_at") or d["acked_at"] or now)
-                        self.store.echo_bind_relay(e["message_id"], e["batch_id"], at_val, st_val, sum_val)
+                        self.store.echo_bind_relay(e["message_id"], e["batch_id"], str(rcpt.get("received_at") or d["acked_at"] or now), st_val, " ".join(str(rcpt.get("summary") or "").split()))
 
     def _echo_excerpt(self, e) -> str:
         from . import pending as pend

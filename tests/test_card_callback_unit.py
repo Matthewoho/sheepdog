@@ -96,14 +96,17 @@ class CardCallbackUnitTest(OwnerCardBase):
             interactive=True,
         )
         els = card["body"]["elements"]
-        # 顶层结构：[summary_md, collapsible_panel(more), hr, button_A, button_B, form(sd_other_form)]
+        # 顶层结构：[summary_md, collapsible_panel(more), hr, column_set(options), form(sd_other_form)]
         self.assertEqual(els[0], {"tag": "markdown", "content": summary})
         self.assertEqual(els[1]["tag"], "collapsible_panel")
         self.assertEqual(els[2], {"tag": "hr"})
 
-        btn_a, btn_b = els[3], els[4]
-        self.assertEqual((btn_a["tag"], btn_a["element_id"], btn_a["type"]), ("button", "sd_opt_A", "primary_filled"))
-        self.assertEqual((btn_b["tag"], btn_b["element_id"], btn_b["type"]), ("button", "sd_opt_B", "default"))
+        opt_cs = els[3]
+        self.assertEqual((opt_cs["tag"], opt_cs["flex_mode"]), ("column_set", "flow"))
+        btn_a = opt_cs["columns"][0]["elements"][0]
+        btn_b = opt_cs["columns"][1]["elements"][0]
+        self.assertEqual((btn_a["tag"], btn_a["element_id"], btn_a["type"], btn_a["width"]), ("button", "sd_opt_A", "primary", "default"))
+        self.assertEqual((btn_b["tag"], btn_b["element_id"], btn_b["type"], btn_b["width"]), ("button", "sd_opt_B", "default", "default"))
         cb_a = btn_a["behaviors"][0]
         self.assertEqual(cb_a["type"], "callback")
         self.assertEqual(
@@ -120,13 +123,17 @@ class CardCallbackUnitTest(OwnerCardBase):
             },
         )
 
-        # 根节点 form 容器（绝不嵌套在 collapsible_panel 内）
-        form_el = els[5]
+        # 根节点 form 容器（绝不嵌套在 collapsible_panel 内，同行双列 column_set 消除 max_length）
+        form_el = els[4]
         self.assertEqual((form_el["tag"], form_el["name"], form_el["element_id"]), ("form", "sd_other_form", "sd_form_other"))
         self.assertNotIn('"tag": "form"', json.dumps(els[1], ensure_ascii=False))
-        inp, sub_btn = form_el["elements"]
-        self.assertEqual((inp["tag"], inp["name"], inp["required"]), ("input", "other_input", True))
-        self.assertEqual((sub_btn["tag"], sub_btn["name"], sub_btn["form_action_type"]), ("button", "other_submit", "submit"))
+        form_row = form_el["elements"][0]
+        self.assertEqual((form_row["tag"], form_row["flex_mode"]), ("column_set", "none"))
+        inp = form_row["columns"][0]["elements"][0]
+        sub_btn = form_row["columns"][1]["elements"][0]
+        self.assertEqual((inp["tag"], inp["name"], inp["width"], inp["required"]), ("input", "other_input", "fill", True))
+        self.assertNotIn("max_length", inp)
+        self.assertEqual((sub_btn["tag"], sub_btn["name"], sub_btn["form_action_type"], sub_btn["width"]), ("button", "other_submit", "submit", "default"))
         self.assertEqual(sub_btn["value"]["kind"], "other")
         self.assertEqual(sub_btn["value"]["topic_id"], "tp_alpha")
 
@@ -160,7 +167,7 @@ class CardCallbackUnitTest(OwnerCardBase):
         sent_call = self.sends()[-1]
         c = card_of(sent_call)
         tags = [e["tag"] for e in c["body"]["elements"]]
-        self.assertEqual(tags, ["markdown", "hr", "button", "button", "form"])
+        self.assertEqual(tags, ["markdown", "hr", "column_set", "form"])
 
         card_mid = self.store.thread_by_key("tp_alpha", "K-OPT")["root_message_id"]
         raw_ev = {
@@ -170,7 +177,7 @@ class CardCallbackUnitTest(OwnerCardBase):
             "chat_id": ESC_CHAT,
             "operator_id": ME,
             "action_tag": "button",
-            "action_value": c["body"]["elements"][2]["behaviors"][0]["value"],
+            "action_value": c["body"]["elements"][2]["columns"][0]["elements"][0]["behaviors"][0]["value"],
             "timestamp": "1792679400000",
         }
         self.assertTrue(is_card_action_event(raw_ev))

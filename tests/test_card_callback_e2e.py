@@ -47,7 +47,7 @@ class CardCallbackE2ETest(IdentityBase):
             "tp_alpha", "K-DEPLOY-773", "生产发版窗口",
             "1. A：今晚 22:00 全量发布\n2. B：明早 10:00 灰度\n3. C：暂缓本次发布",
         )
-        btn_a_val = card["body"]["elements"][2]["behaviors"][0]["value"]
+        btn_a_val = card["body"]["elements"][2]["columns"][0]["elements"][0]["behaviors"][0]["value"]
         cb_event = {
             "type": "card.action.trigger",
             "event_id": "ev_773_click_a",
@@ -119,7 +119,7 @@ class CardCallbackE2ETest(IdentityBase):
             "tp_alpha", "K-DUP-773", "数据库扩容确认",
             "1. A：批准扩容至 16C64G\n2. B：保持现状",
         )
-        btn_a_val = card["body"]["elements"][2]["behaviors"][0]["value"]
+        btn_a_val = card["body"]["elements"][2]["columns"][0]["elements"][0]["behaviors"][0]["value"]
         ev_first = {
             "type": "card.action.trigger",
             "event_id": "ev_773_first",
@@ -135,7 +135,7 @@ class CardCallbackE2ETest(IdentityBase):
         ev_second_click = dict(
             ev_first,
             event_id="ev_773_second_click",
-            action_value=card["body"]["elements"][3]["behaviors"][0]["value"],
+            action_value=card["body"]["elements"][2]["columns"][1]["elements"][0]["behaviors"][0]["value"],
             timestamp="1792680102000",
         )
 
@@ -192,7 +192,7 @@ class CardCallbackE2ETest(IdentityBase):
             "chat_id": ESC_CHAT,
             "operator_id": ALICE,
             "action_tag": "button",
-            "action_value": laohu2_card["body"]["elements"][2]["behaviors"][0]["value"],
+            "action_value": laohu2_card["body"]["elements"][2]["columns"][0]["elements"][0]["behaviors"][0]["value"],
             "timestamp": "1792680200000",
         }
         self.bot_hears(stranger_ev)
@@ -206,7 +206,7 @@ class CardCallbackE2ETest(IdentityBase):
         self.store.record_dispatch("b_running_laohu2", "tp_laohu#2", [])
         self.store.update_topic("tp_laohu#2", state="running", pending_batch_id="b_running_laohu2",
                                 dispatched_at=now_iso())
-        form_btn_val = laohu2_card["body"]["elements"][-1]["elements"][1]["value"]
+        form_btn_val = laohu2_card["body"]["elements"][-1]["elements"][0]["columns"][1]["elements"][0]["value"]
         owner_other_ev = {
             "type": "card.action.trigger",
             "event_id": "ev_773_owner_laohu2",

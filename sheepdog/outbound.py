@@ -111,11 +111,9 @@ def lamb_violation_message(store: Store | None, cmd: str, *, topic_id: str = "",
                 break
     if not matched_lid:
         return None
-    return (
-        f"[sheepdog] 禁止越权：当前执行体是羔羊（lamb_id={matched_lid}，隶属母羊 {parent_tid}），"
-        f"物理禁止直接调用 sheepdog {cmd}（reply/ask/report/forward/receipt/resolve/watch）。"
-        f"请将核查或执行结论直接返回给母羊，由母羊统一对外回话与交回执。"
-    )
+    return (f"[sheepdog] 禁止越权：当前执行体是羔羊（lamb_id={matched_lid}，隶属母羊 {parent_tid}），"
+            f"物理禁止直接调用 sheepdog {cmd}（reply/ask/report/forward/receipt/resolve/watch）。"
+            "请将核查或执行结论直接返回给母羊，由母羊统一对外回话与交回执。")
 
 
 def check_not_lamb(store: Store | None, cmd: str, *, topic_id: str = "", lamb_id: str = "", cid: str = "") -> None:
@@ -128,16 +126,25 @@ def _one_line(text: str) -> str:
 
 
 # ======================= ask / report =======================
-def current_batch(store: Store, topic_id: str) -> str:
-    """会话没传 --batch 时用的批次号：它当前在跑的批次（送出了、等回执的那批）；没有就用它最近一批（跳过主人插话批次）；
-    都没有是空串。
-    同一批里重跑只发一条，隔批再说同样的话不会被当成重复，会话也不用自己记批次号。"""
-    t = store.get_topic(topic_id)
-    if t is not None and t["pending_batch_id"] and not t["pending_batch_id"].startswith(PRIORITY_PREFIX):
-        return t["pending_batch_id"]
-    # 主人插话批次（p…，7.37）不算：它只装主人那句回复，送得又比手上那批晚；取成它，ask 的防重编号会跟着变、默认来源会
-    # 变成找主人聊天里的那句（7.38 第 8 条）
-    return store.latest_batch_id(topic_id, skip_prefix=PRIORITY_PREFIX)
+def current_batch(store: Store, topic_id: str, *, include_priority: bool = False) -> str:
+    """会话没传 --batch 时用的批次号：支持 SessionGroup 槽位族（tp_laohu / tp_laohu#2）与插队批次（p…）。"""
+    base = (topic_id or "").split("#", 1)[0]
+    tids = list(dict.fromkeys([
+        topic_id, base, *(t["topic_id"] for t in store.list_topics() if t["topic_id"].split("#", 1)[0] == base),
+    ]))
+    if include_priority:
+        for tid in tids:
+            if (bid := store.latest_batch_id(tid, skip_prefix="")) and bid.startswith(PRIORITY_PREFIX):
+                return bid
+    for tid in tids:
+        t = store.get_topic(tid)
+        if t is not None and t["pending_batch_id"] and (include_priority or not t["pending_batch_id"].startswith(PRIORITY_PREFIX)):
+            return t["pending_batch_id"]
+    for skip in ((PRIORITY_PREFIX, "") if not include_priority else ("",)):
+        for tid in tids:
+            if bid := store.latest_batch_id(tid, skip_prefix=skip):
+                return bid
+    return ""
 
 
 def compose(cfg: Config, kind: str, topic_id: str, title: str, body: str, summary: str = "") -> str:
@@ -251,16 +258,8 @@ def check_bus_not_forwarded_ask(cfg: Config, store: Store, topic_id: str, about:
 
 def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -> None:
     """7.65：禁止总线 tp_bus 对已 forward 转交给专属会话的消息调用 sheepdog reply。"""
-    if topic_id != BUS_TOPIC_ID:
-        return
-    forwarded = store.forwarded_message_targets([target_id])
-    if target_id in forwarded:
-        dst = forwarded[target_id]
-        raise OutboundError(
-            EXIT_INVALID,
-            f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog reply（{target_id} 已转交给 {dst}）："
-            "请交由承接该消息的专属会话处理与回复，没有发送",
-        )
+    if topic_id == BUS_TOPIC_ID and target_id in (forwarded := store.forwarded_message_targets([target_id])):
+        raise OutboundError(EXIT_INVALID, f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog reply（{target_id} 已转交给 {forwarded[target_id]}）：请交由承接该消息的专属会话处理与回复，没有发送")
 
 
 def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
@@ -270,26 +269,18 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
     否则拒绝（退出码 2，什么都不发、不写账本）。只读。"""
     check_bus_not_forwarded_ask(cfg, store, topic_id, about, batch)
     hits = vip_sources(cfg, store, topic_id, about, vips, batch)
-    clean_floor = _one_line(floor)
-    clean_type = (floor_type or "").strip()
-    has_floor_arg = bool(clean_floor) or bool(floor) or (floor_type is not None)
-    if not hits and not has_floor_arg:
+    clean_floor, clean_type = _one_line(floor), (floor_type or "").strip()
+    if not hits and not (bool(clean_floor) or bool(floor) or (floor_type is not None)):
         return hits
     if not _is_valid_vip_floor(clean_floor, clean_type):
         who = ("这次关联的来源里有 VIP 本人发的消息：" + "、".join(f"{name}（{mid}）" for mid, name in hits) + "。") if hits else ""
         enum_desc = "；".join(f"{k}={v}" for k, v in VIP_FLOOR_TYPES.items())
-        cur_parts = []
-        if clean_type:
-            cur_parts.append(f"--floor-type「{clean_type}」")
-        if clean_floor:
-            cur_parts.append(f"--floor「{clean_floor}」")
+        cur_parts = ([f"--floor-type「{clean_type}」"] if clean_type else []) + ([f"--floor「{clean_floor}」"] if clean_floor else [])
         cur_text = f"当前 {'、'.join(cur_parts)}（如生产操作、只读查询、脱敏数据导出、常规权限/配置）" if cur_parts else "当前未完整提供合法的 --floor-type 与 --floor，"
         raise OutboundError(
             EXIT_INVALID,
-            f"{VIP_FLOOR_REFUSAL}。{who}"
-            "VIP 事务调用 sheepdog ask（或使用 --floor）时，必须同时带上 "
-            "--floor-type <credentials|destructive|vip_conflict> 与 --floor \"<一行具体底线原因>\"。"
-            f"VIP 只有 3 条底线才允许 ask：{enum_desc}。"
+            f"{VIP_FLOOR_REFUSAL}。{who}VIP 事务调用 sheepdog ask（或使用 --floor）时，必须同时带上 "
+            f"--floor-type <credentials|destructive|vip_conflict> 与 --floor \"<一行具体底线原因>\"。VIP 只有 3 条底线才允许 ask：{enum_desc}。"
             f"{cur_text}不属于底线，请直接按安全合理方式办理并用 sheepdog report 报备，严禁调用 sheepdog ask！没有发送",
         )
     return hits
@@ -336,7 +327,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
-    route = tg.route_for_send(cfg, store, topic_id, key, track)
+    route = tg.route_for_send(cfg, store, topic_id, key, track, kind=kind, title=title, batch_id=batch)
     if route.group:
         try:
             res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route, options=options)
@@ -355,30 +346,32 @@ class _GroupDown(Exception):
 
 def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str,
                    text: str, ik: str, route, *, options: str = "") -> SendResult:
-    """7.51：发进话题群里那件事的话题。没有这件事就先开（标题卡是开头那条），办完 / 归档的重开。只有 ask @ 主人。
-    超时原样抛（OutboundError 退出码 1，会话原样重试：标题卡和这一条的防重编号都不变，飞书只发一条）。"""
+    """7.51 / 7.74：发进话题群里那件事的话题。已有 root_message_id 的老事项不受 tg_down 阻断，回复成功自动清除 down。"""
     from . import topicgroup as tg
     item, created = route.item, False
     if item is None:
         item = tg.open_item(store, title, topic_id, topic_id, tg.ORIGIN_TRACK, cfg.topic_group.chat_id, key=key,
                             topic_id=topic_id, related=route.related)
         created = True
-    else:
-        # 别的会话用同一把钥匙（-、_、空格不分）也发进这件事：钥匙原样记一笔（已经有的不动）
-        store.add_item_key(item["item_no"], key, tg.track_norm(key), "alias", topic_id)
+    elif key:
+        tg.bind_alias_key(store, item["item_no"], key, topic_id)
     try:
         item = tg.ensure_title(cfg, store, source, item, "", key)   # 副标题「<会话显示名>开的」按事项现算
         plain, card = owner_content(cfg, text, at=kind == ASK, kind=kind, topic_id=topic_id, key=key, title=title, options=options)
-        res = send_owner(lambda tx, c: source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx,
-                                                       card=c, in_thread=True), plain, card)
+        res = send_owner(
+            lambda tx, c: (source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx, card=c, in_thread=True)
+                           if hasattr(source, "reply_to") or source is None
+                           else source.reply_in_topic(item["root_message_id"], tx, card=c, idem_key=ik)),
+            plain, card)
     except LarkTimeout as e:
         raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
-    except SourceError as e:
+    except (SourceError, RuntimeError) as e:
         if created and not store.get_item(item["item_no"])["root_message_id"]:
             store.delete_item(item["item_no"])
         why = " ".join(str(e).split())[:200]
         tg.mark_down(cfg, store, f"往话题群发消息失败：{why}")
         raise _GroupDown(why)
+    tg.clear_down(cfg, store)
     mid = res["message_id"]
     reopened = tg.reopen(store, item)
     tg.touch(store, item["item_no"])
@@ -387,8 +380,9 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
         store.update_item(item["item_no"], thread_id=res["thread_id"])
     store.add_send(ik, kind, topic_id, mid, text, root_message_id=item["root_message_id"], key=key, norm_key=nk,
                    identity=ident.BOT if cfg.identity.enabled else None)
-    # 会话发的提问、汇报照旧记来源（主人引用回复时按这里送回）；牧羊犬自己的话不记
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
+    if not (created and text.endswith("\n?")):
+        tg.sync_title_card(store, cfg, source, item["item_no"], latest_text=text, kind=kind)
     return SendResult(mid, root_message_id=item["root_message_id"], new_thread=created, text=text,
                       item=tg.label(item["item_no"]), new_item=created, reopened=reopened)
 

@@ -1,103 +1,50 @@
-"""长期跟踪的话题放进专门的话题群（7.51 改版 v1）。
-
-一件事一个话题（事项，编号 T-<数字>），按钥匙认、跨会话合并。进群只有三个入口（不中途搬家）：
-1. 会话第一次用一把钥匙发 ask / report 时带 --track（outbound.send_to_owner）；
-2. 主人在私聊的某个话题里、或引用某条消息，整句只回「放群里」（engine.Collector._tg_move）；
-3. 主人在话题群里新开一个顶层话题（engine.Collector._topic_group_message）。
-
-话题开头那条是静态的标题卡（标题、编号、谁开的），之后永远不改。状态集中在群里置顶的一张索引卡：每
-[topic_group] index_refresh_minutes 分钟按证据对账一次，整张覆盖（patch）；发出满 13 天重发一张。状态由证据算：
-等你定 = 名下有开着的「需要你定」；过期未定 = 最近一条提问过期了还没答；等别人 = 羊群看板上这把钥匙的活在等别人；
-沉睡 = stale_after_days 天没动静；办完只认明确的命令（sheepdog track done、主人在话题里整句回「办完了」「关掉」）。
-每个话题里只在三种变化时发一行：等你定、办完、重开。办完 archive_after_hours 小时没动静就归档，归档满 30 天删掉。
-
-牧羊犬自己在群里发的（标题卡、索引卡、变化说明、「已交给 …」、提示）都记进 sends（kind = tg_*），读回时一律丢弃，
-不登记「需要你定」、不进 bot_outbox。会话经 sheepdog ask / report 发进群里的照旧登记。
-
-群发不进去（飞书报错），或者每 10 分钟查一次群成员发现机器人或主人不在群里：退回私聊（ask / report 照旧进私聊话题），
-发一条系统通知；成员核对正常以后恢复。有别人进群、别人在群里说话：私聊提醒主人，那人说的话不分派。
-"""
+"""长期跟踪的话题放进专门的话题群（7.51 / 7.74）。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
-import re
+import hashlib, json, logging, re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from . import duty
-from . import engine as eng
+from . import duty, engine as eng
 from .card import build_owner_card, card_fits, owner_title, plain_text
 from .router import message_bodies
 from .store import Store, now_iso
 
 log = logging.getLogger("sheepdog")
-
 ITEM_PREFIX = "T-"
-
-# sends.kind：牧羊犬自己在群里（和私聊旧话题里）发的话。读回时一律丢弃
-KIND_TITLE = "tg_title"        # 标题卡（话题开头那条）
-KIND_INDEX = "tg_index"        # 索引卡
-KIND_CHANGE = "tg_change"      # 话题里的变化说明（等你定 / 办完 / 重开）
-KIND_HANDOFF = "tg_handoff"    # 「已交给 …」
-KIND_NOTE = "tg_note"          # 提示（「看置顶的索引卡」、移出群、认不出是哪件事）
-KIND_MOVED = "tg_moved"        # 私聊旧话题里那句「这件事已经放进话题群」
+KIND_TITLE, KIND_INDEX, KIND_CHANGE, KIND_HANDOFF, KIND_NOTE, KIND_MOVED = (
+    "tg_title", "tg_index", "tg_change", "tg_handoff", "tg_note", "tg_moved")
 OWN_KINDS = (KIND_TITLE, KIND_INDEX, KIND_CHANGE, KIND_HANDOFF, KIND_NOTE, KIND_MOVED)
-
-# 整句命令（整句完全一致才算，空白不算；在路由之前拦下）
-CMD_MOVE = ("放群里",)
-CMD_DONE = ("办完了", "关掉")
-CMD_REMOVE = ("移出群",)
-
-# 事项的生命周期（明确的事件才改）
+CMD_MOVE, CMD_DONE, CMD_REMOVE = ("放群里",), ("办完了", "关掉"), ("移出群",)
 ACTIVE, DONE, ARCHIVED, REMOVED = "active", "done", "archived", "removed"
-# 事项从哪个入口进来
 ORIGIN_TRACK, ORIGIN_MOVE, ORIGIN_OWNER = "track", "owner_move", "owner_topic"
 ORIGIN_LABEL = {ORIGIN_TRACK: "会话 --track", ORIGIN_MOVE: "主人「放群里」", ORIGIN_OWNER: "主人在群里新开"}
-
-# 索引卡上的状态（每次按证据现算）
 S_DECIDE, S_EXPIRED, S_DOING, S_WAITING, S_SLEEPING, S_DONE, S_ARCHIVED = (
     "decide", "expired", "doing", "waiting_other", "sleeping", "done", "archived")
 STATUS_LABEL = {S_DECIDE: "等你定", S_EXPIRED: "过期未定", S_DOING: "进行中", S_WAITING: "等别人", S_SLEEPING: "沉睡",
                 S_DONE: "最近办完", S_ARCHIVED: "已归档"}
 INDEX_ORDER = (S_DECIDE, S_EXPIRED, S_DOING, S_WAITING, S_SLEEPING, S_DONE)
 SUGGEST = "suggest"
-
-# 归档超过这么多天的钥匙再被用到，算一件新事（只附一句「可能相关」）
-REOPEN_WITHIN_DAYS = 14
-# 归档满这么多天删掉（事项表、钥匙、它指向的私聊话题都不跟 7 天保留期走）
-PURGE_AFTER_DAYS = 30
-# 索引卡发出满这么多天就重发一张（改卡只能改 14 天内发的）
-INDEX_RENEW_DAYS = 13
-# 多久查一次群成员
-MEMBER_CHECK_MINUTES = 10
-# 「建议放进群」的门槛在配置 [topic_group] suggest_*（10-16 18:0x 架构侧收紧：只看拖过几小时、主人回过几次，
-# 最近 suggest_active_hours 小时有动静，最多列 suggest_max 件）
-# 索引卡每栏最多列几件（卡片有 30KB 上限）
-INDEX_ROWS = 12
-
-META_DOWN = "tg_down"                  # 群不可用（退回私聊）：{"since", "why"}；空 = 正常
-META_INDEX = "tg_index"                # 当前索引卡：{"message_id", "sent_at", "hash", "thread_id", "previous"}
-META_INDEX_PENDING = "tg_index_pending"  # 正在发的新索引卡的防重编号（发成了清空）
-META_DIRTY = "tg_dirty"                # 有事项变化，下一轮就对账
-META_REFRESHED = "tg_index_refreshed_at"
-META_MEMBERS_AT = "tg_members_at"
-META_STRANGERS = "tg_strangers"        # 已经提醒过的别人（open_id 列表）
-NOTICE_KIND = "话题群通知"
-
-DEFAULT_LINK_HOST = "https://applink.larksuite.com"
+REOPEN_WITHIN_DAYS, PURGE_AFTER_DAYS, INDEX_RENEW_DAYS, MEMBER_CHECK_MINUTES, INDEX_ROWS = 14, 30, 13, 10, 12
+META_DOWN, META_INDEX, META_INDEX_PENDING = "tg_down", "tg_index", "tg_index_pending"
+META_DIRTY, META_REFRESHED, META_MEMBERS_AT, META_STRANGERS = "tg_dirty", "tg_index_refreshed_at", "tg_members_at", "tg_strangers"
+NOTICE_KIND, DEFAULT_LINK_HOST = "话题群通知", "https://applink.larksuite.com"
 
 
-# ======================= 钥匙、编号 =======================
 def track_norm(key: str) -> str:
-    """事项的钥匙比较用：`-`、`_`、空白都当成一样（全部去掉），再转大写。SSL-CERT、ssl_cert、SSL CERT 是同一把。"""
     return re.sub(r"[\s_\-]+", "", key or "").upper()
 
 
+def normalize_key(key: str) -> str:
+    return re.sub(r"[\s_\-]+", "-", (key or "").strip().lower()).strip("-")
+
+
+def _cfg_store(a, b=None):
+    return (b, a) if isinstance(a, Store) else (a, b)
+
+
 def _excerpt(text: str, limit: int) -> str:
-    """给主人看的摘录（标题卡、索引卡、话题里那一行）：用「待办」那套去 markdown、合成一行、在句子边界截断（pending.excerpt）。"""
     from .pending import excerpt
     return excerpt(text or "", limit)
 
@@ -107,13 +54,11 @@ def label(item_no: int) -> str:
 
 
 def parse_item_no(key: str) -> int | None:
-    """T-12 / t12 / T_12 → 12；不是事项编号返回 None。"""
     m = re.fullmatch(r"T(\d+)", track_norm(key))
     return int(m.group(1)) if m else None
 
 
 def whole(content: str) -> str:
-    """整句命令比较用：卡片还原成文字，正文（去掉引用外壳）去掉所有空白。"""
     bodies = message_bodies(plain_text(content or ""))
     return "".join((bodies[-1] if bodies else "").split())
 
@@ -135,19 +80,16 @@ def _hash(text: str) -> str:
 
 
 def idem(kind: str, *parts: str) -> str:
-    """防重编号（≤ 50 个字符），同 outbound.idem_key 的口径：sd<种类第 3 个字>-<指纹>。"""
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:40]
     return f"sd{kind[3] if kind.startswith('tg_') else kind[0]}-{digest}"
 
 
-# ======================= 开关、群状态 =======================
 def configured(cfg) -> bool:
-    return bool(cfg.topic_group.chat_id)
+    return bool(cfg and getattr(cfg, "topic_group", None) and cfg.topic_group.chat_id)
 
 
 def down_info(store: Store) -> dict | None:
-    raw = store.get_meta(META_DOWN)
-    if not raw:
+    if not (raw := store.get_meta(META_DOWN)):
         return None
     try:
         return json.loads(raw)
@@ -155,26 +97,28 @@ def down_info(store: Store) -> dict | None:
         return {"since": "", "why": raw}
 
 
+def is_down(store: Store) -> bool:
+    return down_info(store) is not None
+
+
 def usable(cfg, store: Store) -> bool:
-    """配了话题群、开着、没有退回私聊。"""
-    return cfg.topic_group.active and down_info(store) is None
+    return bool(cfg and cfg.topic_group.active) and down_info(store) is None
 
 
 def notify_owner(cfg, store: Store, text: str, kind: str = NOTICE_KIND) -> None:
-    """系统通知（照旧私聊主人）：设了 [notify] file 写进文件；否则落给主人的通知账本，由常驻进程下一轮发（发不出去按退避重试）。"""
-    path = cfg.notify_path
+    path = getattr(cfg, "notify_path", None) if cfg is not None else None
     try:
         if path is not None:
             from .notify import FileNotifier
             FileNotifier(path, cfg.timezone_offset).notify(text, kind)
             return
         store.add_owner_notice(kind, "", text.encode("utf-8"), eng.new_idempotency_key())
-    except Exception as e:   # 通知出错不挡主流程
+    except Exception as e:
         log.warning("话题群的系统通知没记上（%s）: %s", kind, e)
 
 
-def mark_down(cfg, store: Store, why: str) -> bool:
-    """群不可用：退回私聊，发一条系统通知（已经退回的不重复）。返回这次是不是刚退回。"""
+def mark_down(a, b=None, why: str = "") -> bool:
+    cfg, store, why = (None, a, (b or why)) if isinstance(a, Store) else (a, b, why)
     if down_info(store) is not None:
         return False
     store.set_meta(META_DOWN, json.dumps({"since": now_iso(), "why": why}, ensure_ascii=False))
@@ -184,9 +128,9 @@ def mark_down(cfg, store: Store, why: str) -> bool:
     return True
 
 
-def clear_down(cfg, store: Store) -> bool:
-    info = down_info(store)
-    if info is None:
+def clear_down(a, b=None) -> bool:
+    cfg, store = _cfg_store(a, b)
+    if (info := down_info(store)) is None:
         return False
     store.set_meta(META_DOWN, "")
     store.set_meta(META_DIRTY, "1")
@@ -200,43 +144,80 @@ def mark_dirty(store: Store) -> None:
     store.set_meta(META_DIRTY, "1")
 
 
-# ======================= 事项 =======================
-def find_by_key(store: Store, key: str):
-    """按钥匙找事项：事项编号（T-12）直接找；否则按 track_norm 找最近的那件（含已移出、已归档，由调用方判断）。"""
-    no = parse_item_no(key)
-    if no is not None:
-        row = store.get_item(no)
-        if row is not None:
-            return row
-    rows = store.items_by_norm_key(track_norm(key))
-    return rows[0] if rows else None
+def _ensure_extra_col(store: Store) -> None:
+    if "extra" not in {r[1] for r in store.conn.execute("PRAGMA table_info(tracked_items)").fetchall()}:
+        store.conn.execute("ALTER TABLE tracked_items ADD COLUMN extra TEXT DEFAULT '{}'")
+        store.conn.commit()
 
+def _item_extra(store: Store, item) -> dict:
+    _ensure_extra_col(store)
+    raw = item["extra"] if "extra" in item.keys() else None
+    if raw is None:
+        r = store.conn.execute("SELECT extra FROM tracked_items WHERE item_no=?", (item["item_no"],)).fetchone()
+        raw = r[0] if r else "{}"
+    try:
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+def bind_alias_key(store: Store, item_no: int, key: str, topic_id: str = "") -> list[str]:
+    _ensure_extra_col(store)
+    clean, item = " ".join((key or "").split()), store.get_item(item_no)
+    if item is None:
+        return []
+    extra = _item_extra(store, item)
+    aliases, nk = list(extra.get("alias_keys") or []), track_norm(clean)
+    if not nk or parse_item_no(clean) == item_no:
+        return aliases
+    store.add_item_key(item_no, clean, nk, "alias", topic_id or item["owner_topic"] or "")
+    if nk not in {track_norm(x) for x in aliases}:
+        aliases = (aliases + [normalize_key(clean) or clean])[-12:]
+        extra["alias_keys"] = aliases
+        store.conn.execute("UPDATE tracked_items SET extra=? WHERE item_no=?", (json.dumps(extra, ensure_ascii=False), item_no))
+        store.conn.commit()
+    return aliases
+
+def find_by_key(store: Store, key: str):
+    if not (nk := track_norm(key)):
+        return None
+    if (no := parse_item_no(key)) is not None and (row := store.get_item(no)) is not None:
+        return row
+    if rows := store.items_by_norm_key(nk):
+        return rows[0]
+    _ensure_extra_col(store)
+    for row in store.conn.execute("SELECT * FROM tracked_items ORDER BY item_no DESC").fetchall():
+        if any(track_norm(a) == nk for a in (_item_extra(store, row).get("alias_keys") or [])):
+            return row
+    return None
 
 def item_keys(store: Store, item_no: int) -> list[str]:
-    return [r["key"] for r in store.item_keys(item_no) if r["kind"] != "number"]
-
+    out = [r["key"] for r in store.item_keys(item_no) if r["kind"] != "number"]
+    seen = {track_norm(k) for k in out}
+    if (it := store.get_item(item_no)) is not None:
+        for a in _item_extra(store, it).get("alias_keys") or []:
+            if track_norm(a) not in seen:
+                out.append(a)
+                seen.add(track_norm(a))
+    return out
 
 def open_item(store: Store, title: str, owner_topic: str, opened_by: str, origin: str, chat_id: str, *,
               key: str = "", topic_id: str = "", dm_root: str = "", related: int | None = None,
               root_message_id: str = "", thread_id: str = ""):
-    """开一件事项：编号也登记成钥匙（T-12），会话的钥匙登记成钥匙。返回事项行。"""
     no = store.add_item(title=_excerpt(title, 60) or "（无标题）", owner_topic=owner_topic, opened_by=opened_by,
                         origin=origin, chat_id=chat_id, dm_root_message_id=dm_root, related_item=related,
                         root_message_id=root_message_id, thread_id=thread_id)
     store.add_item_key(no, label(no), track_norm(label(no)), "number", "")
     if key:
-        store.add_item_key(no, key, track_norm(key), "key", topic_id or owner_topic)
+        bind_alias_key(store, no, key, topic_id or owner_topic)
     mark_dirty(store)
     log.info("开了事项 %s「%s」（%s，负责 %s）", label(no), title, ORIGIN_LABEL.get(origin, origin), owner_topic or "-")
     return store.get_item(no)
 
-
 def touch(store: Store, item_no: int) -> None:
     store.update_item(item_no, last_activity_at=now_iso())
 
-
 def reopen(store: Store, item) -> bool:
-    """办完 / 归档的事项又有动静：重开（索引卡和话题里的「重开」那一行由常驻进程下一轮补）。"""
     if item["state"] not in (DONE, ARCHIVED):
         return False
     store.update_item(item["item_no"], state=ACTIVE, reopened_at=now_iso(), archived_at=None)
@@ -244,9 +225,7 @@ def reopen(store: Store, item) -> bool:
     log.info("事项 %s 重开", label(item["item_no"]))
     return True
 
-
 def close(store: Store, item, by: str, why: str) -> bool:
-    """办完（只认明确的命令）。"""
     if item["state"] not in (ACTIVE,):
         return False
     store.update_item(item["item_no"], state=DONE, done_at=now_iso(), done_by=by, done_why=why, last_activity_at=now_iso())
@@ -254,42 +233,31 @@ def close(store: Store, item, by: str, why: str) -> bool:
     log.info("事项 %s 办完（%s）：%s", label(item["item_no"]), by, why)
     return True
 
-
 def remove(store: Store, item, by: str) -> bool:
-    """移出群：之后这把钥匙的消息回私聊。"""
     if item["state"] == REMOVED:
         return False
     store.update_item(item["item_no"], state=REMOVED, removed_at=now_iso(), done_by=by)
     mark_dirty(store)
     return True
 
-
 def session_title(store: Store, topic_id: str) -> str:
     if not topic_id:
         return "-"
-    if topic_id == eng.BUS_TOPIC_ID:
-        t = store.get_topic(topic_id)
-        return (t["title"] or "总线").strip() if t is not None else "总线"
     t = store.get_topic(topic_id)
+    if topic_id == eng.BUS_TOPIC_ID:
+        return (t["title"] or "总线").strip() if t is not None else "总线"
     return ((t["title"] or "").strip() or topic_id) if t is not None else topic_id
-
 
 def deliverable(store: Store, topic_id: str) -> bool:
     t = store.get_topic(topic_id) if topic_id else None
     return t is not None and t["state"] != "closed" and (topic_id == eng.BUS_TOPIC_ID or t["kind"] in eng.MANAGED_KINDS)
 
-
 def owner_of(store: Store, item) -> str:
-    """事项现在的负责会话；它收掉了就是总线。"""
     tid = item["owner_topic"] or ""
     return tid if deliverable(store, tid) else eng.BUS_TOPIC_ID
 
-
-# ======================= 链接 =======================
 def _link_host(store: Store) -> str:
-    """链接的域名（applink.larksuite.com / applink.feishu.cn）：按账本里已有的 message_app_link 取，记进 meta 不再查。"""
-    known = store.get_meta("tg_link_host")
-    if known:
+    if known := store.get_meta("tg_link_host"):
         return known
     r = store.conn.execute("SELECT link FROM messages WHERE link LIKE 'https://%/client/%' LIMIT 1").fetchone()
     m = re.match(r"^(https://[^/]+)/client/", r[0]) if r is not None else None
@@ -298,38 +266,102 @@ def _link_host(store: Store) -> str:
     store.set_meta("tg_link_host", m.group(1))
     return m.group(1)
 
-
 def chat_link(store: Store, chat_id: str) -> str:
-    """打开一个聊天的链接：client/chat/open?openChatId=<oc_>。10-17 02:0x Matthew 在真飞书上逐个点过：话题链接
-    （client/thread/open，搜索给的原样、只带两个参数的都一样）打不开，卡片按钮也打不开；chat/open 能打开整个群，
-    带 position 也定位不到那一条。所以只在「从一个聊天跳到另一个聊天」时给链接，跳不进具体话题。"""
-    if not chat_id:
-        return ""
-    return f"{_link_host(store)}/client/chat/open?openChatId={chat_id}"
+    return f"{_link_host(store)}/client/chat/open?openChatId={chat_id}" if chat_id else ""
 
 
-# ======================= 进群：发送这一侧 =======================
+# ======================= 进群：因果路由与发送这一侧（REG-020 ~ REG-022） =======================
 @dataclass
 class SendRoute:
-    """ask / report 带钥匙时去哪：group = 进群里的事项话题（item 为空表示要新开）；否则私聊。note 是给会话看的一句提示。"""
+    """ask / report 去哪：group = 进群里的事项话题（item 为空表示要新开）；否则私聊。"""
     group: bool = False
     item: object = None
+    item_no: int | None = None
+    root_message_id: str = ""
     related: int | None = None
     note: str = ""
 
 
-def route_for_send(cfg, store: Store, topic_id: str, key: str, track: bool) -> SendRoute:
-    """进群入口 1（--track）和「同一把钥匙的新消息都发进群」。"""
-    if not key:
-        return SendRoute()
+def _msg_to_item(store: Store, m):
+    if m is None:
+        return None
+    for tag in json.loads(m["tags_json"] or "[]"):
+        if tag.startswith("item:") and (no := parse_item_no(tag.split(":", 1)[1])) is not None:
+            if (it := store.get_item(no)) is not None and it["state"] != REMOVED:
+                return it
+    rkeys = set(m.keys())
+    for cid in ([m["root_id"]] if "root_id" in rkeys and m["root_id"] else []) + [m["reply_to"], m["message_id"]]:
+        if not cid:
+            continue
+        it = store.item_by_root(cid)
+        if it is None and (s := store.send_by_message(cid)) is not None and s["root_message_id"]:
+            it = store.item_by_root(s["root_message_id"])
+        if it is not None and it["state"] != REMOVED:
+            return it
+    if m["thread_id"]:
+        if (it := store.item_by_thread(m["thread_id"])) is not None and it["state"] != REMOVED:
+            return it
+        for r in store.thread_messages_in_ledger(m["thread_id"]):
+            it = store.item_by_root(r["message_id"]) or (
+                store.item_by_root(s["root_message_id"]) if (s := store.send_by_message(r["message_id"])) and s["root_message_id"] else None)
+            if it is not None and it["state"] != REMOVED:
+                return it
+    return None
+
+
+def resolve_inbound_item(a, b, topic_id: str = "", batch_id: str = ""):
+    """按入站消息来源因果反查话题群事项（REG-020）：当前批次（含 p...）→ 未结清 owner_echoes → 30 分钟内入站话题群消息。"""
+    from .outbound import current_batch
+    cfg, store = _cfg_store(a, b)
+    if not configured(cfg) or not cfg.topic_group.enabled or not topic_id:
+        return None
+    tg_chat = cfg.topic_group.chat_id
+    base = topic_id.split("#", 1)[0]
+    tids = list(dict.fromkeys([topic_id, base, *(t["topic_id"] for t in store.list_topics() if t["topic_id"].split("#", 1)[0] == base)]))
+    marks = ",".join("?" * len(tids))
+    bids: list[str] = []
+    for cand in (batch_id, current_batch(store, topic_id, include_priority=True),
+                 *(t["pending_batch_id"] for tid in tids if (t := store.get_topic(tid)) and t["pending_batch_id"])):
+        if cand and cand not in bids:
+            bids.append(cand)
+    for (bid,) in store.conn.execute(
+            f"SELECT batch_id FROM dispatches WHERE topic_id IN ({marks}) AND state IN ('sending','sent','priority') "
+            "ORDER BY rowid DESC LIMIT 6", tuple(tids)):
+        if bid and bid not in bids:
+            bids.append(bid)
+    for bid in bids:
+        rows = list(store.conn.execute("SELECT * FROM messages WHERE batch_id=? ORDER BY rowid DESC", (bid,)).fetchall())
+        if not rows and (d := store.conn.execute("SELECT message_ids FROM dispatches WHERE batch_id=?", (bid,)).fetchone()) is not None:
+            rows = [r for mid in json.loads(d[0] or "[]") if (r := store.get_message(mid)) is not None]
+        for m in rows:
+            if (m["chat_id"] == tg_chat or '"item:T-' in (m["tags_json"] or "")) and (it := _msg_to_item(store, m)) is not None:
+                return it
+    for (emid,) in store.conn.execute(
+            f"SELECT message_id FROM owner_echoes WHERE chat_id=? AND topic_id IN ({marks}) "
+            "AND settled_at IS NULL AND stage != 'settled' ORDER BY rowid DESC", (tg_chat, *tids)):
+        if (it := _msg_to_item(store, store.get_message(emid)) or store.item_by_root(emid)) is not None and it["state"] != REMOVED:
+            return it
+    cutoff = (eng._now() - timedelta(minutes=30)).isoformat(timespec="seconds")
+    for m in store.conn.execute(
+            f"SELECT * FROM messages WHERE chat_id=? AND topic_id IN ({marks}) AND route!='drop' "
+            "AND COALESCE(create_time, first_seen, '') >= ? ORDER BY COALESCE(create_time, first_seen) DESC, rowid DESC",
+            (tg_chat, *tids, cutoff)).fetchall():
+        if (it := _msg_to_item(store, m)) is not None:
+            return it
+    return None
+
+
+def route_for_send(a, b, topic_id: str, c="", d=False, e=False, *, kind: str = "", title: str = "", batch_id: str = "") -> SendRoute:
+    """进群路由（REG-020 / REG-021）：支持 (cfg, store, topic_id, key, track) 与 (store, cfg, topic_id, kind, key, track, title, batch_id)。"""
+    cfg, store = _cfg_store(a, b)
+    if isinstance(a, Store) and isinstance(d, str) and c in ("ask", "report", ""):
+        kind, key, track = c, d, bool(e)
+    else:
+        key, track = (c or ""), bool(d)
+    key = " ".join((key or "").split())
     if not configured(cfg) or not cfg.topic_group.enabled:
         return SendRoute(note="没配话题群（[topic_group]），--track 不生效，照旧发私聊" if track else "")
-    if down_info(store) is not None:
-        item = find_by_key(store, key)
-        if track or (item is not None and item["state"] != REMOVED):
-            return SendRoute(note="话题群暂时不可用（已退回私聊），这条发进了私聊")
-        return SendRoute()
-    item = find_by_key(store, key)
+    item = find_by_key(store, key) if key else None
     related = None
     if item is not None and item["state"] == REMOVED:
         return SendRoute(note=f"这件事（{label(item['item_no'])}）主人已经移出话题群，照旧发私聊" if track else "")
@@ -337,10 +369,21 @@ def route_for_send(cfg, store: Store, topic_id: str, key: str, track: bool) -> S
         at = _parse(item["archived_at"])
         if at is not None and eng._now() - at > timedelta(days=REOPEN_WITHIN_DAYS):
             related, item = item["item_no"], None
+    if item is None and (inbound := resolve_inbound_item(store, cfg, topic_id, batch_id)) is not None:
+        item = inbound
+        if key:
+            bind_alias_key(store, item["item_no"], key, topic_id)
+        if item["state"] in (DONE, ARCHIVED):
+            reopen(store, item)
+            item = store.get_item(item["item_no"])
     if item is not None:
-        return SendRoute(group=True, item=item)
-    if not track:
+        if down_info(store) is not None and not item["root_message_id"]:
+            return SendRoute(note="话题群暂时不可用（已退回私聊），这条发进了私聊")
+        return SendRoute(group=True, item=item, item_no=item["item_no"], root_message_id=item["root_message_id"] or "")
+    if not key or not track:
         return SendRoute()
+    if down_info(store) is not None:
+        return SendRoute(note="话题群暂时不可用（已退回私聊），这条发进了私聊")
     if store.thread_by_key(topic_id, duty.norm_key(key)) is not None:
         return SendRoute(note="这把钥匙在私聊里已经开过话题，--track 只在第一次用这把钥匙时有效，这条照旧发进私聊的那个话题；"
                               "要放进群请主人在那个话题里回「放群里」")
@@ -357,89 +400,132 @@ SUGGEST_HOW = "在私聊那件事的话题里整句回「放群里」（在私�
 def _grey(text: str) -> str:
     return f"<font color='grey'>{text}</font>"
 
-
 def _name(cfg, store: Store, topic_id: str) -> str:
-    """会话显示名：和「待办」卡片同一套（pending.session_name，去掉 [managed] 这类前缀）。"""
     from .pending import session_name
-    return session_name(cfg, store, topic_id) if topic_id else "-"
-
+    return session_name(cfg, store, topic_id) if (cfg is not None and topic_id) else (topic_id or "-")
 
 def opener_phrase(cfg, store: Store, item) -> str:
-    """标题卡副标题里「谁开的」：会话开的写「<显示名>开的」，主人从私聊搬进来的写「你从私聊放进群」。"""
     if item["origin"] == ORIGIN_MOVE:
         return "你从私聊放进群"
     if item["origin"] == ORIGIN_OWNER or item["opened_by"] == "owner":
         return "你开的"
     return f"{_name(cfg, store, item['opened_by'] or item['owner_topic'] or '')}开的"
 
-
 def title_view(cfg, store: Store, item, opener: str = "", key: str = "") -> dict:
-    """标题卡（话题开头那条，之后永远不改）的内容，卡片和纯文本共用：{title, subtitle, related, footer}。
-    第一行（标题）不会被认成「需要你定」或哪个会话的消息（读回时按 sends 的种类一律丢弃）。"""
-    no = label(item["item_no"])
-    opened = _parse(item["opened_at"])
-    when = opened.astimezone(eng._tz(cfg.timezone_offset)[0]).strftime("%m-%d %H:%M") if opened else ""
-    sub = [f"钥匙 {key}" if key else "", opener or opener_phrase(cfg, store, item), when]
-    related = ""
-    if item["related_item"]:
-        # 同一个群里的另一件事：跳不进话题（见 chat_link），写编号，主人在群里搜编号
-        related = f"可能相关：{label(item['related_item'])}，那件已经归档"
+    no, opened = label(item["item_no"]), _parse(item["opened_at"])
+    when = opened.astimezone(eng._tz(cfg.timezone_offset if cfg else 8)[0]).strftime("%m-%d %H:%M") if opened else ""
+    keys = item_keys(store, item["item_no"])
+    k0 = key or (keys[0] if keys else "")
+    sub = [f"钥匙 {k0}" if k0 else "", opener or opener_phrase(cfg, store, item), when]
+    related = f"可能相关：{label(item['related_item'])}，那件已经归档" if item["related_item"] else ""
     return {"title": f"🗂 {no} · {item['title']}", "subtitle": " · ".join(x for x in sub if x), "related": related,
-            "footer": TITLE_FOOTER}
-
+            "keys": keys, "footer": TITLE_FOOTER}
 
 def title_text(v: dict) -> str:
-    """标题卡的纯文本版（卡片被拒、[notify] owner_card 关着时发它；sends 也记它）。"""
     return "\n".join(x for x in (v["title"], v["subtitle"], v["related"], v["footer"]) if x)
 
-
-def title_card(v: dict) -> dict:
-    """标题卡（Card 2.0）：header 是标题和副标题（钥匙 · 谁开的 · 时间），蓝色；正文只有灰色小字一行（前面可能有「可能相关」）。"""
-    els = []
-    if v["related"]:
-        els.append({"tag": "markdown", "content": v["related"]})
-    els.append({"tag": "markdown", "content": _grey(v["footer"]), "text_size": "notation"})
+def title_card(v: dict, *, template: str = "blue", status_line: str = "", keys_line: str = "") -> dict:
+    els = ([{"tag": "markdown", "content": status_line}] if status_line else []) + (
+        [{"tag": "markdown", "content": keys_line}] if keys_line else []) + (
+        [{"tag": "markdown", "content": v["related"]}] if v["related"] else []) + [
+        {"tag": "markdown", "content": _grey(v["footer"]), "text_size": "notation"}]
     return {"schema": "2.0",
             "header": {"title": {"tag": "plain_text", "content": owner_title(v["title"])},
-                       "subtitle": {"tag": "plain_text", "content": v["subtitle"]}, "template": "blue"},
+                       "subtitle": {"tag": "plain_text", "content": v["subtitle"]}, "template": template},
             "body": {"elements": els}}
+
+def sync_title_card(a, b, source, item_no: int, latest_text: str = "", kind: str = "") -> bool:
+    """REG-022：实时更新话题群首卡（动态状态灯 + 1 行最新进展摘要 + 全部主/别名钥匙列表）。失败仅记 warning，绝不熔断。"""
+    cfg, store = _cfg_store(a, b)
+    item = store.get_item(item_no) if store is not None else None
+    if item is None or not item["root_message_id"] or source is None or not hasattr(source, "patch_card"):
+        return False
+    wait_owner = any(w["state"] == duty.WAITING_OWNER
+                     for k in ({duty.norm_key(x) for x in item_keys(store, item_no)} | {duty.norm_key(label(item_no))})
+                     for w in store.open_work_by_key(k))
+    if item["state"] in (DONE, ARCHIVED) or kind == "done":
+        tpl, badge = "green", "✅ 已结案"
+    elif kind == "ask" or (cfg is not None and open_asks(cfg, store, item)) or wait_owner:
+        tpl, badge = "orange", "⏳ 等你定"
+    else:
+        tpl, badge = "blue", "🔄 跟进中"
+    raw = (latest_text or "").strip()
+    if not raw:
+        sends = [s for s in store.sends_in_thread(item["root_message_id"]) if s["kind"] in ("ask", "report")]
+        raw = sends[-1]["text"] if sends else (item["done_why"] or "")
+    lines = [ln.strip() for ln in plain_text(raw).splitlines() if ln.strip()]
+    body_text = "\n".join(lines[1:]) if len(lines) > 1 and lines[0].startswith(("🐕", "❓", "📋")) else "\n".join(lines)
+    summary_1, v = _excerpt(body_text, 120), title_view(cfg, store, item)
+    v["subtitle"] = " · ".join(x for x in (badge, v["subtitle"]) if x)
+    keys = v.get("keys") or [label(item_no)]
+    card = title_card(v, template=tpl, status_line=f"**{badge}**" + (f" · {summary_1}" if summary_1 else ""),
+                      keys_line=f"🔎 搜索钥匙：{' · '.join(keys)}")
+    try:
+        source.patch_card(item["root_message_id"], card)
+        return True
+    except Exception as e:
+        log.warning("更新事项 %s 标题卡失败（不触发群熔断）: %s", label(item_no), e)
+        return False
+
+def move_from_dm(a, b, source, key: str, *, topic_id: str = "", title: str = ""):
+    """REG-022：把私聊长线事项一键迁移到话题群（幂等：已在群里直接返回原 T-n）。"""
+    cfg, store = _cfg_store(a, b)
+    if not (clean_key := " ".join((key or "").split())):
+        raise ValueError("--key 不能为空")
+    if not configured(cfg) or not cfg.topic_group.enabled:
+        raise ValueError("没配话题群（[topic_group]）或未开启")
+    existing = find_by_key(store, clean_key)
+    if existing is not None and existing["state"] in (ACTIVE, DONE) and existing["root_message_id"]:
+        return existing
+    nk = duty.norm_key(clean_key)
+    thr = (store.thread_by_key(topic_id, nk) if topic_id else None) or store.conn.execute(
+        "SELECT * FROM owner_threads WHERE norm_key=? ORDER BY last_post_at DESC LIMIT 1", (nk,)).fetchone()
+    owner_tid, dm_root = topic_id or (thr["topic_id"] if thr else "") or eng.BUS_TOPIC_ID, (thr["root_message_id"] if thr else "") or ""
+    raw_title = title or (thr["title"] if thr else "") or clean_key
+    clean_title = re.sub(r"^🐕\s*(需要你定|汇报)\s*·\s*", "", raw_title).strip() or clean_key
+    item = existing if (existing is not None and existing["state"] != REMOVED) else open_item(
+        store, clean_title, owner_tid, owner_tid, ORIGIN_MOVE, cfg.topic_group.chat_id,
+        key=clean_key, topic_id=owner_tid, dm_root=dm_root)
+    reopen(store, item)
+    if source is not None and hasattr(source, "send_to_chat"):
+        item = ensure_title(cfg, store, source, item, "", clean_key)
+        sync_title_card(store, cfg, source, item["item_no"], latest_text=clean_title, kind="report")
+        if dm_root and hasattr(source, "reply_to"):
+            no, link = label(item["item_no"]), chat_link(store, cfg.topic_group.chat_id)
+            note = f"📌 这件事已经放进话题群：{no}" + (f"（[打开话题群]({link})，搜 {no}）" if link else "") + "。之后同一把钥匙的消息都发进群里那个话题。"
+            try:
+                post_in_thread(cfg, store, source, dm_root, KIND_MOVED, note, idem(KIND_MOVED, dm_root, no))
+            except Exception as e:
+                log.warning("私聊原话题回迁群提示失败 %s: %s", dm_root, e)
+    return store.get_item(item["item_no"])
 
 
 def post_top(cfg, store: Store, source, kind: str, text: str, ik: str, topic_id: str = "", card: dict | None = None,
              force_card: bool = False) -> dict:
-    """在话题群里发一条顶层消息（就是一个新话题）。返回飞书的 {message_id, chat_id, thread_id}。失败原样抛。"""
     from .outbound import owner_content, send_owner
     if card is not None:
-        # 调用方拼好的卡片：索引卡一律发卡片（force_card，改卡只能改卡片）；标题卡照 [notify] owner_card，太大退回纯文本
         plain, c = text, (card if force_card or (cfg.notify.owner_card and card_fits(card)) else None)
     else:
         plain, c = owner_content(cfg, text)
-        if force_card:
-            c = build_owner_card(text)
+        c = build_owner_card(text) if force_card else c
     chat = cfg.topic_group.chat_id
-    res = send_owner(lambda t, cc: source.send_to_chat(chat, t, ik, "bot", **({"card": cc} if cc is not None else {})),
-                     plain, c)
+    res = send_owner(lambda t, cc: source.send_to_chat(chat, t, ik, "bot", **({"card": cc} if cc is not None else {})), plain, c)
     store.add_send(ik, kind, topic_id, res["message_id"], text, root_message_id=res["message_id"])
     return res
 
 
 def post_in_thread(cfg, store: Store, source, root: str, kind: str, text: str, ik: str, topic_id: str = "",
                    at: bool = False) -> dict:
-    """在一个话题里回一条（--reply-in-thread）。"""
     from .outbound import owner_content, send_owner
-    prev = store.get_send(ik)
-    if prev is not None:
+    if (prev := store.get_send(ik)) is not None:
         return {"message_id": prev["message_id"], "already": True}
     plain, c = owner_content(cfg, text, at=at)
-    res = send_owner(lambda t, cc: source.reply_to(root, identity="bot", idem_key=ik, text=t, card=cc, in_thread=True),
-                     plain, c)
+    res = send_owner(lambda t, cc: source.reply_to(root, identity="bot", idem_key=ik, text=t, card=cc, in_thread=True), plain, c)
     store.add_send(ik, kind, topic_id, res["message_id"], text, root_message_id=root)
     return res
 
 
 def ensure_title(cfg, store: Store, source, item, opener: str = "", key: str = ""):
-    """事项还没有标题卡（刚开、或上次发送超时）：发一张（同一件事防重编号固定，超时重试只发一条）。返回最新的事项行。
-    opener 是副标题里「谁开的」那一段；空 = 按事项的来路现算（opener_phrase）。"""
     if item["root_message_id"]:
         return item
     ik = idem(KIND_TITLE, cfg.topic_group.chat_id, str(item["item_no"]), item["opened_at"] or "")
@@ -453,7 +539,6 @@ def ensure_title(cfg, store: Store, source, item, opener: str = "", key: str = "
 
 
 def learn_thread_id(store: Store, source, item_no: int, root: str) -> str:
-    """发完不知道话题编号（返回里没有）：只读 mget 一次开头那条补上。失败不影响，之后从拉取里补。"""
     fn = getattr(source, "messages_by_id", None)
     if fn is None:
         return ""
@@ -469,93 +554,59 @@ def learn_thread_id(store: Store, source, item_no: int, root: str) -> str:
 
 # ======================= 状态（按证据现算） =======================
 def item_asks(store: Store, item) -> list:
-    """这件事名下会话发过的「需要你定」（escalations 行），按提问时间倒序：群里这个话题里的，加上「放群里」搬进来的事项
-    私聊原话题（dm_root_message_id）里的——私聊里那条提问还开着，这件事就是在等主人定（10-17 01:57 P1C：DEMO-G7 搬进
-    群以后状态算成进行中，主人在群里回的话也认不出是在答它）。"""
-    out = []
-    seen: set[str] = set()
-    n = 0
+    out, seen, n = [], set(), 0
     for root in (item["dm_root_message_id"], item["root_message_id"]):
         if not root:
             continue
         mids = [s["message_id"] for s in store.sends_in_thread(root) if s["kind"] == "ask"]
         if root == item["dm_root_message_id"] and root not in mids:
-            mids.insert(0, root)   # 私聊原话题开头那条本身就是提问（不是经 sheepdog ask 发的、sends 里没有）
+            mids.insert(0, root)
         for mid in mids:
-            if mid in seen:
-                continue
-            seen.add(mid)
-            e = store.get_escalation(mid)
-            if e is not None:
-                out.append((e["asked_at"] or "", n, e))
-            n += 1
-    # 提问时间只到分钟（搜索结果的 create_time）：同一分钟里按发出先后（私聊在前、群里在后，各自按 sends 的顺序）
+            if mid not in seen:
+                seen.add(mid)
+                if (e := store.get_escalation(mid)) is not None:
+                    out.append((e["asked_at"] or "", n, e))
+                n += 1
     out.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return [e for _, _, e in out]
 
 
 def answered_in_flight(store: Store) -> set[str]:
-    """已经有主人的回复（或抄送）带着 escalation:<提问> 排在路上、还没送到会话的提问。它们在送到的那一刻才标「已答」，
-    但在主人眼里已经答了（10-17 00:37 P1C：同一轮读回两条 ask、又拉到主人没引用的回复，话题里多发了一行过时的「等你定」）。"""
-    out: set[str] = set()
-    prefix = eng.ESCALATION_TAG_PREFIX
+    out, prefix = set(), eng.ESCALATION_TAG_PREFIX
     for (tags,) in store.conn.execute(
             "SELECT tags_json FROM messages WHERE route='dispatch' AND COALESCE(dispatch_state,'pending') "
             "IN ('pending','sending','uncertain') AND tags_json LIKE ?", (f'%"{prefix}%',)):
-        for t in json.loads(tags or "[]"):
-            if t.startswith(prefix):
-                out.add(t[len(prefix):])
+        out.update(t[len(prefix):] for t in json.loads(tags or "[]") if t.startswith(prefix))
     return out
 
-
 def open_asks(cfg, store: Store, item) -> list:
-    """这件事里还开着的「需要你定」：没结、没过期，也没有主人的回复正排着要送过去（按这一刻的最终状态算）。"""
-    cutoff = eng._now() - timedelta(hours=cfg.escalation.open_hours)
-    flying = answered_in_flight(store)
+    cutoff, flying = eng._now() - timedelta(hours=cfg.escalation.open_hours), answered_in_flight(store)
     return [e for e in item_asks(store, item) if not e["closed_at"] and e["message_id"] not in flying
             and ((a := _parse(e["asked_at"])) is None or a >= cutoff)]
 
-
 def waiting_other(store: Store, item) -> bool:
     keys = {duty.norm_key(k) for k in item_keys(store, item["item_no"])} | {duty.norm_key(label(item["item_no"]))}
-    for k in keys:
-        for w in store.open_work_by_key(k):
-            if w["state"] == duty.WAITING_OTHER:
-                return True
-    return False
-
+    return any(w["state"] == duty.WAITING_OTHER for k in keys for w in store.open_work_by_key(k))
 
 def status(cfg, store: Store, item, now: datetime | None = None) -> str:
     now = now or eng._now()
-    if item["state"] == ARCHIVED:
-        return S_ARCHIVED
-    if item["state"] == DONE:
-        return S_DONE
+    if item["state"] in (ARCHIVED, DONE):
+        return S_ARCHIVED if item["state"] == ARCHIVED else S_DONE
     if open_asks(cfg, store, item):
         return S_DECIDE
-    asks = item_asks(store, item)
-    if asks and asks[0]["close_reason"] == "expired":
+    if (asks := item_asks(store, item)) and asks[0]["close_reason"] == "expired":
         return S_EXPIRED
     if waiting_other(store, item):
         return S_WAITING
     last = _parse(item["last_activity_at"] or item["opened_at"])
-    if last is not None and now - last >= timedelta(days=cfg.topic_group.stale_after_days):
-        return S_SLEEPING
-    return S_DOING
+    return S_SLEEPING if (last is not None and now - last >= timedelta(days=cfg.topic_group.stale_after_days)) else S_DOING
 
 
 # ======================= 建议放进群（私聊里长期在跟的） =======================
 def suggestions(cfg, store: Store, now: datetime | None = None, owner_chats: list[str] | None = None) -> list[dict]:
-    """私聊话题（7.22 一事一串）里还没进群、最近 [topic_group] suggest_active_hours 小时内有动静（会话往里发，或主人在里面
-    回复）、并且满足任一条的：从开出来到最近一次动静超过 suggest_after_hours 小时；主人在里面回过 suggest_owner_replies 次
-    以上。同一把钥匙（track_norm）只列最近那个话题。按最近动静从新到旧排，全部返回（列几件由 render_index 按 suggest_max 截）。
-    只读。"""
-    g = cfg.topic_group
-    now = now or eng._now()
-    me = cfg.self_open_id
+    g, now, me = cfg.topic_group, now or eng._now(), cfg.self_open_id
     active_from = now - timedelta(hours=g.suggest_active_hours)
     chats = owner_chats if owner_chats is not None else cfg.owner_chat_ids
-    # 最近一次动静要算上主人的回复（owner_threads.last_post_at 只记会话往里发的），所以先不按时间筛，逐个话题算
     rows = store.conn.execute("SELECT * FROM owner_threads WHERE norm_key IS NOT NULL AND key IS NOT NULL "
                               "AND created_at <= ?", (now.isoformat(timespec="seconds"),)).fetchall()
     moved = {r[0] for r in store.conn.execute(
@@ -563,49 +614,37 @@ def suggestions(cfg, store: Store, now: datetime | None = None, owner_chats: lis
     out: dict[str, dict] = {}
     for r in rows:
         nk = track_norm(r["key"])
-        if r["root_message_id"] in moved:
+        if r["root_message_id"] in moved or ((it := find_by_key(store, r["key"])) is not None and it["state"] in (ACTIVE, DONE)):
             continue
-        it = find_by_key(store, r["key"])
-        if it is not None and it["state"] in (ACTIVE, DONE):
-            continue
-        created = _parse(r["created_at"])
-        last = _parse(r["last_post_at"] or r["created_at"])
-        replies: list = []
+        created, last, replies = _parse(r["created_at"]), _parse(r["last_post_at"] or r["created_at"]), []
         if me and r["thread_id"] and chats:
             marks = ",".join("?" * len(chats))
             replies = store.conn.execute(
                 f"SELECT create_time FROM messages WHERE thread_id=? AND sender_id=? AND chat_id IN ({marks}) "
                 "AND create_time <= ?", (r["thread_id"], me, *chats, now.isoformat(timespec="seconds"))).fetchall()
             for x in replies:
-                t = _parse(x["create_time"])
-                if t is not None and (last is None or t > last):
+                if (t := _parse(x["create_time"])) is not None and (last is None or t > last):
                     last = t
         if last is None or last < active_from:
-            continue   # 最近 suggest_active_hours 小时没动静：不列
+            continue
         span = (last - created).total_seconds() / 3600 if created else 0
-        why = []
-        if span >= g.suggest_after_hours:
-            why.append(f"拖了 {span:.0f} 小时")
-        if len(replies) >= g.suggest_owner_replies:
-            why.append(f"你回过 {len(replies)} 次")
+        why = ([f"拖了 {span:.0f} 小时"] if span >= g.suggest_after_hours else []) + (
+            [f"你回过 {len(replies)} 次"] if len(replies) >= g.suggest_owner_replies else [])
         if not why:
             continue
-        cur = out.get(nk)
         cand = {"key": r["key"], "norm_key": nk, "title": r["title"] or r["key"], "topic_id": r["topic_id"],
                 "root_message_id": r["root_message_id"], "thread_id": r["thread_id"] or "", "why": why,
                 "last_at": last.isoformat(timespec="seconds") if last else "", "span_hours": round(span, 1),
                 "owner_replies": len(replies)}
-        if cur is None or cand["last_at"] > cur["last_at"]:
+        if (cur := out.get(nk)) is None or cand["last_at"] > cur["last_at"]:
             out[nk] = cand
     return sorted(out.values(), key=lambda x: x["last_at"], reverse=True)
 
 
 # ======================= 索引卡 =======================
 def build_index(cfg, store: Store, now: datetime | None = None) -> dict:
-    """只读：索引卡的内容（各栏的事项，每件带会话显示名和状态相关的时间）。"""
     from .pending import _hm, waited
-    now = now or eng._now()
-    off = cfg.timezone_offset
+    now, off = now or eng._now(), cfg.timezone_offset
     sections: dict[str, list[dict]] = {k: [] for k in INDEX_ORDER}
     per_session: dict[str, int] = {}
 
@@ -613,11 +652,10 @@ def build_index(cfg, store: Store, now: datetime | None = None) -> dict:
         if dt is None:
             return ""
         m = max(0, int((now - dt).total_seconds() // 60))
-        return f"{m // 1440} 天" if m >= 48 * 60 else waited(m)   # 两天以上按天
+        return f"{m // 1440} 天" if m >= 48 * 60 else waited(m)
 
     for it in store.list_items((ACTIVE, DONE)):
-        st = status(cfg, store, it, now)
-        if st not in sections:
+        if (st := status(cfg, store, it, now)) not in sections:
             continue
         owner = it["owner_topic"] or ""
         if it["state"] == ACTIVE and owner:
@@ -628,11 +666,10 @@ def build_index(cfg, store: Store, now: datetime | None = None) -> dict:
             asked = _parse(e["asked_at"])
             when = f"{_hm(e['asked_at'], now, off)} 问 · 已等 {ago(asked)}" if asked else ""
         elif st == S_EXPIRED:
-            e = item_asks(store, it)[0]
-            when = f"{_hm(e['asked_at'], now, off)} 问 · 已过期没答"
+            when = f"{_hm(item_asks(store, it)[0]['asked_at'], now, off)} 问 · 已过期没答"
         elif st == S_DONE:
             when = f"{_hm(it['done_at'] or '', now, off)} 办完"
-        else:   # 进行中、等别人、沉睡
+        else:
             when = f"最近动静 {ago(last)}前" if last else ""
         sections[st].append({"item_no": it["item_no"], "label": label(it["item_no"]), "title": it["title"],
                              "owner": _name(cfg, store, owner) if owner else "-",
@@ -642,32 +679,26 @@ def build_index(cfg, store: Store, now: datetime | None = None) -> dict:
     sugg = suggestions(cfg, store, now)
     for x in sugg:
         x["name"] = _name(cfg, store, x["topic_id"])
-        # 私聊话题跳不进去（见 chat_link）：打开私聊（找主人聊天），主人在私聊里搜钥匙
         root = store.get_message(x["root_message_id"])
-        x["link"] = chat_link(store, (root["chat_id"] if root is not None else "") or
-                              (cfg.owner_chat_ids[0] if cfg.owner_chat_ids else ""))
+        x["link"] = chat_link(store, (root["chat_id"] if root is not None else "") or (cfg.owner_chat_ids[0] if cfg.owner_chat_ids else ""))
         x["ago"] = ago(_parse(x["last_at"]))
     return {"generated_at": now.isoformat(timespec="seconds"), "sections": sections, "suggest": sugg,
             "per_session": {_name(cfg, store, k): v for k, v in sorted(per_session.items(), key=lambda kv: -kv[1])}}
 
 
 def index_view(cfg, data: dict, rows: int = INDEX_ROWS) -> dict:
-    """给主人看的索引卡，卡片和纯文本共用：{subtitle, n_total, n_decide, sections: [{label, items}], suggest, more_suggest,
-    per_session}。空栏不列。每件 {head: 「T-1 · 标题」, link, meta: 「会话显示名 · 时间」}。"""
     from .pending import _hm
     now = _parse(data["generated_at"]) or eng._now()
     n_total = sum(len(v) for v in data["sections"].values())
     n_decide = len(data["sections"][S_DECIDE])
     secs = []
     for st in INDEX_ORDER:
-        items = data["sections"][st]
-        if not items:
+        if not (items := data["sections"][st]):
             continue
-        shown = [{"head": f"{x['label']} · {_excerpt(x['title'], 40)}", "link": "",   # 索引卡就在群里：不给链接，带编号
+        shown = [{"head": f"{x['label']} · {_excerpt(x['title'], 40)}", "link": "",
                   "meta": " · ".join(y for y in (x["owner"], x["when"]) if y)} for x in items[:rows]]
         secs.append({"label": f"{STATUS_LABEL[st]} · {len(items)} 件", "items": shown, "more": len(items) - len(shown)})
-    sugg = data["suggest"]
-    cap = min(rows, cfg.topic_group.suggest_max)
+    sugg, cap = data["suggest"], min(rows, cfg.topic_group.suggest_max)
     sug = [{"head": _excerpt(s["title"], 40), "link": s.get("link") or "",
             "meta": " · ".join(y for y in (s.get("name") or s["topic_id"].removeprefix("tp_"), f"钥匙 {s['key']}",
                                             "、".join(s["why"]), f"最近动静 {s['ago']}前" if s.get("ago") else "") if y)}
@@ -682,15 +713,11 @@ def _per_session_line(v: dict) -> str:
 
 
 def index_text(v: dict) -> str:
-    """索引卡的纯文本版（sends 记它，对账也按它比）。顺序同卡片。"""
-    lines = [f"{INDEX_TITLE} · {v['subtitle']}"]
-    if not v["sections"]:
-        lines += ["", INDEX_EMPTY]
+    lines = [f"{INDEX_TITLE} · {v['subtitle']}"] + (["", INDEX_EMPTY] if not v["sections"] else [])
     for sec in v["sections"]:
         lines += ["", sec["label"]]
         for x in sec["items"]:
-            lines.append(f"- {x['head']}" + (f"  {x['link']}" if x["link"] else ""))
-            lines.append(f"  {x['meta']}")
+            lines += [f"- {x['head']}" + (f"  {x['link']}" if x["link"] else ""), f"  {x['meta']}"]
         if sec["more"]:
             lines.append(f"- 另有 {sec['more']} 件")
     if v["suggest"]:
@@ -705,11 +732,6 @@ def index_text(v: dict) -> str:
 
 
 def index_card(v: dict) -> dict:
-    """索引卡（Card 2.0），排版同「待办」卡片：header「📌 话题群索引」+ 副标题（几点更新 · 跟踪几件 · 等你定几件），
-    等你定多于 0 件橙色，否则蓝色；只列非空的栏，栏标题加粗；每件两行：加粗的「T-1 · 标题」（不给链接：卡片就在群里，
-    话题链接打不开；「建议放进群」那几件跟「[打开](私聊的 chat/open 链接)」），灰色小字
-    「会话显示名 · 时间」；件与件、栏与栏之间分隔线。全空只写一行「现在没有在跟的事」。「建议放进群」有内容才出现，
-    第一行灰色小字说怎么放。末尾灰色小字说怎么回。"""
     els: list[dict] = []
 
     def rows_of(items: list[dict], more: int) -> None:
@@ -743,19 +765,15 @@ def index_card(v: dict) -> dict:
 
 
 def render_index(cfg, data: dict, rows: int = INDEX_ROWS) -> str:
-    """索引卡的纯文本版（兼容老调用）。"""
     return index_text(index_view(cfg, data, rows))
 
 
 # ======================= 常驻进程每轮（Dispatcher） =======================
 def dispatcher_round(disp) -> dict:
-    """群成员核对、归档、「已交给 …」、话题里的变化说明、索引卡对账。每一步出错只记日志，不挡投递。"""
+    """群成员核对、归档、「已交给 …」、话题里的变化说明、索引卡对账。索引卡异常不触发群熔断（REG-021）。"""
     cfg, store = disp.cfg, disp.store
     out: dict = {}
-    if not configured(cfg) or not cfg.topic_group.enabled:
-        return out
-    source = getattr(disp, "source", None)
-    if source is None:
+    if not configured(cfg) or not cfg.topic_group.enabled or (source := getattr(disp, "source", None)) is None:
         return out
     from .source import SourceError
     from .source.lark import LarkTimeout
@@ -770,7 +788,6 @@ def dispatcher_round(disp) -> dict:
     try:
         for it in store.list_items((ACTIVE,)):
             if not it["root_message_id"] and it["origin"] != ORIGIN_OWNER:
-                # 标题卡上次发送超时（或「放群里」时超时）：同一个防重编号补发，飞书只发一条
                 keys = item_keys(store, it["item_no"])
                 ensure_title(cfg, store, source, it, "", keys[0] if keys else "")
         for it in store.list_items((ACTIVE, DONE, ARCHIVED, REMOVED)):
@@ -778,23 +795,23 @@ def dispatcher_round(disp) -> dict:
                 post_handoff(cfg, store, source, it)
             if it["state"] in (ACTIVE, DONE, ARCHIVED) and it["root_message_id"]:
                 post_change(cfg, store, source, it, now)
-        if index_due(cfg, store, now):
-            out["index"] = refresh_index(cfg, store, source, now)
     except LarkTimeout as e:
         log.warning("话题群发送超时，下一轮重试（同一个防重编号）: %s", e)
     except SourceError as e:
         mark_down(cfg, store, f"往话题群发消息失败：{' '.join(str(e).split())[:200]}")
+        return out
+    if index_due(cfg, store, now):
+        if res := refresh_index(cfg, store, source, now):
+            out["index"] = res
     return out
 
 
 def archive_due(cfg, store: Store, now: datetime) -> int:
-    n = 0
-    hours = cfg.topic_group.archive_after_hours
+    n, hours = 0, cfg.topic_group.archive_after_hours
     for it in store.list_items((DONE,)):
         last = max(filter(None, (_parse(it["done_at"]), _parse(it["last_activity_at"]))), default=None)
         if last is not None and now - last >= timedelta(hours=hours):
-            store.update_item(it["item_no"], state=ARCHIVED, archived_at=now.isoformat(timespec="seconds"),
-                              status=S_ARCHIVED)
+            store.update_item(it["item_no"], state=ARCHIVED, archived_at=now.isoformat(timespec="seconds"), status=S_ARCHIVED)
             mark_dirty(store)
             n += 1
     return n
@@ -803,31 +820,22 @@ def archive_due(cfg, store: Store, now: datetime) -> int:
 def post_handoff(cfg, store: Store, source, item) -> None:
     to = item["handoff_to"]
     text = f"➡️ 已交给「{_name(cfg, store, to)}」"
-    ik = idem(KIND_HANDOFF, str(item["item_no"]), to, item["handoff_at"] or "")
-    post_in_thread(cfg, store, source, item["root_message_id"], KIND_HANDOFF, text, ik)
+    post_in_thread(cfg, store, source, item["root_message_id"], KIND_HANDOFF, text, idem(KIND_HANDOFF, str(item["item_no"]), to, item["handoff_at"] or ""))
     store.update_item(item["item_no"], handoff_to=None)
 
 
 def change_lines(cfg, store: Store, item, st: str) -> list[tuple[str, str]]:
-    """话题里的变化说明（只有三种：重开、等你定、办完）：[(正文, 防重编号的种子)]。别的变化（进行中、等别人、沉睡、过期未定、
-    归档）不发。重开同时又在等你定（同一把钥匙的提问把它重开了），两行都发，先「重开」。"""
-    prev = item["status"] or ""
-    out = []
+    prev, out = item["status"] or "", []
     if prev in (S_DONE, S_ARCHIVED) and st not in (S_DONE, S_ARCHIVED):
         out.append(("🔁 重开", "reopen:" + (item["reopened_at"] or "")))
-    if st == S_DECIDE and prev != S_DECIDE:
-        # 发之前再核一次：那条提问这一刻还开着（没结、没有主人的回复排在路上）才发
-        e = open_asks(cfg, store, item)
-        if e:
-            from .pending import ask_title
-            what = _excerpt(ask_title(cfg, e[0]["text"]), 40)
-            out.append(("🟠 等你定" + (f"：{what}" if what else ""), "decide:" + e[0]["message_id"]))
+    if st == S_DECIDE and prev != S_DECIDE and (e := open_asks(cfg, store, item)):
+        from .pending import ask_title
+        what = _excerpt(ask_title(cfg, e[0]["text"]), 40)
+        out.append(("🟠 等你定" + (f"：{what}" if what else ""), "decide:" + e[0]["message_id"]))
     if st == S_DONE and prev not in (S_DONE, S_ARCHIVED):
-        who = item["done_by"] or ""
-        who = "你" if who == "owner" else _name(cfg, store, who) if who else ""
+        who = "你" if item["done_by"] == "owner" else (_name(cfg, store, item["done_by"]) if item["done_by"] else "")
         why = item["done_why"] or ""
-        out.append(("✅ 办完了" + (f"：{why}" if why else "") + (f"（{who}）" if who else ""),
-                    "done:" + (item["done_at"] or "")))
+        out.append(("✅ 办完了" + (f"：{why}" if why else "") + (f"（{who}）" if who else ""), "done:" + (item["done_at"] or "")))
     return out
 
 
@@ -836,8 +844,7 @@ def post_change(cfg, store: Store, source, item, now: datetime) -> None:
     if st == (item["status"] or ""):
         return
     for text, seed in change_lines(cfg, store, item, st):
-        post_in_thread(cfg, store, source, item["root_message_id"], KIND_CHANGE, text,
-                       idem(KIND_CHANGE, str(item["item_no"]), seed))
+        post_in_thread(cfg, store, source, item["root_message_id"], KIND_CHANGE, text, idem(KIND_CHANGE, str(item["item_no"]), seed))
     store.update_item(item["item_no"], status=st)
     mark_dirty(store)
 
@@ -857,21 +864,20 @@ def index_info(store: Store) -> dict:
         return {}
 
 
-def refresh_index(cfg, store: Store, source, now: datetime) -> str:
-    """对账：内容变了就整张覆盖；还没有、或发出满 13 天就重发一张并置顶。返回做了什么（posted / patched / same）。"""
-    data = build_index(cfg, store, now)
-    rows = INDEX_ROWS
+def refresh_index(cfg, store: Store, source, now: datetime | None = None) -> str:
+    """对账索引卡（REG-021）：patch_card 或新建失败只记 warning 返回空串，绝不调用 mark_down。"""
+    now = now or eng._now()
+    data, rows = build_index(cfg, store, now), INDEX_ROWS
     v = index_view(cfg, data, rows)
     text, card = index_text(v), index_card(v)
-    while not card_fits(card) and rows > 1:   # 太大就每栏少列几件（卡片 30KB 上限）
+    while not card_fits(card) and rows > 1:
         rows = max(1, rows // 2)
         v = index_view(cfg, data, rows)
         text, card = index_text(v), index_card(v)
     info = index_info(store)
-    h = _hash(_strip_time(text))
-    sent = _parse(info.get("sent_at"))
+    h, sent = _hash(_strip_time(text)), _parse(info.get("sent_at"))
 
-    def done(what: str) -> str:   # 发成了（或不用发）才清「要对账」；超时、失败下一轮再来
+    def done(what: str) -> str:
         store.set_meta(META_DIRTY, "")
         store.set_meta(META_REFRESHED, now.isoformat(timespec="seconds"))
         return what
@@ -879,38 +885,43 @@ def refresh_index(cfg, store: Store, source, now: datetime) -> str:
     if info.get("message_id") and sent is not None and now - sent < timedelta(days=INDEX_RENEW_DAYS):
         if info.get("hash") == h:
             return done("same")
-        source.patch_card(info["message_id"], card)
+        try:
+            source.patch_card(info["message_id"], card)
+        except Exception as e:
+            log.warning("索引卡 patch_card 失败（%s，不熔断话题群）: %s", info["message_id"], e)
+            return ""
         info["hash"] = h
         store.set_meta(META_INDEX, json.dumps(info, ensure_ascii=False))
-        log.info("索引卡改了（%s）", info["message_id"])
         return done("patched")
-    # 防重编号：换下来的那张 + 第一次试的时间，发之前记进 meta；发送超时、下一轮重试用同一个编号，飞书只发一条
-    ik = store.get_meta(META_INDEX_PENDING) or idem(KIND_INDEX, cfg.topic_group.chat_id, info.get("message_id") or "",
-                                                     now.isoformat(timespec="minutes"))
+    ik = store.get_meta(META_INDEX_PENDING) or idem(KIND_INDEX, cfg.topic_group.chat_id, info.get("message_id") or "", now.isoformat(timespec="minutes"))
     store.set_meta(META_INDEX_PENDING, ik)
-    res = post_top(cfg, store, source, KIND_INDEX, text, ik, card=card, force_card=True)
+    try:
+        res = post_top(cfg, store, source, KIND_INDEX, text, ik, card=card, force_card=True)
+    except Exception as e:
+        log.warning("发索引卡失败（不熔断话题群）: %s", e)
+        return ""
     store.set_meta(META_INDEX_PENDING, "")
-    mid = res["message_id"]
-    old = info.get("message_id")
-    new = {"message_id": mid, "sent_at": now.isoformat(timespec="seconds"), "hash": h,
-           "thread_id": res.get("thread_id") or "", "previous": old or ""}
-    store.set_meta(META_INDEX, json.dumps(new, ensure_ascii=False))
+    mid, old = res["message_id"], info.get("message_id")
+    store.set_meta(META_INDEX, json.dumps({"message_id": mid, "sent_at": now.isoformat(timespec="seconds"), "hash": h,
+                                           "thread_id": res.get("thread_id") or "", "previous": old or ""}, ensure_ascii=False))
     try:
         source.pin(mid)
     except Exception as e:
         log.warning("置顶索引卡 %s 失败（卡片照样在群里）: %s", mid, e)
     if old:
         retire_index(cfg, store, source, old, mid)
-    log.info("索引卡%s发了一张（%s）", "重" if old else "", mid)
     return done("posted")
 
 
+def sync_index(a, b, source, now: datetime | None = None) -> bool:
+    cfg, store = _cfg_store(a, b)
+    return bool(refresh_index(cfg, store, source, now or eng._now()))
+
+
 def retire_index(cfg, store: Store, source, old: str, new: str) -> None:
-    """换下来的旧索引卡：改成一句「已换新卡」（还在 14 天内能改）；[topic_group] unpin_old_index 开着才取消置顶。"""
     try:
         source.patch_card(old, {"schema": "2.0", "header": {"title": {"tag": "plain_text", "content": INDEX_TITLE},
-                                                            "subtitle": {"tag": "plain_text", "content": "已停用"},
-                                                            "template": "grey"},
+                                                            "subtitle": {"tag": "plain_text", "content": "已停用"}, "template": "grey"},
                                 "body": {"elements": [{"tag": "markdown", "content": _grey("这张已停用，请看群里最新置顶的那张索引卡")}]}})
     except Exception as e:
         log.warning("改旧索引卡 %s 失败: %s", old, e)
@@ -922,20 +933,14 @@ def retire_index(cfg, store: Store, source, old: str, new: str) -> None:
 
 
 def _strip_time(text: str) -> str:
-    """对账比内容时不算第一行（对账时间每次都不一样）。"""
     return text.partition("\n")[2]
 
 
 # ======================= 群成员 =======================
 def check_members(cfg, store: Store, source, now: datetime | None = None) -> str:
-    """每 MEMBER_CHECK_MINUTES 分钟查一次群成员：机器人或主人不在 → 退回私聊；都在 → 恢复；有别人 → 私聊提醒（每人一次）。
-    查询本身失败只记日志（不知道就不改状态）。"""
     now = now or eng._now()
     last = _parse(store.get_meta(META_MEMBERS_AT))
-    if last is not None and now - last < timedelta(minutes=MEMBER_CHECK_MINUTES):
-        return ""
-    fn = getattr(source, "chat_members", None)
-    if fn is None:
+    if (last is not None and now - last < timedelta(minutes=MEMBER_CHECK_MINUTES)) or (fn := getattr(source, "chat_members", None)) is None:
         return ""
     store.set_meta(META_MEMBERS_AT, now.isoformat(timespec="seconds"))
     chat = cfg.topic_group.chat_id
@@ -949,13 +954,8 @@ def check_members(cfg, store: Store, source, now: datetime | None = None) -> str
     from . import identity as ident
     bot_ids = {x for x in (cfg.identity.bot_open_id or store.get_meta(ident.META_OPEN_ID),
                            cfg.identity.bot_app_id or store.get_meta(ident.META_APP_ID)) if x}
-    missing = []
-    if me and me not in users:
-        missing.append("主人")
-    if bot_ids and not (bot_ids & bots):
-        missing.append("机器人")
-    others = sorted(u for u in users if u != me)
-    if others:
+    missing = (["主人"] if me and me not in users else []) + (["机器人"] if bot_ids and not (bot_ids & bots) else [])
+    if others := sorted(u for u in users if u != me):
         warn_strangers(cfg, store, others, "进了话题群")
     if missing:
         mark_down(cfg, store, f"话题群（{chat}）里没有{'和'.join(missing)}")
@@ -965,13 +965,11 @@ def check_members(cfg, store: Store, source, now: datetime | None = None) -> str
 
 
 def warn_strangers(cfg, store: Store, people: list[str], what: str) -> list[str]:
-    """有别人进群 / 在群里说话：私聊提醒主人（每个人只提醒一次），那人说的话不分派。返回这次提醒了谁。"""
     try:
         seen = set(json.loads(store.get_meta(META_STRANGERS) or "[]"))
     except json.JSONDecodeError:
         seen = set()
-    new = [p for p in people if p and p not in seen]
-    if not new:
+    if not (new := [p for p in people if p and p not in seen]):
         return []
     store.set_meta(META_STRANGERS, json.dumps(sorted(seen | set(new))))
     names = "、".join(f"{store.person_name(p) or p}（{p}）" for p in new)
@@ -980,10 +978,8 @@ def warn_strangers(cfg, store: Store, people: list[str], what: str) -> list[str]
     return new
 
 
-# ======================= 转交（forward / 总线开专属会话） =======================
+# ======================= 转交与只读列表 =======================
 def on_forward(store: Store, topic_id: str, rows: list, cli: str = "sheepdog") -> list[int]:
-    """转交的消息属于某件事项（话题群里那件事的开头那条、或在它的话题里）：负责会话改成目标会话，在话题里说一句「已交给 …」
-    （常驻进程下一轮发），给目标会话一条说明：这件事的编号当钥匙用。返回改了哪些事项。"""
     done: list[int] = []
     for r in rows:
         item = store.item_by_root(r["message_id"]) or (store.item_by_thread(r["thread_id"]) if r["thread_id"] else None)
@@ -994,29 +990,22 @@ def on_forward(store: Store, topic_id: str, rows: list, cli: str = "sheepdog") -
             continue
         store.update_item(item["item_no"], owner_topic=topic_id, handoff_to=topic_id, handoff_at=now_iso())
         mark_dirty(store)
-        no = label(item["item_no"])
-        keys = [k for k in item_keys(store, item["item_no"])]
+        no, keys = label(item["item_no"]), item_keys(store, item["item_no"])
         from .prompts import with_cli
         store.add_system_message(
             topic_id, "topic_group", with_cli(
             f"🗂 这件事在话题群里是事项 {no}「{item['title']}」，现在由你负责。找主人时用 `sheepdog ask / report --topic "
             f"{topic_id} --key {no} …`，消息会发进群里这个话题" + (f"（它也认钥匙 {'、'.join(keys)}）" if keys else "")
             + f"；你自己另有钥匙就用 `sheepdog track alias --topic {topic_id} --item {no} --key <你的钥匙>` 登记成别名。"
-            f"办完用 `sheepdog track done --topic {topic_id} --key {no} --why \"<依据>\"`。", cli),
-            [f"item:{no}"])
-        log.info("事项 %s 转交给 %s", no, topic_id)
+            f"办完用 `sheepdog track done --topic {topic_id} --key {no} --why \"<依据>\"`。", cli), [f"item:{no}"])
     return done
 
 
-# ======================= 只读：给命令行看 =======================
 def list_lines(cfg, store: Store, include_all: bool = False) -> list[str]:
-    states = (ACTIVE, DONE, ARCHIVED, REMOVED) if include_all else (ACTIVE, DONE)
-    out = []
-    now = eng._now()
+    states, out, now = ((ACTIVE, DONE, ARCHIVED, REMOVED) if include_all else (ACTIVE, DONE)), [], eng._now()
     for it in store.list_items(states):
         st = status(cfg, store, it, now) if it["state"] != REMOVED else REMOVED
         keys = item_keys(store, it["item_no"])
         out.append(f"{label(it['item_no'])} [{STATUS_LABEL.get(st, '已移出')}] {it['title']} · 负责 {it['owner_topic'] or '-'}"
-                   + (f" · 钥匙 {'、'.join(keys)}" if keys else "") + f" · {ORIGIN_LABEL.get(it['origin'], it['origin'])}"
-                   )
+                   + (f" · 钥匙 {'、'.join(keys)}" if keys else "") + f" · {ORIGIN_LABEL.get(it['origin'], it['origin'])}")
     return out

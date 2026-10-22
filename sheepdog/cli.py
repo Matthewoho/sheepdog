@@ -2392,30 +2392,34 @@ def cmd_track(args) -> int:
 
 
 def cmd_topic_group(args) -> int:
-    """sheepdog topic-group create（7.51）：建话题群。--dry-run 只打印要调的 lark-cli 命令；真建群由上线脚本在主人授权后跑。
-    群主是主人，机器人当管理员，只有群主和管理员能拉人。建完把 chat_id 写进配置 [topic_group]。"""
+    """sheepdog topic-group（7.51 / 7.74）：建群（create）、看状态（status）、从私聊迁入（move）。"""
     import shlex as _sh
     cfg = _load_cfg()
     if args.tg == "status":
         print(topic_group_report(cfg, Store(cfg.db_path)))
         return 0
-    me = cfg.self_open_id
-    if not me:
+    if args.tg == "move":
+        from . import topicgroup as tg
+        store, source = Store(cfg.db_path), _source(cfg)
+        tid = _topic_arg(args.topic) if getattr(args, "topic", "") else ""
+        try:
+            it = tg.move_from_dm(cfg, store, source, args.key, topic_id=tid, title=getattr(args, "title", "") or "")
+        except Exception as e:
+            print(f"topic-group move 失败: {e}", file=sys.stderr)
+            return 2
+        print(f"已迁入话题群：{tg.label(it['item_no'])}「{it['title']}」（root={it['root_message_id'] or '-'}）")
+        return 0
+    if not (me := cfg.self_open_id):
         print("topic-group create 没做: 配置里没有 self_open_id，不知道群主是谁", file=sys.stderr)
         return 2
-    name = args.name.strip()
-    create = ["im", "+chat-create", "--chat-mode", "topic", "--type", "private", "--name", name, "--owner", me,
+    create = ["im", "+chat-create", "--chat-mode", "topic", "--type", "private", "--name", args.name.strip(), "--owner", me,
               "--users", me, "--set-bot-manager", "--format", "json"]
     perm = {"add_member_permission": "only_owner", "share_card_permission": "not_allowed"}
     update = ["im", "chats", "update", "--params", '{"chat_id":"<CHAT_ID>"}', "--data", json.dumps(perm), "--yes"]
     if args.dry_run:
-        print("# 1. 建话题群（机器人身份；群主 = 主人，机器人当管理员）")
-        print(" ".join(_sh.quote(x) for x in ["lark-cli", *create, "--as", "bot"]))
-        print("# 2. 只有群主和管理员能拉人（im chats update 是 high-risk-write，要 --yes；schema 写着只支持 chat_mode = group 的群，"
-              "话题群要在真飞书上核）")
-        print(" ".join(_sh.quote(x) for x in ["lark-cli", *update, "--as", "bot"]))
-        print("# 3. 把第 1 步返回的 chat_id 写进配置：")
-        print('[topic_group]\nenabled = true\nchat_id = "<CHAT_ID>"')
+        print("# 1. 建话题群（机器人身份；群主 = 主人，机器人当管理员）\n" + " ".join(_sh.quote(x) for x in ["lark-cli", *create, "--as", "bot"]))
+        print("# 2. 只有群主和管理员能拉人\n" + " ".join(_sh.quote(x) for x in ["lark-cli", *update, "--as", "bot"]))
+        print('# 3. 把第 1 步返回的 chat_id 写进配置：\n[topic_group]\nenabled = true\nchat_id = "<CHAT_ID>"')
         return 0
     src = LarkCliSource(tz=cfg.timezone_offset)
     try:
@@ -2423,14 +2427,12 @@ def cmd_topic_group(args) -> int:
     except Exception as e:
         print(f"建群失败: {e}", file=sys.stderr)
         return 1
-    chat = src._find(data, "chat_id") or ""
-    if not chat:
+    if not (chat := src._find(data, "chat_id") or ""):
         print(f"建群没返回 chat_id: {json.dumps(data, ensure_ascii=False)[:300]}", file=sys.stderr)
         return 1
     print(f"已建话题群：{chat}")
     try:
-        src._run_once(["im", "chats", "update", "--params", json.dumps({"chat_id": chat}), "--data", json.dumps(perm),
-                       "--yes"], "bot")
+        src._run_once(["im", "chats", "update", "--params", json.dumps({"chat_id": chat}), "--data", json.dumps(perm), "--yes"], "bot")
         print("已设成只有群主和管理员能拉人")
     except Exception as e:
         print(f"⚠ 设「只有群主和管理员能拉人」失败（话题群可能不支持 im chats update，在群设置里手动改）：{e}")
@@ -2710,7 +2712,6 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--key", default="", help="说的是哪件活")
     sp.add_argument("--quote", default="", help="要转达的主人原话（核对同 forward）")
     sp.set_defaults(func=cmd_tell)
-
     sp = sub.add_parser("notices", help="给主人的通知：没发出去的；人工重发 / 确认已处理")
     sp.add_argument("--all", action="store_true", help="列最近的全部通知（含已发的）")
     sp.add_argument("--limit", type=int, default=50)
@@ -2719,12 +2720,10 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--retry", metavar="N|all", help="没发出去的回到待发（2 小时重新算），常驻进程下一轮重发")
     g.add_argument("--ack", metavar="N|all", help="确认已处理：不再提示、不再重发")
     sp.set_defaults(func=cmd_notices)
-
     sp = sub.add_parser("board", help="羊群看板：各会话在干什么")
     sp.add_argument("--topic", default="", help="只看这个会话（附最近回执和动作）")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_board)
-
     for name, what in (("ask", "需要主人定的事"), ("report", "向主人汇报")):
         sp = sub.add_parser(name, help=f"经机器人私聊主人：{what}（sheepdog 加开头一行；带 --key 的同一件事归到一个话题里）")
         sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
@@ -2744,7 +2743,6 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--floor", default="", help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
             sp.add_argument("--options", default="", help="显式指定卡片按钮选项（如 'A:同意发布|B:暂缓'、'auto' 或 'none'）")
         sp.set_defaults(func=cmd_ask)
-
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
     g = sp.add_mutually_exclusive_group(required=True)
@@ -2767,14 +2765,12 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.add_argument("--even-if-owner-replied", action="store_true", help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
     sp.set_defaults(func=cmd_reply)
-
     sp = sub.add_parser("thread", help="只读：列出一个话题的全部消息")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("--key", help="钥匙（ask / report 带这把 --key 发过）")
     g.add_argument("--thread", help="话题编号 omt_…（或开头那条的 om_）")
     sp.set_defaults(func=cmd_thread)
-
     sp = sub.add_parser("track", help="话题群里的事项（7.51）：办完、登记别名、列出")
     tsub = sp.add_subparsers(dest="track", required=True)
     t = tsub.add_parser("done", help="这件事办完了（只认明确的命令）；牧羊犬在话题里补一行并更新索引卡")
@@ -2788,13 +2784,16 @@ def main(argv: list[str] | None = None) -> int:
     t = tsub.add_parser("list", help="只读：话题群里跟踪中的事项和状态")
     t.add_argument("--all", action="store_true", help="含已归档、已移出的")
     sp.set_defaults(func=cmd_track)
-
-    sp = sub.add_parser("topic-group", help="话题群（7.51）：建群（create，--dry-run 只打印命令）、看状态（status）")
+    sp = sub.add_parser("topic-group", help="话题群（7.51 / 7.74）：建群（create）、看状态（status）、从私聊迁入（move）")
     gsub = sp.add_subparsers(dest="tg", required=True)
     g = gsub.add_parser("create", help="建话题群：群主是主人、机器人当管理员、只有群主和管理员能拉人")
     g.add_argument("--name", default="🐕 牧羊犬 · 长期跟踪", help="群名")
     g.add_argument("--dry-run", action="store_true", help="只打印要调的 lark-cli 命令，不建群")
     gsub.add_parser("status", help="只读：配没配、开没开、是不是退回私聊了")
+    gm = gsub.add_parser("move", help="把私聊长线事项一键迁移到话题群（7.74 REG-022）")
+    gm.add_argument("--key", required=True, help="要迁移的私聊话题钥匙")
+    gm.add_argument("--topic", default="", help="可选：负责会话（tp_x）")
+    gm.add_argument("--title", default="", help="可选：指定事项标题")
     sp.set_defaults(func=cmd_topic_group)
 
     sp = sub.add_parser("lamb", help="羔羊管理（7.63 / 7.72）：准备任务单、登记 subagent、派生后台 CLI 子进程、标记完工、查看、取消")
