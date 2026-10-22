@@ -269,3 +269,12 @@
 | 7.72 | 母羊直接把生产命令/密钥/URL 塞进 `invoke_subagent.Task` 触发宿主 Conseca `pre-tool hook` 拦截：未通过 `sheepdog lamb prepare` 将详细任务落盘至 `lamb_tasks/<lamb_id>.md` 并输出零敏感文件指针 `subagent_prompt` 与预登记 `running` 羔羊（REG-014） | `test_lamb_772.Lamb772Test.test_reg_014_lamb_prepare_writes_spec_file_and_emits_zero_sensitive_pointer_prompt` |
 | 7.72 | 母羊单轮独自串行执行 $\ge 6$ 步业务工具且耗时 $\ge 90$ 秒、未派生任何羔羊卸锁时，`sheepdog receipt` 未记录 `monolithic_turn` 审计并输出并发守卫告警，或误伤已派羔羊/轻活批次（REG-015） | `test_lamb_772.Lamb772Test.test_reg_015_monolithic_parent_turn_without_lamb_triggers_receipt_guard` |
 | 7.72 | 单人私聊羊圈 `running` 态被 30 分钟窗口无限吸附导致慢任务期间新消息无法溢出到 `#2`（缺少 `90s` 连发微窗口 vs `180s` 租约上限双时间窗解耦）、同羊圈缺少兄弟在跑羔羊与最近收发快照注入，或恢复 `max_sessions` 后 `sync_roster` 未重开 `closed` 副槽位并收敛已落盘回执（REG-016） | `test_session_group.SessionGroupTest.test_reg_016_p2p_dual_window_and_group_context_snapshot_and_reopen`、`test_lamb_772.Lamb772Test.test_reg_016_render_group_peer_status_renders_snapshot` |
+
+## 7.73 飞书交互式卡片回调（ABCDE 按钮 + 其他输入表单、双层幂等与双锚点零错路由，REG-017 ~ REG-019）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.73 | `sheepdog ask` 决策卡片未自动提取或按 `--options` 注入 Card JSON 2.0 选项按钮（A~E `behaviors: [{type: "callback", value: {...}}]`）与根节点「其他：可输入」表单（`form` + `input` + `submit button`），或误把代码块内内容当选项、点击后未将卡片原地回写为绿头 `✅ 已拍板` 卡片（REG-017） | `test_card_callback_unit.CardCallbackUnitTest.test_reg_017_parse_ask_options_auto_and_explicit`、`test_card_callback_unit.CardCallbackUnitTest.test_reg_017_ask_card_renders_buttons_and_other_form_and_updates_card`、`test_card_callback_unit.CardCallbackUnitTest.test_reg_017_cli_ask_options_and_callback_unit_guards` |
+| 7.73 | `BotEventConsumer` 未同时常驻消费 `im.message.receive_v1` 与 `card.action.trigger` 双事件流、卡片回调未落盘 `messages` 表（`sd_card_cb_<event_id>`）并触发 `patch_card` 与 `answer_escalation`，或同一 `event_id` WebSocket 重推 / 主人连点同一张卡片两次导致重复改卡、重复投递（REG-018） | `test_card_callback_e2e.CardCallbackE2ETest.test_reg_018_bot_events_consumes_card_action_and_persists_message`、`test_card_callback_e2e.CardCallbackE2ETest.test_reg_018_duplicate_click_and_replay_idempotent_single_dispatch`、`test_card_callback_unit.CardCallbackUnitTest.test_reg_018_and_019_other_form_and_closed_slot_revival` |
+| 7.73 | 群内非主人点击审批卡未被拦截为 `card_callback_non_owner` `drop`，或多会话与羊圈副槽位（如 `tp_laohu#2`）并存时点击按钮 / 提交「其他」表单串线到别的会话或 `tp_bus`、`running` 态未触发 `priority` 插话秒级送达（REG-019） | `test_card_callback_e2e.CardCallbackE2ETest.test_reg_019_dual_anchor_routes_exact_session_and_rejects_non_owner`、`test_card_callback_unit.CardCallbackUnitTest.test_reg_018_and_019_other_form_and_closed_slot_revival` |
+

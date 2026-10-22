@@ -511,6 +511,10 @@ class Collector:
 
     def _decide(self, m: Message, ctx: RouteContext):
         """路由 → 名册归属 → 等待归属 → 防循环。返回 (决策, topic_id, 命中的等待)；等待由调用方在安全闸之后关闭。"""
+        if isinstance(m.raw, dict) and m.raw.get("_sd_card_callback") and m.reply_to:
+            d = self._escalation_message(m)
+            r = self.store.get_message(m.message_id)
+            return d, (r["topic_id"] if r else None), None
         d, topic_id, w = self._decide_inner(m, ctx)
         if d.route == SELF:
             return d, topic_id, w
@@ -622,16 +626,8 @@ class Collector:
         if w:
             return RouteDecision(DISPATCH, d.reason, [*d.tags, f"watch:{w['id']}"]), w["topic_id"], w
         if d.route == DISPATCH and topic_id and d.reason != "owner_context":
-            topic_id = route_within_group(
-                self.store,
-                self.roster,
-                topic_id,
-                chat_id=m.chat_id,
-                root_id=m.root_id,
-                reply_to_msg_id=m.reply_to,
-                thread_id=m.thread_id,
-                sender_id=m.sender_id,
-            )
+            topic_id = route_within_group(self.store, self.roster, topic_id, chat_id=m.chat_id, root_id=m.root_id,
+                                          reply_to_msg_id=m.reply_to, thread_id=m.thread_id, sender_id=m.sender_id)
         return d, topic_id, None
 
     def _secure(self, message_id: str) -> str:
@@ -736,7 +732,7 @@ class Collector:
                 continue
             if existing is None and me and m.sender_id == me:
                 self._own_message(m)
-            if existing is None and m.chat_id in esc_chats:
+            if existing is None and (m.chat_id in esc_chats or (isinstance(m.raw, dict) and m.raw.get("_sd_card_callback"))):
                 d = self._escalation_message(m)
                 if rb:
                     self.store.set_received_by(m.message_id, rb)
@@ -936,15 +932,20 @@ class Collector:
         """取机器人身份这期间收到的事件，入账（received_by = bot）。没开 / 没起接收返回 None。"""
         if self.bot_events is None or not self.cfg.identity.enabled:
             return None
+        from . import card_callback
         raws = self.bot_events.poll()
-        msgs = [parse_event(r, self.cfg.timezone_offset) for r in raws]
-        msgs = [m for m in msgs if m.message_id]
         only = set(self.cfg.source.only_chat_ids)
-        if only:
-            msgs = [m for m in msgs if m.chat_id in only]
-        if not msgs:
+        msgs, card_msgs = [], []
+        for r in raws:
+            if card_callback.is_card_action_event(r):
+                m = card_callback.process_card_action_event(r, cfg=self.cfg, store=self.store, source=self.source)
+                if m is not None and (not only or m.chat_id in only):
+                    card_msgs.append(m)
+            elif (m := parse_event(r, self.cfg.timezone_offset)).message_id and (not only or m.chat_id in only):
+                msgs.append(m)
+        if not msgs and not card_msgs:
             return {"fetched": 0}
-        msgs = self._enrich_bot_events(msgs)
+        msgs = (self._enrich_bot_events(msgs) if msgs else []) + card_msgs
         self._fill_chat_names(msgs)
         return self.ingest(msgs, received_by=identity.BOT)
 
@@ -1047,13 +1048,8 @@ class Collector:
             s_own = owner[0]
             if s_own.group_id:
                 aff = self.store.find_recent_thread_topic_in_group(
-                    s_own.group_id,
-                    chat_id=chat_id,
-                    root_id=m.root_id,
-                    reply_to_msg_id=m.reply_to,
-                    thread_id=m.thread_id,
-                    sender_id=m.sender_id,
-                )
+                    s_own.group_id, chat_id=chat_id, root_id=m.root_id, reply_to_msg_id=m.reply_to,
+                    thread_id=m.thread_id, sender_id=m.sender_id)
                 if aff:
                     return aff
             return s_own.topic_id
@@ -1091,15 +1087,10 @@ class Collector:
         if called:
             if not topic_id:
                 topic_id = BUS_TOPIC_ID
-                note = with_cli(
-                    "📮 主人在没有固定归属会话的聊天里点名了 sheepdog。"
-                    f"判断该谁处理后用 `sheepdog forward --topic <会话> --message-ids {m.message_id}` 转交"
-                    "（没有合适的就新开）；主人明说让总线自己做才自己做。",
-                    self.cfg.cli_command,
-                )
-            self.store.route_owner_instruction(
-                m.message_id, topic_id, [OWNER_INSTRUCTION, OWNER_MENTION_TAG], note
-            )
+                note = with_cli("📮 主人在没有固定归属会话的聊天里点名了 sheepdog。"
+                                f"判断该谁处理后用 `sheepdog forward --topic <会话> --message-ids {m.message_id}` 转交"
+                                "（没有合适的就新开）；主人明说让总线自己做才自己做。", self.cfg.cli_command)
+            self.store.route_owner_instruction(m.message_id, topic_id, [OWNER_INSTRUCTION, OWNER_MENTION_TAG], note)
             log.info("主人在聊天里点名 sheepdog %s：升格为指令送给 %s", m.message_id, topic_id)
             return True
         if not topic_id:
@@ -1155,16 +1146,9 @@ class Collector:
             topic_id, how = g["topic"], g["source"]
             note = self._group_note(g, m, "主人的指令")
         elif self.roster is not None and (owner := self.roster.owner_of(m.chat_id)) is not None:
-            topic_id = route_within_group(
-                self.store,
-                self.roster,
-                owner[0].topic_id,
-                chat_id=m.chat_id,
-                root_id=m.root_id,
-                reply_to_msg_id=m.reply_to,
-                thread_id=m.thread_id,
-                sender_id=m.sender_id,
-            )
+            topic_id = route_within_group(self.store, self.roster, owner[0].topic_id, chat_id=m.chat_id,
+                                          root_id=m.root_id, reply_to_msg_id=m.reply_to, thread_id=m.thread_id,
+                                          sender_id=m.sender_id)
             how = "roster_chat"
         elif m.chat_id in self._dynamic:
             topic_id, how = self._dynamic[m.chat_id][0], "dynamic_chat"
@@ -1474,6 +1458,17 @@ class Collector:
         """先于普通路由，不受 ignore_chat_ids 影响。三种结果：登记提问 / 主人的回复 / 其他一律 drop。
         7.51：话题群（[topic_group] chat_id）在入口就分开，走自己的分支（_topic_group_message），不进私聊那套「没引用就猜」。"""
         me = self.cfg.self_open_id
+        if isinstance(m.raw, dict) and m.raw.get("_sd_card_callback") and m.reply_to:
+            d = self._owner_reply(m)
+            from . import topicgroup as tg
+            s = self.store.send_by_message(m.reply_to)
+            item = self.store.item_by_root(m.reply_to) or (
+                self.store.item_by_root(s["root_message_id"]) if s and s["root_message_id"] else None)
+            if item is not None:
+                tg.touch(self.store, item["item_no"])
+                tg.mark_dirty(self.store)
+            self._echo_record(m, d.reason)
+            return d
         if self._in_topic_group(m.chat_id):
             d = self._topic_group_message(m)
             if me and m.sender_id == me and d.route == DISPATCH and d.reason in ECHO_REQUEST_REASONS:
@@ -1683,7 +1678,7 @@ class Collector:
         列表，由总线判断转给谁；是在回答某一条就由总线 forward --answers。路由这一层不猜、不关任何提问。
         不走安全闸（发送人已由 IM 账号核实）。"""
         opens = open_escalations(self.store, self.cfg.escalation.open_hours)  # 按提问时间倒序
-        tags = [OWNER_VERIFIED_TAG]
+        tags = [OWNER_VERIFIED_TAG, *(["card_callback"] if isinstance(m.raw, dict) and m.raw.get("_sd_card_callback") else [])]
         d = RouteDecision(DISPATCH, OWNER_REPLY, tags)
         if not m.reply_to and m.thread_id and not is_thread_root(m):
             # 7.22：在话题里回复（话题里的消息没有 parent_id）：按话题找会话，不当成没引用去猜
@@ -2333,7 +2328,7 @@ class Collector:
 
     def _tag_read_status(self) -> None:
         ids = [r["message_id"] for r in self.store.pending_dispatch()
-               if not r["message_id"].startswith(SYSTEM_ID_PREFIX)] + self.store.unread_inbox_ids()
+               if not r["message_id"].startswith((SYSTEM_ID_PREFIX, "sd_card_cb_"))] + self.store.unread_inbox_ids()
         if not ids:
             return
         try:
@@ -3641,6 +3636,8 @@ class Dispatcher:
             lines += [last["relay_summary"] or "（回执没写说明）",
                       f"状态：{RELAY_STATUS_LABEL.get(last['relay_status'], last['relay_status'] or '已处理')}"]
             anchor = "" if dest == "new" else rows[-1]["message_id"]
+            if anchor.startswith("sd_card_cb_"):
+                anchor = (self.store.get_message(anchor) or {"reply_to": ""})["reply_to"] or ""
             in_thread = dests[dest] and bool(anchor)
             ids = [e["message_id"] for e in rows]
 

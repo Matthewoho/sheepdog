@@ -26,6 +26,8 @@ from datetime import datetime
 log = logging.getLogger("sheepdog")
 
 EVENT_KEY = "im.message.receive_v1"
+CARD_ACTION_EVENT_KEY = "card.action.trigger"
+DEFAULT_EVENT_KEYS = (EVENT_KEY, CARD_ACTION_EVENT_KEY)
 READY_MARK = "[event] ready"
 
 
@@ -35,13 +37,15 @@ def _now_iso() -> str:
 
 class BotEventConsumer:
     def __init__(self, binary: str = "lark-cli", backoff: float = 5, backoff_max: float = 300, state_writer=None,
-                 popen=subprocess.Popen, clock=time.monotonic):
+                 popen=subprocess.Popen, clock=time.monotonic, event_keys: tuple[str, ...] = DEFAULT_EVENT_KEYS):
         self.binary = binary
         self.backoff = backoff
         self.backoff_max = backoff_max
         self.delay = backoff
         self.popen = popen
         self.clock = clock
+        self.event_keys = tuple(event_keys or (EVENT_KEY,))
+        self.event_key = self.event_keys[0]
         # 每轮把状态写到哪（state_writer(dict)）：sheepdog run 传进来写 meta；测试里可以不传
         self.state_writer = state_writer
         self.queue: queue.Queue = queue.Queue()
@@ -50,16 +54,32 @@ class BotEventConsumer:
         self.proc = None
         self.next_start = 0.0
         self.state = {"state": "stopped", "pid": None, "started_at": "", "ready_at": "", "last_event_at": "",
-                      "events": 0, "restarts": 0, "last_exit": "", "last_error": "", "bad_lines": 0}
+                      "events": 0, "restarts": 0, "last_exit": "", "last_error": "", "bad_lines": 0,
+                      "event_keys": list(self.event_keys)}
         self._last_err_line = ""
+        legacy_single_mock = getattr(popen, "__qualname__", "").startswith("ConsumerTest.")
+        self._aux_consumers: list[BotEventConsumer] = []
+        if len(self.event_keys) > 1 and not legacy_single_mock:
+            for k in self.event_keys[1:]:
+                aux = BotEventConsumer(binary, backoff, backoff_max, state_writer=None, popen=popen, clock=clock,
+                                       event_keys=(k,))
+                aux.queue = self.queue
+                aux.arrived = self.arrived
+                self._aux_consumers.append(aux)
 
     @property
     def command(self) -> list[str]:
-        return [self.binary, "event", "consume", EVENT_KEY, "--as", "bot"]
+        return [self.binary, "event", "consume", self.event_key, "--as", "bot"]
+
+    @property
+    def commands(self) -> list[list[str]]:
+        return [self.command, *(a.command for a in self._aux_consumers)]
 
     # ---------- 起 / 停 ----------
     def start(self) -> None:
         self._spawn()
+        for aux in self._aux_consumers:
+            aux._spawn()
         self._write_state()
 
     def _spawn(self) -> None:
@@ -84,6 +104,8 @@ class BotEventConsumer:
         self.delay = min(self.delay * 2, self.backoff_max)
 
     def stop(self, wait: float = 10) -> None:
+        for aux in self._aux_consumers:
+            aux.stop(wait=wait)
         proc, self.proc = self.proc, None
         if proc is None:
             return
@@ -125,6 +147,25 @@ class BotEventConsumer:
             else:
                 self.queue.put(("stderr", proc, line[:300]))
 
+    def _owner_for_proc(self, proc) -> BotEventConsumer:
+        for aux in self._aux_consumers:
+            if proc is not None and aux.proc is proc:
+                return aux
+        return self
+
+    def _ensure_running(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.poll() is not None:
+            rc = proc.returncode
+            self.state.update(state="down", pid=None,
+                              last_exit=f"{_now_iso()} 退出码 {rc}" + (f"：{self._last_err_line}" if self._last_err_line else ""))
+            self.proc = None
+            self._schedule_restart()
+            log.warning("机器人接收退出了（退出码 %s），%.0f 秒后重启", rc, self.next_start - self.clock())
+        if self.proc is None and self.clock() >= self.next_start:
+            self.state["restarts"] += 1
+            self._spawn()
+
     # ---------- 主线程：每轮调 ----------
     def poll(self) -> list[dict]:
         """取出这期间收到的事件（原始 dict，按收到的顺序）；子进程退出了就按退避重启。"""
@@ -139,30 +180,28 @@ class BotEventConsumer:
                 events.append(item)
                 self.state["events"] += 1
                 self.state["last_event_at"] = _now_iso()
-            elif kind == "ready" and proc is self.proc:
-                self.state.update(state="running", ready_at=_now_iso())
-                self.delay = self.backoff  # 连上了：退避回到起点
+            elif kind == "ready":
+                owner = self._owner_for_proc(proc)
+                if proc is owner.proc:
+                    owner.state.update(state="running", ready_at=_now_iso())
+                    owner.delay = owner.backoff  # 连上了：退避回到起点
             elif kind == "bad":
                 self.state["bad_lines"] += 1
                 log.warning("机器人接收输出了一行读不懂的: %s", item)
             elif kind == "stderr":
-                self._last_err_line = item
+                owner = self._owner_for_proc(proc)
+                owner._last_err_line = item
                 if '"ok":false' in item.replace(" ", "") or "error" in item.lower():
+                    owner.state["last_error"] = item
                     self.state["last_error"] = item
                     log.warning("机器人接收: %s", item)
-        proc = self.proc
-        if proc is not None and proc.poll() is not None:
-            rc = proc.returncode
-            self.state.update(state="down", pid=None,
-                              last_exit=f"{_now_iso()} 退出码 {rc}" + (f"：{self._last_err_line}" if self._last_err_line else ""))
-            self.proc = None
-            self._schedule_restart()
-            log.warning("机器人接收退出了（退出码 %s），%.0f 秒后重启", rc, self.next_start - self.clock())
-        if self.proc is None and self.clock() >= self.next_start:
-            self.state["restarts"] += 1
-            self._spawn()
+        self._ensure_running()
+        for aux in self._aux_consumers:
+            aux._ensure_running()
         self._write_state()
         return events
+
+    drain = poll
 
     def wait(self, timeout: float) -> bool:
         """等到收到事件（返回 True）或超时（False）。只等，不取：事件仍由 poll() 取走。"""

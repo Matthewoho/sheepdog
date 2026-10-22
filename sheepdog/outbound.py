@@ -81,40 +81,24 @@ def target_ok(store: Store, topic_id: str) -> bool:
     return t is not None and t["state"] != sm.CLOSED and (topic_id == BUS_TOPIC_ID or t["kind"] in MANAGED_KINDS)
 
 
-def lamb_violation_message(
-    store: Store | None,
-    cmd: str,
-    *,
-    topic_id: str = "",
-    lamb_id: str = "",
-    cid: str = "",
-) -> str | None:
+def lamb_violation_message(store: Store | None, cmd: str, *, topic_id: str = "", lamb_id: str = "", cid: str = "") -> str | None:
     """7.63 羔羊越权硬拦截：判定当前调用方是否为羔羊（环境变量 SHEEPDOG_LAMB_ID / 会话 conversation_id / lambs 表匹配）。"""
     lid = (lamb_id or os.environ.get("SHEEPDOG_LAMB_ID") or "").strip()
     conv_id = (
-        cid
-        or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-        or os.environ.get("SHEEPDOG_CONVERSATION_ID")
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("CLAUDE_SESSION_ID")
-        or ""
+        cid or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or os.environ.get("SHEEPDOG_CONVERSATION_ID")
+        or os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
     ).strip()
     tid = (topic_id or "").strip()
-    matched_lid = ""
-    parent_tid = ""
+    matched_lid, parent_tid = "", ""
     if lid:
         lb = store.get_lamb(lid) if store is not None and hasattr(store, "get_lamb") else None
         matched_lid = lb["lamb_id"] if lb else lid
         parent_tid = (lb["parent_topic_id"] if lb else "") or tid or "unknown"
     elif conv_id and store is not None and hasattr(store, "find_lamb_by_cid"):
-        lb = store.find_lamb_by_cid(conv_id)
-        if lb is not None:
-            matched_lid = lb["lamb_id"]
-            parent_tid = lb["parent_topic_id"]
+        if (lb := store.find_lamb_by_cid(conv_id)) is not None:
+            matched_lid, parent_tid = lb["lamb_id"], lb["parent_topic_id"]
     if not matched_lid and tid and store is not None:
-        candidates = [tid]
-        if tid.startswith("tp_"):
-            candidates.append(tid.removeprefix("tp_"))
+        candidates = [tid, *([tid.removeprefix("tp_")] if tid.startswith("tp_") else [])]
         for c in list(candidates):
             if c.startswith("lamb:"):
                 candidates.append(c.removeprefix("lamb:"))
@@ -123,8 +107,7 @@ def lamb_violation_message(
                 store.find_lamb_by_cid(cand) if hasattr(store, "find_lamb_by_cid") else None
             )
             if lb is not None:
-                matched_lid = lb["lamb_id"]
-                parent_tid = lb["parent_topic_id"]
+                matched_lid, parent_tid = lb["lamb_id"], lb["parent_topic_id"]
                 break
     if not matched_lid:
         return None
@@ -135,16 +118,8 @@ def lamb_violation_message(
     )
 
 
-def check_not_lamb(
-    store: Store | None,
-    cmd: str,
-    *,
-    topic_id: str = "",
-    lamb_id: str = "",
-    cid: str = "",
-) -> None:
-    msg = lamb_violation_message(store, cmd, topic_id=topic_id, lamb_id=lamb_id, cid=cid)
-    if msg:
+def check_not_lamb(store: Store | None, cmd: str, *, topic_id: str = "", lamb_id: str = "", cid: str = "") -> None:
+    if msg := lamb_violation_message(store, cmd, topic_id=topic_id, lamb_id=lamb_id, cid=cid):
         raise OutboundError(EXIT_INVALID, msg)
 
 
@@ -323,7 +298,7 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
                   key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
                   floor: str = "", vips: dict | None = None, summary: str = "",
-                  floor_type: str | None = None) -> SendResult:
+                  floor_type: str | None = None, options: str = "") -> SendResult:
     """ask / report：以机器人身份私聊主人（或发进话题群），ask 发前核 VIP 底线并当场记来源与 floor。"""
     from . import topicgroup as tg
     check_not_lamb(store, kind, topic_id=topic_id)
@@ -364,12 +339,12 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     route = tg.route_for_send(cfg, store, topic_id, key, track)
     if route.group:
         try:
-            res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route)
+            res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route, options=options)
             res.batch_chats = n_chats
             return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
         except _GroupDown as e:
             route = tg.SendRoute(note=f"话题群发不进去（{e}），已退回私聊，这条发进了私聊")
-    res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik)
+    res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik, options=options)
     res.batch_chats, res.note = n_chats, route.note
     return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
 
@@ -379,7 +354,7 @@ class _GroupDown(Exception):
 
 
 def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str,
-                   text: str, ik: str, route) -> SendResult:
+                   text: str, ik: str, route, *, options: str = "") -> SendResult:
     """7.51：发进话题群里那件事的话题。没有这件事就先开（标题卡是开头那条），办完 / 归档的重开。只有 ask @ 主人。
     超时原样抛（OutboundError 退出码 1，会话原样重试：标题卡和这一条的防重编号都不变，飞书只发一条）。"""
     from . import topicgroup as tg
@@ -393,7 +368,7 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
         store.add_item_key(item["item_no"], key, tg.track_norm(key), "alias", topic_id)
     try:
         item = tg.ensure_title(cfg, store, source, item, "", key)   # 副标题「<会话显示名>开的」按事项现算
-        plain, card = owner_content(cfg, text, at=kind == ASK)   # 群里只有「需要你定」@ 主人
+        plain, card = owner_content(cfg, text, at=kind == ASK, kind=kind, topic_id=topic_id, key=key, title=title, options=options)
         res = send_owner(lambda tx, c: source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx,
                                                        card=c, in_thread=True), plain, card)
     except LarkTimeout as e:
@@ -419,10 +394,10 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
 
 
 def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str, text: str,
-             ik: str) -> SendResult:
+             ik: str, *, options: str = "") -> SendResult:
     """私聊主人（7.22 一事一串，原来的路）。"""
     root = store.thread_by_key(topic_id, nk) if nk else None
-    plain, card = owner_content(cfg, text, at=root is not None)
+    plain, card = owner_content(cfg, text, at=root is not None, kind=kind, topic_id=topic_id, key=key, title=title, options=options)
     if source is None:
         res = {"message_id": f"om_test_{ik[-12:]}", "thread_id": ""}
     else:
@@ -624,15 +599,21 @@ CARD_REJECT_CODES = ("230025", "230099")
 _CARD_REJECT = re.compile(r"(?<!\d)(" + "|".join(CARD_REJECT_CODES) + r")(?!\d)")
 
 
-def owner_content(cfg: Config, text: str, at: bool = False) -> tuple[str, dict | None]:
+def owner_content(cfg: Config, text: str, at: bool = False, *, summary: str = "", kind: str = "",
+                  topic_id: str = "", key: str = "", title: str = "", options: str = "") -> tuple[str, dict | None]:
     """发给主人的这一条：(纯文本那一份, 卡片或 None)。超上限或关着 owner_card 时返回 None。"""
     plain = with_owner_at(cfg, text) if at else text
     if not cfg.notify.owner_card:
         return plain, None
     try:
-        card = build_owner_card(text, cfg.self_open_id if at else "")
+        card = build_owner_card(text, cfg.self_open_id if at else "", summary=summary)
     except ValueError:
         return plain, None
+    first_line = (text or "").strip("\n").partition("\n")[0]
+    if kind == ASK or first_line.startswith("🐕 需要你定"):
+        from .card_callback import attach_ask_interactions
+        card = attach_ask_interactions(card, text=text, summary=summary, options_spec=options,
+                                       topic_id=topic_id, key=key, title=title, interactive=bool(cfg.identity.enabled))
     if not card_fits(card):
         log.warning("发给主人的这条卡片估算 %d 字节，超过上限，改发纯文本：%s", card_request_bytes(card),
                     _one_line(text)[:80])

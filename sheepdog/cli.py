@@ -2207,9 +2207,7 @@ def cmd_ask(args) -> int:
                 print(f"{kind} 没发: {e}", file=sys.stderr)
                 return e.code
         try:
-            _, _, resolved_body = resolve_summary_and_body(
-                body, summary, require_summary=cfg.notify.require_summary, hoist_at=False
-            )
+            _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
         except ValueError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID
@@ -2218,7 +2216,8 @@ def cmd_ask(args) -> int:
     try:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
                                    about=getattr(args, "about", None) or None, track=getattr(args, "track", False),
-                                   floor=floor, vips=vips, summary=summary, floor_type=floor_type)
+                                   floor=floor, vips=vips, summary=summary, floor_type=floor_type,
+                                   options=getattr(args, "options", "") or "")
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -2743,6 +2742,7 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--about", action="append", default=[], help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。主人之后在那个聊天里说过话，sheepdog 会提醒你核实")
             sp.add_argument("--floor-type", default=None, help="碰到哪类底线（7.65，必填枚举：credentials | destructive | vip_conflict）：为名册 VIP 本人发的消息找主人（或使用 --floor）时必须与 --floor 同时写")
             sp.add_argument("--floor", default="", help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
+            sp.add_argument("--options", default="", help="显式指定卡片按钮选项（如 'A:同意发布|B:暂缓'、'auto' 或 'none'）")
         sp.set_defaults(func=cmd_ask)
 
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
@@ -2752,11 +2752,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--key", help="钥匙：结掉这个话题里所有还开着的提问")
     sp.add_argument("--why", required=True, help="依据，一句话（主人在哪说了什么 / 你核实到什么）")
     sp.set_defaults(func=cmd_resolve)
-
     sp = sub.add_parser("pending", help="只读：待办清单（要主人定的、可能已处理的、各会话在等主人的）")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_pending)
-
     sp = sub.add_parser("reply", help="代回：以主人身份回复一条消息（卡片带代回标记）；发前先查主人有没有新发言")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
     sp.add_argument("--to", required=True, help="要回复的那条消息（om_）")
@@ -2767,8 +2765,7 @@ def main(argv: list[str] | None = None) -> int:
     sg = sp.add_mutually_exclusive_group()
     sg.add_argument("--summary", default="", help="当面日常大白话回话（7.70：展示在卡片首屏，≤3 行、≤100 字，只答问题、不括技术亮点、不露修订号/SHA/路径/分点列表）")
     sg.add_argument("--summary-file", default="", help="白话总结文件")
-    sp.add_argument("--even-if-owner-replied", action="store_true",
-                    help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
+    sp.add_argument("--even-if-owner-replied", action="store_true", help="主人已经回过也照样发（跳过发前检查）；默认主人回过就不发，退出码 3")
     sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("thread", help="只读：列出一个话题的全部消息")
