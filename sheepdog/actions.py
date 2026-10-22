@@ -54,6 +54,7 @@ def execute(dispatcher, kind: str, args: dict) -> object:
             reply_to=args.get("reply_to", ""),
             command=args.get("command", ""),
             no_pull=bool(args.get("no_pull", False)),
+            channel=str(args.get("channel") or "stable"),
         )
     d.sync_roster()
     if kind == "spawn":

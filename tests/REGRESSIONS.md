@@ -286,4 +286,12 @@
 | 7.74 | 置顶索引卡 `patch_card` 限流/超限报错误调 `mark_down` 把整个话题群熔断、已有 `root_message_id` 的老事项发消息未绕过 `tg_down` 直连回复并自愈；或话题群卡片点击回调未关联 `item:T-n` 标签、私聊卡片缺一键「📌 转入长期跟踪」（`tg_move`）回调（REG-021） | `test_topic_group_causal_routing.TopicGroupBreakerDecoupleTest.test_index_card_patch_or_post_failure_never_marks_group_down`、`test_topic_group_causal_routing.TopicGroupBreakerDecoupleTest.test_existing_item_reply_bypasses_tg_down_and_clears_down_on_success`、`test_topic_group_order_e2e.TopicGroupOrderE2ETest.test_reg_021_topic_group_card_callback_routing_and_one_click_move` |
 | 7.74 | 话题群内未建档顶层消息下主人回复时未自动兜底建档 `T-n` 产生悬空无主 thread；或 `Dispatcher._echo_sync` 被会话发往私聊的无关 `report` 误销账话题群 `owner_echo`；或话题首卡缺动态状态看板（`sync_title_card`）与 `sheepdog topic-group move` CLI 幂等迁群（REG-022） | `test_topic_group_causal_routing.TopicGroupTitleCardAndMoveCliTest.test_sync_title_card_updates_template_summary_and_alias_keys`、`test_topic_group_causal_routing.TopicGroupTitleCardAndMoveCliTest.test_cli_topic_group_move_is_idempotent`、`test_topic_group_order_e2e.TopicGroupOrderE2ETest.test_reg_022_unregistered_thread_auto_anchor_and_echo_sync_isolation` |
 
+## 7.75 双轨 GitHub 版本分发（Release=Stable 稳定版 vs Tag=Beta 尝鲜版）、非交互远端探针与诚实双轨升级（REG-023 ~ REG-025）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.75 | 后台常驻进程 `_git_run` 未注入 `GIT_TERMINAL_PROMPT=0` 与 `GIT_SSH_COMMAND`（`BatchMode=yes`）导致无 SSH Agent 时卡死或失败，或 `origin` 鉴权失败后未自动 fallback 到公开免鉴权 HTTPS 源 `https://github.com/Matthewoho/sheepdog.git`；或附注标签 `refs/tags/vX.Y.Z^{}` 解引用 commit SHA 被丢弃、本机版本领先远端时误发降级提醒（REG-023） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_023_non_interactive_git_fallback_and_peeled_tag_and_no_downgrade_alert` |
+| 7.75 | 将每次同步的 Git Tag 与稳定版混为一谈导致每次打 Beta Tag（`tag > release`）都向别的 `sheepdog` 后台主动推送刷屏提醒，而非仅在发布新 GitHub Release（Stable）高于本机版本时发送单次非强制更新建议，或未将 `stable_tag` / `beta_tag` / `has_beta` 落盘 `meta["version_remote_latest"]`（REG-024） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_024_stable_release_advisory_only_and_beta_silence_in_background` |
+| 7.75 | 主人在飞书找主人私聊问「有新版本吗 / 有没有 beta / 查版本」（或 CLI `sheepdog version --check-remote`）未被拦截并实时返回本机、GitHub 稳定版（Release）与 Beta 尝鲜版（`tag > release`）及双轨非强制升级指引；或回复「升级稳定版 / 你来升级」与「升级 beta」未区分 `channel="stable" \| "beta"`，以及工作区 `dirty` 或 `git pull --ff-only` 失败时 `Dispatcher.upgrade` 谎报「✅ 当前代码已是最新」（REG-025） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_025_owner_ask_beta_query_and_dual_channel_honest_upgrade` |
+
 

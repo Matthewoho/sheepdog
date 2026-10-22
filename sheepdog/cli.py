@@ -20,9 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import __version__, _git_run, default_repo_dir, parse_version_tuple, version_info
-from . import actions
-from . import observe as obs
+from . import __version__, _git_run, actions, default_repo_dir, observe as obs, parse_version_tuple, version_info, version_watch
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
@@ -447,56 +445,11 @@ def _pid_alive(pid) -> bool:
 
 
 def _record_daemon_runtime(store: Store, repo_dir: Path | None = None) -> dict:
-    info = version_info(repo_dir)
-    runtime_payload = {
-        "version": info["version"],
-        "git_sha": info["git_sha"],
-        "git_short": info["git_short"],
-        "dirty": info["dirty"],
-        "display": info["display"],
-        "repo_dir": info["repo_dir"],
-        "pid": os.getpid(),
-        "started_at": now_iso(),
-    }
-    store.set_meta("daemon_runtime", json.dumps(runtime_payload, ensure_ascii=False))
-    return runtime_payload
+    return version_watch.record_daemon_runtime(store, repo_dir)
 
 
-def get_version_status(store: Store | None = None, repo_dir: Path | None = None) -> dict:
-    cli_info = version_info(repo_dir, prefer_disk_version=True)
-    daemon = None
-    if store is not None:
-        raw = store.get_meta("daemon_runtime")
-        if raw:
-            try:
-                daemon = json.loads(raw)
-            except json.JSONDecodeError:
-                daemon = None
-    pid = daemon.get("pid") if isinstance(daemon, dict) else None
-    daemon_alive = bool(pid and _pid_alive(pid))
-    in_sync = bool(
-        isinstance(daemon, dict)
-        and daemon_alive
-        and daemon.get("version") == cli_info["version"]
-        and (not cli_info["git_sha"] or not daemon.get("git_sha") or daemon.get("git_sha") == cli_info["git_sha"])
-    )
-    if not isinstance(daemon, dict):
-        daemon_display = "未记录"
-    elif not daemon_alive:
-        daemon_display = f"{daemon.get('display', daemon.get('version', '?'))} [PID {pid} 未运行]"
-    elif in_sync:
-        daemon_display = f"{daemon.get('display')} PID {pid} 一致"
-    else:
-        daemon_display = f"{daemon.get('display')} PID {pid} ≠ 磁盘 {cli_info['display']}（待重启）"
-    summary_line = f"sheepdog {cli_info['display']}（常驻进程: {daemon_display}）"
-    return {
-        "cli": cli_info,
-        "daemon": daemon,
-        "daemon_alive": daemon_alive,
-        "in_sync": in_sync,
-        "daemon_display": daemon_display,
-        "summary_line": summary_line,
-    }
+def get_version_status(store: Store | None = None, repo_dir: Path | None = None, *, check_remote: bool = False) -> dict:
+    return version_watch.get_version_status(store, repo_dir, check_remote=check_remote)
 
 
 def _check_version_update(
@@ -508,119 +461,9 @@ def _check_version_update(
     repo_dir: Path | None = None,
     now: datetime | None = None,
 ) -> list[str]:
-    """常驻进程版本巡检（7.68）：
-    A. 秒级本机检测：磁盘代码版本/SHA 与常驻进程内存 runtime_info 不一致时单次提醒；
-    B. 周期远端检测：每 check_interval_minutes 调 git ls-remote origin 检查是否有新版本 tag 或新 main 提交，单次提醒。
-    返回本次新触发的通知文案列表。
-    """
-    if not cfg.version.enabled:
-        return []
-    ref_now = now or datetime.now().astimezone()
-    root = (repo_dir or default_repo_dir()).resolve()
-    disk = version_info(root, prefer_disk_version=True)
-    mem = runtime_info
-    if mem is None:
-        raw_rt = store.get_meta("daemon_runtime")
-        if raw_rt:
-            try:
-                mem = json.loads(raw_rt)
-            except json.JSONDecodeError:
-                mem = None
-    if not isinstance(mem, dict):
-        mem = version_info(root, prefer_disk_version=False)
-
-    try:
-        notified: set[str] = set(json.loads(store.get_meta("version_notified") or "[]"))
-    except json.JSONDecodeError:
-        notified = set()
-    sent_texts: list[str] = []
-
-    def _emit(key: str, text: str) -> None:
-        if key in notified:
-            return
-        if dispatcher is not None:
-            dispatcher._notify_owner(text, "新版提醒", BUS_TOPIC_ID)
-        notified.add(key)
-        store.set_meta("version_notified", json.dumps(sorted(notified), ensure_ascii=False))
-        sent_texts.append(text)
-
-    ver_changed = bool(disk["version"] != mem.get("version"))
-    sha_changed = bool(disk["git_sha"] and mem.get("git_sha") and disk["git_sha"] != mem.get("git_sha"))
-    if ver_changed or sha_changed:
-        local_key = f"local:{disk['version']}:{disk['git_sha'][:12]}"
-        mem_disp = mem.get("display") or mem.get("version") or "?"
-        pid = mem.get("pid") or os.getpid()
-        text = (
-            f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
-            f"🔔 检测到本机代码已更新至 **{disk['display']}**，当前常驻进程仍运行在 **{mem_disp}**（PID {pid}）。\n"
-            "💡 直接回复「**你来升级**」（或「**升级**」「**重启生效**」），我会自动原地重启常驻进程使其生效；"
-            "也可在终端运行 `sheepdog upgrade`。"
-        )
-        _emit(local_key, text)
-
-    interval_min = cfg.version.check_interval_minutes
-    if interval_min > 0:
-        last_checked_raw = store.get_meta("version_remote_checked_at")
-        should_check = True
-        if last_checked_raw:
-            try:
-                last_dt = datetime.fromisoformat(last_checked_raw)
-                if (ref_now - last_dt).total_seconds() < interval_min * 60.0:
-                    should_check = False
-            except ValueError:
-                should_check = True
-        if should_check:
-            store.set_meta("version_remote_checked_at", ref_now.isoformat(timespec="seconds"))
-            r = _git_run(
-                ["git", "-C", str(root), "ls-remote", "origin", "refs/heads/main", "refs/tags/v*"],
-                timeout=10,
-            )
-            if r is not None and r.returncode == 0 and r.stdout:
-                disk_tuple = parse_version_tuple(disk["version"])
-                best_tag_tuple: tuple[int, ...] = disk_tuple
-                best_tag_name = ""
-                best_tag_sha = ""
-                remote_main_sha = ""
-                for line in r.stdout.splitlines():
-                    parts = line.strip().split()
-                    if len(parts) < 2:
-                        continue
-                    sha, ref = parts[0], parts[1]
-                    if ref.endswith("^{}"):
-                        ref = ref[:-3]
-                    if ref == "refs/heads/main":
-                        remote_main_sha = sha
-                    elif ref.startswith("refs/tags/v"):
-                        tag_name = ref.removeprefix("refs/tags/")
-                        t_tuple = parse_version_tuple(tag_name)
-                        if t_tuple and t_tuple > best_tag_tuple:
-                            best_tag_tuple = t_tuple
-                            best_tag_name = tag_name
-                            best_tag_sha = sha
-                remote_ahead_main = False
-                if remote_main_sha and disk["git_sha"] and remote_main_sha != disk["git_sha"]:
-                    anc = _git_run(
-                        ["git", "-C", str(root), "merge-base", "--is-ancestor", remote_main_sha, "HEAD"],
-                        timeout=3,
-                    )
-                    remote_ahead_main = (anc is None or anc.returncode != 0)
-                if best_tag_name or remote_ahead_main:
-                    remote_id = best_tag_name or remote_main_sha[:12]
-                    remote_desc = (
-                        f"{best_tag_name} ({best_tag_sha[:7]})"
-                        if best_tag_name
-                        else f"origin/main ({remote_main_sha[:7]})"
-                    )
-                    remote_key = f"remote:{remote_id}"
-                    text = (
-                        f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
-                        f"🔔 检测到远端 origin 有新版本 **{remote_desc}**（当前本机为 **{disk['display']}**）。\n"
-                        "💡 直接回复「**你来升级**」（或「**升级**」），我会自动拉取最新代码并重启常驻进程使其生效；"
-                        "也可在终端运行 `sheepdog upgrade`。"
-                    )
-                    _emit(remote_key, text)
-
-    return sent_texts
+    return version_watch.check_version_update(
+        cfg, store, dispatcher, runtime_info=runtime_info, repo_dir=repo_dir, now=now
+    )
 
 
 def cmd_version(args) -> int:
@@ -632,11 +475,16 @@ def cmd_version(args) -> int:
     except Exception:
         store = None
     try:
-        status = get_version_status(store)
+        check_remote = bool(getattr(args, "check_remote", False))
         if getattr(args, "json", False):
-            print(json.dumps(status, ensure_ascii=False, indent=2))
+            st = get_version_status(store, check_remote=check_remote)
+            if check_remote and not st.get("remote"):
+                st["remote"] = version_watch.probe_remote_versions()
+            print(json.dumps(st, ensure_ascii=False, indent=2))
+        elif check_remote:
+            print(version_watch.format_version_query_reply(store, check_remote=True))
         else:
-            print(status["summary_line"])
+            print(get_version_status(store)["summary_line"])
         return 0
     finally:
         if store is not None:
@@ -648,6 +496,7 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
     root = (repo_dir or default_repo_dir()).resolve()
     no_pull = bool(getattr(args, "no_pull", False))
     dry_run = bool(getattr(args, "dry_run", False))
+    channel = "beta" if getattr(args, "beta", False) else "stable"
     disk_before = version_info(root, prefer_disk_version=True)
     if dry_run:
         store = Store(cfg.db_path) if cfg.db_path.exists() else None
@@ -657,14 +506,13 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
             if store is not None:
                 store.close()
         pull_plan = "跳过 git pull" if (no_pull or disk_before["dirty"]) else f"git -C {root} pull --ff-only"
-        print(f"[dry-run] upgrade: {pull_plan}；{st['summary_line']}")
+        print(f"[dry-run] upgrade (channel={channel}): {pull_plan}；{st['summary_line']}")
         return 0
 
     if not no_pull and (root / ".git").exists():
         if not disk_before["dirty"]:
-            r = _git_run(["git", "-C", str(root), "pull", "--ff-only"], timeout=15)
-            if r is not None and r.returncode != 0:
-                err_msg = ((r.stderr or "") or (r.stdout or "")).strip()
+            pulled, _out, err_msg = version_watch.pull_repo_for_channel(root, channel=channel, timeout=15.0)
+            if not pulled and err_msg != "git 命令执行失败":
                 print(f"git pull --ff-only 失败：{err_msg}", file=sys.stderr)
                 return 1
         else:
@@ -675,11 +523,11 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
         st = get_version_status(store, root)
         if st["daemon_alive"]:
             existing = [a for a in store.pending_actions() if a["kind"] == "upgrade"]
-            if existing:
-                aid = existing[0]["id"]
-            else:
-                aid = actions.enqueue(store, "upgrade", {"no_pull": True, "command": "sheepdog upgrade"})
-            print(f"已提交常驻进程原地热重启（动作 #{aid}，目标版本 {st['cli']['display']}，当前常驻 {st['daemon_display']}）")
+            cmd_str = "sheepdog upgrade --beta" if channel == "beta" else "sheepdog upgrade"
+            aid = existing[0]["id"] if existing else actions.enqueue(
+                store, "upgrade", {"no_pull": True, "channel": channel, "command": cmd_str}
+            )
+            print(f"已提交常驻进程原地热重启（动作 #{aid}，channel={channel}，目标版本 {st['cli']['display']}，当前常驻 {st['daemon_display']}）")
             return 0
         print(f"代码已就绪：{st['cli']['display']}（当前无运行中的常驻进程，将由 sidecar supervisor 自动拉起或运行 `sheepdog run`）")
         return 0
@@ -2553,10 +2401,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
     sp = sub.add_parser("version", help="显示 CLI 代码版本与常驻进程内存版本")
     sp.add_argument("--json", action="store_true", help="输出 JSON")
+    sp.add_argument("--check-remote", action="store_true", help="实时探测 GitHub Release 与 Beta Tag")
     sp.set_defaults(func=cmd_version)
     sp = sub.add_parser("upgrade", help="拉取最新代码并通知常驻进程原地热重启（os.execv，保留 sidecar 环境）")
     sp.add_argument("--no-pull", action="store_true", help="不执行 git pull，仅通知常驻进程原地重启")
     sp.add_argument("--dry-run", action="store_true", help="只打印将要执行的升级动作，不拉代码、不入队")
+    sp.add_argument("--beta", action="store_true", help="升级至最新 Beta Tag（tag > release）")
+    sp.add_argument("--stable", action="store_true", help="升级至最新 GitHub Release 稳定版（默认）")
     sp.set_defaults(func=cmd_upgrade)
     sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
     obs.add_observe_arguments(sp)

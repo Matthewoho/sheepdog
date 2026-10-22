@@ -213,23 +213,14 @@ def is_agent_reply(content: str, oc) -> bool:
 
 
 UPGRADE_WORDS = frozenset({
-    "升级", "你来升级", "立即升级", "更新", "你来更新",
-    "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade",
+    "升级", "你来升级", "立即升级", "更新", "你来更新", "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade",
 })
-_UPGRADE_AT_TAG_RE = re.compile(r"<at\b[^>]*>.*?</at>", re.I | re.S)
-_UPGRADE_TRAIL_PUNCT = " \t\r\n。！!~～？?，,、.·\"'”’」』】"
 
 
 def is_upgrade_command(content: str) -> bool:
-    """主人在找主人聊天里发的「你来升级 / 升级 / 重启生效」快捷口令（7.69）：
-    剥离 <at> 标签、首尾空白及末尾标点后大小写不敏感匹配 UPGRADE_WORDS。"""
-    raw = _UPGRADE_AT_TAG_RE.sub(" ", content or "")
-    for b in message_bodies(plain_text(raw)):
-        cleaned = _UPGRADE_AT_TAG_RE.sub(" ", b or "")
-        cleaned = " ".join(cleaned.split()).strip(_UPGRADE_TRAIL_PUNCT).lower()
-        if cleaned in UPGRADE_WORDS:
-            return True
-    return False
+    """主人在找主人聊天里发的升级快捷口令（7.69 / 7.75）：委托给 version_watch.is_upgrade_command。"""
+    from . import version_watch
+    return version_watch.is_upgrade_command(content)
 
 
 # 话题里开头那条的序号（thread_message_position）：开头那条 "-1"、回复从 "0" 起。7.22 时（10-12 22:5x）按一个样本以为
@@ -1489,7 +1480,7 @@ class Collector:
                 d = RouteDecision(SELF, "agent_reply_in_owner_chat")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
-            from . import pending as pend, topicgroup as tg
+            from . import pending as pend, topicgroup as tg, version_watch
             if tg.is_command(m.content, tg.CMD_MOVE) and tg.configured(self.cfg) and self.cfg.topic_group.enabled:
                 return self._tg_move(m)
             if self.cfg.escalation.owner_shortcut and not m.reply_to and (not m.thread_id or is_thread_root(m)) and pend.is_pending_query(m.content):
@@ -1501,6 +1492,11 @@ class Collector:
                 d = RouteDecision(DROP, "upgrade_command", [OWNER_VERIFIED_TAG])
                 self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
                 self._upgrade_shortcut(m)
+                return d
+            if self.cfg.escalation.owner_shortcut and version_watch.is_version_query(m.content) and not self._is_answering_open_escalation(m):
+                d = RouteDecision(DROP, "version_query", [OWNER_VERIFIED_TAG])
+                self.store.upsert_message(m, d.route, d.reason, [OWNER_VERIFIED_TAG])
+                self._version_query_reply(m)
                 return d
             d = self._owner_reply(m)
             self._echo_record(m, d.reason)
@@ -1604,15 +1600,44 @@ class Collector:
                     return True
         return False
 
+    def _notify_owner(self, text: str, what: str, topic_id: str = "", reply_to: str = "",
+                      in_thread: bool = False, idem_key: str = "") -> bool:
+        text = with_cli(text, self.cfg.cli_command)
+        ik = idem_key or identity.short_key("notice", what, reply_to or topic_id, text)
+        if self.store.owner_notice_by_key(ik) is not None:
+            return True
+        nid = self.store.add_owner_notice(what, topic_id, text.encode("utf-8"), ik, reply_to, in_thread)
+        if (fn := getattr(self.source, "reply_to", None) if reply_to else None) is None or self.dry_run:
+            return True
+        from .outbound import owner_content, send_owner
+        plain, card = owner_content(self.cfg, text)
+        try:
+            self.store.owner_notice_start(nid)
+            send_owner(lambda t, c: fn(reply_to, identity=identity.BOT, idem_key=ik, text=t, in_thread=in_thread,
+                                       **({"card": c} if c is not None else {})), plain, card)
+            self.store.owner_notice_sent(nid)
+            return True
+        except Exception as e:
+            self.store.owner_notice_failed(nid, str(e)[:300], (_now() + notice_backoff(1)).isoformat(timespec="seconds"))
+            log.warning("给主人发%s失败: %s", what, e)
+            return False
+
+    def _version_query_reply(self, m: Message) -> None:
+        """主人在找主人聊天里询问当前版本 / 有没有新版本或 Beta（7.75）：实时查远端并回复主人。"""
+        from . import version_watch
+        self._notify_owner(version_watch.format_version_query_reply(self.store, check_remote=True),
+                           "版本查询", BUS_TOPIC_ID, reply_to=m.message_id)
+
     def _upgrade_shortcut(self, m: Message) -> None:
-        """主人在找主人聊天里发「你来升级 / 升级 / 重启生效」（7.69）：入队 upgrade 动作，由常驻进程原地拉取并 os.execv 重启。"""
-        from . import actions
+        """主人在找主人聊天里发「你来升级 / 升级 beta / 重启生效」（7.69 / 7.75）：入队 upgrade 动作，由常驻进程原地拉取并 os.execv 重启。"""
+        from . import actions, version_watch
         if any(a["kind"] == "upgrade" for a in self.store.pending_actions()):
             log.info("主人发了升级口令 %s，队列里已有待执行的 upgrade 动作，不重复入队", m.message_id)
             return
-        cmd_text = " ".join(plain_text(m.content or "").split()).strip()
-        aid = actions.enqueue(self.store, "upgrade", {"reply_to": m.message_id, "command": cmd_text})
-        log.info("主人发了升级口令 %s（%r），已入队动作 #%d（upgrade）", m.message_id, cmd_text, aid)
+        channel = version_watch.parse_upgrade_request(m.content or "") or "stable"
+        cmd_text = plain_text(m.content or "").strip()
+        aid = actions.enqueue(self.store, "upgrade", {"reply_to": m.message_id, "command": cmd_text, "channel": channel})
+        log.info("主人发了升级口令 %s（%r, channel=%s），已入队动作 #%d（upgrade）", m.message_id, cmd_text, channel, aid)
 
     def _agent_reply_text(self, content: str) -> bool:
         """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix / 内置跨版本签名
@@ -5614,63 +5639,17 @@ class Dispatcher:
         return report
 
     def upgrade(self, *, reply_to: str = "", command: str = "", no_pull: bool = False,
-                repo_dir: Path | None = None) -> dict:
-        """7.69：执行常驻进程热升级动作——工作区干净时 git pull --ff-only，发升级完成确认卡片，并标记 restart_requested=True
-        由常驻循环收尾后原地 os.execv 重启（100% 保留原 PID 与 sidecar 环境）。"""
-        from . import _git_run, default_repo_dir, version_info
-        root = (repo_dir or default_repo_dir()).resolve()
-        mem = self.runtime_info
-        if not isinstance(mem, dict):
-            raw_rt = self.store.get_meta("daemon_runtime")
-            if raw_rt:
-                try:
-                    mem = json.loads(raw_rt)
-                except json.JSONDecodeError:
-                    mem = None
-        if not isinstance(mem, dict):
-            mem = version_info(root, prefer_disk_version=False)
-        mem_disp = mem.get("display") or mem.get("version") or "?"
-        pid = mem.get("pid") or os.getpid()
-
-        disk_before = version_info(root, prefer_disk_version=True)
-        pulled = False
-        pull_output = ""
-        if not no_pull and (root / ".git").exists():
-            if not disk_before["dirty"]:
-                r = _git_run(["git", "-C", str(root), "pull", "--ff-only"], timeout=15)
-                if r is not None:
-                    pulled = (r.returncode == 0)
-                    pull_output = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[:300]
-            else:
-                pull_output = "工作区有未提交改动（dirty），跳过 git pull，直接按本机当前代码重启"
-
-        disk_after = version_info(root, prefer_disk_version=True)
-        self.restart_requested = True
-
-        if disk_after["display"] != mem_disp:
-            text = (
-                f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n"
-                f"✅ 已更新至 **{disk_after['display']}**（原常驻进程 **{mem_disp}**，PID {pid}），"
-                "正在原地重启常驻进程使其立即生效。"
+                channel: str = "stable", repo_dir: Path | None = None) -> dict:
+        """7.69 / 7.75：执行常驻进程热升级动作——委托给 version_watch.execute_upgrade。"""
+        from . import version_watch
+        if channel == "stable":
+            act = next((json.loads(a["args_json"] or "{}") for a in self.store.pending_actions() if a["kind"] == "upgrade"), {})
+            channel = (version_watch.parse_upgrade_request(command) if command else None) or (
+                act.get("channel") if act.get("channel") in ("stable", "beta") else "stable"
             )
-        else:
-            text = (
-                f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n"
-                f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），"
-                "正在原地重启常驻进程刷新运行态。"
-            )
-        self._notify_owner(text, "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
-        log.info("已执行 upgrade 动作（%s -> %s，pulled=%s，command=%r），标记原地重启",
-                 mem_disp, disk_after["display"], pulled, command)
-        return {
-            "from": mem_disp,
-            "to": disk_after["display"],
-            "version": disk_after["version"],
-            "git_sha": disk_after["git_sha"],
-            "pulled": pulled,
-            "pull_output": pull_output,
-            "restart_requested": True,
-        }
+        return version_watch.execute_upgrade(
+            self, reply_to=reply_to, command=command, no_pull=no_pull, channel=channel, repo_dir=repo_dir
+        )
 
 
 def _check_target(store: Store, topic_id: str, verb: str):

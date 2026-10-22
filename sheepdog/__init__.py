@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
-__version__ = "0.7.74"
+__version__ = "0.7.75"
 
 
 def parse_version_tuple(ver: str) -> tuple[int, ...]:
@@ -37,11 +38,18 @@ def read_disk_version(repo_dir: Path | None = None) -> str:
     return __version__
 
 
-def _git_run(args: list[str], *, timeout: int = 2) -> subprocess.CompletedProcess | None:
-    if type(subprocess.run).__name__ == "FakeLark":
+def _git_run(args: list[str], cwd: Path | None = None, timeout: float = 3.0) -> subprocess.CompletedProcess | None:
+    if type(subprocess.run).__name__ == "FakeLark" or not args:
         return None
+    if args[0] == "git":
+        cmd = ["git", "-C", str(cwd), *args[1:]] if (cwd is not None and "-C" not in args) else list(args)
+    else:
+        cmd = ["git", "-C", str(cwd), *args] if cwd is not None else ["git", *args]
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=5")
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except Exception:
         return None
 

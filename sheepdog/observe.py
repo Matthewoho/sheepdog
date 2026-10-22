@@ -20,7 +20,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import default_repo_dir, version_info
+from . import default_repo_dir, version_info, version_watch
 from .config import Config, load_config
 from .guard import decode_command_line, normalize
 from .sink import agentapi
@@ -525,35 +525,12 @@ def run_observe(
         try:
             tabs = {x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
-            # L1.3: daemon_runtime vs 磁盘版本一致性
-            daemon_runtime = None
-            if "meta" in tabs:
-                row = c.execute("SELECT value FROM meta WHERE key = 'daemon_runtime'").fetchone()
-                if row and row["value"]:
-                    try:
-                        daemon_runtime = json.loads(row["value"])
-                    except json.JSONDecodeError:
-                        daemon_runtime = None
-            if isinstance(daemon_runtime, dict):
-                d_ver = daemon_runtime.get("version") or ""
-                d_sha = daemon_runtime.get("git_sha") or ""
-                ver_diff = bool(d_ver and d_ver != disk_ver_info["version"])
-                sha_diff = bool(d_sha and disk_ver_info["git_sha"] and d_sha != disk_ver_info["git_sha"])
-                if ver_diff or sha_diff:
-                    if not version_mismatch_since:
-                        version_mismatch_since = iso(ref_now)
-                    mismatch_sec = age_seconds(version_mismatch_since, ref_now) or 0.0
-                    if mismatch_sec >= 300:
-                        warn.append(
-                            f"版本不一致已超 {int(mismatch_sec // 60)} 分钟：磁盘代码为 {disk_ver_info['display']}，"
-                            f"但常驻进程仍运行在 {daemon_runtime.get('display', d_ver)}（PID {daemon_runtime.get('pid')}），请重启"
-                        )
-                    else:
-                        info.append(
-                            f"磁盘版本 {disk_ver_info['display']} ≠ 常驻进程 {daemon_runtime.get('display', d_ver)}（观察中 {int(mismatch_sec)}s）"
-                        )
-                else:
-                    version_mismatch_since = ""
+            # L1.3: daemon_runtime vs 磁盘版本一致性 + 远端可用版本提示
+            d_warns, d_infos, version_mismatch_since = version_watch.check_version_drift(
+                c, disk_ver_info, version_mismatch_since, ref_now
+            )
+            warn.extend(d_warns)
+            info.extend(d_infos)
 
             # 卡住的 attention / lost 会话
             if "topics" in tabs:
