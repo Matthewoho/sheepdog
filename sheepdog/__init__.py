@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-__version__ = "0.7.70"
+__version__ = "0.7.71"
 
 
 def parse_version_tuple(ver: str) -> tuple[int, ...]:

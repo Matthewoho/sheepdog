@@ -266,7 +266,7 @@ class SessionGroupTest(Base):
         )
         Collector(self.cfg, self.store, FakeSource([[
             msg(message_id="om_test_767_lh0", chat_type="p2p", chat_id="oc_test_laohu_p2p",
-                sender_id="ou_test_laohu", content="帮我拉一份上月全量报表"),
+                sender_id="ou_test_other", content="帮我拉一份上月全量报表"),
         ]]), r_laohu).poll_once()
         d_lh.dispatch_once()
         self.assertEqual(self.store.get_topic("tp_laohu")["state"], sm.RUNNING)

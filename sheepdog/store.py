@@ -1151,8 +1151,7 @@ class Store:
         sender_id: str = "",
         window_minutes: int = 30,
     ) -> str | None:
-        """羊圈内话题/回复链/watch/等待回复亲和性查询（7.49 Step 1）：
-        同一回复链、引用回复或未结 watch 绝不拆到别的成员。"""
+        """羊圈内话题/回复链/watch/在途或等待回复亲和性查询（7.49 / 7.71）：同一链或窗口内同人绝不拆。"""
         gid = (group_id or "").strip()
         if not gid:
             return None
@@ -1212,7 +1211,7 @@ class Store:
             row = self.conn.execute(
                 """SELECT m.topic_id FROM messages m
                    JOIN topics t ON t.topic_id = m.topic_id
-                   WHERE t.group_id = ? AND t.state = 'waiting_human'
+                   WHERE t.group_id = ? AND t.state IN ('running', 'waiting_human')
                      AND m.route = 'dispatch' AND m.chat_id = ? AND m.sender_id = ?
                      AND m.first_seen >= ?
                    ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",

@@ -1,61 +1,6 @@
-"""命令行入口。
-
-  sheepdog doctor                 检查依赖与环境
-  sheepdog poll [--dry-run]       拉取一次并路由（--dry-run 不投递）
-  sheepdog run [--dry-run]        常驻循环：拉取 → 路由 → 投递
-  sheepdog inbox [--chat 群名]     查看 Inbox（按群分组）
-  sheepdog inbox-clear [--chat 群名 | --all]
-  sheepdog init [--dry-run]       同步名册、没有总线就建、给未 onboarding 的 managed 会话发 onboarding
-  sheepdog sessions               查看 session 注册表与状态（含名册 mode、职责、负责的聊天）
-  sheepdog forward --topic T [--message-ids a,b] [--quote 主人原话] [--note 总线备注]   转交消息 / 转达主人原话
-  sheepdog spawn --key K [--dry-run]                     为名册里 conversation_id 留空的条目新建会话（可接手前任）
-  sheepdog watch --topic T --person ou_x [--chat oc_x] [--note ...]   登记「等别人回复」
-  sheepdog watches [--all]  /  sheepdog unwatch --id N  /  sheepdog watch-done --id N（确认真等到了）
-  sheepdog security-log [--since 24h]                    列出被安全规则标记 / 拦截的消息
-  sheepdog escalations [--all] [--topic T]               列出未结 / 全部「需要你定」（--topic 只列这个会话名下的）
-  sheepdog acks [--open]                                 列出点过的确认表情及是否已撤
-  sheepdog new-session --key K --title T --duty D [--chat oc_x[:all]]... [--message-ids a,b] [--note ...]
-                       [--host antigravity|codex|claude] [--model M] [--effort E] [--quote 主人原话] [--dry-run]
-                                                         总线临时新开一个专属会话（只在账本里）
-  sheepdog close-session --topic T                       收掉总线新开的会话
-  sheepdog push-rules [--topic T] [--dry-run]            立即给会话发一次完整现行规则
-  sheepdog retire --topic <tp_x 或 conversation_id> [--successor-title ...]   给会话补发 / 手动发退休通知
-  sheepdog actions [--all]                               排队 / 完成 / 失败的动作
-  sheepdog loops [--clear <chat_id>]                     疑似和 Agent 循环而冷却中的聊天；手动解除
-  sheepdog redeliver --batch B                           发送中断、不确定是否送达的批次：人工确认后重发
-  sheepdog show <message_id>                             打印账本里这条消息的完整正文
-  sheepdog show --topic T                                打印这个会话最近几轮的问答，告诉你去哪里接着看
-  sheepdog inject --text 正文 [--chat oc_x] [--sender ou_x] ...  （只在 [source] enabled = false 时）放一条合成消息进账本
-  sheepdog reply-card (--text 正文 | --text-file 文件或 -)  打印代回卡片 JSON（正文 + 右下角标记）
-  sheepdog receipt --topic T --batch B --json '{...}'   由 session 调用，提交回执
-  sheepdog session-reset --topic T                       人工把 attention/failed 复位（同时清掉羊群看板的中断 / 失联判定）
-  sheepdog work set --topic T --key K --title ... --state S [--waiting-on 谁] [--until 几点] [--expect ...] [--to 会话]
-  sheepdog work done --topic T --key K --result ...      羊群看板：登记 / 收掉会话名下的活（立即写入）
-  sheepdog tell --topic T --to 会话 "话" [--key K] [--quote 主人原话]   给别的会话留言（下一批送到）
-  sheepdog board [--topic T] [--json]                    羊群看板：各会话在干什么
-  sheepdog notices [--all] [--show N] [--retry N|all] [--ack N|all]   给主人的通知：没发出去的；人工重发 / 确认已处理
-  sheepdog ask --topic T --title 短标题 (--text 正文 | --file F) [--key K] [--batch B（默认当前 / 最近一批）]
-               [--about om_x ...（为哪条消息问的，可多次；不给 = 这批送到的全部消息）]
-               [--floor-type <credentials|destructive|vip_conflict> --floor 碰到哪条底线（来源里有名册 VIP 本人发的消息时必须写，7.61/7.65）]
-                                                         经机器人找主人「需要你定」（sheepdog 加开头一行）；带 --key：
-                                                         同一把钥匙第一次在主聊天里起一条，之后回到它的话题里（一事一串）
-  sheepdog report ...（参数同 ask，没有 --about / --floor-type / --floor）  经机器人向主人汇报
-  sheepdog resolve --topic T (--message-id om_x | --key K) --why 依据
-                                                         会话结案自己名下还开着的「需要你定」；机器人在话题里补一句「已结案」
-  sheepdog pending [--json]                              只读：要主人定的、可能已处理的、各会话在等主人的（待办清单）
-  sheepdog reply --topic T --to om_x (--card-text 正文 | --card-file F | --text 正文) [--even-if-owner-replied]
-                                                         代回：发前只读检查主人有没有新发言；说过就不发（退出码 3）
-  sheepdog thread --topic T (--key K | --thread omt_x)    只读：列出一个话题的全部消息
-  sheepdog hook stop                                     Antigravity 的 Stop hook：stdin 读入参；这批没交回执就输出
-                                                         {"decision":"continue",...} 不让停，其他一律不输出、退出码 0
-
-ask / report / reply 的退出码：0 发出（或同样的内容已经发过）/ 1 发送失败或超时（原样重试，防重编号保证只发一条）/
-2 参数不对 / 3 主人已经回过、没发 / 4 发前检查失败、没发。代回内容一样才算重复：同一条先回「稍等」再回结论两条都发
-
---dry-run 一律在账本的内存副本上执行，不写真实账本（否则假的 conversation_id、onboarded_at 会留下来）。
-
-spawn / new-session / push-rules / init / retire 要调 agentapi：只有常驻进程（sheepdog run）能跨项目投递，
-其他进程里执行时只入队，由 run 下一轮执行（--dry-run 一律本地执行）。
+"""命令行入口：doctor / poll / run / inbox / init / sessions / forward / spawn / watch / security-log / escalations /
+acks / new-session / close-session / push-rules / retire / actions / loops / redeliver / show / inject / reply-card /
+receipt / session-reset / work / tell / board / notices / ask / report / resolve / pending / reply / thread / lamb / hook。
 """
 
 from __future__ import annotations
@@ -1442,10 +1387,61 @@ def attention_report(cfg, store: Store) -> list[str]:
     return lines
 
 
+def _reject_vip_needs_decision_without_floor_ask(
+    cfg, store: Store, tid: str, bid: str, status: str, *, vips: dict | None = None
+) -> str | None:
+    if status != "needs_decision":
+        return None
+    tid = _topic_arg(tid)
+    t = store.get_topic(tid)
+    eff_bid = (bid or "").strip() or (t["pending_batch_id"] if t is not None and t["pending_batch_id"] else "")
+    vips_map = _ask_vips(cfg) if vips is None else vips
+    if not vips_map:
+        return None
+    vip_srcs = outbound.vip_sources(cfg, store, tid, None, vips_map, batch=eff_bid)
+    if not vip_srcs and t is not None and t["pending_batch_id"] and t["pending_batch_id"] != eff_bid:
+        vip_srcs = outbound.vip_sources(cfg, store, tid, None, vips_map, batch=t["pending_batch_id"])
+    if not vip_srcs:
+        return None
+    from .roster import primary_topic_id
+    p_tid = primary_topic_id(tid)
+    group_tids = list(dict.fromkeys([
+        tid, p_tid, *(r["topic_id"] for r in store.list_topics() if primary_topic_id(r["topic_id"]) == p_tid),
+    ]))
+    for gtid in group_tids:
+        rows = (store.list_sends(topic_id=gtid) if hasattr(store, "list_sends")
+                else store.conn.execute("SELECT * FROM sends WHERE topic_id=?", (gtid,)).fetchall())
+        for s in rows:
+            sd = dict(s)
+            if sd.get("kind") == "ask" and outbound._is_valid_vip_floor(sd.get("floor") or ""):
+                esc = store.get_escalation(sd["message_id"]) if sd.get("message_id") else None
+                if esc is None or not esc["closed_at"]:
+                    return None
+        for e in open_escalations(store, cfg.escalation.open_hours, gtid):
+            s = store.send_by_message(e["message_id"])
+            if s is not None and outbound._is_valid_vip_floor(s["floor"] or ""):
+                return None
+    return (
+        'receipt 没收: 当前批次含 VIP 请求，未发起带合法 --floor-type 的 sheepdog ask，'
+        '禁止提交 status="needs_decision" 挂起等主人；请按 VIP 规则合理就办并提交 status="handled"（长任务用 status="waiting"）'
+    )
+
+
 def cmd_receipt(args) -> int:
     cfg = _load_cfg()
     try:
         receipt = json.loads(args.json)
+        if isinstance(receipt, dict) and cfg.db_path.exists():
+            store = Store(cfg.db_path)
+            try:
+                if not outbound.lamb_violation_message(store, "receipt", topic_id=args.topic):
+                    if err := _reject_vip_needs_decision_without_floor_ask(
+                        cfg, store, args.topic, args.batch, str(receipt.get("status") or "")
+                    ):
+                        print(err, file=sys.stderr)
+                        return 2
+            finally:
+                store.close()
         p = write_receipt(cfg, args.topic, args.batch, receipt)
     except (json.JSONDecodeError, ValueError) as e:
         print(f"回执无效: {e}", file=sys.stderr)

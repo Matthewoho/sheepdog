@@ -4289,132 +4289,112 @@ class Dispatcher:
                                     topic_id=t["topic_id"])
 
     # ---------- 羔羊（7.63） ----------
+    def _bind_subagent_cids(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
+        for cid in subagent_created_cids_in(host, d):
+            existing_by_cid = self.store.find_lamb_by_cid(cid)
+            if existing_by_cid is not None:
+                if existing_by_cid["parent_topic_id"] == tid:
+                    dup_empty = next((
+                        lb for lb in self.store.get_active_lambs(tid)
+                        if lb["lamb_id"] != existing_by_cid["lamb_id"]
+                        and lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
+                    ), None)
+                    if dup_empty is not None:
+                        merged_title = existing_by_cid["task_title"]
+                        if (not merged_title or merged_title in ("subagent", existing_by_cid["lamb_id"])) and dup_empty["task_title"]:
+                            merged_title = dup_empty["task_title"]
+                        self.store.update_lamb(existing_by_cid["lamb_id"], task_title=merged_title)
+                        with self.store.tx() as c:
+                            c.execute("DELETE FROM lambs WHERE lamb_id=?", (dup_empty["lamb_id"],))
+                continue
+            matched = next((
+                lb for lb in self.store.get_active_lambs(tid)
+                if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
+            ), None)
+            ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
+            if matched is not None:
+                self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
+                log.info("topic %s: 关联 subagent conversation_id %s -> %s (%s)", tid, cid, matched["lamb_id"], matched["task_title"])
+            else:
+                lid = f"lamb_{hashlib.sha1(f'{tid}:{off}:{cid}'.encode('utf-8')).hexdigest()[:8]}"
+                if self.store.get_lamb(lid) is None:
+                    self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent", conversation_id=cid,
+                                           state="running", started_at=ts, last_act_at=ts)
+                    discovered.append(lid)
+                    log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
+
+    def _handle_lamb_line(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
+        new_lids_in_line: set[str] = set()
+        for inv in subagent_invocations_in(host, d, off):
+            if inv.conversation_id and self.store.find_lamb_by_cid(inv.conversation_id) is not None:
+                continue
+            matched = next((
+                lb for lb in self.store.get_active_lambs(tid)
+                if lb["task_title"] == inv.task_title
+                and (not (lb["conversation_id"] or "").strip() or lb["conversation_id"] == inv.conversation_id)
+                and lb["lamb_id"] not in new_lids_in_line
+            ), None)
+            if matched is not None:
+                new_lids_in_line.add(matched["lamb_id"])
+                if inv.conversation_id and not matched["conversation_id"]:
+                    self.store.update_lamb(matched["lamb_id"], conversation_id=inv.conversation_id, last_act_at=inv.at or now_iso())
+                continue
+            raw_id = (inv.lamb_id or "").strip()
+            if raw_id.startswith("lamb_") and self.store.get_lamb(raw_id) is None:
+                lid = raw_id
+            else:
+                digest = hashlib.sha1(f"{tid}:{off}:{inv.step}:{inv.task_title}:{inv.conversation_id}".encode("utf-8")).hexdigest()[:8]
+                lid = f"lamb_{digest}"
+            if self.store.get_lamb(lid) is not None:
+                continue
+            ts = inv.at or now_iso()
+            self.store.create_lamb(lid, tid, kind="subagent", task_title=inv.task_title or "subagent",
+                                   conversation_id=inv.conversation_id or None, state="running", started_at=ts, last_act_at=ts)
+            new_lids_in_line.add(lid)
+            discovered.append(lid)
+            log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
+        self._bind_subagent_cids(tid, host, off, d, discovered)
+        if host == ANTIGRAVITY and d.get("type") == "GENERIC":
+            err_low = f"{d.get('content') or ''}\n{d.get('error') or ''}".lower()
+            if (str(d.get("status") or "").upper() == "ERROR"
+                    or "denied by pre-tool hook" in err_low
+                    or "encountered error in step execution" in err_low):
+                for lb in self.store.get_active_lambs(tid):
+                    if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip():
+                        complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错",
+                                      state="failed", report_msg_id="subagent_spawn_error")
+        for ret in subagent_returns_in(host, d):
+            for matched in [lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id]:
+                lid = matched["lamb_id"]
+                summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
+                complete_lamb(self.store, lid, summary=summary, state="done", report_msg_id="native_system_message")
+                log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
+        kill_all, killed_cids = subagent_kills_in(host, d)
+        if kill_all or killed_cids:
+            killed_set = set(killed_cids)
+            for lb in self.store.get_active_lambs(tid):
+                if lb["kind"] not in ("subagent", "native_subagent"):
+                    continue
+                cid = (lb["conversation_id"] or "").strip()
+                if (kill_all and lb["lamb_id"] in new_lids_in_line and cid not in killed_set) or (not kill_all and cid not in killed_set):
+                    continue
+                complete_lamb(self.store, lb["lamb_id"], summary=lb["result_summary"] or "已由母羊销毁",
+                              state="done", report_msg_id=lb["report_msg_id"] or "killed_by_parent")
+                log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lb["lamb_id"], cid)
+
     def _scan_lambs(self) -> list[str]:
-        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写与 SYSTEM_MESSAGE 子代理回传结案。"""
+        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案。"""
+        from . import guard as _g
+        if b"pre-tool hook" not in _g._NEEDLES[LAMB_DISCOVERY]:
+            _g._NEEDLES[LAMB_DISCOVERY] = (*_g._NEEDLES[LAMB_DISCOVERY], b"pre-tool hook", b"Encountered error", b'"ERROR"')
         discovered: list[str] = []
         for t in self.store.list_topics():
             if (t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS) or t["state"] == sm.CLOSED \
                     or not t["conversation_id"]:
                 continue
             tid, host = t["topic_id"], self.topic_host(t)
-
-            def handle(off: int, d: dict, tid=tid, host=host) -> None:
-                new_lids_in_line: set[str] = set()
-                for inv in subagent_invocations_in(host, d, off):
-                    if inv.conversation_id and self.store.find_lamb_by_cid(inv.conversation_id) is not None:
-                        continue
-                    active = self.store.get_active_lambs(tid)
-                    matched = next(
-                        (
-                            lb for lb in active
-                            if lb["task_title"] == inv.task_title
-                            and (not (lb["conversation_id"] or "").strip() or lb["conversation_id"] == inv.conversation_id)
-                            and lb["lamb_id"] not in new_lids_in_line
-                        ),
-                        None,
-                    )
-                    if matched is not None:
-                        new_lids_in_line.add(matched["lamb_id"])
-                        if inv.conversation_id and not matched["conversation_id"]:
-                            self.store.update_lamb(matched["lamb_id"], conversation_id=inv.conversation_id,
-                                                   last_act_at=inv.at or now_iso())
-                        continue
-                    raw_id = (inv.lamb_id or "").strip()
-                    if raw_id.startswith("lamb_") and self.store.get_lamb(raw_id) is None:
-                        lid = raw_id
-                    else:
-                        digest = hashlib.sha1(
-                            f"{tid}:{off}:{inv.step}:{inv.task_title}:{inv.conversation_id}".encode("utf-8")
-                        ).hexdigest()[:8]
-                        lid = f"lamb_{digest}"
-                    if self.store.get_lamb(lid) is not None:
-                        continue
-                    ts = inv.at or now_iso()
-                    self.store.create_lamb(lid, tid, kind="subagent", task_title=inv.task_title or "subagent",
-                                           conversation_id=inv.conversation_id or None, state="running",
-                                           started_at=ts, last_act_at=ts)
-                    new_lids_in_line.add(lid)
-                    discovered.append(lid)
-                    log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
-
-                for cid in subagent_created_cids_in(host, d):
-                    existing_by_cid = self.store.find_lamb_by_cid(cid)
-                    if existing_by_cid is not None:
-                        if existing_by_cid["parent_topic_id"] == tid:
-                            active = self.store.get_active_lambs(tid)
-                            dup_empty = next(
-                                (
-                                    lb for lb in active
-                                    if lb["lamb_id"] != existing_by_cid["lamb_id"]
-                                    and lb["kind"] in ("subagent", "native_subagent")
-                                    and not (lb["conversation_id"] or "").strip()
-                                ),
-                                None,
-                            )
-                            if dup_empty is not None:
-                                merged_title = existing_by_cid["task_title"]
-                                if (not merged_title or merged_title in ("subagent", existing_by_cid["lamb_id"])) and dup_empty["task_title"]:
-                                    merged_title = dup_empty["task_title"]
-                                self.store.update_lamb(existing_by_cid["lamb_id"], task_title=merged_title)
-                                with self.store.tx() as c:
-                                    c.execute("DELETE FROM lambs WHERE lamb_id=?", (dup_empty["lamb_id"],))
-                        continue
-                    active = self.store.get_active_lambs(tid)
-                    matched = next(
-                        (
-                            lb for lb in active
-                            if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
-                        ),
-                        None,
-                    )
-                    ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
-                    if matched is not None:
-                        self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
-                        log.info("topic %s: 关联 subagent conversation_id %s -> %s (%s)",
-                                 tid, cid, matched["lamb_id"], matched["task_title"])
-                    else:
-                        digest = hashlib.sha1(f"{tid}:{off}:{cid}".encode("utf-8")).hexdigest()[:8]
-                        lid = f"lamb_{digest}"
-                        if self.store.get_lamb(lid) is None:
-                            self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent",
-                                                   conversation_id=cid, state="running",
-                                                   started_at=ts, last_act_at=ts)
-                            discovered.append(lid)
-                            log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
-
-                for ret in subagent_returns_in(host, d):
-                    active = self.store.get_active_lambs(tid)
-                    matched_list = [lb for lb in active if (lb["conversation_id"] or "").strip() == ret.conversation_id]
-                    for matched in matched_list:
-                        lid = matched["lamb_id"]
-                        summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
-                        complete_lamb(self.store, lid, summary=summary, state="done", report_msg_id="native_system_message")
-                        log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
-
-                kill_all, killed_cids = subagent_kills_in(host, d)
-                if kill_all or killed_cids:
-                    killed_set = set(killed_cids)
-                    for lb in self.store.get_active_lambs(tid):
-                        if lb["kind"] not in ("subagent", "native_subagent"):
-                            continue
-                        cid = (lb["conversation_id"] or "").strip()
-                        if kill_all:
-                            if lb["lamb_id"] in new_lids_in_line and cid not in killed_set:
-                                continue
-                        elif cid not in killed_set:
-                            continue
-                        lid = lb["lamb_id"]
-                        summary = lb["result_summary"] or "已由母羊销毁"
-                        complete_lamb(
-                            self.store,
-                            lid,
-                            summary=summary,
-                            state="done",
-                            report_msg_id=lb["report_msg_id"] or "killed_by_parent",
-                        )
-                        log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lid, cid)
-
-            self._follow(t, LAMB_DISCOVERY, handle, backfill=LAST_ACTIVITY_TAIL)
+            self._follow(t, LAMB_DISCOVERY, lambda off, d, tid=tid, host=host: self._handle_lamb_line(tid, host, off, d, discovered),
+                         backfill=LAST_ACTIVITY_TAIL)
         return discovered
 
     discover_lambs_from_transcript = _scan_lambs

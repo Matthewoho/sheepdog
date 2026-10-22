@@ -69,7 +69,7 @@ _NEEDLES = {
         b"Created the following subagent",
         b"SYSTEM_MESSAGE",
         b"[Message]",
-        b"manage_subagents",
+        b"manage_subagents", b"denied by pre-tool hook", b"Encountered error in step execution",
     ),
 }
 # 找最后一次动作时只读记录末尾这么多字节（记录里常有很长的工具输出，整份读太慢）
