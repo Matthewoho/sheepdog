@@ -26,8 +26,7 @@ from . import observe as obs
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
-from . import lastgood
-from . import duty
+from . import lastgood, duty, guard, outbound, identity as ident, session as sm
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
                      bus_quote_verifier, cancel_lamb, close_session, complete_lamb, delivered_text, display_time,
@@ -39,18 +38,15 @@ from .prompts import with_cli
 from .roster import Roster, RosterError, check_hosts, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
-from .sink.agentapi import AgentApiSink, DryRunSink, transcript_contains
+from .sink.agentapi import AgentApiSink, DryRunSink, transcript_contains, transcript_path
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
 from .notify import FileNotifier, OwnerDM
-from . import outbound
 from .source import NullSource
 from .source.lark import LarkCliSource
 from .source.bot_events import BotEventConsumer
-from . import identity as ident
 from .store import Store, infer_topic_lifecycle, now_iso
-from . import session as sm
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -1395,8 +1391,7 @@ def _reject_vip_needs_decision_without_floor_ask(
     tid = _topic_arg(tid)
     t = store.get_topic(tid)
     eff_bid = (bid or "").strip() or (t["pending_batch_id"] if t is not None and t["pending_batch_id"] else "")
-    vips_map = _ask_vips(cfg) if vips is None else vips
-    if not vips_map:
+    if not (vips_map := _ask_vips(cfg) if vips is None else vips):
         return None
     vip_srcs = outbound.vip_sources(cfg, store, tid, None, vips_map, batch=eff_bid)
     if not vip_srcs and t is not None and t["pending_batch_id"] and t["pending_batch_id"] != eff_bid:
@@ -1405,12 +1400,9 @@ def _reject_vip_needs_decision_without_floor_ask(
         return None
     from .roster import primary_topic_id
     p_tid = primary_topic_id(tid)
-    group_tids = list(dict.fromkeys([
-        tid, p_tid, *(r["topic_id"] for r in store.list_topics() if primary_topic_id(r["topic_id"]) == p_tid),
-    ]))
+    group_tids = list(dict.fromkeys([tid, p_tid, *(r["topic_id"] for r in store.list_topics() if primary_topic_id(r["topic_id"]) == p_tid)]))
     for gtid in group_tids:
-        rows = (store.list_sends(topic_id=gtid) if hasattr(store, "list_sends")
-                else store.conn.execute("SELECT * FROM sends WHERE topic_id=?", (gtid,)).fetchall())
+        rows = store.list_sends(topic_id=gtid) if hasattr(store, "list_sends") else store.conn.execute("SELECT * FROM sends WHERE topic_id=?", (gtid,)).fetchall()
         for s in rows:
             sd = dict(s)
             if sd.get("kind") == "ask" and outbound._is_valid_vip_floor(sd.get("floor") or ""):
@@ -1421,14 +1413,37 @@ def _reject_vip_needs_decision_without_floor_ask(
             s = store.send_by_message(e["message_id"])
             if s is not None and outbound._is_valid_vip_floor(s["floor"] or ""):
                 return None
-    return (
-        'receipt 没收: 当前批次含 VIP 请求，未发起带合法 --floor-type 的 sheepdog ask，'
-        '禁止提交 status="needs_decision" 挂起等主人；请按 VIP 规则合理就办并提交 status="handled"（长任务用 status="waiting"）'
-    )
+    return ('receipt 没收: 当前批次含 VIP 请求，未发起带合法 --floor-type 的 sheepdog ask，'
+            '禁止提交 status="needs_decision" 挂起等主人；请按 VIP 规则合理就办并提交 status="handled"（长任务用 status="waiting"）')
+
+
+def _check_monolithic_parent_turn(cfg, store: Store, tid: str, bid: str) -> str | None:
+    tid = _topic_arg(tid)
+    t = store.get_topic(tid)
+    eff_bid = (bid or "").strip() or (t["pending_batch_id"] if t is not None and t["pending_batch_id"] else "")
+    if t is None or not eff_bid or not (t["conversation_id"] or "").strip():
+        return None
+    d = store.get_dispatch(eff_bid)
+    if d is None or not (sent_dt := guard._iso_dt(str(d["sent_at"] or ""))) or not (now_dt := guard._iso_dt(now_iso())):
+        return None
+    if (elapsed_sec := (now_dt - sent_dt).total_seconds()) < 90:
+        return None
+    for lb in store.list_lambs(parent_topic_id=tid, include_finished=True):
+        st_dt = guard._iso_dt(str(lb.get("started_at") or ""))
+        if lb.get("state") == "running" or (st_dt is not None and st_dt >= sent_dt):
+            return None
+    if (parent_steps := guard.count_parent_tool_steps_since(transcript_path(t["conversation_id"]), str(d["sent_at"]))) < 6:
+        return None
+    store.add_history(tid, "monolithic_turn", f"批次 {eff_bid} 耗时 {int(elapsed_sec)}s 母羊串行 {parent_steps} 步且 0 羔羊")
+    return (f"⚠️ [牧羊犬并发守卫 REG-015] 本批母羊独自串行执行了 {parent_steps} 步业务工具（耗时 {int(elapsed_sec)}s）"
+            "且派生了 0 只羔羊，导致会话长时间锁死在 running 态阻塞新消息！按规则：凡整批 >3 步工具调用或 >45s 的任务，"
+            "必须在前 3 步内用 `sheepdog lamb prepare` + `invoke_subagent`（或 `sheepdog lamb spawn`）派生 1..N 只并行羔羊，"
+            '并立即交 status="waiting" 回执卸锁！')
 
 
 def cmd_receipt(args) -> int:
     cfg = _load_cfg()
+    warn_msg: str | None = None
     try:
         receipt = json.loads(args.json)
         if isinstance(receipt, dict) and cfg.db_path.exists():
@@ -1440,12 +1455,15 @@ def cmd_receipt(args) -> int:
                     ):
                         print(err, file=sys.stderr)
                         return 2
+                    warn_msg = _check_monolithic_parent_turn(cfg, store, args.topic, args.batch)
             finally:
                 store.close()
         p = write_receipt(cfg, args.topic, args.batch, receipt)
     except (json.JSONDecodeError, ValueError) as e:
         print(f"回执无效: {e}", file=sys.stderr)
         return 2
+    if warn_msg:
+        print(warn_msg)
     print(f"回执已提交: {p}")
     return 0
 
@@ -2421,16 +2439,49 @@ def cmd_topic_group(args) -> int:
     return 0
 
 
+def _lamb_prepare(cfg, store: Store, args) -> int:
+    tid, title = _topic_arg(args.topic), (args.title or "").strip()
+    if store.get_topic(tid) is None or not title:
+        print(f"lamb prepare 被拒绝: {'母羊会话 ' + tid + ' 不存在' if store.get_topic(tid) is None else '--title 不能为空'}", file=sys.stderr)
+        return 2
+    try:
+        spec_body = (args.spec if getattr(args, "spec", None) else
+                     (sys.stdin.read() if args.spec_file == "-" else Path(args.spec_file).read_text(encoding="utf-8")) if getattr(args, "spec_file", None) else
+                     sys.stdin.read() if getattr(args, "spec_stdin", False) else title)
+        lid = register_lamb(store, tid, title, kind=args.kind or "subagent", lamb_id=args.lamb_id or None)
+    except (OSError, ValueError) as e:
+        print(f"lamb prepare 被拒绝: {e}", file=sys.stderr)
+        return 2
+    tasks_dir = cfg.state_dir / "lamb_tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    task_file = tasks_dir / f"{lid}.md"
+    task_file.write_text(
+        f"# 羔羊任务单 {lid}（母羊：{tid}）\n- 任务标题：{title}\n"
+        f"- 铁律：你是母羊 {tid} 派出的后台执行/调研子代理（羔羊 {lid}）。严禁调用 sheepdog reply / ask / report / receipt；"
+        f"完成任务后直接将结论与证据回报母羊，并在回报开头或末尾原样带上标签 [lamb:{lid}]。\n\n"
+        f"## 任务详情与执行步骤\n{spec_body.strip()}\n", encoding="utf-8")
+    store.update_lamb(lid, log_path=str(task_file))
+    subagent_prompt = (f"请读取本机任务单文件 {task_file} ，严格按其中步骤完成调研或执行；"
+                       f"禁止调用 sheepdog 外发/回执命令，完成后将结论与证据回报母羊并附上 [lamb:{lid}]。")
+    if getattr(args, "json", False):
+        print(json.dumps({"lamb_id": lid, "topic_id": tid, "task_file": str(task_file),
+                          "subagent_prompt": subagent_prompt, "waiting_anchor": f"lamb:{lid}"}, ensure_ascii=False))
+    else:
+        print(f"已准备羔羊任务单 {lid}（母羊 {tid}）\n- task_file: {task_file}\n- subagent_prompt: {subagent_prompt}\n"
+              f"- waiting 回执示例: sheepdog receipt --topic {tid} --batch <BATCH_ID> "
+              f"--json '{{\"status\":\"waiting\",\"summary\":\"已派羔羊 {lid}\",\"anchors\":[\"lamb:{lid}\"]}}'")
+    return 0
+
+
 def cmd_lamb(args) -> int:
-    """sheepdog lamb（7.63）：母羊登记/派生/收尾/列出/取消羔羊（Subagent 或后台 CLI 子进程）。"""
-    cfg = _load_cfg()
-    store = Store(cfg.db_path)
-    sub_cmd = args.lamb_cmd
+    """sheepdog lamb（7.63 / 7.72）：母羊准备/登记/派生/收尾/列出/取消羔羊（Subagent 或后台 CLI 子进程）。"""
+    cfg, store, sub_cmd = _load_cfg(), Store(_load_cfg().db_path), args.lamb_cmd
+    if sub_cmd == "prepare":
+        return _lamb_prepare(cfg, store, args)
     if sub_cmd == "register":
         tid = _topic_arg(args.topic)
         try:
-            lid = register_lamb(store, tid, args.title, kind=args.kind, conversation_id=args.cid or None,
-                                lamb_id=args.lamb_id or None)
+            lid = register_lamb(store, tid, args.title, kind=args.kind, conversation_id=args.cid or None, lamb_id=args.lamb_id or None)
         except ValueError as e:
             print(f"lamb register 被拒绝: {e}", file=sys.stderr)
             return 2
@@ -2439,25 +2490,18 @@ def cmd_lamb(args) -> int:
         print(f"已登记羔羊 {lid}（母羊 {tid}，[{args.kind}] {args.title}{cid_text}）")
         return 0
     if sub_cmd == "spawn":
-        tid = _topic_arg(args.topic)
-        if store.get_topic(tid) is None:
-            print(f"lamb spawn 被拒绝: 母羊会话 {tid} 不存在", file=sys.stderr)
-            return 2
-        cmd_str = (args.command or "").strip()
-        if not cmd_str:
-            print("lamb spawn 被拒绝: --cmd 不能为空", file=sys.stderr)
+        tid, cmd_str = _topic_arg(args.topic), (args.command or "").strip()
+        if store.get_topic(tid) is None or not cmd_str:
+            print(f"lamb spawn 被拒绝: {'母羊会话 ' + tid + ' 不存在' if store.get_topic(tid) is None else '--cmd 不能为空'}", file=sys.stderr)
             return 2
         raw_lid = (args.lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
         lid = raw_lid if raw_lid.startswith("lamb_") else f"lamb_{raw_lid}"
-        lambs_dir = cfg.lambs_dir
-        lambs_dir.mkdir(parents=True, exist_ok=True)
-        log_path = lambs_dir / f"{lid}.log"
-        env = dict(os.environ)
-        env["SHEEPDOG_LAMB_ID"] = lid
+        cfg.lambs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = cfg.lambs_dir / f"{lid}.log"
+        env = {**os.environ, "SHEEPDOG_LAMB_ID": lid}
         try:
             with log_path.open("ab") as lf:
-                proc = subprocess.Popen(cmd_str, shell=True, stdin=subprocess.DEVNULL, stdout=lf,
-                                        stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                proc = subprocess.Popen(cmd_str, shell=True, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
             try:
                 proc.wait(timeout=0.1)
             except subprocess.TimeoutExpired:
@@ -2468,21 +2512,14 @@ def cmd_lamb(args) -> int:
             return 2
         print(f"已启动羔羊 {lid}（母羊 {tid}，[cli] {args.title}，pid={proc.pid}，日志 {log_path}）")
         return 0
-    if sub_cmd == "done":
+    if sub_cmd in ("done", "cancel"):
         try:
-            r = complete_lamb(store, args.lamb_id, summary=args.summary, state=args.status)
+            r = complete_lamb(store, args.lamb_id, summary=args.summary, state=args.status) if sub_cmd == "done" else cancel_lamb(store, args.lamb_id, reason=args.reason)
         except ValueError as e:
-            print(f"lamb done 被拒绝: {e}", file=sys.stderr)
+            print(f"lamb {sub_cmd} 被拒绝: {e}", file=sys.stderr)
             return 2
-        print(f"羔羊 {r['lamb_id']} 已标为 {r['state']}（母羊 {r['parent_topic_id']}）：{r['summary']}")
-        return 0
-    if sub_cmd == "cancel":
-        try:
-            r = cancel_lamb(store, args.lamb_id, reason=args.reason)
-        except ValueError as e:
-            print(f"lamb cancel 被拒绝: {e}", file=sys.stderr)
-            return 2
-        print(f"已取消羔羊 {r['lamb_id']}（母羊 {r['parent_topic_id']}）：{r['summary']}")
+        print(f"羔羊 {r['lamb_id']} 已标为 {r['state']}（母羊 {r['parent_topic_id']}）：{r['summary']}" if sub_cmd == "done"
+              else f"已取消羔羊 {r['lamb_id']}（母羊 {r['parent_topic_id']}）：{r['summary']}")
         return 0
     if sub_cmd == "list":
         tid = _topic_arg(args.topic) if getattr(args, "topic", "") else None
@@ -2494,18 +2531,9 @@ def cmd_lamb(args) -> int:
             print("没有运行中的羔羊" if not args.all else "没有羔羊记录")
             return 0
         for lb in rows:
-            extra = []
-            if lb.get("conversation_id"):
-                extra.append(f"cid={lb['conversation_id']}")
-            if lb.get("pid"):
-                extra.append(f"pid={lb['pid']}")
-            if lb.get("log_path"):
-                extra.append(f"log={lb['log_path']}")
-            if lb.get("result_summary"):
-                extra.append(f"结果={lb['result_summary']}")
+            extra = [f"{k}={lb[col]}" for k, col in (("cid", "conversation_id"), ("pid", "pid"), ("log", "log_path"), ("结果", "result_summary")) if lb.get(col)]
             tail = (" · " + " · ".join(extra)) if extra else ""
-            print(f"- {lb['lamb_id']} [{lb['kind']}] [{lb['state']}] topic={lb['parent_topic_id']} "
-                  f"title={lb['task_title']}{tail}")
+            print(f"- {lb['lamb_id']} [{lb['kind']}] [{lb['state']}] topic={lb['parent_topic_id']} title={lb['task_title']}{tail}")
         return 0
     return 2
 
@@ -2522,80 +2550,63 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=False)
 
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
-
     sp = sub.add_parser("version", help="显示 CLI 代码版本与常驻进程内存版本")
     sp.add_argument("--json", action="store_true", help="输出 JSON")
     sp.set_defaults(func=cmd_version)
-
     sp = sub.add_parser("upgrade", help="拉取最新代码并通知常驻进程原地热重启（os.execv，保留 sidecar 环境）")
     sp.add_argument("--no-pull", action="store_true", help="不执行 git pull，仅通知常驻进程原地重启")
     sp.add_argument("--dry-run", action="store_true", help="只打印将要执行的升级动作，不拉代码、不入队")
     sp.set_defaults(func=cmd_upgrade)
-
     sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
     obs.add_observe_arguments(sp)
     sp.set_defaults(func=cmd_observe)
-
     sp = sub.add_parser("poll")
     sp.add_argument("--dry-run", action="store_true", help="不真正投递，只打印")
     sp.add_argument("--no-dispatch", action="store_true", help="只拉取与路由，不投递")
     sp.set_defaults(func=cmd_poll)
-
     sp = sub.add_parser("run")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--interval", type=int, default=0)
     sp.set_defaults(func=cmd_run)
-
     sp = sub.add_parser("inbox")
     sp.add_argument("--chat", default="")
     sp.add_argument("--limit", type=int, default=50)
     sp.set_defaults(func=cmd_inbox)
-
     sp = sub.add_parser("inbox-clear")
     sp.add_argument("--chat", default="")
     sp.add_argument("--all", action="store_true")
     sp.set_defaults(func=cmd_inbox_clear)
-
     sp = sub.add_parser("init")
     sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本")
     sp.set_defaults(func=cmd_init)
-
     sub.add_parser("sessions").set_defaults(func=cmd_sessions)
-
     sp = sub.add_parser("forward")
     sp.add_argument("--topic", required=True)
     sp.add_argument("--message-ids", default="", help="逗号分隔；可以不带，只转达 --quote / --note")
     sp.add_argument("--quote", default="", help="主人原话，投递时标成「主人原话（经总线转达）」")
     sp.add_argument("--note", default="", help="总线备注，投递时标成「总线备注」")
-    sp.add_argument("--answers", default="", help="7.53：主人这句是在回答哪条「需要你定」（提问的 om_，只能一个）："
-                                                  "给了才关那一条；必须是 --topic 那个会话名下、还开着的")
+    sp.add_argument("--answers", default="", help="7.53：主人这句是在回答哪条「需要你定」（提问的 om_，只能一个）：给了才关那一条；必须是 --topic 那个会话名下、还开着的")
     sp.set_defaults(func=cmd_forward)
-
     sp = sub.add_parser("spawn")
     sp.add_argument("--key", required=True)
     sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本")
     sp.set_defaults(func=cmd_spawn)
-
     sp = sub.add_parser("watch")
     sp.add_argument("--topic", required=True)
     sp.add_argument("--person", required=True, help="对方 open_id")
     sp.add_argument("--chat", default="", help="只认这个聊天里的回复；不填 = 任意聊天")
     sp.add_argument("--note", default="", help="在等什么")
     sp.set_defaults(func=cmd_watch)
-
     sp = sub.add_parser("watches")
     sp.add_argument("--all", action="store_true", help="包括已结束的")
     sp.set_defaults(func=cmd_watches)
-
     sp = sub.add_parser("security-log")
     sp.add_argument("--since", default="24h", help="回看时长：30m / 24h / 7d")
     sp.set_defaults(func=cmd_security_log)
-
     sp = sub.add_parser("escalations")
     sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
     sp.add_argument("--topic", default="", help="只列这个会话（tp_x）名下的")
     sp.set_defaults(func=cmd_escalations)
-
     sp = sub.add_parser("new-session")
     sp.add_argument("--key", required=True)
     sp.add_argument("--title", required=True)
@@ -2606,32 +2617,25 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--host", default=ANTIGRAVITY, choices=HOSTS, help="会话宿主，默认 antigravity；建好后不能换")
     sp.add_argument("--model", default="", help="模型；留空 = 这个宿主的默认值")
     sp.add_argument("--effort", default="", help="推理档位（只对 codex / claude）；留空 = 这个宿主的默认值")
-    sp.add_argument("--quote", default="", help="主人同意开这个会话的原话（codex / claude 且 ask_owner_before_new 时必填，"
-                                                "核对同 forward）")
-    sp.add_argument("--lifecycle", choices=("standing", "oneshot"), default=None,
-                    help="生命周期（7.58）：standing（回执 done 不关）| oneshot（回执 done 自动收掉）；不传按标题前缀推断")
+    sp.add_argument("--quote", default="", help="主人同意开这个会话的原话（codex / claude 且 ask_owner_before_new 时必填，核对同 forward）")
+    sp.add_argument("--lifecycle", choices=("standing", "oneshot"), default=None, help="生命周期（7.58）：standing（回执 done 不关）| oneshot（回执 done 自动收掉）；不传按标题前缀推断")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写账本、不建会话")
     sp.set_defaults(func=cmd_new_session)
-
     sp = sub.add_parser("push-rules")
     sp.add_argument("--topic", default="", help="不填 = 全部会话（含总线）")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不发、不写账本")
     sp.set_defaults(func=cmd_push_rules)
-
     sp = sub.add_parser("retire")
     sp.add_argument("--topic", required=True, help="tp_x 或裸 conversation_id")
     sp.add_argument("--successor-title", default="", help="接手者的称呼，填进 retire.md 的 {{successor_title}}")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不发、不写账本")
     sp.set_defaults(func=cmd_retire)
-
     sp = sub.add_parser("actions")
     sp.add_argument("--all", action="store_true", help="全部（默认只看排队中和最近 10 条已完成）")
     sp.set_defaults(func=cmd_actions)
-
     sp = sub.add_parser("loops")
     sp.add_argument("--clear", default="", help="手动解除这个聊天的冷却")
     sp.set_defaults(func=cmd_loops)
-
     sp = sub.add_parser("redeliver")
     sp.add_argument("--batch", default="", help="按批次号重投")
     sp.add_argument("--topic", default="", help="按会话重投最近一批 uncertain 或未进会话记录的批次")
@@ -2646,13 +2650,11 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("--summary", default="", help="当面日常大白话回话（7.70：展示在卡片首屏，≤3 行、≤100 字，只答问题、不括技术亮点、不露修订号/SHA/路径/分点列表）")
     sg.add_argument("--summary-file", default="", help="白话总结文件")
     sp.set_defaults(func=cmd_reply_card)
-
     sp = sub.add_parser("show")
     sp.add_argument("message_id", nargs="?", default="")
     sp.add_argument("--topic", default="", help="打印这个会话最近几轮的问答")
     sp.add_argument("--limit", type=int, default=6, help="--topic 时最多打印几条")
     sp.set_defaults(func=cmd_show)
-
     sp = sub.add_parser("inject")
     sp.add_argument("--text", required=True)
     sp.add_argument("--chat", default="oc_test_inject", help="聊天 ID（默认 oc_test_inject）")
@@ -2664,41 +2666,33 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--at-me", action="store_true", help="群消息里 @主人")
     sp.add_argument("--reply-to", default="")
     sp.set_defaults(func=cmd_inject)
-
     sp = sub.add_parser("close-session")
     sp.add_argument("--topic", required=True)
     sp.set_defaults(func=cmd_close_session)
-
     sp = sub.add_parser("acks")
     sp.add_argument("--open", action="store_true", help="只看还没撤的")
     sp.set_defaults(func=cmd_acks)
-
     sp = sub.add_parser("watch-done")
     sp.add_argument("--id", type=int, required=True)
     sp.set_defaults(func=cmd_watch_done)
-
     sp = sub.add_parser("unwatch")
     sp.add_argument("--id", type=int, required=True)
     sp.set_defaults(func=cmd_unwatch)
-
     sp = sub.add_parser("receipt")
     sp.add_argument("--topic", required=True)
     sp.add_argument("--batch", required=True)
     sp.add_argument("--json", required=True)
     sp.set_defaults(func=cmd_receipt)
-
     sp = sub.add_parser("session-reset")
     sp.add_argument("--topic", required=True)
     sp.set_defaults(func=cmd_session_reset)
-
     sp = sub.add_parser("work", help="羊群看板：登记 / 收掉会话名下的活")
     wsub = sp.add_subparsers(dest="work_cmd", required=True)
     w = wsub.add_parser("set")
     w.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
     w.add_argument("--key", required=True, help="钥匙：外部编号（审批单号、PR、Linear 单号）或短名")
     w.add_argument("--title", default="", help="一句话：这件活是什么")
-    w.add_argument("--state", default=duty.DOING,
-                   help="doing | waiting_other | waiting_owner | done | handed_off（也认中文：进行中 / 等别人 / 等主人 / 已完成 / 已转交）")
+    w.add_argument("--state", default=duty.DOING, help="doing | waiting_other | waiting_owner | done | handed_off（也认中文：进行中 / 等别人 / 等主人 / 已完成 / 已转交）")
     w.add_argument("--waiting-on", default="", help="等谁")
     w.add_argument("--until", default="", help="到几点")
     w.add_argument("--expect", default="", help="答应交出什么（一句话）")
@@ -2710,7 +2704,6 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--key", required=True)
     w.add_argument("--result", required=True, help="做成了什么（一句话）")
     w.set_defaults(func=cmd_work)
-
     sp = sub.add_parser("tell", help="羊群看板：给别的会话留言")
     sp.add_argument("--topic", "--from", dest="topic", required=True, help="你自己的会话（tp_x）")
     sp.add_argument("--to", required=True, help="收件会话（tp_x）")
@@ -2744,21 +2737,12 @@ def main(argv: list[str] | None = None) -> int:
         sg.add_argument("--summary", default="", help="卡片首屏白话总结（7.62/7.70：ask/report ≤6 行、≤220 字、不含代码块；原文自动收进 more 折叠区）")
         sg.add_argument("--summary-file", default="", help="白话总结文件")
         sp.add_argument("--key", default="", help="钥匙（和羊群看板的活同一套）：同一把钥匙第一次在主聊天里起一条，之后回到它的话题里")
-        sp.add_argument("--batch", default="",
-                        help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
-        sp.add_argument("--track", action="store_true",
-                        help="长期跟踪（7.51）：第一次用这把 --key 时带上，这件事放进话题群（一件事一个话题）；"
-                             "之后同一把钥匙不用再带，自动发进群里那个话题")
+        sp.add_argument("--batch", default="", help="批次号（可选，一般不用传）：参与防重编号。不传时取这个会话当前在跑的批次，没有就取最近一批")
+        sp.add_argument("--track", action="store_true", help="长期跟踪（7.51）：第一次用这把 --key 时带上，这件事放进话题群（一件事一个话题）；之后同一把钥匙不用再带，自动发进群里那个话题")
         if name == "ask":
-            sp.add_argument("--about", action="append", default=[],
-                            help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。"
-                                 "主人之后在那个聊天里说过话，sheepdog 会提醒你核实")
-            sp.add_argument("--floor-type", default=None,
-                            help="碰到哪类底线（7.65，必填枚举：credentials | destructive | vip_conflict）："
-                                 "为名册 VIP 本人发的消息找主人（或使用 --floor）时必须与 --floor 同时写")
-            sp.add_argument("--floor", default="",
-                            help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，"
-                                 "不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
+            sp.add_argument("--about", action="append", default=[], help="为哪条消息问的（om_，可多次或逗号分隔）；不给 = 这个会话最近一批送到的全部消息。主人之后在那个聊天里说过话，sheepdog 会提醒你核实")
+            sp.add_argument("--floor-type", default=None, help="碰到哪类底线（7.65，必填枚举：credentials | destructive | vip_conflict）：为名册 VIP 本人发的消息找主人（或使用 --floor）时必须与 --floor 同时写")
+            sp.add_argument("--floor", default="", help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
         sp.set_defaults(func=cmd_ask)
 
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
@@ -2816,8 +2800,17 @@ def main(argv: list[str] | None = None) -> int:
     gsub.add_parser("status", help="只读：配没配、开没开、是不是退回私聊了")
     sp.set_defaults(func=cmd_topic_group)
 
-    sp = sub.add_parser("lamb", help="羔羊管理（7.63）：登记 subagent、派生后台 CLI 子进程、标记完工、查看、取消")
+    sp = sub.add_parser("lamb", help="羔羊管理（7.63 / 7.72）：准备任务单、登记 subagent、派生后台 CLI 子进程、标记完工、查看、取消")
     lsub = sp.add_subparsers(dest="lamb_cmd", required=True)
+    lp = lsub.add_parser("prepare", help="零敏感文件指针派单（7.72 REG-014）：落盘任务单并预登记羔羊")
+    lp.add_argument("--topic", required=True, help="母羊会话（tp_x）")
+    lp.add_argument("--title", required=True, help="一句话任务标题")
+    lp.add_argument("--spec", default="", help="详细任务与命令正文")
+    lp.add_argument("--spec-file", default="", help="详细任务文件路径（- 表示 stdin）")
+    lp.add_argument("--spec-stdin", action="store_true", help="从标准输入读取详细任务")
+    lp.add_argument("--kind", choices=("subagent", "cli"), default="subagent", help="羔羊类型（默认 subagent）")
+    lp.add_argument("--lamb-id", "--id", dest="lamb_id", default="", help="指定 lamb_id（不填自动生成）")
+    lp.add_argument("--json", action="store_true", help="输出 JSON")
     lr = lsub.add_parser("register", help="登记一只 subagent 羔羊")
     lr.add_argument("--topic", required=True, help="母羊会话（tp_x）")
     lr.add_argument("--title", required=True, help="羔羊任务标题")

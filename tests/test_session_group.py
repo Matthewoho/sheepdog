@@ -10,6 +10,7 @@ import json
 import tempfile
 import tomllib
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sheepdog import duty, prompts
@@ -266,10 +267,14 @@ class SessionGroupTest(Base):
         )
         Collector(self.cfg, self.store, FakeSource([[
             msg(message_id="om_test_767_lh0", chat_type="p2p", chat_id="oc_test_laohu_p2p",
-                sender_id="ou_test_other", content="帮我拉一份上月全量报表"),
+                sender_id="ou_test_laohu", content="帮我拉一份上月全量报表"),
         ]]), r_laohu).poll_once()
         d_lh.dispatch_once()
         self.assertEqual(self.store.get_topic("tp_laohu")["state"], sm.RUNNING)
+        # 模拟 #1 已经在跑慢活满 200 秒（超出 90s 连发窗与 180s 租约窗）
+        old_ts = (datetime.now().astimezone() - timedelta(seconds=200)).isoformat(timespec="seconds")
+        self.store.conn.execute("UPDATE messages SET first_seen=? WHERE message_id='om_test_767_lh0'", (old_ts,))
+        self.store.update_topic("tp_laohu", dispatched_at=old_ts)
 
         Collector(self.cfg, self.store, FakeSource([[
             msg(message_id="om_test_767_lh1", chat_type="p2p", chat_id="oc_test_laohu_p2p",
@@ -289,6 +294,84 @@ class SessionGroupTest(Base):
         prompt_text = self.sink.to(t2["conversation_id"])[-1]
         self.assertIn("另外看下这个报错", prompt_text)
         self.assertIn("截图刚发你了", prompt_text)
+
+    def test_reg_016_p2p_dual_window_and_group_context_snapshot_and_reopen(self):
+        def _mk(n: int):
+            return parse_roster(tomllib.loads(f"""
+                [[session]]
+                key = "laohu"
+                mode = "managed"
+                conversation_id = "conv_test_laohu_1"
+                title = "人·老胡"
+                duty = "负责老胡私聊与需求跟进"
+                max_sessions = {n}
+                chats = [{{ chat_id = "oc_test_laohu_p2p", name = "老胡私聊", all_messages = true }}]
+            """))
+
+        r2, r1 = _mk(2), _mk(1)
+        d = self.disp(r2)
+        d.sync_roster()
+        self.store.update_topic("tp_laohu", onboarded_at="2026-10-20T00:00:00+08:00")
+        self.store.create_topic("tp_laohu#2", "人·老胡 #2", "adopted", "负责老胡私聊与需求跟进", sm.ACTIVE, group_id="laohu")
+        self.store.update_topic("tp_laohu#2", conversation_id="conv_test_laohu_2",
+                                spawned_at="2026-10-20T00:00:00+08:00", onboarded_at="2026-10-20T00:00:00+08:00")
+
+        # 1. 双时间窗：<90s 内紧接补充吸附 #1；>180s 长跑时新消息溢出到 #2
+        now = datetime.now().astimezone()
+        recent_ts = (now - timedelta(seconds=20)).isoformat(timespec="seconds")
+        self.store.upsert_message(
+            msg(message_id="om_test_r16_m1", chat_type="p2p", chat_id="oc_test_laohu_p2p",
+                sender_id="ou_test_laohu", content="先帮我改下测试环境配置"),
+            "dispatch", "p2p", [], "tp_laohu",
+        )
+        self.store.mark_batch(["om_test_r16_m1"], "b_test_r16_1", "tp_laohu", "delivered")
+        self.store.conn.execute("UPDATE messages SET first_seen=? WHERE message_id='om_test_r16_m1'", (recent_ts,))
+        self.store.update_topic("tp_laohu", state=sm.RUNNING, pending_batch_id="b_test_r16_1", dispatched_at=recent_ts)
+        self.assertEqual(route_within_group(self.store, r2, "tp_laohu", chat_id="oc_test_laohu_p2p", sender_id="ou_test_laohu"), "tp_laohu")
+
+        long_ts = (now - timedelta(seconds=200)).isoformat(timespec="seconds")
+        self.store.conn.execute("UPDATE messages SET first_seen=? WHERE message_id='om_test_r16_m1'", (long_ts,))
+        self.store.update_topic("tp_laohu", dispatched_at=long_ts)
+        self.assertIsNone(self.store.find_recent_thread_topic_in_group("laohu", chat_id="oc_test_laohu_p2p", sender_id="ou_test_laohu"))
+        self.assertEqual(route_within_group(self.store, r2, "tp_laohu", chat_id="oc_test_laohu_p2p", sender_id="ou_test_laohu"), "tp_laohu#2")
+
+        # 2. group_context_snapshot 提取同羊圈兄弟的在跑羔羊、最近入站消息和最近对外回复，并注入批次提示词
+        self.store.register_lamb("lamb_test_r16", "tp_laohu", task_title="拉取生产 BFF 监控指标", conversation_id="conv_lamb_r16")
+        self.store.conn.execute("UPDATE messages SET first_seen=? WHERE message_id='om_test_r16_m1'", (recent_ts,))
+        self.store.add_send("sdr_test_r16", "reply", "tp_laohu", "om_test_r16_rep", "收到，正在拉取生产监控指标",
+                            target_message_id="om_test_r16_m1")
+        snap = self.store.group_context_snapshot("laohu", "tp_laohu#2")
+        self.assertTrue(any("🐑 tp_laohu 在跑羔羊 lamb_test_r16：拉取生产 BFF 监控指标" in s for s in snap), snap)
+        self.assertTrue(any("📥 tp_laohu 刚收" in s and "先帮我改下测试环境配置" in s for s in snap), snap)
+        self.assertTrue(any("📤 tp_laohu 已回：收到，正在拉取生产监控指标" in s for s in snap), snap)
+
+        self.store.upsert_message(
+            msg(message_id="om_test_r16_m2", chat_type="p2p", chat_id="oc_test_laohu_p2p",
+                sender_id="ou_test_laohu", content="顺便查下灰度网关日志"),
+            "dispatch", "p2p", [], "tp_laohu#2", "pending",
+        )
+        d.dispatch_once()
+        prompt_2 = self.sink.to("conv_test_laohu_2")[-1]
+        self.assertIn("🐑 tp_laohu 在跑羔羊 lamb_test_r16", prompt_2)
+        self.assertIn("📤 tp_laohu 已回：收到，正在拉取生产监控指标", prompt_2)
+
+        # 3. 副槽位在途批次优雅排空与恢复 max_sessions=2 后自动 reopen + 收敛孤儿回执
+        bid2 = self.store.get_topic("tp_laohu#2")["pending_batch_id"]
+        self.disp(r1).sync_roster()
+        self.assertEqual(self.store.get_topic("tp_laohu#2")["state"], sm.RUNNING)
+        self.assertEqual(self.store.get_topic("tp_laohu#2")["pending_batch_id"], bid2)
+
+        self.store.update_topic("tp_laohu#2", state=sm.CLOSED, pending_batch_id=None)
+        self.store.upsert_card("tp_laohu#2", run_state=duty.WORKING, detail="处理中")
+        rp = d.receipt_path("tp_laohu#2", bid2)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text('{"status":"handled","summary":"灰度网关日志已查清"}', encoding="utf-8")
+
+        rep = d.sync_roster()
+        self.assertIn("tp_laohu#2", rep["reopened"])
+        self.assertEqual(self.store.get_topic("tp_laohu#2")["state"], sm.ACTIVE)
+        self.assertEqual(self.store.get_dispatch(bid2)["state"], "acked")
+        self.assertEqual(self.store.get_card("tp_laohu#2")["run_state"], duty.IDLE)
 
 
 if __name__ == "__main__":

@@ -2509,21 +2509,13 @@ class Dispatcher:
                 t = self.store.get_topic(s.topic_id)
                 report["created"].append(s.topic_id)
             chat_ids = [c.chat_id for c in s.chats]
-            # 聊天锚点以名册为准；回执带来的其他锚点（issue:/service: 等）保留
             keep = [a for a in json.loads(t["anchors_json"] or "[]") if not a.startswith("oc_") and a not in chat_ids]
-            if s.to_spawn:
-                # 名册留空 = 由 sheepdog 新建：运行态以 topics 表为准，不回写名册；还没 spawn 就没有投递目标
-                cid = t["conversation_id"] if t["spawned_at"] else None
-            else:
-                cid = s.conversation_id or None
+            cid = (t["conversation_id"] if t["spawned_at"] else None) if s.to_spawn else (s.conversation_id or None)
             fields = {
-                "title": s.display_title, "kind": s.kind, "duty": s.duty,
-                "conversation_id": cid,
+                "title": s.display_title, "kind": s.kind, "duty": s.duty, "conversation_id": cid,
                 "anchors_json": json.dumps(chat_ids + sorted(set(keep)), ensure_ascii=False),
-                "model": s.model or None, "effort": s.effort or None,
-                "group_id": s.group_id,
+                "model": s.model or None, "effort": s.effort or None, "group_id": s.group_id,
             }
-            # 已有会话不能换宿主（7.18）：要换就退休旧的、新开一个，走接手流程
             host = self.topic_host(t)
             if host != s.host:
                 if t["conversation_id"] and cid == t["conversation_id"]:
@@ -2534,14 +2526,12 @@ class Dispatcher:
                 else:
                     fields["host"] = s.host
             if t["conversation_id"] and t["conversation_id"] != fields["conversation_id"]:
-                # 换了会话：新会话没收过 onboarding，旧批次的回执也不再等
                 fields.update(onboarded_at=None, pending_batch_id=None)
                 if not s.to_spawn:
                     fields["spawned_at"] = None
                 if t["state"] == sm.RUNNING:
                     fields["state"] = sm.ACTIVE
             if t["state"] == sm.CLOSED:
-                # 名册是 adopted/known 会话存续的唯一依据：在名册里就不是 closed
                 fields["state"] = sm.ACTIVE
                 report["reopened"].append(s.topic_id)
             changed = {k: v for k, v in fields.items() if t[k] != v}
@@ -2549,31 +2539,47 @@ class Dispatcher:
                 self.store.update_topic(s.topic_id, **changed)
                 if s.topic_id not in report["created"]:
                     report["updated"].append(s.topic_id)
-        for t in self.store.list_topics():
-            if "#" in t["topic_id"] and (s_mem := self.roster.by_topic(t["topic_id"])) is not None:
-                live.add(t["topic_id"])
-                mem_fields = {
-                    "group_id": s_mem.group_id,
-                    "duty": s_mem.duty,
-                    "model": s_mem.model or None,
-                    "effort": s_mem.effort or None,
-                }
-                changed_mem = {k: v for k, v in mem_fields.items() if t[k] != v}
-                if changed_mem:
-                    self.store.update_topic(t["topic_id"], **changed_mem)
-                continue
-            if t["kind"] in (ADOPTED, KNOWN_KIND) and t["topic_id"] not in live and t["state"] != sm.CLOSED:
-                self.store.update_topic(t["topic_id"], state=sm.CLOSED, pending_batch_id=None)
-                report["closed"].append(t["topic_id"])
-                log.info("topic %s 已从名册移除，置为 closed", t["topic_id"])
+        self._sync_secondary_and_stale(live, report)
         h = self.roster.content_hash()
         prev = self.store.get_meta("roster_hash")
         if prev != h:
             self.store.set_meta("roster_hash", h)
-            # 从没有名册到仍然没有名册不算变化
             if prev or self.roster.sessions:
                 self.store.set_meta("roster_notify_bus", "1")
         return report
+
+    def _sync_secondary_and_stale(self, live: set[str], report: dict) -> None:
+        for t in self.store.list_topics():
+            tid = t["topic_id"]
+            for (bid,) in self.store.conn.execute(
+                "SELECT batch_id FROM dispatches WHERE topic_id=? AND state='sent'", (tid,)
+            ).fetchall():
+                rp = self.receipt_path(tid, bid)
+                if not rp.exists():
+                    rp = self.cfg.receipts_dir / f"{bid}.json"
+                if rp.exists() and (t["pending_batch_id"] != bid or t["state"] != sm.RUNNING):
+                    self.store.finish_dispatch(bid, "acked", rp.read_text(encoding="utf-8"))
+                    self.store.mark_batch_state(bid, "acked")
+                    if (card := self.store.get_card(tid)) is not None and card["run_state"] == duty.WORKING:
+                        self.store.upsert_card(tid, run_state=duty.IDLE, detail="", stuck_since=None, idle_since=now_iso())
+            if "#" in tid and (s_mem := self.roster.by_topic(tid)) is not None:
+                live.add(tid)
+                mem_fields = {"group_id": s_mem.group_id, "duty": s_mem.duty,
+                              "model": s_mem.model or None, "effort": s_mem.effort or None}
+                if t["state"] == sm.CLOSED:
+                    mem_fields["state"] = sm.ACTIVE
+                    report["reopened"].append(tid)
+                    if (card := self.store.get_card(tid)) is not None and card["run_state"] == duty.WORKING:
+                        self.store.upsert_card(tid, run_state=duty.IDLE, detail="", stuck_since=None, idle_since=now_iso())
+                if changed_mem := {k: v for k, v in mem_fields.items() if t[k] != v}:
+                    self.store.update_topic(tid, **changed_mem)
+                continue
+            if t["kind"] in (ADOPTED, KNOWN_KIND) and tid not in live and t["state"] != sm.CLOSED:
+                if "#" in tid and t["state"] == sm.RUNNING and t["pending_batch_id"]:
+                    continue
+                self.store.update_topic(tid, state=sm.CLOSED, pending_batch_id=None)
+                report["closed"].append(tid)
+                log.info("topic %s 已从名册移除，置为 closed", tid)
 
     # ---------- 回执与超时 ----------
     def _check_receipt(self, t) -> None:
@@ -2587,20 +2593,19 @@ class Dispatcher:
             hook.clear_stop_state(self.cfg.state_dir, t["topic_id"])
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
-            # 常驻会话（名册 adopted、总线、7.58 standing 动态会话）回执 done 都不关会话，按 handled 处理；
-            # oneshot 动态会话是为一件事开的，done 就收掉（7.10 / 7.58）
             if is_standing_topic(t) and status == "done":
                 status = "handled"
             summary = receipt.get("summary", t["summary"])
             answered = ""
             if status == "needs_decision" and (answered := self._answered_by_priority(t)):
-                # 7.47 第 3 条：回执是会话看到主人插话之前写的，主人其实已经答了、名下也没有还开着的提问：不卡在等主人
                 status = "handled"
                 summary = f"（回执说等主人拍板，但主人已在插话批次 `{answered}` 回复）{summary or ''}"
                 log.info("回执 %s/%s 说等主人拍板，但主人已在插话批次 %s 回复、名下没有开着的提问：按 handled 收",
                          t["topic_id"], batch, answered)
             event = sm.RECEIPT_EVENTS.get(status, "receipt_handled")
             new_state = sm.transition(t["state"], event)
+            if "#" in t["topic_id"] and self.roster.by_topic(t["topic_id"]) is None and new_state == sm.ACTIVE:
+                new_state = sm.CLOSED
             self.store.finish_dispatch(batch, "acked", json.dumps(receipt, ensure_ascii=False))
             self.store.mark_batch_state(batch, "acked")
             fields = {"state": new_state, "pending_batch_id": None, "retries": 0, "summary": summary}
@@ -3181,11 +3186,28 @@ class Dispatcher:
         log.info("topic %s: 已发 onboarding %s", t["topic_id"], bid)
         return bid
 
+    def _group_peer_status(self, t) -> str:
+        gid = (t["group_id"] if "group_id" in t.keys() else "") or ""
+        if not gid:
+            return ""
+        g_topics = self.store.get_group_topics(gid)
+        all_watches = self.store.open_watches()
+        p_counts = {gt["topic_id"]: self.store.count_pending_messages_for_topic(gt["topic_id"]) for gt in g_topics}
+        p_work = {gt["topic_id"]: self.store.open_work(gt["topic_id"]) for gt in g_topics}
+        p_watches = {gt["topic_id"]: [w for w in all_watches if w["topic_id"] == gt["topic_id"]] for gt in g_topics}
+        snap = self.store.group_context_snapshot(gid, t["topic_id"])
+        try:
+            out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches, snapshot=snap)
+        except TypeError:
+            out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches)
+        if out and snap and not any(s in out for s in snap):
+            out = "\n".join([*out.splitlines(), *[f"  - {s}" for s in snap]][:10])
+        return out
+
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
             if t["state"] == sm.RUNNING and self.cfg.session.owner_priority and (urgent := self._priority_rows(rows)):
-                # 7.37 第 4 件：会话在跑上一批，主人的回复不等那批回执，当轮单独送到；其余信号照旧排队
                 return self._dispatch_priority(t, urgent, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
@@ -3196,26 +3218,21 @@ class Dispatcher:
             return res
         card = self.store.get_card(t["topic_id"])
         if card is not None and card["run_state"] in duty.STUCK and t["state"] != sm.FAILED:
-            # 在岗表判为中断 / 失联（7.20 第 6 步）：排队，主人那边已经通知；会话记录一有新动作就恢复投递。
-            # failed 照旧重投（重投本身就是在试它还活着没有，连续失败由 7.21 的 attention 接手）
             why = f"羊群看板判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))
             res["queued"] = why
             return res
         if card is not None and card["run_state"] == duty.OCCUPIED and t["state"] == sm.FAILED:
-            # 主人正在会话里（failed 进不了 human_attached）：回执超时退回的批次等主人走了再重投，不往他正说话的会话里塞
             why = f"主人在会话里（{card['detail']}），等主人走了再重投"
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))
             res["queued"] = why
             return res
         busy = self._busy(t) if t["conversation_id"] else ""
         if busy:
-            # 命令行宿主（7.18）：宿主不可用 / 会话还在跑上一轮 / 并发已满 → 排队，下一轮再看
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], busy, len(rows))
             res["queued"] = busy
             return res
-        roster_update = ""
-        batch_id = ""
+        roster_update, batch_id = "", ""
         try:
             if adopted and not t["conversation_id"] and "#" in t["topic_id"]:
                 s_mem = self.roster.by_topic(t["topic_id"])
@@ -3233,7 +3250,6 @@ class Dispatcher:
                                         rules_hash=self.rules_hash(t), compacted_at=None)
                 t = self.store.get_topic(t["topic_id"])
             if t["kind"] == ADOPTED and not t["onboarded_at"]:
-                # 第一次收消息前先发 onboarding；消息等它回执或超时后下一轮再投
                 res.update(onboarding=self.send_onboarding(t), state=sm.RUNNING)
                 self._send_ok(t, 0)
                 return res
@@ -3243,37 +3259,20 @@ class Dispatcher:
                     roster_update = roster_table(self.roster, open_dynamic_topics(self.store),
                                                  closed_dynamic_topics(self.store, self.roster))
             batch_id = self._new_batch_id("b", t["topic_id"])
-            # 主人本人的发言（背景）与信号同批；只有背景时不要求回执、不改状态（7.13）
             signals = [r for r in rows if not _is_pure_owner_context(r)]
             context = [r for r in rows if _is_pure_owner_context(r)]
             waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
-            # Inbox 摘要只给总线；adopted 会话只管自己的聊天
             inbox = [] if adopted else self.store.inbox_summary(self.cfg.self_open_id)
-            # 规则变了（或从没记录过指纹）：这批最前面带上完整现行规则（7.11）
             new_hash = self.rules_hash(t)
             rules_update = self.standing_rules(t) if new_hash and new_hash != t["rules_hash"] else ""
-            # 7.15：有引用的消息都附「↪ 回复的是」（从账本取被引用的那条）
             quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"]))
                       for r in rows if "reply_to" in r.keys() and r["reply_to"]}
-            # 在岗表（7.20）：消息里的编号登记在别的会话名下 → 附撞车提醒；总线批次在在岗表变化时附摘要
             notes = self._collision_notes(t, rows)
-            # 发前再看一眼（7.22）：会话 sheepdog reply 时已经看到过的主人发言，送到时注明，不当新提醒
             for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in rows]):
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
-            images = self._images(rows)   # 7.54：图片先下到本机，正文里换成路径
-            group_id = (t["group_id"] if "group_id" in t.keys() else "") or ""
-            peer_status = ""
-            if group_id:
-                g_topics = self.store.get_group_topics(group_id)
-                all_watches = self.store.open_watches()
-                p_counts = {gt["topic_id"]: self.store.count_pending_messages_for_topic(gt["topic_id"]) for gt in g_topics}
-                p_work = {gt["topic_id"]: self.store.open_work(gt["topic_id"]) for gt in g_topics}
-                p_watches = {
-                    gt["topic_id"]: [w for w in all_watches if w["topic_id"] == gt["topic_id"]]
-                    for gt in g_topics
-                }
-                peer_status = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches)
+            images = self._images(rows)
+            peer_status = self._group_peer_status(t)
             prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
                                   waiting, roster_update=roster_update,
                                   security=self.security, rules_update=rules_update, context_only=not signals,
@@ -3282,7 +3281,6 @@ class Dispatcher:
                                   rules_note=self._compaction_note(t) if rules_update else "",
                                   reminder=self.reminder(t), notes=notes, digest=digest, images=images,
                                   vips=self._vips(), peer_status=peer_status)
-            # 先记「正在发」再发送（7.16）：发完后若来不及记账就崩溃，下一轮能从 transcript 核对，不会重投
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
         except SinkError as e:

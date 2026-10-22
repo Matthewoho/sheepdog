@@ -1103,19 +1103,13 @@ class Store:
         self.update_topic(topic_id, dispatched_at=ts, last_active=ts)
 
     def upsert_topic(self, topic_id: str, **fields) -> None:
-        existing = self.get_topic(topic_id)
-        if existing is None:
-            title = fields.pop("title", topic_id)
-            kind = fields.pop("kind", "dynamic")
-            duty = fields.pop("duty", "")
-            state = fields.pop("state", "active")
-            host = fields.pop("host", "antigravity")
-            model = fields.pop("model", "") or ""
-            effort = fields.pop("effort", "") or ""
-            lifecycle = fields.pop("lifecycle", None)
-            group_id = fields.pop("group_id", "") or ""
-            self.create_topic(topic_id, title, kind, duty, state, host, model, effort,
-                              lifecycle=lifecycle, group_id=group_id)
+        if self.get_topic(topic_id) is None:
+            self.create_topic(
+                topic_id, fields.pop("title", topic_id), fields.pop("kind", "dynamic"), fields.pop("duty", ""),
+                fields.pop("state", "active"), fields.pop("host", "antigravity"), fields.pop("model", "") or "",
+                fields.pop("effort", "") or "", lifecycle=fields.pop("lifecycle", None),
+                group_id=fields.pop("group_id", "") or "",
+            )
         if fields:
             self.update_topic(topic_id, **fields)
 
@@ -1124,114 +1118,91 @@ class Store:
         gid = (group_id or "").strip()
         if not gid:
             return []
-        if include_closed:
-            rows = self.conn.execute("SELECT * FROM topics WHERE group_id=?", (gid,)).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM topics WHERE group_id=? AND state != 'closed'", (gid,)
-            ).fetchall()
-
-        def _sort_key(r: sqlite3.Row) -> tuple[int, int, str]:
-            tid = r["topic_id"]
-            if "#" not in tid:
-                return (0, 1, tid)
-            _, _, tail = tid.partition("#")
-            return (1, int(tail) if tail.isdigit() else 999999, tid)
-
-        return sorted(rows, key=_sort_key)
+        sql = "SELECT * FROM topics WHERE group_id=?" + ("" if include_closed else " AND state != 'closed'")
+        rows = self.conn.execute(sql, (gid,)).fetchall()
+        return sorted(rows, key=lambda r: (
+            (0, 1, r["topic_id"]) if "#" not in r["topic_id"]
+            else (1, int(r["topic_id"].partition("#")[2]) if r["topic_id"].partition("#")[2].isdigit() else 999999, r["topic_id"])
+        ))
 
     def find_recent_thread_topic_in_group(
-        self,
-        group_id: str,
-        chat_id: str = "",
-        root_id: str = "",
-        parent_id: str = "",
-        reply_to_msg_id: str = "",
-        thread_id: str = "",
-        sender_id: str = "",
-        window_minutes: int = 30,
+        self, group_id: str, chat_id: str = "", root_id: str = "", parent_id: str = "",
+        reply_to_msg_id: str = "", thread_id: str = "", sender_id: str = "", window_minutes: int = 30,
+        running_burst_seconds: int = 90, running_lease_seconds: int = 180,
     ) -> str | None:
-        """羊圈内话题/回复链/watch/在途或等待回复亲和性查询（7.49 / 7.71）：同一链或窗口内同人绝不拆。"""
+        """羊圈内话题/回复链/watch/在途或等待回复亲和性查询（7.49 / 7.72 双时间窗）：同一链或微窗口内同人绝不拆，长跑溢出。"""
         gid = (group_id or "").strip()
         if not gid:
             return None
         chain_ids = [x for x in dict.fromkeys([root_id, parent_id, reply_to_msg_id, thread_id]) if x]
         if chain_ids:
-            placeholders = ",".join("?" for _ in chain_ids)
-            row = self.conn.execute(
-                f"""SELECT b.topic_id FROM bot_outbox b
-                    JOIN topics t ON t.topic_id = b.topic_id
-                    WHERE t.group_id = ? AND t.state != 'closed'
-                      AND b.message_id IN ({placeholders})
-                    ORDER BY b.sent_at DESC LIMIT 1""",
-                (gid, *chain_ids),
-            ).fetchone()
-            if row is not None:
-                return row["topic_id"]
-            row = self.conn.execute(
-                f"""SELECT e.topic_id FROM escalations e
-                    JOIN topics t ON t.topic_id = e.topic_id
-                    WHERE t.group_id = ? AND t.state != 'closed' AND e.closed_at IS NULL
-                      AND e.message_id IN ({placeholders})
-                    ORDER BY e.asked_at DESC LIMIT 1""",
-                (gid, *chain_ids),
-            ).fetchone()
-            if row is not None:
-                return row["topic_id"]
-            row = self.conn.execute(
-                f"""SELECT m.topic_id FROM messages m
-                    JOIN topics t ON t.topic_id = m.topic_id
-                    WHERE t.group_id = ? AND t.state != 'closed'
-                      AND m.route = 'dispatch' AND m.topic_id IS NOT NULL
-                      AND (
-                          m.message_id IN ({placeholders})
-                          OR m.root_id IN ({placeholders})
-                          OR m.reply_to IN ({placeholders})
-                          OR m.thread_id IN ({placeholders})
-                      )
-                    ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
-                (gid, *chain_ids, *chain_ids, *chain_ids, *chain_ids),
-            ).fetchone()
-            if row is not None:
-                return row["topic_id"]
+            ph = ",".join("?" for _ in chain_ids)
+            for sql, params in (
+                (f"SELECT b.topic_id FROM bot_outbox b JOIN topics t ON t.topic_id = b.topic_id "
+                 f"WHERE t.group_id = ? AND t.state != 'closed' AND b.message_id IN ({ph}) ORDER BY b.sent_at DESC LIMIT 1",
+                 (gid, *chain_ids)),
+                (f"SELECT e.topic_id FROM escalations e JOIN topics t ON t.topic_id = e.topic_id "
+                 f"WHERE t.group_id = ? AND t.state != 'closed' AND e.closed_at IS NULL AND e.message_id IN ({ph}) "
+                 f"ORDER BY e.asked_at DESC LIMIT 1", (gid, *chain_ids)),
+                (f"SELECT m.topic_id FROM messages m JOIN topics t ON t.topic_id = m.topic_id "
+                 f"WHERE t.group_id = ? AND t.state != 'closed' AND m.route = 'dispatch' AND m.topic_id IS NOT NULL "
+                 f"AND (m.message_id IN ({ph}) OR m.root_id IN ({ph}) OR m.reply_to IN ({ph}) OR m.thread_id IN ({ph})) "
+                 f"ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1",
+                 (gid, *chain_ids, *chain_ids, *chain_ids, *chain_ids)),
+            ):
+                if (row := self.conn.execute(sql, params).fetchone()) is not None:
+                    return row["topic_id"]
         if sender_id or chat_id:
             row = self.conn.execute(
-                """SELECT w.topic_id FROM watches w
-                   JOIN topics t ON t.topic_id = w.topic_id
+                """SELECT w.topic_id FROM watches w JOIN topics t ON t.topic_id = w.topic_id
                    WHERE t.group_id = ? AND t.state != 'closed' AND w.closed_at IS NULL
                      AND (? = '' OR w.person_id = '' OR w.person_id = ?)
                      AND (? = '' OR w.chat_id IS NULL OR w.chat_id = '' OR w.chat_id = ?)
                    ORDER BY w.started_at DESC, w.id DESC LIMIT 1""",
-                (gid, sender_id, sender_id, chat_id, chat_id),
-            ).fetchone()
+                (gid, sender_id, sender_id, chat_id, chat_id)).fetchone()
             if row is not None:
                 return row["topic_id"]
         if chat_id and sender_id and window_minutes > 0:
-            cutoff = (datetime.now().astimezone() - timedelta(minutes=window_minutes)).isoformat(timespec="seconds")
+            now = datetime.now().astimezone()
+            cutoff = (now - timedelta(minutes=window_minutes)).isoformat(timespec="seconds")
+            burst_cut = (now - timedelta(seconds=running_burst_seconds)).isoformat(timespec="seconds")
+            lease_cut = (now - timedelta(seconds=running_lease_seconds)).isoformat(timespec="seconds")
             row = self.conn.execute(
-                """SELECT m.topic_id FROM messages m
-                   JOIN topics t ON t.topic_id = m.topic_id
-                   WHERE t.group_id = ? AND t.state IN ('running', 'waiting_human')
-                     AND m.route = 'dispatch' AND m.chat_id = ? AND m.sender_id = ?
-                     AND m.first_seen >= ?
-                   ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
-                (gid, chat_id, sender_id, cutoff),
-            ).fetchone()
-            if row is not None:
-                return row["topic_id"]
-            row = self.conn.execute(
-                """SELECT m.topic_id FROM messages m
-                   JOIN topics t ON t.topic_id = m.topic_id
-                   WHERE t.group_id = ? AND t.state = 'active'
-                     AND m.route = 'dispatch' AND m.dispatch_state = 'pending'
-                     AND m.chat_id = ? AND m.sender_id = ?
-                     AND m.first_seen >= ?
-                   ORDER BY m.first_seen DESC, m.rowid DESC LIMIT 1""",
-                (gid, chat_id, sender_id, cutoff),
-            ).fetchone()
+                """SELECT m.topic_id FROM messages m JOIN topics t ON t.topic_id = m.topic_id
+                   WHERE t.group_id = ? AND m.route = 'dispatch' AND m.chat_id = ? AND m.sender_id = ? AND m.first_seen >= ?
+                     AND (t.state = 'waiting_human'
+                          OR (t.state = 'active' AND m.dispatch_state = 'pending')
+                          OR (t.state = 'running' AND m.first_seen >= ? AND (t.dispatched_at IS NULL OR t.dispatched_at >= ?)))
+                   ORDER BY CASE WHEN t.state = 'waiting_human' THEN 0 WHEN m.dispatch_state = 'pending' THEN 1 ELSE 2 END,
+                            m.first_seen DESC, m.rowid DESC LIMIT 1""",
+                (gid, chat_id, sender_id, cutoff, burst_cut, lease_cut)).fetchone()
             if row is not None:
                 return row["topic_id"]
         return None
+
+    def group_context_snapshot(self, group_id: str, exclude_topic_id: str, window_minutes: int = 30, limit: int = 3) -> list[str]:
+        gid = (group_id or "").strip()
+        if not gid:
+            return []
+        cutoff = (datetime.now().astimezone() - timedelta(minutes=window_minutes)).isoformat(timespec="seconds")
+        out: list[str] = []
+        for r in self.conn.execute(
+            """SELECT l.parent_topic_id, l.lamb_id, l.task_title FROM lambs l JOIN topics t ON t.topic_id = l.parent_topic_id
+               WHERE t.group_id = ? AND l.parent_topic_id != ? AND l.state = 'running' ORDER BY l.started_at DESC LIMIT ?""",
+            (gid, exclude_topic_id, limit)).fetchall():
+            out.append(f"🐑 {r['parent_topic_id']} 在跑羔羊 {r['lamb_id']}：{(r['task_title'] or '')[:60]}")
+        for r in self.conn.execute(
+            """SELECT m.topic_id, m.sender_name, m.sender_id, m.content FROM messages m JOIN topics t ON t.topic_id = m.topic_id
+               WHERE t.group_id = ? AND m.topic_id != ? AND m.route = 'dispatch'
+                 AND m.dispatch_state IN ('delivered', 'acked') AND m.first_seen >= ? ORDER BY m.first_seen DESC LIMIT ?""",
+            (gid, exclude_topic_id, cutoff, limit)).fetchall():
+            out.append(f"📥 {r['topic_id']} 刚收({r['sender_name'] or r['sender_id']})：{(r['content'] or '').replace(chr(10), ' ')[:60]}")
+        for r in self.conn.execute(
+            """SELECT s.topic_id, s.target_message_id, s.text FROM sends s JOIN topics t ON t.topic_id = s.topic_id
+               WHERE t.group_id = ? AND s.topic_id != ? AND s.kind = 'reply' AND s.sent_at >= ? ORDER BY s.sent_at DESC LIMIT ?""",
+            (gid, exclude_topic_id, cutoff, limit)).fetchall():
+            out.append(f"📤 {r['topic_id']} 已回：{(r['text'] or '').replace(chr(10), ' ')[:60]}")
+        return out
 
     # ---------- dispatches ----------
     def dispatch_exists(self, batch_id: str) -> bool:
@@ -1239,10 +1210,8 @@ class Store:
 
     def record_dispatch(self, batch_id: str, topic_id: str, message_ids: list[str], state: str = "sent") -> None:
         with self.tx() as c:
-            c.execute(
-                "INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
-                (batch_id, topic_id, json.dumps(message_ids), now_iso(), state),
-            )
+            c.execute("INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
+                      (batch_id, topic_id, json.dumps(message_ids), now_iso(), state))
 
     def get_dispatch(self, batch_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM dispatches WHERE batch_id=?", (batch_id,)).fetchone()
