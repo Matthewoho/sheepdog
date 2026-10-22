@@ -1,18 +1,15 @@
-"""飞书交互式拍板卡片（Card JSON 2.0 按钮 + 其他输入框）与 card.action.trigger 回调处理（7.73，REG-017 ~ REG-019）。"""
+"""飞书交互式拍板卡片与版本升级交互卡片（Card JSON 2.0 按钮 + 其他输入框）及 card.action.trigger 回调处理（7.73 ~ 7.76，REG-017 ~ REG-026）。"""
 
 from __future__ import annotations
 
-import copy
-import hashlib
-import json
-import logging
-import re
+import copy, hashlib, json, logging, re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from .card import build_owner_card, card_fits
+from .card import build_owner_card, card_fits, plain_text
 from .models import Message
 from .store import now_iso
+from .version_watch import attach_version_interactions, parse_version_card_actions
 
 log = logging.getLogger("sheepdog")
 
@@ -25,12 +22,9 @@ _HEADER_LINE_RE = re.compile(r"^🐕\s*(?:需要你定|汇报)\b[^\n]*")
 _EXPLICIT_ITEM_RE = re.compile(r"^\s*[\(\[（【]?([A-Ea-e])[\)\]）】]?\s*[:：=.、·\-—)\]]\s*(.+?)\s*$")
 _LINE_OPTION_RE = re.compile(
     r"^\s*(?:(?:[-*•+]|\d+[.)、])\s*)?(?:\*\*|__)?(?:选项\s*|方案\s*|回(?:复)?\s*|选\s*)?"
-    r"[\(\[（【]?([A-E])[\)\]）】]?(?:（[^）]{1,10}）|\([^)]{1,10}\))?(?:\*\*|__)?"
-    r"\s*(?:[:：.、=·\-—]|(?<=[A-E])\s+)\s*(.+?)\s*$"
+    r"[\(\[（【]?([A-E])[\)\]）】]?(?:（[^）]{1,10}）|\([^)]{1,10}\))?(?:\*\*|__)?\s*(?:[:：.、=·\-—]|(?<=[A-E])\s+)\s*(.+?)\s*$"
 )
-_INLINE_PREFIXED_RE = re.compile(
-    r"(?:回(?:复)?|选|选项|方案)\s*[\(\[（]?([A-E])[\)\]）]?\s*(?:[:：.、=·\-—]\s*|\s+)([^，,；;\n。！!？?]{1,48})"
-)
+_INLINE_PREFIXED_RE = re.compile(r"(?:回(?:复)?|选|选项|方案)\s*[\(\[（]?([A-E])[\)\]）]?\s*(?:[:：.、=·\-—]\s*|\s+)([^，,；;\n。！!？?]{1,48})")
 _INLINE_COLON_RE = re.compile(r"(?<![A-Za-z0-9_])([A-E])\s*[:：]\s*([^，,；;\n。！!？?]{1,48})")
 _QUOTE_CMD_RE = re.compile(r"(?:请\s*)?(?:回(?:复)?|发)\s*[「『“\"]([^」』”\"\n]{2,60})[」』”\"]")
 _TOPIC_TAG_RE = re.compile(r"\[(tp_[A-Za-z0-9_.#-]+)\]")
@@ -112,44 +106,30 @@ def _truncate_label(text: str, limit: int = 28) -> str:
 
 
 def _build_option_button(opt: AskOption, idx: int, *, topic_id: str, key: str, title: str) -> dict:
-    val = {"sd_cb": "1", "kind": "option", "choice": opt.key, "label": opt.label,
-           "reply_text": opt.reply_text, "topic_id": topic_id, "key": key, "title": title}
-    return {"tag": "button", "element_id": f"sd_opt_{opt.key}",
-            "text": {"tag": "plain_text", "content": _truncate_label(f"{opt.key} · {opt.label}")},
-            "type": "primary" if idx == 0 else "default", "size": "medium", "width": "default",
-            "behaviors": [{"type": "callback", "value": val}]}
+    val = {"sd_cb": "1", "kind": "option", "choice": opt.key, "label": opt.label, "reply_text": opt.reply_text, "topic_id": topic_id, "key": key, "title": title}
+    return {"tag": "button", "element_id": f"sd_opt_{opt.key}", "text": {"tag": "plain_text", "content": _truncate_label(f"{opt.key} · {opt.label}")},
+            "type": "primary" if idx == 0 else "default", "size": "medium", "width": "default", "behaviors": [{"type": "callback", "value": val}]}
 
 
 def _build_options_column_set(opts: list[AskOption], *, topic_id: str, key: str, title: str) -> dict:
     return {
-        "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "8px",
-        "margin": "4px 0px 0px 0px",
-        "columns": [{"tag": "column", "width": "auto",
-                     "elements": [_build_option_button(opt, idx, topic_id=topic_id, key=key, title=title)]}
-                    for idx, opt in enumerate(opts)],
+        "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "8px", "margin": "4px 0px 0px 0px",
+        "columns": [{"tag": "column", "width": "auto", "elements": [_build_option_button(opt, idx, topic_id=topic_id, key=key, title=title)]} for idx, opt in enumerate(opts)],
     }
 
 
 def _build_other_form(*, topic_id: str, key: str, title: str) -> dict:
     submit_val = {"sd_cb": "1", "kind": "other", "topic_id": topic_id, "key": key, "title": title}
-    inp = {"tag": "input", "name": "other_input", "element_id": "sd_inp_other",
-           "placeholder": {"tag": "plain_text", "content": "补充说明或直接拍板..."},
-           "width": "fill", "required": True}
-    btn = {"tag": "button", "name": "other_submit", "element_id": "sd_btn_other",
-           "text": {"tag": "plain_text", "content": "提交"}, "type": "primary", "size": "medium",
-           "width": "default", "form_action_type": "submit", "value": submit_val,
-           "behaviors": [{"type": "callback", "value": submit_val}]}
+    inp = {"tag": "input", "name": "other_input", "element_id": "sd_inp_other", "placeholder": {"tag": "plain_text", "content": "补充说明或直接拍板..."}, "width": "fill", "required": True}
+    btn = {"tag": "button", "name": "other_submit", "element_id": "sd_btn_other", "text": {"tag": "plain_text", "content": "提交"}, "type": "primary", "size": "medium", "width": "default", "form_action_type": "submit", "value": submit_val, "behaviors": [{"type": "callback", "value": submit_val}]}
     row = {"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "vertical_align": "center",
-           "columns": [{"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": [inp]},
-                       {"tag": "column", "width": "auto", "vertical_align": "center", "elements": [btn]}]}
-    return {"tag": "form", "name": "sd_other_form", "element_id": "sd_form_other",
-            "direction": "vertical", "vertical_spacing": "small", "elements": [row]}
+           "columns": [{"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": [inp]}, {"tag": "column", "width": "auto", "vertical_align": "center", "elements": [btn]}]}
+    return {"tag": "form", "name": "sd_other_form", "element_id": "sd_form_other", "direction": "vertical", "vertical_spacing": "small", "elements": [row]}
 
 
 def _coerce_options(options, text: str = "", options_spec: str = "") -> list[AskOption]:
     if options is None:
-        opts = parse_ask_options(text, options_spec or "auto")
-        return opts or [AskOption("A", "同意 / 确认", "A：同意"), AskOption("B", "暂缓 / 拒绝", "B：暂缓")]
+        return parse_ask_options(text, options_spec or "auto") or [AskOption("A", "同意 / 确认", "A：同意"), AskOption("B", "暂缓 / 拒绝", "B：暂缓")]
     out: list[AskOption] = []
     for idx, item in enumerate(options):
         if isinstance(item, AskOption):
@@ -157,12 +137,10 @@ def _coerce_options(options, text: str = "", options_spec: str = "") -> list[Ask
         elif isinstance(item, dict):
             k = str(item.get("key") or item.get("code") or item.get("choice") or _OPTION_KEYS[idx % len(_OPTION_KEYS)]).strip().upper()
             lbl = str(item.get("label") or item.get("text") or "").strip()
-            rep = str(item.get("reply_text") or f"{k}：{lbl}").strip()
-            out.append(AskOption(k, lbl[:28], rep))
+            out.append(AskOption(k, lbl[:28], str(item.get("reply_text") or f"{k}：{lbl}").strip()))
         elif isinstance(item, (tuple, list)) and len(item) >= 2:
             k, lbl = str(item[0]).strip().upper(), str(item[1]).strip()
-            rep = str(item[2]).strip() if len(item) > 2 else f"{k}：{lbl}"
-            out.append(AskOption(k, lbl[:28], rep))
+            out.append(AskOption(k, lbl[:28], str(item[2]).strip() if len(item) > 2 else f"{k}：{lbl}"))
     return out
 
 
@@ -182,19 +160,19 @@ def attach_ask_interactions(
     card: dict, *, text: str, summary: str = "", options_spec: str = "",
     topic_id: str = "", key: str = "", title: str = "", interactive: bool = False,
 ) -> dict:
-    """向 ask 卡片根节点追加紧凑选项流式 column_set 与同行『其他』form 容器（超 28KB 自动回退原卡）。"""
+    """向 ask 卡片或版本汇报卡片追加紧凑流式 column_set 交互控件（超 28KB 自动回退原卡）。"""
     spec = (options_spec or "").strip()
     if spec.lower() in _DISABLED_SPECS:
         return card
+    if (text or "").strip("\n").startswith(("🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态")):
+        return attach_version_interactions(card, text)
     opts = parse_ask_options(f"{summary}\n{text}" if summary else text, spec)
     if not (bool(spec) or (interactive and bool(opts))):
         return card
-    if not opts:
-        opts = [AskOption("A", "同意 / 确认", "A：同意"), AskOption("B", "暂缓 / 拒绝", "B：暂缓")]
+    opts = opts or [AskOption("A", "同意 / 确认", "A：同意"), AskOption("B", "暂缓 / 拒绝", "B：暂缓")]
     tid, ttl = _infer_header_meta(text, topic_id, title)
     new_card = copy.deepcopy(card)
-    els = new_card.setdefault("body", {}).setdefault("elements", [])
-    els.extend(build_interactive_elements(opts, topic_id=tid, key=key, title=ttl))
+    new_card.setdefault("body", {}).setdefault("elements", []).extend(build_interactive_elements(opts, topic_id=tid, key=key, title=ttl))
     return new_card if card_fits(new_card) else card
 
 
@@ -208,8 +186,7 @@ def build_answered_owner_card(
     card.setdefault("header", {"title": {"tag": "plain_text", "content": "🐕 需要你定"}})
     card["header"]["template"] = "green"
     ts = answered_at or now_iso()
-    els = card.setdefault("body", {}).setdefault("elements", [])
-    els.extend([{"tag": "hr"}, {"tag": "markdown", "content": f"✅ **已拍板：{chosen_display}**（{ts} → `{topic_id}`）"}])
+    card.setdefault("body", {}).setdefault("elements", []).extend([{"tag": "hr"}, {"tag": "markdown", "content": f"✅ **已拍板：{chosen_display}**（{ts} → `{topic_id}`）"}])
     return card
 
 
@@ -300,26 +277,15 @@ def resolve_callback_target(store, open_message_id: str = "", value: dict | None
     if item is None and send_row is not None and send_row["root_message_id"] and hasattr(store, "item_by_root"):
         item = store.item_by_root(send_row["root_message_id"])
     if item is None and orig_msg is not None:
-        item = (store.item_by_thread(orig_msg["thread_id"]) if orig_msg["thread_id"] and hasattr(store, "item_by_thread") else None) or (
-            store.item_by_root(orig_msg["root_id"]) if orig_msg["root_id"] and hasattr(store, "item_by_root") else None
-        )
+        item = (store.item_by_thread(orig_msg["thread_id"]) if orig_msg["thread_id"] and hasattr(store, "item_by_thread") else None) or (store.item_by_root(orig_msg["root_id"]) if orig_msg["root_id"] and hasattr(store, "item_by_root") else None)
     if item is None and (ino := _parse_item_int(val.get("item_no"))) is not None and hasattr(store, "get_item"):
         item = store.get_item(ino)
-    topic_id = ((esc["topic_id"] if esc is not None and esc["topic_id"] else "") or (send_row["topic_id"] if send_row is not None and send_row["topic_id"] else "")
-                or (out_row["topic_id"] if out_row is not None and out_row["topic_id"] else "") or str(val.get("topic_id") or "").strip()
-                or (item["owner_topic"] if item is not None and item["owner_topic"] else ""))
+    topic_id = ((esc["topic_id"] if esc is not None and esc["topic_id"] else "") or (send_row["topic_id"] if send_row is not None and send_row["topic_id"] else "") or (out_row["topic_id"] if out_row is not None and out_row["topic_id"] else "") or str(val.get("topic_id") or "").strip() or (item["owner_topic"] if item is not None and item["owner_topic"] else ""))
     item_no = item["item_no"] if item is not None else _parse_item_int(val.get("item_no"))
-    return {"topic_id": topic_id, "owner_topic_id": (item["owner_topic"] if item is not None and item["owner_topic"] else topic_id),
-            "key": (send_row and send_row["key"]) or str(val.get("key") or "").strip(),
-            "title": str(val.get("title") or (item["title"] if item is not None else "") or "").strip(),
-            "open_message_id": card_mid, "card_message_id": card_mid, "item_no": item_no,
-            "escalation": esc, "send": send_row, "outbox": out_row, "orig_message": orig_msg, "item": item}
+    return {"topic_id": topic_id, "owner_topic_id": (item["owner_topic"] if item is not None and item["owner_topic"] else topic_id), "key": (send_row and send_row["key"]) or str(val.get("key") or "").strip(), "title": str(val.get("title") or (item["title"] if item is not None else "") or "").strip(), "open_message_id": card_mid, "card_message_id": card_mid, "item_no": item_no, "escalation": esc, "send": send_row, "outbox": out_row, "orig_message": orig_msg, "item": item}
 
 
-def record_card_callback_to_ledger(
-    store, msg_or_event, *, target: dict | None = None, value: dict | None = None,
-    cfg=None, source=None, route: str = "dispatch", reason: str = "owner_reply", received_by: str = "bot",
-) -> Message | None:
+def record_card_callback_to_ledger(store, msg_or_event, *, target: dict | None = None, value: dict | None = None, cfg=None, source=None, route: str = "dispatch", reason: str = "owner_reply", received_by: str = "bot") -> Message | None:
     """将卡片回调归一化消息落盘 messages 表，命中话题群 T-n 时自动注入 item:T-n 标签。"""
     msg = process_card_action_event(msg_or_event, cfg=cfg, store=store, source=source) if isinstance(msg_or_event, dict) else msg_or_event
     if msg is None:
@@ -329,14 +295,12 @@ def record_card_callback_to_ledger(
     tgt = target or resolve_callback_target(store, msg.reply_to or cb.get("card_message_id", ""), val or cb)
     item_no = _parse_item_int(tgt.get("item_no") or val.get("item_no") or cb.get("item_no"))
     topic_id = str(tgt.get("topic_id") or cb.get("topic_id") or val.get("topic_id") or "").strip()
-    tags = ["owner_verified", "card_callback", *([f"escalation:{tgt['escalation']['message_id']}"] if tgt.get("escalation") and tgt["escalation"]["message_id"] else []),
-            *([f"item:T-{item_no}"] if item_no is not None else [])]
+    tags = ["owner_verified", "card_callback", *([f"escalation:{tgt['escalation']['message_id']}"] if tgt.get("escalation") and tgt["escalation"]["message_id"] else []), *([f"item:T-{item_no}"] if item_no is not None else [])]
     store.upsert_message(msg, route, reason, tags, topic_id=topic_id or None, received_by=received_by)
     return msg
 
 
-def _handle_tg_move_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_id: str, chat_type: str,
-                             operator_id: str, create_time: str, raw: dict, cfg, store, source) -> Message:
+def _handle_tg_move_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_id: str, chat_type: str, operator_id: str, create_time: str, raw: dict, cfg, store, source) -> Message:
     from . import duty, topicgroup as tg
     key, topic = str(val.get("key") or "").strip(), str(val.get("topic_id") or "").strip()
     dm_root = str(val.get("dm_root_message_id") or val.get("root_message_id") or "").strip()
@@ -355,10 +319,37 @@ def _handle_tg_move_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_i
                 log.warning("卡片一键放进话题群发标题卡失败: %s", e)
     no = tg.label(item["item_no"])
     cb_meta = {"kind": "tg_move", "topic_id": topic or item["owner_topic"] or "tp_bus", "key": key, "item_no": item["item_no"], "card_message_id": card_mid or dm_root}
-    return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name=store.known_chat_name(chat_id) if chat_id else "",
-                   chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user",
-                   content=f"[卡片回调] 放进话题群：{no}", msg_type="text", create_time=create_time,
-                   reply_to=card_mid or dm_root, raw=dict(raw, _sd_card_callback=cb_meta))
+    return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name=store.known_chat_name(chat_id) if chat_id else "", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=f"[卡片回调] 放进话题群：{no}", msg_type="text", create_time=create_time, reply_to=card_mid or dm_root, raw=dict(raw, _sd_card_callback=cb_meta))
+
+
+def _handle_version_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_id: str, chat_type: str, operator_id: str, create_time: str, raw: dict, tgt: dict, store, source) -> Message | None:
+    act = str(val.get("sd_action") or "").strip()
+    if act in ("version_upgrade", "version_dismiss") and card_mid:
+        if store.conn.execute("SELECT 1 FROM messages WHERE reply_to = ? AND reason IN ('upgrade_command', 'version_dismiss') LIMIT 1", (card_mid,)).fetchone() is not None:
+            dup_m = Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=str(val.get("label") or act), msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw))
+            store.upsert_message(dup_m, "drop", "card_callback_duplicate", ["card_callback"], topic_id="tp_bus", received_by="bot")
+            return None
+    send_row, out_row, orig_msg = tgt["send"], tgt["outbox"], tgt["orig_message"]
+    orig_text = ((send_row and send_row["text"]) or (out_row and out_row["text"]) or (orig_msg and plain_text(orig_msg["content"])) or "🐕 汇报 · 新版提醒 [tp_bus]\n（版本提醒卡片）")
+    if act == "version_query":
+        cb_meta = {"kind": "version_query", "topic_id": "tp_bus", "card_message_id": card_mid}
+        return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content="有没有 beta", msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw, _sd_card_callback=cb_meta))
+    if act == "version_dismiss":
+        chosen = f"{val.get('label') or '⏸ 暂不升级'}（不强制）"
+        cb_meta = {"kind": "version_dismiss", "topic_id": "tp_bus", "card_message_id": card_mid, "chosen_display": chosen}
+        content = chosen
+    else:
+        channel = "beta" if val.get("channel") == "beta" else "stable"
+        no_pull, target_ver = bool(val.get("no_pull", False)), str(val.get("target_version") or "")
+        content = "重启生效" if no_pull else ("升级 beta" if channel == "beta" else "升级稳定版")
+        chosen = f"{val.get('label') or content}（已提交后台执行）"
+        cb_meta = {"kind": "version_upgrade", "topic_id": "tp_bus", "card_message_id": card_mid, "channel": channel, "no_pull": no_pull, "target_version": target_ver, "chosen_display": chosen}
+    if source is not None and hasattr(source, "patch_card") and card_mid:
+        try:
+            source.patch_card(card_mid, build_answered_owner_card(orig_text, chosen_display=chosen, topic_id="tp_bus", answered_at=create_time), identity="bot")
+        except Exception as e:
+            log.warning("回写版本卡片失败（%s）: %s", card_mid, e)
+    return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=content, msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw, _sd_card_callback=cb_meta))
 
 
 def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | None:
@@ -377,12 +368,16 @@ def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | Non
                         or (tg_chat if item is not None and tg_chat else "")
                         or getattr(getattr(cfg, "threads", None), "owner_chat_id", "") or (esc_chats[0] if esc_chats else ""))
     resolved_chat_type = (orig_msg["chat_type"] if orig_msg is not None and orig_msg["chat_type"] else "") or ("group" if resolved_chat_id and resolved_chat_id == tg_chat else "p2p")
-    if cfg.self_open_id and operator_id != cfg.self_open_id:
+    if not getattr(cfg, "self_open_id", "") or operator_id != cfg.self_open_id:
         drop_m = Message(message_id=cb_msg_id, chat_id=resolved_chat_id, chat_name="", chat_type=resolved_chat_type,
                          sender_id=operator_id, sender_name="", sender_type="user", content="[卡片回调] 非主人操作",
                          msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw))
         store.upsert_message(drop_m, "drop", "card_callback_non_owner", ["card_callback", f"operator:{operator_id}"], received_by="bot")
         return None
+    if val.get("sd_action") in ("version_upgrade", "version_dismiss", "version_query"):
+        return _handle_version_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
+                                        chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,
+                                        raw=raw, tgt=tgt, store=store, source=source)
     if (val.get("kind") or val.get("action") or val.get("cmd")) == "tg_move":
         return _handle_tg_move_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
                                         chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,

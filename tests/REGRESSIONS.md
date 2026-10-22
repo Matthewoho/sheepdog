@@ -294,4 +294,8 @@
 | 7.75 | 将每次同步的 Git Tag 与稳定版混为一谈导致每次打 Beta Tag（`tag > release`）都向别的 `sheepdog` 后台主动推送刷屏提醒，而非仅在发布新 GitHub Release（Stable）高于本机版本时发送单次非强制更新建议，或未将 `stable_tag` / `beta_tag` / `has_beta` 落盘 `meta["version_remote_latest"]`（REG-024） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_024_stable_release_advisory_only_and_beta_silence_in_background` |
 | 7.75 | 主人在飞书找主人私聊问「有新版本吗 / 有没有 beta / 查版本」（或 CLI `sheepdog version --check-remote`）未被拦截并实时返回本机、GitHub 稳定版（Release）与 Beta 尝鲜版（`tag > release`）及双轨非强制升级指引；或回复「升级稳定版 / 你来升级」与「升级 beta」未区分 `channel="stable" \| "beta"`，以及工作区 `dirty` 或 `git pull --ff-only` 失败时 `Dispatcher.upgrade` 谎报「✅ 当前代码已是最新」（REG-025） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_025_owner_ask_beta_query_and_dual_channel_honest_upgrade` |
 
+## 7.76 可点击交互式新版提醒与版本/Beta状态查询卡片（Card JSON 2.0 胶囊按钮、主人鉴权、双重防重与原地绿卡回写，REG-026）
 
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.76 | `🐕 汇报 · 新版提醒`（远端稳定版提醒 / 本地待重启提醒）与 `🐕 汇报 · 版本与更新状态` 未经 `outbound.owner_content` 注入合法 Card JSON 2.0 流式胶囊按钮（`column_set` `flex_mode="flow"`，禁含 `vertical_spacing`），或点击 `[🚀 升级稳定版]` / `[🧪 升级 Beta 尝鲜版]` / `[🔄 立即重启生效]` / `[🔍 查有没有 Beta 版]` / `[⏸ 暂不升级]` 未在 `card_callback` + `Collector` 闭环入队 `upgrade`（区分 `channel="stable" \| "beta"` 与 `no_pull`）、未原地 `patch_card` 回写绿卡、非主人点击未被 `card_callback_non_owner` 拦截、连点两次或点卡后再发文字重复入队（REG-026） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_026_interactive_version_notice_and_beta_query_card_callbacks` |

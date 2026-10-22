@@ -1,40 +1,26 @@
-"""双轨版本巡检与非强制升级闭环（7.75 / SD-775-REMOTE-VERSION-WATCH）：
-Stable（GitHub Release）后台单次非强制提醒；Beta（Git Tag > Release）后台静默、按需查询与升级。
-"""
+"""双轨版本巡检与可点击交互升级闭环（7.75 / 7.76，REG-023 ~ REG-026）。"""
 
 from __future__ import annotations
 
-import json, logging, os, re, subprocess, urllib.error, urllib.parse, urllib.request
+import copy, json, logging, os, re, subprocess, urllib.error, urllib.parse, urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import sheepdog as _pkg
 from . import _git_run, default_repo_dir, parse_version_tuple, version_info
-from .card import plain_text
+from .card import card_fits, plain_text
 from .store import now_iso
 
 log = logging.getLogger("sheepdog")
 
-BUS_TOPIC_ID = "tp_bus"
-PUBLIC_REPO_SLUG = "Matthewoho/sheepdog"
+BUS_TOPIC_ID, PUBLIC_REPO_SLUG = "tp_bus", "Matthewoho/sheepdog"
 PUBLIC_REPO_GIT_URL = "https://github.com/Matthewoho/sheepdog.git"
 GITHUB_RELEASE_API_URL = f"https://api.github.com/repos/{PUBLIC_REPO_SLUG}/releases/latest"
 GITHUB_RELEASE_WEB_URL = f"https://github.com/{PUBLIC_REPO_SLUG}/releases/latest"
-
-BETA_UPGRADE_WORDS = frozenset({
-    "升级beta", "升级 beta", "升级beta版", "升级 beta 版", "你来升级beta", "你来升级 beta",
-    "立即升级beta", "立即升级 beta", "更新beta", "更新 beta", "升级尝鲜版", "你来升级尝鲜版", "sheepdog upgrade --beta",
-})
-STABLE_UPGRADE_WORDS = frozenset({
-    "升级", "你来升级", "立即升级", "更新", "你来更新", "升级稳定版", "你来升级稳定版", "更新稳定版",
-    "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade",
-})
+BETA_UPGRADE_WORDS = frozenset({"升级beta", "升级 beta", "升级beta版", "升级 beta 版", "你来升级beta", "你来升级 beta", "立即升级beta", "立即升级 beta", "更新beta", "更新 beta", "升级尝鲜版", "你来升级尝鲜版", "sheepdog upgrade --beta"})
+STABLE_UPGRADE_WORDS = frozenset({"升级", "你来升级", "立即升级", "更新", "你来更新", "升级稳定版", "你来升级稳定版", "更新稳定版", "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade"})
 UPGRADE_WORDS = STABLE_UPGRADE_WORDS | BETA_UPGRADE_WORDS
-VERSION_QUERY_WORDS = frozenset({
-    "有新版本吗", "有没有新版本", "有没有新版", "有新版吗", "有没有beta", "有没有 beta", "有beta吗", "有 beta 吗",
-    "有没有beta版", "有没有 beta 版", "有beta版吗", "有 beta 版吗", "有没有尝鲜版", "有尝鲜版吗",
-    "查版本", "查询版本", "查一下版本", "看看版本", "当前版本", "检查更新", "查更新", "sheepdog version", "sheepdog version --check-remote",
-})
+VERSION_QUERY_WORDS = frozenset({"有新版本吗", "有没有新版本", "有没有新版", "有新版吗", "有没有beta", "有没有 beta", "有beta吗", "有 beta 吗", "有没有beta版", "有没有 beta 版", "有beta版吗", "有 beta 版吗", "有没有尝鲜版", "有尝鲜版吗", "查版本", "查询版本", "查一下版本", "看看版本", "当前版本", "检查更新", "查更新", "sheepdog version", "sheepdog version --check-remote"})
 _AT_TAG_RE = re.compile(r"<at\b[^>]*>.*?</at>", re.I | re.S)
 _TRAIL_PUNCT = " \t\r\n。！!~～？?，,、.·\"'”’」』】"
 
@@ -49,10 +35,8 @@ def _repo_root(repo_dir: Path | None) -> Path:
 
 
 def _safe_json(raw: str | None, default=None):
-    if not raw:
-        return default
     try:
-        return json.loads(raw)
+        return json.loads(raw) if raw else default
     except (json.JSONDecodeError, TypeError):
         return default
 
@@ -60,8 +44,7 @@ def _safe_json(raw: str | None, default=None):
 def _cleaned_candidates(content: str) -> list[str]:
     raw = _AT_TAG_RE.sub(" ", content or "")
     bodies = [raw.lstrip(), plain_text(raw).lstrip()]
-    d = _safe_json(content)
-    if isinstance(d, dict) and isinstance(d.get("text"), str):
+    if isinstance(d := _safe_json(content), dict) and isinstance(d.get("text"), str):
         bodies.append(d["text"].lstrip())
     out: list[str] = []
     for b in bodies:
@@ -88,21 +71,14 @@ def is_upgrade_command(content: str) -> bool:
 
 def is_version_query(content: str) -> bool:
     """识别主人询问版本或 Beta 的短句（整句精确匹配，防长业务句子误触）。"""
-    for c in _cleaned_candidates(content):
-        norm = c if c.startswith("sheepdog ") else re.sub(r"\s*beta\s*", "beta", c)
-        if c in VERSION_QUERY_WORDS or norm in VERSION_QUERY_WORDS:
-            return True
-    return False
+    return any(c in VERSION_QUERY_WORDS or (c if c.startswith("sheepdog ") else re.sub(r"\s*beta\s*", "beta", c)) in VERSION_QUERY_WORDS for c in _cleaned_candidates(content))
 
 
 def fetch_latest_github_release(repo_slug: str = PUBLIC_REPO_SLUG, timeout: float = 5.0) -> dict | None:
     """探测 GitHub Latest Release（稳定版）。无 Release(404) 返回空 tag 字典；网络不可达返回 None。"""
     if (_is_mocked(subprocess.run) or _is_mocked(_git_run) or _is_mocked(probe_remote_tags)) and not _is_mocked(urllib.request.urlopen):
         return None
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo_slug}/releases/latest",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "sheepdog-version-watch"},
-    )
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo_slug}/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "sheepdog-version-watch"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _safe_json(resp.read().decode("utf-8", errors="replace"), {})
@@ -136,9 +112,7 @@ def probe_remote_tags(repo_dir: Path | None = None, *, remote_url: str = "", tim
         if r2 is not None and (r is None or r.returncode != 0 or (r2.stdout or "").strip()):
             r = r2
     ok = bool(r is not None and r.returncode == 0)
-    tags: dict[str, str] = {}
-    peeled_seen: set[str] = set()
-    best_tuple: tuple[int, ...] = ()
+    tags, peeled_seen, best_tuple = {}, set(), ()
     best_tag = best_ver = best_sha = ""
     for line in (r.stdout.splitlines() if (ok and r and r.stdout) else ()):
         parts = line.strip().split()
@@ -147,11 +121,7 @@ def probe_remote_tags(repo_dir: Path | None = None, *, remote_url: str = "", tim
         sha, ref = parts[0], parts[1]
         is_peeled = ref.endswith("^{}")
         ref = ref[:-3] if is_peeled else ref
-        if not ref.startswith("refs/tags/v"):
-            continue
-        tag_name = ref.removeprefix("refs/tags/")
-        t_tuple = parse_version_tuple(tag_name)
-        if not t_tuple:
+        if not ref.startswith("refs/tags/v") or not (t_tuple := parse_version_tuple(tag_name := ref.removeprefix("refs/tags/"))):
             continue
         if is_peeled or tag_name not in peeled_seen:
             tags[tag_name] = sha
@@ -165,8 +135,7 @@ def probe_remote_tags(repo_dir: Path | None = None, *, remote_url: str = "", tim
 def probe_remote_versions(repo_dir: Path | None = None, *, timeout: float = 5.0, now: datetime | None = None) -> dict:
     """组合 Git Tag（Beta 候选）与 GitHub Release（Stable）双轨版本状态。"""
     ref_now = now or datetime.now().astimezone()
-    tag_info = probe_remote_tags(repo_dir, timeout=timeout)
-    rel_info = fetch_latest_github_release(timeout=timeout)
+    tag_info, rel_info = probe_remote_tags(repo_dir, timeout=timeout), fetch_latest_github_release(timeout=timeout)
     tags, latest_tag, latest_version, latest_sha = tag_info["tags"], tag_info["latest_tag"], tag_info["latest_version"], tag_info["latest_sha"]
     if rel_info is not None:
         stable_tag, stable_version = rel_info.get("tag") or "", rel_info.get("version") or ""
@@ -221,10 +190,7 @@ def get_version_status(store=None, repo_dir: Path | None = None, *, check_remote
             store.set_meta("version_remote_latest", json.dumps(remote, ensure_ascii=False))
     pid = daemon.get("pid") if isinstance(daemon, dict) else None
     daemon_alive = bool(pid and _pid_alive(pid))
-    in_sync = bool(
-        isinstance(daemon, dict) and daemon_alive and daemon.get("version") == cli_info["version"]
-        and (not cli_info["git_sha"] or not daemon.get("git_sha") or daemon.get("git_sha") == cli_info["git_sha"])
-    )
+    in_sync = bool(isinstance(daemon, dict) and daemon_alive and daemon.get("version") == cli_info["version"] and (not cli_info["git_sha"] or not daemon.get("git_sha") or daemon.get("git_sha") == cli_info["git_sha"]))
     if not isinstance(daemon, dict):
         daemon_display = "未记录"
     elif not daemon_alive:
@@ -233,15 +199,10 @@ def get_version_status(store=None, repo_dir: Path | None = None, *, check_remote
         daemon_display = f"{daemon.get('display')} PID {pid} 一致"
     else:
         daemon_display = f"{daemon.get('display')} PID {pid} ≠ 磁盘 {cli_info['display']}（待重启）"
-    return {
-        "cli": cli_info, "daemon": daemon, "daemon_alive": daemon_alive, "in_sync": in_sync,
-        "daemon_display": daemon_display, "summary_line": f"sheepdog {cli_info['display']}（常驻进程: {daemon_display}）", "remote": remote,
-    }
+    return {"cli": cli_info, "daemon": daemon, "daemon_alive": daemon_alive, "in_sync": in_sync, "daemon_display": daemon_display, "summary_line": f"sheepdog {cli_info['display']}（常驻进程: {daemon_display}）", "remote": remote}
 
 
-def check_version_update(
-    cfg, store, dispatcher, *, runtime_info: dict | None = None, repo_dir: Path | None = None, now: datetime | None = None
-) -> list[str]:
+def check_version_update(cfg, store, dispatcher, *, runtime_info: dict | None = None, repo_dir: Path | None = None, now: datetime | None = None) -> list[str]:
     """常驻进程版本巡检：本机升版单次提醒 + 远端 Stable Release 单次非强制建议（Beta 静默不打扰，严禁倒挂误报）。"""
     if not cfg.version.enabled:
         return []
@@ -266,16 +227,14 @@ def check_version_update(
         mem_disp, pid = mem.get("display") or mem.get("version") or "?", mem.get("pid") or os.getpid()
         _emit(local_key, (
             f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
-            f"🔔 检测到本机代码已更新至 **{disk['display']}**，当前常驻进程仍运行在 **{mem_disp}**（PID {pid}）。\n"
-            "💡 非强制更新建议：直接回复「**你来升级**」（或「**升级**」「**重启生效**」），我会自动原地重启常驻进程使其生效；"
-            "也可在终端运行 `sheepdog upgrade`。"
+            f"🔔 检测到本地仓库代码已更新至 **{disk['display']}**，当前常驻进程仍运行在 **{mem_disp}**（PID {pid}，尚未重启加载）。\n"
+            "💡 非强制更新建议：可直接点击下方卡片按钮一键操作，或回复「**你来升级**」（或「**升级**」「**重启生效**」），我会自动原地重启常驻进程使其生效；也可在终端运行 `sheepdog upgrade`。"
         ))
         store.set_meta("version_watch_local_notified", local_key)
 
     interval_min = cfg.version.check_interval_minutes
     if interval_min > 0:
-        last_raw = store.get_meta("version_remote_checked_at")
-        should_check = True
+        last_raw, should_check = store.get_meta("version_remote_checked_at"), True
         if last_raw:
             try:
                 should_check = (ref_now - datetime.fromisoformat(last_raw)).total_seconds() >= interval_min * 60.0
@@ -289,24 +248,17 @@ def check_version_update(
             if stable_tag and parse_version_tuple(stable_tag) > max(disk_t, mem_t):
                 s_sha = (probe.get("stable_sha") or "")[:7]
                 desc = f"{stable_tag} ({s_sha})" if s_sha else stable_tag
-                beta_hint = (
-                    f"（另有 Beta 尝鲜版 **{probe['beta_tag']}**，可发「**有没有 beta**」查看或「**升级 beta**」尝鲜）"
-                    if probe.get("has_beta") and probe.get("beta_tag")
-                    else "（想查是否有 Beta 尝鲜版可发「**有没有 beta**」）"
-                )
+                beta_hint = (f"（另有 Beta 尝鲜版 **{probe['beta_tag']}**，可发「**有没有 beta**」查看或「**升级 beta**」尝鲜）" if probe.get("has_beta") and probe.get("beta_tag") else "（想查是否有 Beta 尝鲜版可发「**有没有 beta**」）")
                 _emit(f"remote:{stable_tag}", (
                     f"🐕 汇报 · 新版提醒 [{BUS_TOPIC_ID}]\n"
-                    f"🔔 检测到远端新稳定版 Release **{desc}**（当前本机为 **{disk['display']}**）。\n"
-                    f"💡 非强制更新建议：直接回复「**你来升级**」（或「**升级稳定版**」），我会自动拉取并重启生效；"
-                    f"也可在终端运行 `sheepdog upgrade`{beta_hint}。"
+                    f"🔔 GitHub 已发布最新稳定版 Release **{desc}**（当前本机为 **{disk['display']}**）。\n"
+                    f"💡 非强制更新建议：可直接点击下方卡片按钮一键操作，或回复「**你来升级**」（或「**升级稳定版**」），我会自动拉取并重启生效；也可在终端运行 `sheepdog upgrade`{beta_hint}。"
                 ))
                 store.set_meta("version_watch_remote_notified", stable_tag)
     return sent_texts
 
 
-def format_version_query_reply(
-    store=None, *, repo_dir: Path | None = None, check_remote: bool = True, now: datetime | None = None
-) -> str:
+def format_version_query_reply(store=None, *, repo_dir: Path | None = None, check_remote: bool = True, now: datetime | None = None) -> str:
     root = _repo_root(repo_dir)
     st = get_version_status(store, repo_dir=root, check_remote=False)
     probe = probe_remote_versions(root, now=now) if check_remote else (st.get("remote") or {})
@@ -332,9 +284,66 @@ def format_version_query_reply(
         beta_line = "- 🧪 Beta 尝鲜版（tag > release）：当前无高于稳定版的 Beta Tag"
     return (
         f"🐕 汇报 · 版本与更新状态 [{BUS_TOPIC_ID}]\n- 💻 本机状态：{st['summary_line']}\n{stable_line}\n{beta_line}\n"
-        "💡 非强制更新建议：回复「**升级稳定版**」或「**你来升级**」（`sheepdog upgrade`）升级稳定版；"
-        "回复「**升级 beta**」（`sheepdog upgrade --beta`）升级尝鲜版。"
+        "💡 非强制更新建议：可直接点击下方卡片按钮一键操作，或回复「**升级稳定版**」/「**你来升级**」（`sheepdog upgrade`）升级稳定版；回复「**升级 beta**」（`sheepdog upgrade --beta`）升级尝鲜版。"
     )
+
+
+def _ver_btn(label: str, sd_action: str, btn_type: str = "default", **extra) -> dict:
+    lbl = label.strip()
+    return {"label": lbl, "type": btn_type, "value": {"sd_action": sd_action, **extra, "label": lbl}}
+
+
+def parse_version_card_actions(text: str) -> list[dict]:
+    """按新版提醒（Scenario A/B）或版本与更新状态（Scenario C）文本推导 Card 2.0 胶囊按钮列表。"""
+    first, _, body = (text or "").strip("\n").partition("\n")
+    if first.startswith("🐕 汇报 · 新版提醒"):
+        if any(k in body for k in ("GitHub 已发布最新稳定版", "远端新稳定版", "升级稳定版")):
+            m = re.search(r"(?:Release|稳定版)[^vV0-9\n]*?([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）`'\"”]*)", body) or re.search(r"\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）]*)", body)
+            ver = m.group(1) if m else ""
+            return [
+                _ver_btn(f"🚀 升级稳定版 {ver}", "version_upgrade", "primary", channel="stable", no_pull=False, target_version=ver),
+                _ver_btn("🔍 查有没有 Beta 版", "version_query"),
+                _ver_btn("⏸ 暂不升级", "version_dismiss", target_version=ver),
+            ]
+        m = re.search(r"更新至[^vV0-9\n]*?([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）`'\"”]*)", body) or re.search(r"\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）]*)", body)
+        ver = m.group(1) if m else ""
+        return [_ver_btn(f"🔄 立即重启生效 {ver}", "version_upgrade", "primary", channel="stable", no_pull=True, target_version=ver), _ver_btn("⏸ 稍后手动重启", "version_dismiss", target_version=ver)]
+    if not first.startswith("🐕 汇报 · 版本与更新状态"):
+        return []
+    b_line = next((ln for ln in body.splitlines() if "Beta 尝鲜版" in ln), "")
+    s_line = next((ln for ln in body.splitlines() if "GitHub 稳定版" in ln), "")
+    l_line = next((ln for ln in body.splitlines() if "本机状态" in ln), "")
+    mb, ms = re.search(r"\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）]*)", b_line), re.search(r"\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）]*)", s_line)
+    b_tag, s_tag = (mb.group(1) if mb else ""), (ms.group(1) if ms else "")
+    if b_tag and ("高于本机" in b_line or "可尝鲜升级" in b_line):
+        btns = [_ver_btn(f"🧪 升级 Beta 尝鲜版 {b_tag}", "version_upgrade", "primary", channel="beta", no_pull=False, target_version=b_tag)]
+        if s_tag:
+            btns.append(_ver_btn(f"🚀 升级稳定版 {s_tag}", "version_upgrade", "default", channel="stable", no_pull=False, target_version=s_tag))
+        return [*btns, _ver_btn("⏸ 暂不升级", "version_dismiss", target_version=b_tag)]
+    if s_tag and "高于本机" in s_line:
+        return [_ver_btn(f"🚀 升级稳定版 {s_tag}", "version_upgrade", "primary", channel="stable", no_pull=False, target_version=s_tag), _ver_btn("🔍 刷新版本状态", "version_query"), _ver_btn("⏸ 暂不升级", "version_dismiss", target_version=s_tag)]
+    if any(k in l_line for k in ("≠", "待重启", "未运行")):
+        return [_ver_btn("🔄 立即重启生效", "version_upgrade", "primary", channel="stable", no_pull=True, target_version=""), _ver_btn("⏸ 暂不升级", "version_dismiss", target_version="")]
+    btns = [_ver_btn("🔄 重新检查远端版本", "version_query")]
+    if b_tag:
+        btns.append(_ver_btn(f"🧪 重新拉取 Beta 版 {b_tag}", "version_upgrade", channel="beta", no_pull=False, target_version=b_tag))
+    elif s_tag:
+        btns.append(_ver_btn(f"🚀 升级/对齐稳定版 {s_tag}", "version_upgrade", channel="stable", no_pull=False, target_version=s_tag))
+    return [*btns, _ver_btn("⏸ 暂不升级", "version_dismiss", target_version=b_tag or s_tag)]
+
+
+def attach_version_interactions(card: dict, text: str, cfg=None) -> dict:
+    """为新版提醒与版本查询卡片挂载 Card JSON 2.0 紧凑胶囊按钮（不含 vertical_spacing 与表单）。"""
+    acts = parse_version_card_actions(text)
+    if not acts or not isinstance(card, dict):
+        return card
+    cols = [
+        {"tag": "column", "width": "auto", "elements": [{"tag": "button", "element_id": f"sd_ver_{idx + 1}", "text": {"tag": "plain_text", "content": a["label"][:28]}, "type": a["type"], "size": "medium", "width": "default", "value": a["value"], "behaviors": [{"type": "callback", "value": a["value"]}]}]}
+        for idx, a in enumerate(acts)
+    ]
+    new_card = copy.deepcopy(card)
+    new_card.setdefault("body", {}).setdefault("elements", []).extend([{"tag": "hr"}, {"tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "8px", "margin": "4px 0px 0px 0px", "columns": cols}])
+    return new_card if card_fits(new_card) else card
 
 
 def pull_repo_for_channel(root: Path, channel: str = "stable", timeout: float = 15.0) -> tuple[bool, str, str]:
@@ -356,9 +365,7 @@ def pull_repo_for_channel(root: Path, channel: str = "stable", timeout: float = 
     return (r.returncode == 0), out, ("" if r.returncode == 0 else (out or f"returncode={r.returncode}"))
 
 
-def execute_upgrade(
-    dispatcher, *, reply_to: str = "", command: str = "", no_pull: bool = False, channel: str = "stable", repo_dir: Path | None = None
-) -> dict:
+def execute_upgrade(dispatcher, *, reply_to: str = "", command: str = "", no_pull: bool = False, channel: str = "stable", repo_dir: Path | None = None) -> dict:
     """执行常驻进程双轨（stable / beta）热升级，诚实报告拉取失败或 dirty 跳过。"""
     root = _repo_root(repo_dir)
     mem = _resolve_mem(dispatcher.store, dispatcher.runtime_info, root)
@@ -380,53 +387,37 @@ def execute_upgrade(
         body = f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程刷新运行态。"
     dispatcher._notify_owner(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n{body}", "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
     log.info("已执行 upgrade 动作（channel=%s，%s -> %s，pulled=%s，command=%r），标记原地重启", channel, mem_disp, disk_after["display"], pulled, command)
-    return {
-        "from": mem_disp, "to": disk_after["display"], "version": disk_after["version"],
-        "git_sha": disk_after["git_sha"], "channel": channel, "pulled": pulled,
-        "pull_output": pull_output, "pull_failed_reason": pull_failed_reason, "restart_requested": True,
-    }
+    return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": channel, "pulled": pulled, "pull_output": pull_output, "pull_failed_reason": pull_failed_reason, "restart_requested": True}
 
 
-def check_version_drift(
-    c, disk_ver_info: dict, version_mismatch_since: str | None, ref_now: datetime
-) -> tuple[list[str], list[str], str | None]:
+def check_version_drift(c, disk_ver_info: dict, version_mismatch_since: str | None, ref_now: datetime) -> tuple[list[str], list[str], str | None]:
     """L1.3：daemon_runtime vs 磁盘版本一致性检查 + 远端可用版本轻量 info 提示。"""
-    warns: list[str] = []
-    infos: list[str] = []
-    mismatch_since = version_mismatch_since or ""
+    warns, infos, mismatch_since = [], [], version_mismatch_since or ""
     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
         return warns, infos, mismatch_since
     row = c.execute("SELECT value FROM meta WHERE key = 'daemon_runtime'").fetchone()
     daemon_runtime = _safe_json(row[0] if row else None)
     if isinstance(daemon_runtime, dict):
         d_ver, d_sha = daemon_runtime.get("version") or "", daemon_runtime.get("git_sha") or ""
-        ver_diff = bool(d_ver and d_ver != disk_ver_info["version"])
-        sha_diff = bool(d_sha and disk_ver_info["git_sha"] and d_sha != disk_ver_info["git_sha"])
-        if ver_diff or sha_diff:
+        if bool(d_ver and d_ver != disk_ver_info["version"]) or bool(d_sha and disk_ver_info["git_sha"] and d_sha != disk_ver_info["git_sha"]):
             mismatch_since = mismatch_since or ref_now.isoformat(timespec="seconds")
             try:
                 mismatch_sec = max(0.0, (ref_now - datetime.fromisoformat(mismatch_since)).total_seconds())
             except ValueError:
                 mismatch_sec = 0.0
             if mismatch_sec >= 300:
-                warns.append(
-                    f"版本不一致已超 {int(mismatch_sec // 60)} 分钟：磁盘代码为 {disk_ver_info['display']}，"
-                    f"但常驻进程仍运行在 {daemon_runtime.get('display', d_ver)}（PID {daemon_runtime.get('pid')}），请重启"
-                )
+                warns.append(f"版本不一致已超 {int(mismatch_sec // 60)} 分钟：磁盘代码为 {disk_ver_info['display']}，但常驻进程仍运行在 {daemon_runtime.get('display', d_ver)}（PID {daemon_runtime.get('pid')}），请重启")
             else:
                 infos.append(f"磁盘版本 {disk_ver_info['display']} ≠ 常驻进程 {daemon_runtime.get('display', d_ver)}（观察中 {int(mismatch_sec)}s）")
         else:
             mismatch_since = ""
     row_rem = c.execute("SELECT value FROM meta WHERE key = 'version_remote_latest'").fetchone()
-    rem = _safe_json(row_rem[0] if row_rem else None)
-    if isinstance(rem, dict):
+    if isinstance(rem := _safe_json(row_rem[0] if row_rem else None), dict):
         local_t = parse_version_tuple(disk_ver_info.get("version") or "")
         if isinstance(daemon_runtime, dict) and daemon_runtime.get("version"):
             local_t = max(local_t, parse_version_tuple(daemon_runtime["version"]))
         s_tag, b_tag = rem.get("stable_tag") or "", rem.get("beta_tag") or ""
-        hints = ([f"稳定版 {s_tag}"] if (s_tag and parse_version_tuple(s_tag) > local_t) else []) + (
-            [f"Beta {b_tag}"] if (rem.get("has_beta") and b_tag and parse_version_tuple(b_tag) > local_t) else []
-        )
+        hints = ([f"稳定版 {s_tag}"] if (s_tag and parse_version_tuple(s_tag) > local_t) else []) + ([f"Beta {b_tag}"] if (rem.get("has_beta") and b_tag and parse_version_tuple(b_tag) > local_t) else [])
         if hints:
             infos.append(f"远端有可用更新（{'，'.join(hints)}，非强制）")
     return warns, infos, mismatch_since

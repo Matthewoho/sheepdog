@@ -233,6 +233,95 @@ class RemoteVersionWatchBetaStableTest(unittest.TestCase):
             self.assertIn("⚠️ 未能拉取远端最新代码", sent_cards[0])
             self.assertNotIn("✅ 当前代码已是最新", sent_cards[0])
 
+    def test_reg_026_interactive_version_notice_and_beta_query_card_callbacks(self):
+        from sheepdog import card_callback, outbound
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            sha_772 = _init_temp_git_repo(repo, "0.7.72")
+            cfg = _make_owner_cfg(tmp_path / "state")
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            rt = {"version": "0.7.72", "git_sha": sha_772, "display": f"0.7.72 ({sha_772[:7]})", "pid": 3003}
+            store.set_meta("daemon_runtime", json.dumps(rt, ensure_ascii=False))
+            now_dt = datetime(2026, 10, 23, 3, 0, 0, tzinfo=observe.TZ)
+            ls_out = f"{sha_772}\trefs/tags/v0.7.72\n{'a' * 40}\trefs/tags/v0.7.75^{{}}\n{'b' * 40}\trefs/tags/v0.7.76^{{}}\n"
+            # 1. 生成 Scenario B（本地待重启）、Scenario A（远端稳定版）、Scenario C（版本与 Beta 查询）三张交互卡片
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.73"\n', encoding="utf-8")
+            with mock.patch("subprocess.run", side_effect=_fake_tag_runner(ls_out)), \
+                    mock.patch("sheepdog.version_watch.fetch_latest_github_release", return_value={"tag": "v0.7.75", "version": "0.7.75", "url": ""}):
+                notices = version_watch.check_version_update(cfg, store, None, runtime_info=rt, repo_dir=repo, now=now_dt)
+                query_text = version_watch.format_version_query_reply(store, repo_dir=repo, check_remote=True, now=now_dt)
+            local_text, remote_text = notices[0], notices[1]
+            _, card_b = outbound.owner_content(cfg, local_text)
+            _, card_a = outbound.owner_content(cfg, remote_text)
+            _, card_c = outbound.owner_content(cfg, query_text)
+            for c in (card_a, card_b, card_c):
+                cs = c["body"]["elements"][-1]
+                self.assertEqual((cs["tag"], cs["flex_mode"], cs["horizontal_spacing"]), ("column_set", "flow", "8px"))
+                self.assertNotIn("vertical_spacing", cs)
+                self.assertNotIn('"tag": "form"', json.dumps(c, ensure_ascii=False))
+            btns_a = [col["elements"][0] for col in card_a["body"]["elements"][-1]["columns"]]
+            btns_b = [col["elements"][0] for col in card_b["body"]["elements"][-1]["columns"]]
+            btns_c = [col["elements"][0] for col in card_c["body"]["elements"][-1]["columns"]]
+            self.assertEqual([b["text"]["content"] for b in btns_a], ["🚀 升级稳定版 v0.7.75", "🔍 查有没有 Beta 版", "⏸ 暂不升级"])
+            self.assertEqual([b["text"]["content"] for b in btns_b], ["🔄 立即重启生效 0.7.73", "⏸ 稍后手动重启"])
+            self.assertEqual([b["text"]["content"] for b in btns_c], ["🧪 升级 Beta 尝鲜版 v0.7.76", "🚀 升级稳定版 v0.7.75", "⏸ 暂不升级"])
+            for mid, txt in (("om_card_a", remote_text), ("om_card_b", local_text), ("om_card_c", query_text), ("om_card_d", remote_text)):
+                store.add_bot_outbox(mid, "tp_bus", False, txt, observe.iso(now_dt))
+            fake_source = mock.MagicMock()
+            fake_source.reply_to.return_value = {"message_id": "om_query_reply_card"}
+            col = Collector(cfg, store, fake_source, Roster(), SecurityConfig())
+            mk_ev = lambda eid, mid, val, op="ou_test_owner": {
+                "type": "card.action.trigger", "event_id": eid, "message_id": mid, "chat_id": "oc_owner_dm",
+                "operator_id": op, "action_tag": "button", "action_value": val, "timestamp": "2026-10-23T03:05:00+08:00",
+            }
+            # 2. 非主人点击升级按钮：fail-closed 拦截为 card_callback_non_owner，不入队、不改卡
+            self.assertIsNone(card_callback.process_card_action_event(mk_ev("ev_stranger", "om_card_a", btns_a[0]["value"], op="ou_stranger"), cfg=cfg, store=store, source=fake_source))
+            self.assertEqual(store.get_message("sd_card_cb_ev_stranger")["reason"], "card_callback_non_owner")
+            self.assertEqual(store.pending_actions(), [])
+            fake_source.patch_card.assert_not_called()
+            # 3. 点击 [🔍 查有没有 Beta 版]：路由为 version_query 并触发回复带胶囊按钮的交互状态卡
+            with mock.patch("subprocess.run", side_effect=_fake_tag_runner(ls_out)), \
+                    mock.patch("sheepdog.default_repo_dir", return_value=repo), \
+                    mock.patch("sheepdog.version_watch.fetch_latest_github_release", return_value={"tag": "v0.7.75", "version": "0.7.75", "url": ""}):
+                m_q = card_callback.process_card_action_event(mk_ev("ev_q1", "om_card_a", btns_a[1]["value"]), cfg=cfg, store=store, source=fake_source)
+                col.ingest([m_q], received_by="bot")
+            self.assertEqual(store.get_message("sd_card_cb_ev_q1")["reason"], "version_query")
+            self.assertEqual(fake_source.reply_to.call_count, 1)
+            self.assertEqual(fake_source.reply_to.call_args.kwargs["card"]["body"]["elements"][-1]["tag"], "column_set")
+            # 4. 点击 [🚀 升级稳定版 v0.7.75] + 双重防重（同卡二次点击 & 文字口令防重）
+            m_s = card_callback.process_card_action_event(mk_ev("ev_upg_s1", "om_card_a", btns_a[0]["value"]), cfg=cfg, store=store, source=fake_source)
+            col.ingest([m_s], received_by="bot")
+            self.assertEqual(fake_source.patch_card.call_count, 1)
+            patched_a = fake_source.patch_card.call_args.args[1]
+            self.assertEqual(patched_a["header"]["template"], "green")
+            self.assertNotIn('"tag": "button"', json.dumps(patched_a, ensure_ascii=False))
+            self.assertIn("✅ **已拍板：🚀 升级稳定版 v0.7.75（已提交后台执行）**", json.dumps(patched_a, ensure_ascii=False))
+            self.assertIsNone(card_callback.process_card_action_event(mk_ev("ev_upg_s2_dup", "om_card_a", btns_a[0]["value"]), cfg=cfg, store=store, source=fake_source))
+            self.assertEqual(store.get_message("sd_card_cb_ev_upg_s2_dup")["reason"], "card_callback_duplicate")
+            col._escalation_message(_owner_dm_msg("om_text_dup", "升级", observe.iso(now_dt + timedelta(seconds=20))))
+            acts = store.pending_actions()
+            self.assertEqual(len(acts), 1)
+            self.assertEqual(json.loads(acts[0]["args_json"]), {"reply_to": "om_card_a", "command": "升级稳定版", "channel": "stable", "no_pull": False})
+            store.finish_action(acts[0]["id"], result="{}")
+            # 5. 点击 [🧪 升级 Beta 尝鲜版 v0.7.76]、[🔄 立即重启生效 0.7.73] 与 [⏸ 暂不升级]
+            m_b = card_callback.process_card_action_event(mk_ev("ev_upg_b1", "om_card_c", btns_c[0]["value"]), cfg=cfg, store=store, source=fake_source)
+            col.ingest([m_b], received_by="bot")
+            acts_b = store.pending_actions()
+            self.assertEqual(json.loads(acts_b[0]["args_json"]), {"reply_to": "om_card_c", "command": "升级 beta", "channel": "beta", "no_pull": False})
+            store.finish_action(acts_b[0]["id"], result="{}")
+            m_r = card_callback.process_card_action_event(mk_ev("ev_upg_r1", "om_card_b", btns_b[0]["value"]), cfg=cfg, store=store, source=fake_source)
+            col.ingest([m_r], received_by="bot")
+            acts_r = store.pending_actions()
+            self.assertEqual(json.loads(acts_r[0]["args_json"]), {"reply_to": "om_card_b", "command": "重启生效", "channel": "stable", "no_pull": True})
+            store.finish_action(acts_r[0]["id"], result="{}")
+            m_d = card_callback.process_card_action_event(mk_ev("ev_dis_1", "om_card_d", btns_a[2]["value"]), cfg=cfg, store=store, source=fake_source)
+            col.ingest([m_d], received_by="bot")
+            self.assertEqual((store.get_message("sd_card_cb_ev_dis_1")["route"], store.get_message("sd_card_cb_ev_dis_1")["reason"]), ("drop", "version_dismiss"))
+            self.assertEqual(store.pending_actions(), [])
+            self.assertEqual(store.pending_dispatch(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

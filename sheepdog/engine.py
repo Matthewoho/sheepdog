@@ -1448,12 +1448,21 @@ class Collector:
     def _escalation_message(self, m: Message) -> RouteDecision:
         """先于普通路由，不受 ignore_chat_ids 影响。话题群（7.51）在入口分开走 _topic_group_message。"""
         me = self.cfg.self_open_id
-        if isinstance(m.raw, dict) and (cb := m.raw.get("_sd_card_callback")) and (m.reply_to or cb.get("kind") == "tg_move"):
+        if isinstance(m.raw, dict) and (cb := m.raw.get("_sd_card_callback")) and (m.reply_to or str(cb.get("kind") or "").startswith(("tg_", "version_"))):
             from . import topicgroup as tg
-            if cb.get("kind") == "tg_move":
+            cb_kind = cb.get("kind")
+            if cb_kind == "tg_move":
                 no = f"T-{cb['item_no']}" if cb.get("item_no") else ""
                 d = RouteDecision(DROP, "tg_move", [OWNER_VERIFIED_TAG, "card_callback", *([f"item:{no}"] if no else [])])
                 self.store.upsert_message(m, d.route, d.reason, d.tags, cb.get("topic_id") or None)
+                return d
+            if cb_kind in ("version_dismiss", "version_query", "version_upgrade"):
+                d = RouteDecision(DROP, "upgrade_command" if cb_kind == "version_upgrade" else cb_kind, [OWNER_VERIFIED_TAG, "card_callback"])
+                self.store.upsert_message(m, d.route, d.reason, d.tags, BUS_TOPIC_ID)
+                if cb_kind == "version_query":
+                    self._version_query_reply(m)
+                elif cb_kind == "version_upgrade":
+                    self._upgrade_shortcut(m)
                 return d
             d = self._owner_reply(m)
             s = self.store.send_by_message(m.reply_to)
@@ -1471,12 +1480,10 @@ class Collector:
             return d
         if me and m.sender_id == me:
             if m.chat_id == self.cfg.threads.owner_chat_id and is_agent_reply(m.content, self.cfg.owner_context):
-                # 测试用的找主人群（[threads] owner_chat_id）：会话以主人身份代回的，不算主人发言
                 d = RouteDecision(DROP, "escalation_agent_reply")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
             if self._agent_reply_text(m.content):
-                # 10-13 热修：会话误用 sheepdog reply 以主人身份把代回卡片发进了找主人聊天，不投递
                 d = RouteDecision(SELF, "agent_reply_in_owner_chat")
                 self.store.upsert_message(m, d.route, d.reason, [])
                 return d
@@ -1537,12 +1544,11 @@ class Collector:
     def _register_bot_owner_message(self, m: Message, topic: str, question: str, text: str) -> None:
         ok = self._escalation_target_ok(topic)
         if ok:
-            # 7.15：机器人发给主人的每条消息都记来源，主人引用回复它时按这里送回（记还原后的纯文本，7.48）
             self.store.add_bot_outbox(m.message_id, topic, bool(question), text, m.create_time or now_iso())
         if question and ok:
             self.store.add_escalation(m.message_id, topic, m.chat_id, text, m.create_time or now_iso())
             log.info("登记「需要你定」%s -> %s", m.message_id, topic)
-            try:  # 7.36：ask 当场记过来源就连上；没记过（老版本、别的途径发的）按提问时间补
+            try:
                 from . import pending as pend
                 pend.ensure_sources(self.cfg, self.store, self.store.get_escalation(m.message_id))
             except Exception as e:
@@ -1551,30 +1557,26 @@ class Collector:
             log.warning("机器人消息 %s 的 topic %s 不在名册里（或已关闭），只记日志", m.message_id, topic)
 
     def _pending_reply(self, m: Message) -> None:
-        """「待办」快捷问法（7.36）：机器人回复主人那条，正文是 sheepdog pending 的清单。只读账本拼清单；
-        发出去的记进 sends（kind = pending），拉回来时认得出是自己的话。失败只记日志，主人再发一次就行。"""
+        """「待办」快捷问法（7.36）：机器人回复主人那条，正文是 sheepdog pending 的清单。"""
         from . import pending as pend
-        fn = getattr(self.source, "reply_to", None)
-        if fn is None:
+        from .outbound import send_owner
+        if (fn := getattr(self.source, "reply_to", None)) is None:
             return
         try:
-            # 7.48：给主人的「待办」卡片和纯文本版（[notify] owner_card 关着或卡片太大时卡片是 None），sends 记纯文本版
             plain, card = pend.owner_list(self.cfg, self.store)
         except Exception as e:
             log.warning("拼待办清单出错: %s", e)
             return
-        text = plain
         ik = identity.short_key(pend.SEND_PENDING, pend.SEND_PENDING, m.message_id)
         if self.store.get_send(ik) is not None:
             return
-        from .outbound import send_owner
         try:
             res = send_owner(lambda t, c: fn(m.message_id, identity=identity.BOT, idem_key=ik, text=t,
                                              **({"card": c} if c is not None else {})), plain, card)
         except Exception as e:
             log.warning("回主人的「待办」%s 失败: %s", m.message_id, e)
             return
-        self.store.add_send(ik, pend.SEND_PENDING, "", res.get("message_id", ""), text, target_message_id=m.message_id,
+        self.store.add_send(ik, pend.SEND_PENDING, "", res.get("message_id", ""), plain, target_message_id=m.message_id,
                             identity=identity.BOT if self.cfg.identity.enabled else None)
         log.info("主人发了「待办」%s，已回清单 %s", m.message_id, res.get("message_id", ""))
 
@@ -1583,21 +1585,14 @@ class Collector:
         open_ids = {e["message_id"] for e in open_escalations(self.store, self.cfg.escalation.open_hours)}
         if not open_ids:
             return False
-        if m.reply_to and m.reply_to in open_ids:
-            return True
-        if m.root_id and m.root_id in open_ids:
+        if (m.reply_to and m.reply_to in open_ids) or (m.root_id and m.root_id in open_ids):
             return True
         if m.thread_id and not is_thread_root(m):
             thr = self.store.thread_by_thread_id(m.thread_id)
-            if thr is not None:
-                if thr["root_message_id"] in open_ids:
-                    return True
-                for s in self.store.sends_in_thread(thr["root_message_id"]):
-                    if s["message_id"] in open_ids:
-                        return True
-            for r in self.store.thread_messages_in_ledger(m.thread_id):
-                if r["message_id"] in open_ids:
-                    return True
+            if thr is not None and (thr["root_message_id"] in open_ids or any(s["message_id"] in open_ids for s in self.store.sends_in_thread(thr["root_message_id"]))):
+                return True
+            if any(r["message_id"] in open_ids for r in self.store.thread_messages_in_ledger(m.thread_id)):
+                return True
         return False
 
     def _notify_owner(self, text: str, what: str, topic_id: str = "", reply_to: str = "",
@@ -1623,25 +1618,28 @@ class Collector:
             return False
 
     def _version_query_reply(self, m: Message) -> None:
-        """主人在找主人聊天里询问当前版本 / 有没有新版本或 Beta（7.75）：实时查远端并回复主人。"""
+        """主人在找主人聊天里询问当前版本 / 有没有新版本或 Beta（7.75 / 7.76）：实时查远端并回复主人。"""
         from . import version_watch
+        cb = m.raw.get("_sd_card_callback") if isinstance(m.raw, dict) else None
         self._notify_owner(version_watch.format_version_query_reply(self.store, check_remote=True),
-                           "版本查询", BUS_TOPIC_ID, reply_to=m.message_id)
+                           "版本查询", BUS_TOPIC_ID, reply_to=(m.reply_to or m.message_id) if isinstance(cb, dict) else m.message_id)
 
     def _upgrade_shortcut(self, m: Message) -> None:
-        """主人在找主人聊天里发「你来升级 / 升级 beta / 重启生效」（7.69 / 7.75）：入队 upgrade 动作，由常驻进程原地拉取并 os.execv 重启。"""
+        """主人在找主人聊天里发「你来升级 / 升级 beta / 重启生效」或点升级卡片按钮（7.69 / 7.75 / 7.76）：入队 upgrade 动作。"""
         from . import actions, version_watch
         if any(a["kind"] == "upgrade" for a in self.store.pending_actions()):
             log.info("主人发了升级口令 %s，队列里已有待执行的 upgrade 动作，不重复入队", m.message_id)
             return
-        channel = version_watch.parse_upgrade_request(m.content or "") or "stable"
+        cb = m.raw.get("_sd_card_callback") if isinstance(m.raw, dict) else None
+        channel = (cb.get("channel") if isinstance(cb, dict) and cb.get("channel") else None) or version_watch.parse_upgrade_request(m.content or "") or "stable"
+        no_pull = bool(cb.get("no_pull")) if isinstance(cb, dict) else False
+        reply_to = (m.reply_to or m.message_id) if isinstance(cb, dict) else m.message_id
         cmd_text = plain_text(m.content or "").strip()
-        aid = actions.enqueue(self.store, "upgrade", {"reply_to": m.message_id, "command": cmd_text, "channel": channel})
-        log.info("主人发了升级口令 %s（%r, channel=%s），已入队动作 #%d（upgrade）", m.message_id, cmd_text, channel, aid)
+        aid = actions.enqueue(self.store, "upgrade", {"reply_to": reply_to, "command": cmd_text, "channel": channel, "no_pull": no_pull})
+        log.info("主人发了升级口令 %s（%r, channel=%s, no_pull=%s），已入队动作 #%d（upgrade）", m.message_id, cmd_text, channel, no_pull, aid)
 
     def _agent_reply_text(self, content: str) -> bool:
-        """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix / 内置跨版本签名
-        （代回卡片右下角的标记；没配 agent_markers 时也认得出）。"""
+        """主人身份的消息是不是会话代回的：带 [owner_context] 的代回前缀 / 标记，或 [session] reply_suffix / 内置跨版本签名。"""
         suffix = self.cfg.session.reply_suffix
         return is_agent_reply(content, self.cfg.owner_context) or has_reply_suffix(content, suffix)
 
@@ -1649,8 +1647,7 @@ class Collector:
     _BRACKET = re.compile(r"\[([^\[\]]+)\]")
 
     def _attribute(self, m: Message) -> str | None:
-        """机器人发给主人的消息来自哪个 topic：第一行先用 attribution_regex，认不出再用 aliases 和会话标题；唯一命中才算。
-        卡片（7.48）按还原后的「标题\n正文」认，第一行就是 header 标题。"""
+        """机器人发给主人的消息来自哪个 topic：第一行先用 attribution_regex，认不出再用 aliases 和会话标题；唯一命中才算。"""
         bodies = message_bodies(plain_text(m.content))
         text = (bodies[-1] if len(bodies) > 1 else bodies[0]).strip()
         first = text.splitlines()[0] if text else ""
@@ -1674,22 +1671,16 @@ class Collector:
         for t in self.store.list_topics():
             if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED:
                 title = (t["title"] or "").strip()
-                if prefix and title.startswith(prefix):
-                    title = title[len(prefix):].strip()
-                out.append((t["topic_id"], title))
+                out.append((t["topic_id"], title[len(prefix):].strip() if prefix and title.startswith(prefix) else title))
         return out
 
     def _escalation_target_ok(self, topic_id: str) -> bool:
-        # 名册里的 managed 会话，或总线自己（总线也会找主人）。看名册本身：新账本第一轮还没同步 topics 表
         if topic_id == BUS_TOPIC_ID:
             return True
         if self.roster is not None and (s := self.roster.by_topic(topic_id)) is not None:
             return s.mode == MANAGED
         t = self.store.get_topic(topic_id)
-        if t is None or t["state"] == sm.CLOSED:
-            return False
-        # 总线新开的会话也会找主人；没有名册时退回看账本里的 adopted
-        return t["kind"] == DYNAMIC or (self.roster is None and t["kind"] == ADOPTED)
+        return bool(t is not None and t["state"] != sm.CLOSED and (t["kind"] == DYNAMIC or (self.roster is None and t["kind"] == ADOPTED)))
 
     def _owner_reply(self, m: Message) -> RouteDecision:
         """主人在「找主人」聊天里的回复：有引用按引用投；在话题里按话题送回；没引用且不在话题里（7.53）当成主人指令投总线。"""

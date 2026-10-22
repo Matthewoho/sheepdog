@@ -604,13 +604,12 @@ def owner_content(cfg: Config, text: str, at: bool = False, *, summary: str = ""
     except ValueError:
         return plain, None
     first_line = (text or "").strip("\n").partition("\n")[0]
-    if kind == ASK or first_line.startswith("🐕 需要你定"):
+    if kind == ASK or first_line.startswith(("🐕 需要你定", "🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态")):
         from .card_callback import attach_ask_interactions
         card = attach_ask_interactions(card, text=text, summary=summary, options_spec=options,
                                        topic_id=topic_id, key=key, title=title, interactive=bool(cfg.identity.enabled))
     if not card_fits(card):
-        log.warning("发给主人的这条卡片估算 %d 字节，超过上限，改发纯文本：%s", card_request_bytes(card),
-                    _one_line(text)[:80])
+        log.warning("发给主人的这条卡片估算 %d 字节，超过上限，改发纯文本：%s", card_request_bytes(card), _one_line(text)[:80])
         return plain, None
     return plain, card
 
