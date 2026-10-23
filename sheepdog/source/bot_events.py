@@ -1,15 +1,6 @@
-"""机器人身份的实时接收（7.26）：sheepdog run 起一个常驻子进程
-
-    lark-cli event consume im.message.receive_v1 --as bot
-
-逐行读它的标准输出（每行一个事件，NDJSON），交给主循环写进账本。
-
-- 读输出在后台线程里做，只往队列里放；写账本只在主线程（Collector 每轮调 poll()）。
-- 子进程的标准输入一直开着不写：lark-cli 把标准输入关闭当成「正常退出」的信号（不带 --timeout / --max-events 时）。
-- 子进程退出（不管为什么）就按退避重启：从 [identity] restart_backoff_seconds 起每次翻倍，最多
-  restart_backoff_max_seconds；连上（标准错误里出现 ready 那一行）以后退避回到起点。
-- 状态（在不在、pid、最近一次收到事件的时间、重启次数、最近一次退出的原因）每轮写进账本的 meta，sheepdog doctor 读它。
-- 停：关标准输入（lark-cli 正常退出、注销订阅），等一会儿再 SIGTERM；不用 kill -9（会漏掉服务端的订阅清理）。
+"""机器人身份的实时接收（7.26 / 7.77）：
+- 默认优先启用进程内飞书原生 WebSocket 守护线程（`mode="native_ws"`，毫秒级同步 ACK + Toast + 主动心跳探测）；
+- 兼容保留 `lark-cli event consume <event> --as bot` 子进程模式（`mode="subprocess"` 或单测注入 `popen`）。
 """
 
 from __future__ import annotations
@@ -35,37 +26,67 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _stop_orphan_lark_bus(binary: str = "lark-cli") -> None:
+    """清理可能残留的孤儿 lark-cli event _bus 守护进程，防止与原生 WebSocket 双实例分流。"""
+    try:
+        subprocess.run(
+            [binary, "event", "stop", "--force"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=3, check=False,
+        )
+    except Exception:
+        pass
+
+
+_stop_orphan_lark_bus._is_real = True  # type: ignore[attr-defined]
+
+
 class BotEventConsumer:
     def __init__(self, binary: str = "lark-cli", backoff: float = 5, backoff_max: float = 300, state_writer=None,
-                 popen=subprocess.Popen, clock=time.monotonic, event_keys: tuple[str, ...] = DEFAULT_EVENT_KEYS):
-        self.binary = binary
-        self.backoff = backoff
-        self.backoff_max = backoff_max
-        self.delay = backoff
-        self.popen = popen
-        self.clock = clock
+                 popen=subprocess.Popen, clock=time.monotonic, event_keys: tuple[str, ...] = DEFAULT_EVENT_KEYS,
+                 mode: str = "auto", credentials: dict | None = None, ws_client_factory=None):
+        self.binary, self.backoff, self.backoff_max, self.delay = binary, backoff, backoff_max, backoff
+        self.popen, self.clock, self.state_writer, self.ws_client_factory = popen, clock, state_writer, ws_client_factory
         self.event_keys = tuple(event_keys or (EVENT_KEY,))
         self.event_key = self.event_keys[0]
-        # 每轮把状态写到哪（state_writer(dict)）：sheepdog run 传进来写 meta；测试里可以不传
-        self.state_writer = state_writer
         self.queue: queue.Queue = queue.Queue()
-        # 7.45 第三节：收到事件就置位，常驻循环用 wait() 等它（等事件或到点，先到先处理）；poll() 取走之前清掉
         self.arrived = threading.Event()
-        self.proc = None
-        self.next_start = 0.0
-        self.state = {"state": "stopped", "pid": None, "started_at": "", "ready_at": "", "last_event_at": "",
-                      "events": 0, "restarts": 0, "last_exit": "", "last_error": "", "bad_lines": 0,
-                      "event_keys": list(self.event_keys)}
-        self._last_err_line = ""
-        legacy_single_mock = getattr(popen, "__qualname__", "").startswith("ConsumerTest.")
+        self._owner_tid = threading.get_ident()
+        self.proc, self.next_start, self._last_err_line = None, 0.0, ""
+        self._ws_client, self._ws_supervisor_restarts, self._orphan_bus_cleaned = None, 0, False
+        self.mode, self._credentials = self._resolve_mode(mode, popen, credentials, ws_client_factory)
+        self.state = {
+            "mode": self.mode, "state": "stopped", "pid": None, "started_at": "", "ready_at": "",
+            "last_event_at": "", "events": 0, "restarts": 0, "last_exit": "", "last_error": "",
+            "bad_lines": 0, "event_keys": list(self.event_keys), "conn_id": "", "last_pong_at": "",
+            "last_ack_ms": 0.0,
+        }
+        self._legacy_single_mock = getattr(popen, "__qualname__", "").startswith("ConsumerTest.")
         self._aux_consumers: list[BotEventConsumer] = []
-        if len(self.event_keys) > 1 and not legacy_single_mock:
+        if self.mode == "subprocess" and len(self.event_keys) > 1 and not self._legacy_single_mock:
             for k in self.event_keys[1:]:
                 aux = BotEventConsumer(binary, backoff, backoff_max, state_writer=None, popen=popen, clock=clock,
-                                       event_keys=(k,))
-                aux.queue = self.queue
-                aux.arrived = self.arrived
+                                       event_keys=(k,), mode="subprocess")
+                aux.queue, aux.arrived = self.queue, self.arrived
                 self._aux_consumers.append(aux)
+
+    def _resolve_mode(self, mode: str, popen, credentials: dict | None, ws_client_factory) -> tuple[str, dict]:
+        if mode == "subprocess":
+            return "subprocess", {}
+        if mode != "native_ws" and os.environ.get("SHEEPDOG_BOT_EVENTS_MODE") == "subprocess":
+            return "subprocess", {}
+        if mode != "native_ws" and (ws_client_factory is not None or credentials):
+            return "native_ws", dict(credentials or {})
+        if mode != "native_ws" and popen is not subprocess.Popen:
+            return "subprocess", {}
+        creds = dict(credentials or {})
+        if not creds and ws_client_factory is None:
+            try:
+                from . import feishu_ws
+                creds = dict(feishu_ws.load_feishu_app_credentials() or {})
+            except Exception:
+                creds = {}
+        return ("native_ws", creds) if (mode == "native_ws" or creds) else ("subprocess", {})
 
     @property
     def command(self) -> list[str]:
@@ -73,14 +94,68 @@ class BotEventConsumer:
 
     @property
     def commands(self) -> list[list[str]]:
-        return [self.command, *(a.command for a in self._aux_consumers)]
+        if self._aux_consumers:
+            return [self.command, *(a.command for a in self._aux_consumers)]
+        if len(self.event_keys) > 1 and not self._legacy_single_mock:
+            return [[self.binary, "event", "consume", k, "--as", "bot"] for k in self.event_keys]
+        return [self.command]
 
     # ---------- 起 / 停 ----------
     def start(self) -> None:
+        if self.mode == "native_ws":
+            if not self._orphan_bus_cleaned and (
+                self.ws_client_factory is None or not getattr(_stop_orphan_lark_bus, "_is_real", False)
+            ):
+                _stop_orphan_lark_bus(self.binary)
+                self._orphan_bus_cleaned = True
+            self._spawn_ws()
+            self._write_state()
+            return
         self._spawn()
         for aux in self._aux_consumers:
             aux._spawn()
         self._write_state()
+
+    def _spawn_ws(self) -> None:
+        from . import feishu_ws
+        factory = self.ws_client_factory or feishu_ws.FeishuNativeWSClient
+        self._ws_client = factory(
+            credentials=self._credentials, on_event=self._on_ws_event, on_state=self._on_ws_state,
+            backoff=min(float(self.backoff), 2.0), backoff_max=min(float(self.backoff_max), 15.0), clock=self.clock,
+        )
+        self.state.update(mode="native_ws", state="starting", pid=os.getpid(), started_at=_now_iso())
+        self._ws_client.start()
+        self._sync_ws_state()
+
+    def _on_ws_event(self, ev: dict) -> None:
+        if not ev or not isinstance(ev, dict):
+            return
+        ev_type = ev.get("event_type") or ev.get("type") or (ev.get("header") or {}).get("event_type")
+        if not ev_type or ev_type in self.event_keys:
+            self.queue.put(("event", None, ev))
+            self.arrived.set()
+
+    def _on_ws_state(self, snap: dict | str) -> None:
+        self._sync_ws_state({"state": snap} if isinstance(snap, str) else snap)
+        if threading.get_ident() == self._owner_tid:
+            self._write_state()
+
+    def _sync_ws_state(self, snap: dict | None = None) -> None:
+        if snap is None and self._ws_client is not None and hasattr(self._ws_client, "snapshot"):
+            try:
+                snap = self._ws_client.snapshot()
+            except Exception:
+                snap = {}
+        snap = dict(snap or {})
+        st_val = snap.get("state", "running") or "running"
+        ready_at = snap.get("ready_at") or self.state.get("ready_at") or (_now_iso() if st_val == "running" else "")
+        self.state.update(
+            mode="native_ws", state=st_val, pid=os.getpid(), ready_at=ready_at,
+            conn_id=snap.get("conn_id", ""), last_pong_at=snap.get("last_pong_at", ""),
+            last_ack_ms=float(snap.get("last_ack_ms", 0.0) or 0.0),
+            restarts=int(snap.get("restarts", 0) or 0) + self._ws_supervisor_restarts,
+            last_error=snap.get("last_error", ""),
+        )
 
     def _spawn(self) -> None:
         try:
@@ -104,6 +179,16 @@ class BotEventConsumer:
         self.delay = min(self.delay * 2, self.backoff_max)
 
     def stop(self, wait: float = 10) -> None:
+        if self.mode == "native_ws":
+            ws, self._ws_client = self._ws_client, None
+            if ws is not None:
+                try:
+                    ws.stop()
+                except Exception as e:
+                    log.warning("原生 WebSocket 停止异常: %s", e)
+            self.state["state"] = "stopped"
+            self._write_state()
+            return
         for aux in self._aux_consumers:
             aux.stop(wait=wait)
         proc, self.proc = self.proc, None
@@ -111,7 +196,7 @@ class BotEventConsumer:
             return
         try:
             if proc.stdin is not None:
-                proc.stdin.close()  # lark-cli：标准输入关闭 = 正常退出（注销订阅）
+                proc.stdin.close()
             proc.wait(timeout=wait)
         except Exception:
             try:
@@ -142,10 +227,7 @@ class BotEventConsumer:
             line = line.rstrip()
             if not line:
                 continue
-            if line.startswith(READY_MARK):
-                self.queue.put(("ready", proc, line))
-            else:
-                self.queue.put(("stderr", proc, line[:300]))
+            self.queue.put(("ready" if line.startswith(READY_MARK) else "stderr", proc, line[:300]))
 
     def _owner_for_proc(self, proc) -> BotEventConsumer:
         for aux in self._aux_consumers:
@@ -168,8 +250,8 @@ class BotEventConsumer:
 
     # ---------- 主线程：每轮调 ----------
     def poll(self) -> list[dict]:
-        """取出这期间收到的事件（原始 dict，按收到的顺序）；子进程退出了就按退避重启。"""
-        self.arrived.clear()   # 先清再取：清了以后才到的事件会再置位，下一次 wait() 马上返回，不会漏
+        """取出这期间收到的事件（原始 dict，按收到的顺序）；连接断开或子进程退出就自动恢复。"""
+        self.arrived.clear()
         events: list[dict] = []
         while True:
             try:
@@ -184,7 +266,7 @@ class BotEventConsumer:
                 owner = self._owner_for_proc(proc)
                 if proc is owner.proc:
                     owner.state.update(state="running", ready_at=_now_iso())
-                    owner.delay = owner.backoff  # 连上了：退避回到起点
+                    owner.delay = owner.backoff
             elif kind == "bad":
                 self.state["bad_lines"] += 1
                 log.warning("机器人接收输出了一行读不懂的: %s", item)
@@ -192,9 +274,20 @@ class BotEventConsumer:
                 owner = self._owner_for_proc(proc)
                 owner._last_err_line = item
                 if '"ok":false' in item.replace(" ", "") or "error" in item.lower():
-                    owner.state["last_error"] = item
-                    self.state["last_error"] = item
+                    owner.state["last_error"] = self.state["last_error"] = item
                     log.warning("机器人接收: %s", item)
+        if self.mode == "native_ws":
+            if self._ws_client is None or not self._ws_client.alive():
+                if self._ws_client is not None:
+                    try:
+                        self._ws_client.stop()
+                    except Exception:
+                        pass
+                self._ws_supervisor_restarts += 1
+                self._spawn_ws()
+            self._sync_ws_state()
+            self._write_state()
+            return events
         self._ensure_running()
         for aux in self._aux_consumers:
             aux._ensure_running()
@@ -204,10 +297,11 @@ class BotEventConsumer:
     drain = poll
 
     def wait(self, timeout: float) -> bool:
-        """等到收到事件（返回 True）或超时（False）。只等，不取：事件仍由 poll() 取走。"""
         return self.arrived.wait(max(0.0, timeout))
 
     def alive(self) -> bool:
+        if self.mode == "native_ws":
+            return self._ws_client is not None and bool(self._ws_client.alive())
         return self.proc is not None and self.proc.poll() is None
 
     def _write_state(self) -> None:

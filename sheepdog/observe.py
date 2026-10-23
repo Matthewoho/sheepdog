@@ -418,26 +418,19 @@ def run_observe(
     db = db_path or (cfg.db_path if cfg is not None else DEFAULT_DB)
     st_path = state_path or (state_dir / "watchdog-cursor.json")
     log_file = log_path or DEFAULT_LOG
-    roster_file = roster_path or (
-        cfg.roster_file if (cfg is not None and getattr(cfg, "roster_file", None)) else DEFAULT_ROSTER
-    )
+    roster_file = roster_path or (cfg.roster_file if (cfg is not None and getattr(cfg, "roster_file", None)) else DEFAULT_ROSTER)
     media_dir = state_dir / "media" if state_dir else DEFAULT_MEDIA
-    owner_id = (
-        cfg.self_open_id if (cfg is not None and getattr(cfg, "self_open_id", None)) else DEFAULT_OWNER
-    )
+    owner_id = cfg.self_open_id if (cfg is not None and getattr(cfg, "self_open_id", None)) else DEFAULT_OWNER
     if not notify_chat_id and cfg is not None and getattr(cfg, "owner_chat_ids", None):
         notify_chat_id = cfg.owner_chat_ids[0]
     bus_topic_id = "tp_bus"
     default_ack_reasons = set(_DEFAULT_ACK_REASONS)
     if cfg is not None and cfg.ack.enabled:
-        ack_enabled = True
-        ack_reasons = (set(cfg.ack.reasons or ()) | set(cfg.ack.bot_reasons or ())) or default_ack_reasons
+        ack_enabled, ack_reasons = True, (set(cfg.ack.reasons or ()) | set(cfg.ack.bot_reasons or ())) or default_ack_reasons
     elif cfg is not None and getattr(cfg, "config_path", None) and cfg.config_path.exists():
-        ack_enabled = False
-        ack_reasons = default_ack_reasons
+        ack_enabled, ack_reasons = False, default_ack_reasons
     else:
-        ack_enabled = True
-        ack_reasons = default_ack_reasons
+        ack_enabled, ack_reasons = True, default_ack_reasons
 
     st: dict = {}
     if st_path.exists():
@@ -449,40 +442,37 @@ def run_observe(
     if not now_dt:
         since = max(since, GOLIVE)
 
-    warn: list[str] = []
-    info: list[str] = []
-    self_healed: list[str] = []
-
+    warn, info, self_healed = [], [], []
     disk_ver_info = version_info(repo_dir or default_repo_dir(), prefer_disk_version=True)
 
     # ==================== L1: 进程与版本一致性 ====================
     if check_processes:
         if ps_output is None:
             try:
-                ps_output = subprocess.run(
-                    ["ps", "-axo", "pid,lstart,command"],
-                    capture_output=True, text=True, timeout=10, check=False,
-                ).stdout
+                ps_output = subprocess.run(["ps", "-axo", "pid,lstart,command"], capture_output=True, text=True, timeout=10, check=False).stdout
             except (OSError, subprocess.SubprocessError):
                 ps_output = ""
-        run_procs = [
-            l for l in ps_output.splitlines()
-            if re.search(r"(?:/sheepdog|sheepdog(?:\.cli)?)\s+run(?:\s|$)", l) and "grep" not in l
-        ]
-        consumer_procs = [
-            l for l in ps_output.splitlines()
-            if "lark-cli event consume" in l and "grep" not in l
-        ]
+        run_procs = [l for l in ps_output.splitlines() if re.search(r"(?:/sheepdog|sheepdog(?:\.cli)?)\s+run(?:\s|$)", l) and "grep" not in l]
+        consumer_procs = [l for l in ps_output.splitlines() if "lark-cli event consume" in l and "grep" not in l]
         if len(run_procs) != 1:
-            if not run_procs:
-                warn.append("正式常驻进程数量=0（应为 1）：`sheepdog run` 不在")
-            else:
-                pids = ", ".join(r.split()[0] for r in run_procs)
-                warn.append(f"正式常驻进程数量={len(run_procs)}（应为 1，PIDs: {pids}）")
+            warn.append("正式常驻进程数量=0（应为 1）：`sheepdog run` 不在" if not run_procs else f"正式常驻进程数量={len(run_procs)}（应为 1，PIDs: {', '.join(r.split()[0] for r in run_procs)}）")
         else:
             parts = run_procs[0].split()
             info.append(f"常驻进程 {parts[0]}（起于 {' '.join(parts[1:6])}）")
-        if not consumer_procs:
+        ic_meta: dict = {}
+        if db.exists():
+            try:
+                with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as _mc:
+                    _mr = _mc.execute("SELECT value FROM meta WHERE key='identity_consumer'").fetchone()
+                    ic_meta = json.loads(_mr[0]) if (_mr and _mr[0]) else {}
+            except Exception:
+                ic_meta = {}
+        if ic_meta.get("mode") == "native_ws":
+            if ic_meta.get("state") in ("running", "starting", "reconnecting"):
+                info.append(f"原生 WebSocket 常驻在线（conn={ic_meta.get('conn_id') or '-'}，重启 {ic_meta.get('restarts', 0)} 次）")
+            else:
+                warn.append(f"原生 WebSocket 异常：state={ic_meta.get('state')} err={str(ic_meta.get('last_error', ''))[:80]}")
+        elif not consumer_procs:
             warn.append("lark-cli event consume 没在跑")
 
     if check_log:

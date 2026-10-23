@@ -299,3 +299,11 @@
 | 规格 | 症状 | 守它的测试 |
 | --- | --- | --- |
 | 7.76 | `🐕 汇报 · 新版提醒`（远端稳定版提醒 / 本地待重启提醒）与 `🐕 汇报 · 版本与更新状态` 未经 `outbound.owner_content` 注入合法 Card JSON 2.0 流式胶囊按钮（`column_set` `flex_mode="flow"`，禁含 `vertical_spacing`），或点击 `[🚀 升级稳定版]` / `[🧪 升级 Beta 尝鲜版]` / `[🔄 立即重启生效]` / `[🔍 查有没有 Beta 版]` / `[⏸ 暂不升级]` 未在 `card_callback` + `Collector` 闭环入队 `upgrade`（区分 `channel="stable" \| "beta"` 与 `no_pull`）、未原地 `patch_card` 回写绿卡、非主人点击未被 `card_callback_non_owner` 拦截、连点两次或点卡后再发文字重复入队（REG-026） | `test_remote_version_watch_beta_stable.RemoteVersionWatchBetaStableTest.test_reg_026_interactive_version_notice_and_beta_query_card_callbacks` |
+
+## 7.77 飞书原生常驻 WebSocket 守护线程、毫秒级同步 ACK+Toast 与主动心跳秒级自愈监管（REG-027 ~ REG-029）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.77 | 依赖外部 `lark-cli event _bus` 僵尸进程或处理完业务才回包导致飞书卡片点击报 `200672` 超时：未由进程内原生 WebSocket 在 `< 10ms` 内优先同步回写 pbbp2 Frame HTTP 200 + Toast 回执并异步归一化投递 v2 事件（REG-027） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_027_native_ws_sub10ms_ack_with_toast_and_v2_normalization` |
+| 7.77 | 睡眠唤醒或 NAT 静默断网后 TCP 半开连接被永久挂死：未通过主动应用层 Ping/Pong 帧与静默看门狗在超时后秒级主动断线重连并刷新 endpoint（REG-028） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_028_half_open_zombie_detection_and_fast_reconnect` |
+| 7.77 | `BotEventConsumer` 在 `native_ws` 模式下未清理孤儿 `lark-cli event _bus`、客户端线程异常死掉时 `poll()` 未自动拉起并同步 `identity_consumer` 状态，或 `sheepdog observe` 在 `native_ws` 在线时误报 `lark-cli event consume 没在跑`（REG-029） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_029_bot_event_consumer_native_supervision_and_observe_health` |
