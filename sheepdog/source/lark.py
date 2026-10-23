@@ -429,7 +429,7 @@ class LarkCliSource:
 
     def reactions_of(self, message_ids: list[str]) -> dict[str, list[dict]]:
         """每条消息的表情（每条最多取第一页 10 个）：{message_id: [{emoji_type, operator_id, reaction_id}]}。"""
-        out: dict[str, list[dict]] = {}
+        out, message_ids = {}, [m for m in message_ids if m and not str(m).startswith(("sd_card_cb_", "sd_sys_"))]
         for i in range(0, len(message_ids), self.REACTION_BATCH):
             chunk = message_ids[i: i + self.REACTION_BATCH]
             data = self._run_once(["im", "reactions", "batch_query",

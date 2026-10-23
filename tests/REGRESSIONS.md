@@ -307,3 +307,9 @@
 | 7.77 | 依赖外部 `lark-cli event _bus` 僵尸进程或处理完业务才回包导致飞书卡片点击报 `200672` 超时：未由进程内原生 WebSocket 在 `< 10ms` 内优先同步回写 pbbp2 Frame HTTP 200 + Toast 回执并异步归一化投递 v2 事件（REG-027） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_027_native_ws_sub10ms_ack_with_toast_and_v2_normalization` |
 | 7.77 | 睡眠唤醒或 NAT 静默断网后 TCP 半开连接被永久挂死：未通过主动应用层 Ping/Pong 帧与静默看门狗在超时后秒级主动断线重连并刷新 endpoint（REG-028） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_028_half_open_zombie_detection_and_fast_reconnect` |
 | 7.77 | `BotEventConsumer` 在 `native_ws` 模式下未清理孤儿 `lark-cli event _bus`、客户端线程异常死掉时 `poll()` 未自动拉起并同步 `identity_consumer` 状态，或 `sheepdog observe` 在 `native_ws` 在线时误报 `lark-cli event consume 没在跑`（REG-029） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_029_bot_event_consumer_native_supervision_and_observe_health` |
+
+## 7.78 飞书原生 WebSocket 多 IP TLS 故障转移、坏节点冷却降权、断线零等待瞬时重连与合成消息表情查询过滤（REG-030）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.78 | 飞书边缘节点单 IP 出现 TCP 连通但 TLS 握手 EOF（`UNEXPECTED_EOF_WHILE_READING`）时在 DNS TTL 周期内反复撞同一坏首 IP、已建连长连接闪断后先睡 backoff 导致分钟级 `✖ 目标回调服务当前未在线` 空窗、心跳混发冗余 `0x9` 控制帧，或 `reactions_of` 将 `sd_card_cb_*` 合成卡片消息 ID 传给 `im reactions batch_query` 报 `99992354 Invalid ids`（REG-030） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_030_multi_ip_tls_failover_zero_gap_reconnect_and_card_reaction_filter` |

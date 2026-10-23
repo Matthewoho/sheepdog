@@ -1,8 +1,7 @@
-"""飞书原生常驻 WebSocket 客户端（规格 7.77，REG-027 ~ REG-029）。"""
+"""飞书原生常驻 WebSocket 客户端（规格 7.77 ~ 7.78，REG-027 ~ REG-030）。"""
 from __future__ import annotations
 
-import base64, ctypes, ctypes.util, json, logging, os, socket, ssl, struct, subprocess, threading, time
-import urllib.parse, urllib.request
+import base64, ctypes, ctypes.util, json, logging, os, socket, ssl, struct, subprocess, threading, time, urllib.parse, urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -223,25 +222,55 @@ def fetch_ws_endpoint(app_id: str, app_secret: str, domain: str = "https://open.
         raise RuntimeError(f"ws endpoint rejected: code={payload.get('code')} msg={payload.get('msg')}")
     return {"url": str(ws_url), "client_config": data.get("ClientConfig") or payload.get("ClientConfig") or {}}
 
+_BAD_IP_UNTIL: dict[str, float] = {}
+_BAD_IP_COOLDOWN_SEC: float = 180.0
+_GOOD_IP_CACHE: dict[tuple[str, int], str] = {}
+
+def _resolve_candidate_addrs(host: str, port: int) -> list[tuple[int, int, int, tuple]]:
+    seen, unique = set(), []
+    for info in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        if (item := (info[0], info[1], info[2], info[-1])) not in seen: seen.add(item); unique.append(item)
+    now_m, good_ip = time.monotonic(), _GOOD_IP_CACHE.get((host, port))
+    return [it for _, it in sorted(enumerate(unique), key=lambda iv: (1 if _BAD_IP_UNTIL.get(str(iv[1][3][0]), 0.0) > now_m else 0, 0 if str(iv[1][3][0]) == good_ip else 1, iv[0]))]
+
 class _RawWebSocket:
-    def __init__(self, ws_url: str, connect_timeout: float = 8.0, read_timeout: float = 0.5):
-        parsed = urllib.parse.urlsplit(ws_url)
+    def __init__(self, ws_url: str = "", connect_timeout: float = 8.0, read_timeout: float = 15.0, *, url: str = ""):
+        parsed = urllib.parse.urlsplit(ws_url or url)
         scheme, host = (parsed.scheme or "wss").lower(), parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if scheme == "wss" else 80)
-        path, qs = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else ""), urllib.parse.parse_qs(parsed.query)
+        port, use_tls = parsed.port or (443 if scheme == "wss" else 80), (parsed.scheme or "wss").lower() == "wss"
+        path_q, qs = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else ""), urllib.parse.parse_qs(parsed.query)
         self.service_id = int((qs.get("service_id") or ["0"])[0] or 0)
         self.conn_id = (qs.get("device_id") or qs.get("conn_id") or [f"svc_{self.service_id}"])[0]
-        raw_sock = socket.create_connection((host, port), timeout=connect_timeout)
-        try: raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception: pass
-        self.sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host) if scheme == "wss" else raw_sock
-        self._send_lock, self._rx_buf = threading.Lock(), bytearray()
-        self._handshake(host, port, path)
-        self.sock.settimeout(read_timeout)
+        self.timeout, self.remote_ip, self._send_lock, self._rx_buf, self.sock = float(read_timeout), "", threading.Lock(), bytearray(), None
+        addrs, per_ip_timeout, last_err = _resolve_candidate_addrs(host, port), max(0.2, min(float(connect_timeout), 3.5)), None
+        for af, socktype, proto, sa in addrs:
+            raw_sock = sock = None
+            try:
+                raw_sock = socket.socket(af, socktype, proto)
+                raw_sock.settimeout(per_ip_timeout)
+                raw_sock.connect(sa)
+                for lvl, opt in ((socket.IPPROTO_TCP, socket.TCP_NODELAY), (socket.SOL_SOCKET, socket.SO_KEEPALIVE)):
+                    try: raw_sock.setsockopt(lvl, opt, 1)
+                    except OSError: pass
+                sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host) if use_tls else raw_sock
+                self.sock, self._rx_buf = sock, bytearray()
+                self._handshake(host, port, path_q) if getattr(getattr(self._handshake, "__code__", None), "co_argcount", 4) != 3 else self._handshake(host, path_q)
+                self.sock.settimeout(self.timeout)
+                self.remote_ip = _GOOD_IP_CACHE[(host, port)] = str(sa[0])
+                _BAD_IP_UNTIL.pop(self.remote_ip, None); last_err = None; break
+            except Exception as e:
+                last_err, self.sock = e, None
+                for s in (sock, raw_sock):
+                    try: s and s.close()
+                    except Exception: pass
+                _BAD_IP_UNTIL[str(sa[0])] = time.monotonic() + _BAD_IP_COOLDOWN_SEC
+                if _GOOD_IP_CACHE.get((host, port)) == str(sa[0]): _GOOD_IP_CACHE.pop((host, port), None)
+        if last_err is not None or self.sock is None: raise last_err or OSError("no candidate address")
 
-    def _handshake(self, host: str, port: int, path: str) -> None:
+    def _handshake(self, host: str, port: int | str, path: str | None = None) -> None:
+        hdr_host, req_path = (host, str(port)) if path is None else (f"{host}:{port}", path)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        self.sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode("ascii"))
+        self.sock.sendall(f"GET {req_path} HTTP/1.1\r\nHost: {hdr_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode("ascii"))
         buf = bytearray()
         while b"\r\n\r\n" not in buf:
             if not (chunk := self.sock.recv(4096)): raise ConnectionResetError("ws handshake eof")
@@ -296,17 +325,17 @@ class _RawWebSocket:
 
 class FeishuNativeWSClient:
     def __init__(self, credentials: dict, on_event: Callable[[dict], None], on_state: Callable[[dict], None] | None = None,
-                 ping_interval: float = 15.0, pong_timeout: float = 8.0, backoff: float = 1.0, backoff_max: float = 15.0,
+                 ping_interval: float = 15.0, pong_timeout: float = 8.0, backoff: float = 0.5, backoff_max: float = 3.0,
                  toast_text: str = DEFAULT_TOAST_TEXT, endpoint_fetcher=fetch_ws_endpoint, clock=time.monotonic):
         self.credentials, self.on_event, self.on_state = dict(credentials or {}), on_event, on_state
         self.ping_interval, self.pong_timeout, self.backoff, self.backoff_max = float(ping_interval), float(pong_timeout), float(backoff), float(backoff_max)
         self.toast_text, self.endpoint_fetcher, self.clock = toast_text, endpoint_fetcher, clock
         self._stop_evt, self._reconnect_evt, self._thread, self._ws = threading.Event(), threading.Event(), None, None
-        self._seq, self._connected_in_round, self._multipart = 0, False, {}
+        self._seq, self._connected_in_round, self._multipart, self._last_ep = 0, False, {}, None
         self._state = {
             "mode": "native_ws", "state": "stopped", "pid": os.getpid(), "started_at": "", "ready_at": "",
             "last_event_at": "", "last_ping_at": "", "last_pong_at": "", "last_pong_mono": 0.0,
-            "last_ack_ms": 0.0, "events": 0, "restarts": 0, "zombie_restarts": 0, "last_exit": "", "last_error": "", "conn_id": "", "ws_url": "",
+            "last_ack_ms": 0.0, "events": 0, "restarts": 0, "zombie_restarts": 0, "last_exit": "", "last_error": "", "conn_id": "", "ws_url": "", "remote_ip": "",
         }
 
     def start(self) -> None:
@@ -347,19 +376,25 @@ class FeishuNativeWSClient:
             except Exception as e:
                 self._state.update(state="down", last_error=str(e)[:240], last_exit=f"{_now_iso()} {e}"[:240])
                 self._notify_state()
-            if self._connected_in_round: delay = self.backoff
             if self._stop_evt.is_set(): break
+            if self._connected_in_round:
+                delay = self.backoff; continue
             self._stop_evt.wait(max(0.01, delay))
             delay = min(delay * 2.0, self.backoff_max)
 
     def _serve_once(self) -> None:
-        ep = self.endpoint_fetcher(self.credentials.get("app_id", ""), self.credentials.get("app_secret", ""),
-                                   self.credentials.get("domain", "https://open.larksuite.com"))
-        ws_url, read_to = ep["url"], max(0.02, min(1.0, self.ping_interval / 2.0, self.pong_timeout / 2.0))
+        try:
+            code = getattr(self.endpoint_fetcher, "__code__", None)
+            no_args = code is not None and not (code.co_flags & 0x04) and (code.co_argcount - (1 if hasattr(self.endpoint_fetcher, "__self__") else 0)) == 0
+            ep = self._last_ep = self.endpoint_fetcher() if no_args else self.endpoint_fetcher(
+                self.credentials.get("app_id", ""), self.credentials.get("app_secret", ""), self.credentials.get("domain", "https://open.larksuite.com"))
+        except Exception:
+            if self._last_ep is None: raise
+            ep, self._last_ep = self._last_ep, None
+        ws_url, read_to = ep["url"] if isinstance(ep, dict) else getattr(ep, "url", str(ep)), max(0.02, min(1.0, self.ping_interval / 2.0, self.pong_timeout / 2.0))
         ws = _RawWebSocket(ws_url, connect_timeout=max(1.0, self.pong_timeout), read_timeout=read_to)
         self._ws, self._connected_in_round, now_m = ws, True, self.clock()
-        self._state.update(state="running", ready_at=_now_iso(), conn_id=ws.conn_id, ws_url=ws_url,
-                           last_pong_at=_now_iso(), last_pong_mono=now_m, last_error="")
+        self._state.update(state="running", ready_at=_now_iso(), conn_id=ws.conn_id, ws_url=ws_url, remote_ip=ws.remote_ip, last_pong_at=_now_iso(), last_pong_mono=now_m, last_error="")
         self._notify_state()
         last_ping_m, awaiting_pong_since = now_m, None
         try:
@@ -377,12 +412,10 @@ class FeishuNativeWSClient:
                 if (now_m - last_ping_m) >= self.ping_interval:
                     self._seq += 1
                     ws.send_frame(0x2, encode_pb_frame(build_ping_frame(ws.service_id, self._seq)))
-                    ws.send_frame(0x9, b"ping")
                     last_ping_m, self._state["last_ping_at"] = now_m, _now_iso()
                     if awaiting_pong_since is None: awaiting_pong_since = now_m
         finally:
-            self._ws = None
-            ws.close()
+            self._ws = None; ws.close()
 
     def _handle_binary_frame(self, ws: _RawWebSocket, data: bytes) -> None:
         t0, pb = time.perf_counter(), decode_pb_frame(data)

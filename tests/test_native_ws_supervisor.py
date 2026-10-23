@@ -1,7 +1,7 @@
-"""REG-027 ~ REG-029 飞书原生常驻 WebSocket 守护线程、毫秒级 ACK+Toast 与心跳自愈回归测试（7.77）。"""
+"""REG-027 ~ REG-030 飞书原生常驻 WebSocket 守护线程、毫秒级 ACK+Toast、多 IP 故障转移与心跳自愈回归测试（7.78）。"""
 from __future__ import annotations
 
-import base64, hashlib, json, os, socket, struct, sys, tempfile, threading, time, unittest
+import base64, hashlib, json, os, socket, ssl, struct, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -339,6 +339,74 @@ class NativeWSSupervisorTest(unittest.TestCase):
             consumer.poll()
             self.assertTrue(consumer.alive())
             self.assertGreaterEqual(consumer.state["restarts"], 1)
+
+    def test_reg_030_multi_ip_tls_failover_zero_gap_reconnect_and_card_reaction_filter(self):
+        feishu_ws._BAD_IP_UNTIL.clear()
+        feishu_ws._GOOD_IP_CACHE.clear()
+        srv = _LocalMockWSServer()
+        self.addCleanup(srv.close)
+        real_getaddrinfo, real_sock_cls = socket.getaddrinfo, socket.socket
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            if host == "msg-frontier-sg.larksuite.com":
+                return [
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.1", int(port))),
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port))),
+                ]
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        class _FailoverSock(real_sock_cls):
+            def connect(self, addr):
+                self._target_ip = addr[0]
+                return None if addr[0] == "203.0.113.1" else super().connect(addr)
+
+        class _FakeSSLContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                if getattr(sock, "_target_ip", "") == "203.0.113.1":
+                    sock.close()
+                    raise ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1010)")
+                return sock
+
+        with mock.patch.object(feishu_ws.socket, "getaddrinfo", side_effect=fake_getaddrinfo), \
+                mock.patch.object(feishu_ws.socket, "socket", _FailoverSock), \
+                mock.patch.object(feishu_ws.ssl, "create_default_context", return_value=_FakeSSLContext()):
+            ws = feishu_ws._RawWebSocket(
+                f"wss://msg-frontier-sg.larksuite.com:{srv.port}/ws/v2?service_id=33554678&device_id=d1"
+            )
+            self.addCleanup(ws.close)
+            self.assertEqual(ws.remote_ip, "127.0.0.1")
+            self.assertIn("203.0.113.1", feishu_ws._BAD_IP_UNTIL)
+            ordered = feishu_ws._resolve_candidate_addrs("msg-frontier-sg.larksuite.com", srv.port)
+            self.assertEqual(ordered[0][-1][0], "127.0.0.1")
+            ws.close()
+
+        srv2 = _LocalMockWSServer()
+        self.addCleanup(srv2.close)
+        client = feishu_ws.FeishuNativeWSClient(
+            credentials={"app_id": "cli_test", "app_secret": "sec_test"},
+            on_event=lambda _: None,
+            backoff=1.5, backoff_max=3.0, ping_interval=0.12, pong_timeout=0.25,
+            endpoint_fetcher=lambda *_: {"url": srv2.ws_url("conn_reg030", 33554678), "client_config": {}},
+        )
+        client.start()
+        self.addCleanup(client.stop)
+        self.assertTrue(srv2.connected_evt.wait(1.0))
+        self.assertTrue(srv2.rx_evt.wait(0.6))
+        t_drop = time.perf_counter()
+        for c in list(srv2._clients):
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            c.close()
+        self.assertTrue(srv2.second_connected_evt.wait(0.8), "已建连会话断开后未在 0.8s 内完成 0s 瞬时重连")
+        self.assertLess(time.perf_counter() - t_drop, 0.6)
+        self.assertTrue(srv2.rx_frames)
+        self.assertTrue(all(op == 0x2 for _, op, _, _, _ in srv2.rx_frames))
+        self.assertFalse(any(op == 0x9 for _, op, _, _, _ in srv2.rx_frames))
+
+        with mock.patch("subprocess.run", side_effect=AssertionError("unexpected subprocess.run")):
+            self.assertEqual(lark.LarkCliSource(binary="false").reactions_of(["sd_card_cb_ev123", "sd_sys_1"]), {})
 
 
 if __name__ == "__main__":
