@@ -17,7 +17,7 @@ from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_ST
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
                      bus_quote_verifier, cancel_lamb, close_session, complete_lamb, delivered_text, display_time,
                      duty_reset_key, escalation_summary, forward_messages, open_escalations, owner_quote_verifier,
-                     register_lamb, unsent_notice_line, write_receipt)
+                     register_lamb, touch_wakeup, unsent_notice_line, write_receipt)
 from .models import Message, Mention
 from .people_roster import add_roster_arguments, run_roster_cli
 from .playbook import PLAYBOOK_FILES, Playbook
@@ -775,10 +775,8 @@ def host_report(cfg, store: Store) -> list[str]:
                 lines.append(f"  配置档: profile = {hc.profile}，读的是 {sb['file']}；sheepdog 把它展开成 -c 参数传给自己起的 "
                              "app-server（主人在 Codex 应用里的会话不受影响）")
                 lines.append("  提示: 配置档只对之后新开的 Codex 会话生效；改了配置档，老会话要退休换新才会跟着变")
-                try:
-                    lines.append("  展开: " + " ".join(profile_overrides(hc.profile)))
-                except ProfileError as e:
-                    lines.append(f"  ✗ 配置档有问题，这个宿主的每一轮都会直接失败：{e}")
+                try: lines.append("  展开: " + " ".join(profile_overrides(hc.profile)))
+                except ProfileError as e: lines.append(f"  ✗ 配置档有问题，这个宿主的每一轮都会直接失败：{e}")
             else:
                 lines.append(f"  配置档: 没设（只用用户配置 {sb['file']}）")
             source = (f"来自配置档 {sb['file']}，sheepdog 展开成 -c 传给自己起的 app-server" if hc.profile
@@ -789,18 +787,22 @@ def host_report(cfg, store: Store) -> list[str]:
     return lines
 
 
-# 7.45 第三节：机器人事件到了以后再攒几秒（同一句话常常几条一起来、搜索那条路的同一条也可能马上到），再做小轮次
 BOT_EVENT_SETTLE_SECONDS = 2
 
 
-def _mini_cycle(collector: Collector, dispatcher: Dispatcher | None) -> dict | None:
-    """机器人事件触发的小轮次：只入账 + 投递，不跑搜索（搜索仍按 poll_interval_seconds，免得撞飞书频率限制）。"""
+def _wakeup_mtime(cfg) -> int:
+    try: return (cfg.state_dir / ".wakeup").stat().st_mtime_ns
+    except OSError: return 0
+
+
+def _mini_cycle(collector: Collector, dispatcher: Dispatcher | None, *, local_wake: bool = False) -> dict | None:
+    """机器人事件或本地 CLI 写后（.wakeup）触发的小轮次：只入账 + 投递，不跑搜索。"""
     stats = collector.poll_bot_only()
-    if not stats or not stats.get("fetched"):
+    if not local_wake and (not stats or not stats.get("fetched")):
         return stats
     logging.info("机器人事件小轮次: %s", stats)
     if dispatcher:
-        res = dispatcher.deliver_only()
+        res = dispatcher.deliver_only(check_receipts=local_wake)
         logging.info("机器人事件小轮次投递: %s", res)
         if dispatcher.store.pending_actions():
             if n := actions.run_pending(dispatcher):
@@ -809,29 +811,33 @@ def _mini_cycle(collector: Collector, dispatcher: Dispatcher | None) -> dict | N
 
 
 def _wait_next(args, collector: Collector, dispatcher: Dispatcher | None, clock=None, sleep=None) -> int:
-    """两轮完整轮次之间怎么等（7.45 第三节）：[run] wake_on_bot_event 开着、起了机器人接收时，等「机器人事件到了」或「到点」，
-    先到先处理——事件到了攒 BOT_EVENT_SETTLE_SECONDS 秒做一次小轮次，接着等到点；关着（热改成关也一样，下一次等就生效）
-    或没起接收就照旧睡满间隔。返回做了几次小轮次。clock / sleep 调用时才取（测试 patch time.sleep 照样生效）。"""
-    clock = clock or time.monotonic
-    sleep = sleep or time.sleep
+    """两轮完整轮次之间等待机器人事件或本地 CLI .wakeup 信号（7.45 / 7.86 REG-050）。"""
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
     deadline = clock() + (args.interval or collector.cfg.poll_interval_seconds)
-    consumer = collector.bot_events
-    n = 0
+    consumer, n, w0 = collector.bot_events, 0, _wakeup_mtime(collector.cfg)
     while True:
-        if getattr(dispatcher, "restart_requested", False):
-            return n
-        left = deadline - clock()
-        if left <= 0:
+        if getattr(dispatcher, "restart_requested", False) or (left := deadline - clock()) <= 0:
             return n
         if not (collector.cfg.run.wake_on_bot_event and consumer is not None and hasattr(consumer, "wait")):
-            sleep(left)
+            sleep(left); return n
+        local_wake, ev_woke = False, False
+        if isinstance(consumer, BotEventConsumer):
+            while (left := deadline - clock()) > 0:
+                if consumer.wait(min(left, 0.5)):
+                    ev_woke = True; break
+                if (w_now := _wakeup_mtime(collector.cfg)) != w0:
+                    w0, local_wake = w_now, True; break
+            if not ev_woke and not local_wake:
+                return n
+        elif not consumer.wait(left):
             return n
-        if not consumer.wait(left):
-            return n
-        sleep(max(0.0, min(BOT_EVENT_SETTLE_SECONDS, deadline - clock())))
+        else:
+            ev_woke = True
+        if ev_woke:
+            sleep(max(0.0, min(BOT_EVENT_SETTLE_SECONDS, deadline - clock())))
         try:
-            _mini_cycle(collector, dispatcher)
-        except Exception as e:  # 小轮次失败不挡下一轮
+            _mini_cycle(collector, dispatcher, local_wake=local_wake) if local_wake else _mini_cycle(collector, dispatcher)
+        except Exception as e:
             logging.error("机器人事件小轮次失败: %s: %s", type(e).__name__, e)
         n += 1
         if getattr(dispatcher, "restart_requested", False):
@@ -1839,15 +1845,11 @@ def _topic_arg(x: str) -> str:
 
 
 def cmd_work(args) -> int:
-    cfg = _load_cfg()
-    store = Store(cfg.db_path)
-    tid = _topic_arg(args.topic)
+    cfg = _load_cfg(); store, tid = Store(cfg.db_path), _topic_arg(args.topic)
     if not _duty_target_ok(store)(tid):
-        print(f"work 被拒绝: {tid} 不是在投递的会话（总线、名册 managed、总线新开的）", file=sys.stderr)
-        return 2
+        print(f"work 被拒绝: {tid} 不是在投递的会话（总线、名册 managed、总线新开的）", file=sys.stderr); return 2
     try:
         if args.work_cmd == "set":
-            from . import decision_hub
             if decision_hub.hub_active(cfg, store):
                 setattr(store, "enforce_waiting_owner_ask", True)
             wid, others = duty.set_work(store, tid, args.key, title=args.title, state=args.state,
@@ -1856,8 +1858,7 @@ def cmd_work(args) -> int:
         else:
             wid, others = duty.done_work(store, tid, args.key, args.result), []
     except duty.DutyError as e:
-        print(f"work 被拒绝: {e}", file=sys.stderr)
-        return 2
+        print(f"work 被拒绝: {e}", file=sys.stderr); return 2
     w = store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone()
     print(f"已登记（立即写入羊群看板）：{tid} · {duty.work_line(w)}")
     for o in others:
@@ -1871,15 +1872,14 @@ def cmd_work(args) -> int:
 
 def cmd_tell(args) -> int:
     cfg = _load_cfg()
-    security = _security(cfg)
-    store = Store(cfg.db_path)
+    security, store = _security(cfg), Store(cfg.db_path)
     verify = owner_quote_verifier(store, security.quote_max_age_hours, cfg.self_open_id) if args.quote else None
     try:
         mail_id = duty.send_mail(store, cfg, _topic_arg(args.topic), _topic_arg(args.to), args.text, args.key,
                                  args.quote, verify, Playbook.from_config(cfg), _duty_target_ok(store))
     except duty.DutyError as e:
-        print(f"tell 被拒绝: {e}", file=sys.stderr)
-        return 2
+        print(f"tell 被拒绝: {e}", file=sys.stderr); return 2
+    touch_wakeup(cfg)
     print(f"留言 #{mail_id} 已存进信箱，{_topic_arg(args.to)} 下一批收到（对方排队、离线都不丢）")
     return 0
 

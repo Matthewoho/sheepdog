@@ -392,8 +392,8 @@ def one_sentence(text: str, limit: int = 80) -> str:
 
 # ---------- 自动发现 invoke_subagent（7.63） ----------
 _UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.I)
-_CREATED_SUBAGENT_HDR_RE = re.compile(r"Created the following subagents?:\s*\n")
-_CREATED_SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.I)
+_CREATED_SUBAGENT_HDR_RE = re.compile(r"Created the following subagent(?:\(s\)|s)?:\s*\n", re.I)
+_CREATED_SUBAGENT_CID_RE = re.compile(r'"?conversationId"?\s*:\s*"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"?', re.I)
 _TRUNCATED_SUBAGENT_ROLE_RE = re.compile(r'(?:\\?"Role\\?"|\\?"TaskTitle\\?")\s*:\s*\\?"([^"\\]+)')
 _SUBAGENT_RETURN_BLOCK_RE = re.compile(
     r"<SYSTEM_MESSAGE>\s*\[Message\]\s+timestamp=([^\s]+)\s+sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s)[^\n]*?\bcontent=(.*?)(?:</SYSTEM_MESSAGE>|\Z)",
@@ -449,18 +449,17 @@ def _extract_subagent_fields(obj: dict, parent: dict, step_fallback: str) -> Sub
     cid = _pick_str(
         args.get("conversation_id"), args.get("ConversationId"), args.get("cid"), args.get("subagent_id"), args.get("SubagentId"),
         obj.get("conversation_id"), obj.get("subagent_id"), obj.get("cid"), res.get("conversation_id"), res.get("subagent_id"),
-        res.get("cid"), parent.get("subagent_conversation_id"), parent.get("subagent_id"),
-    )
+        res.get("cid"), parent.get("subagent_conversation_id"), parent.get("subagent_id"))
     if not cid:
         raw_blob = json.dumps({"res": obj.get("result"), "p_res": parent.get("result"), "content": obj.get("content") or parent.get("content")}, ensure_ascii=False)
-        if m := _UUID_RE.search(raw_blob):
-            cid = m.group(1)
+        cid = m.group(1) if (m := _UUID_RE.search(raw_blob)) else ""
     title = one_sentence(_pick_str(
         args.get("Role"), args.get("role"), args.get("task_title"), args.get("TaskTitle"), args.get("title"), args.get("Title"),
         args.get("toolSummary"), args.get("Task"), args.get("task"), args.get("Prompt"), args.get("prompt"), args.get("Name"),
         args.get("name"), args.get("toolAction"), obj.get("Role"), obj.get("role"), obj.get("task_title"), obj.get("title"),
-        res.get("task_title"), res.get("title"), parent.get("task_title"), parent.get("title"),
-    ), 80) or "subagent"
+        res.get("task_title"), res.get("title"), parent.get("task_title"), parent.get("title")), 80) or "subagent"
+    if not lid and (m_lid := re.search(r"\blamb_[0-9a-f]{8}\b", f"{title}\n{args.get('Prompt') or args.get('prompt') or ''}", re.I)):
+        lid = m_lid.group(0).lower()
     at = str(parent.get("created_at") or parent.get("timestamp") or obj.get("created_at") or "")
     return SubagentInvocation(lamb_id=lid, conversation_id=cid, task_title=title, step=step_fallback, at=at)
 
@@ -477,8 +476,9 @@ def _extract_subagent_invocations(obj: dict, parent: dict, step_fallback: str) -
         cid = _pick_str(sub.get("conversation_id"), sub.get("ConversationId"), sub.get("cid"), sub.get("subagent_id"), sub.get("SubagentId"))
         title = one_sentence(_pick_str(
             sub.get("Role"), sub.get("role"), sub.get("TaskTitle"), sub.get("task_title"), sub.get("Title"), sub.get("title"),
-            args.get("toolSummary"), sub.get("Prompt"), sub.get("prompt"), sub.get("TypeName"), sub.get("type_name"), args.get("toolAction"),
-        ), 80) or "subagent"
+            args.get("toolSummary"), sub.get("Prompt"), sub.get("prompt"), sub.get("TypeName"), sub.get("type_name"), args.get("toolAction")), 80) or "subagent"
+        if not lid and (m_lid := re.search(r"\blamb_[0-9a-f]{8}\b", f"{title}\n{sub.get('Prompt') or sub.get('prompt') or ''}", re.I)):
+            lid = m_lid.group(0).lower()
         out.append(SubagentInvocation(lamb_id=lid, conversation_id=cid, task_title=title, step=f"{step_fallback}:{j}", at=at))
     return out
 

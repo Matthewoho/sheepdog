@@ -367,3 +367,12 @@
 | 7.85 | `sheepdog forward --answers` 与超时关闭（`_expire_escalations`）跨通道关结「需要你定」时，未同步触发 `decision_hub.sync_escalation_dual_cards` 刷绿业务原卡、全局聚合台镜像卡并刷新 1F 汇总卡，或未给转交消息打上 `escalation:<mid>` 标签（REG-047） | `test_forward_answers_and_card_heal_785.TestForwardAnswersAndCardHeal785.test_reg_047_forward_answers_patches_dual_green_cards` |
 | 7.85 | 当「需要你定」此前已通过非卡片回调路径（`prev_cb is None`，如 `forward --answers` 或 `resolve`）在 SQLite 标为 `answered_at/closed_at`、但主人仍在飞书橙卡上点击按钮或提交「其他」表单时，`process_card_action_event` 在防重 `drop` 返回前未调用 `decision_hub.sync_escalation_dual_cards` 原地自愈刷绿飞书双卡，导致「点提交没反应」的橙卡死锁（REG-048） | `test_forward_answers_and_card_heal_785.TestForwardAnswersAndCardHeal785.test_reg_048_card_callback_on_non_card_answered_escalation_self_heals_green_card` |
 
+## 7.86 群引用回复直达、CLI 写后即时唤醒投递、Subagent lamb_id 防克隆与结案清理（REG-049 ~ REG-052）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.86 | 业务专席在公共群（fallback 归 `tp_bus`）经 `sends` / `bot_outbox` 发出消息后，群内同事或对方 Bot 发送普通引用回复（`reply_to` 命中已发消息，`thread_id=""`）时未被 `_group_reply_owner` / `_quote_owner` 识别而误落入 `tp_bus`（REG-049） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_049_group_quote_reply_and_bot_reply_route_directly_to_origin_topic` |
+| 7.86 | `forward_messages` / `write_receipt` 等 CLI 写操作后未触发 `state_dir/.wakeup` 唤醒，或 `Dispatcher.deliver_only()` 在会话 `state="running"` 但已写入完成回执文件时未先调用 `_check_receipt` 解锁并当场投递排队消息（REG-050） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_050_cli_write_touches_wakeup_and_deliver_only_checks_receipt` |
+| 7.86 | `guard._extract_subagent_invocations` 未从 `Prompt="[lamb:lamb_xxx]"` 提取 `lamb_id` 导致 `_handle_lamb_line` 在 `Role` 与中文 `task_title` 不一致时未复用 `lamb prepare` 预建羔羊而派生第二只克隆羊，或母羊提交非 `waiting` 终态回执时未自动收口名下 `running` 的 `subagent` 羔羊（REG-051） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_051_subagent_lamb_id_extraction_reuses_prepared_lamb_and_auto_closes_on_receipt` |
+| 7.86 | 动态会话通过 `close_session` 或终态回执进入 `topics.state == "closed"` 后，`duty_cards.run_state` 仍残留 `"working"` / `queued > 0` 或活跃跟踪项未收口（REG-052） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_052_closed_topic_resets_duty_card_working_and_tracked_items` |
+
