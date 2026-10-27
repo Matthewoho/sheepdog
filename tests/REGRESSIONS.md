@@ -313,3 +313,57 @@
 | 规格 | 症状 | 守它的测试 |
 | --- | --- | --- |
 | 7.78 | 飞书边缘节点单 IP 出现 TCP 连通但 TLS 握手 EOF（`UNEXPECTED_EOF_WHILE_READING`）时在 DNS TTL 周期内反复撞同一坏首 IP、已建连长连接闪断后先睡 backoff 导致分钟级 `✖ 目标回调服务当前未在线` 空窗、心跳混发冗余 `0x9` 控制帧，或 `reactions_of` 将 `sd_card_cb_*` 合成卡片消息 ID 传给 `im reactions batch_query` 报 `99992354 Invalid ids`（REG-030） | `test_native_ws_supervisor.NativeWSSupervisorTest.test_reg_030_multi_ip_tls_failover_zero_gap_reconnect_and_card_reaction_filter` |
+
+## 7.79 原生 SQLite 自学习花名册（people_roster）、多说话人身份反查与 Mattheuu 单一人格契约（REG-031 ~ REG-032）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.79 | 缺少原生 SQLite `people_roster` 双向花名册种子与 `sheepdog roster` CLI、主人语音/文字指令无法实时自学习落盘别名与展开私聊检索词、对主人汇报未把英文显示名（如 `Wenbo Wang`/`Mac`）归一为首选称呼或误伤 `Mac 桌面端` 平台词，以及 `[persona]` 单一人格契约（`Mattheuu`）与多说话人 `resolve_speaker_profile` 身份反查缺失（REG-031） | `test_people_roster_779.PeopleRoster779Test.test_reg_031_auto_seed_and_bidirectional_lookup_and_cli`、`test_people_roster_779.PeopleRoster779Test.test_reg_031_voice_natural_language_self_learning_and_query_expansion`、`test_people_roster_779.PeopleRoster779Test.test_reg_031_canonicalize_names_for_owner_and_mac_platform_guard`、`test_people_roster_779.PeopleRoster779Test.test_reg_031_persona_contract_and_multi_speaker_counterparty_profile` |
+| 7.79 | `zekai`（泽楷 / Mac）与 `max_luo`（Max Luo）自然人实体混绑导致旧库 `zekai` 残留 `max`/`max luo`/`bymax` 脏别名与错绑 `open_id`，或 `canonicalize_names_for_owner` 把对主人汇报里的 `Max` 误替换成 `泽楷`（REG-032） | `test_people_roster_779.PeopleRoster779Test.test_reg_032_max_vs_mac_zekai_entity_isolation_and_seed_self_healing` |
+
+## 7.80 飞书 Bot TAT 跨进程文件锁缓存、`_run_once` 限流退避与失效重取、话题群瞬态错误免熔断及索引卡时间去抖（REG-033）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.80 | `lark-cli --as bot` 短命子进程每次调用无状态重打 `POST /oauth/v3/token` 触发 `TAT endpoint rate limited (HTTP 429)` 风暴、`_run_once` 遇 429 零重试或遇 `99991663` 令牌失效未清缓存重取、`outbound._send_to_group` 与 `topicgroup.dispatcher_round` 将瞬态 429 当作群永久故障误触发 `tg.mark_down` 熔断退回私聊，或 `topicgroup._strip_time` 未剥离每分钟跳变的相对时间（`已等 X 分钟` / `最近动静 X前` / `拖了 X 小时`）导致每分钟无效 `patch_card`（REG-033） | `test_tat_rate_limit_780.TatRateLimit780Test.test_reg_033_tat_cache_reuses_token_and_injects_env`、`test_tat_rate_limit_780.TatRateLimit780Test.test_reg_033_lark_run_once_retries_429_and_refreshes_invalid_tat`、`test_tat_rate_limit_780.TatRateLimit780Test.test_reg_033_transient_429_does_not_mark_topic_group_down`、`test_tat_rate_limit_780.TatRateLimit780Test.test_reg_033_strip_time_ignores_relative_minute_ticks` |
+
+## 7.81 独立自身可观测与告警群、report 球权契约与结案门禁、全局待拍板聚合台双视图同步与三阶温和催办（REG-034 ~ REG-037）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.81 | 看门狗、羊群看板中断/失联、attention、回音账本与版本提醒等系统通知发进主人私聊或主业务话题群造成噪音污染，或 `alert_chat_id` 为空/失效时未自动创建绑定并置顶欢迎卡的独立告警群 `🐕 牧羊犬 · 自身可观测与告警`（REG-034） | `test_decision_hub_and_alert_group_781.TestAlertGroupIsolation781.test_reg_034_auto_create_bind_pin_and_route_owner_notices`、`test_decision_hub_and_alert_group_781.TestAlertGroupIsolation781.test_reg_034_fallback_recreate_on_invalid_chat` |
+| 7.81 | `sheepdog report` 允许传 `--ball owner` 或在正文末尾塞交互选项块/祈使回执口令把待拍板伪装成汇报，或普通词黑名单误杀含「授权/拍板/方案 A」的正常事实汇报；或 `sheepdog resolve` 在 `answered_at IS NULL` 且未提供可验真 `--quote` / `--superseded-by` 时允许会话自关未答提问（REG-035） | `test_decision_hub_and_alert_group_781.TestBallContractAndResolveGuard781.test_reg_035_report_allows_normal_prose_with_authorization_words`、`test_decision_hub_and_alert_group_781.TestBallContractAndResolveGuard781.test_reg_035_report_blocks_ball_owner_and_disguised_option_prompts`、`test_decision_hub_and_alert_group_781.TestBallContractAndResolveGuard781.test_reg_035_resolve_anti_self_close_guard` |
+| 7.81 | 话题群未自动初始化置顶『📌 待我拍板 · 全局聚合台』根话题、新 `ask` 未双向镜像投射至聚合台或同一 `(topic_id, key)` 重复建楼刷屏而非原地双端 `PATCH`，以及在原业务话题或聚合台任一处点击按钮/文字回复后未原子结案并同步将双端卡片与 1F 汇总卡刷绿（REG-036） | `test_decision_hub_and_alert_group_781.TestDecisionHubDualViewAndKeyIsolation781.test_reg_036_decision_hub_auto_init_and_dual_view_mirror`、`test_decision_hub_and_alert_group_781.TestDecisionHubDualViewAndKeyIsolation781.test_reg_036_same_key_ask_idempotent_in_place_dual_patch`、`test_decision_hub_and_alert_group_781.TestDecisionHubDualViewAndKeyIsolation781.test_reg_036_button_click_in_either_view_settles_both_cards_atomic_cas`、`test_decision_hub_and_alert_group_781.TestDecisionHubDualViewAndKeyIsolation781.test_reg_036_text_reply_in_hub_routes_and_settles_both_cards` |
+| 7.81 | 未答提问缺少三阶温和催办（`+30m`、`+2h`、次日 `10:00 CST`，上限 3 次）、同一阶梯重复刷屏催办，或 `00:00~09:00 CST` 夜间免打扰时段未静默顺延至 `10:00 CST`（REG-037） | `test_decision_hub_and_alert_group_781.TestEscalationNudgeLadder781.test_reg_037_three_tier_nudge_ladder_and_quiet_hours` |
+
+## 7.82 Canonical 话题群一会话一主贴、会话级钥匙隔离与跨会话追问路标、waiting/话题群回执 0s 原帖带回、存量账本自愈与群顶层 reply Bot 优先发送（REG-038 ~ REG-042）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.82 | Canonical 话题群模式下业务会话调 `ask` / `report` 未传 `--track`（或未传 `--key`）退回机器人私聊 `owner_threads` 死锁，或单职责会话后续换用新 `--key` 时分裂出新话题 `T-(n+1)` 而未复用唯一 Canonical `T-n` 并自动追认别名钥匙（REG-038） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_038_canonical_session_topic_and_no_dm_scatter` |
+| 7.82 | `find_by_key` 缺少会话边界导致不同业务会话（如 `tp_release` 与 `tp_wenbo-ops`）传同一发版单号 `--key` 时串入同一话题；或主人在 `T-A`（归属 `tp_alpha`）顺带问 `tp_beta` 的事并由 `tp_alpha` `forward` 转交时夺舍 `T-A.owner_topic`、未重绑到 `tp_beta` 专属话题 `T-B` 并在原帖发 `↪️ 这件事归属...已转入专属话题` 路标（REG-039） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_039_session_key_isolation_and_cross_domain_forward_signpost` |
+| 7.82 | `"回执带回"` 被误放入 `SYSTEM_ALERT_KINDS` 导致剥离 `reply_to` 跑偏到独立告警群顶层，或主人在话题群发言后会话交 `status="waiting"` 回执（未发 `ask/report`）受 `owner_relay_after_minutes` 延迟阻塞/静默吞没而未在 `0s` 内原帖 `in_thread=True` 盖楼带回 `已派后台任务处理中`（REG-040） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_040_instant_in_thread_waiting_receipt_relay_not_hijacked_to_alert_group` |
+| 7.82 | 存量账本中跨会话污染的 `tracked_keys`、单职责会话重复分裂的多个 `active` `tracked_items` 以及残留未关联的 `owner_threads` 私聊串缺少 `heal_canonical_topics` 自愈剥离、归并与收编（REG-041） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_041_heal_canonical_topics_merges_duplicates_and_cleans_cross_session_keys` |
+| 7.82 | `sheepdog reply --to` 不支持 `oc_<chat_id>` 群顶层主动发卡片、未在机器人在群时强制优先用 `identity="bot"` 调 `post_to` 并记入 `sends`，或遇飞书 `230002`（机器人不在群）未作废缓存、记入 `bot_absent_chats` 并自动降级 `identity="user"` 重发，以及未拦截找主人侧聊天（REG-042） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_042_reply_to_group_chat_id_uses_bot_identity_first_and_falls_back_on_230002` |
+
+## 7.83 机器人私聊追问自动路标引导与回执反死球真空硬门禁（REG-043 ~ REG-044）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.83 | 主人在机器人私聊（`oc_owner_dm`）发问并由 `tp_bus` 转交（或直接派发）给业务会话后，业务会话调 `ask` / `report` 自动路由进话题群专属话题 `T-n`，导致私聊原消息下静默无声、缺少 `↪️ 这件事已在话题群专属话题 T-n 回复你` 自动路标引导（REG-043） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_043_p2p_dm_question_gets_signpost_when_answer_routes_to_canonical_topic` |
+| 7.83 | 会话在 `work_items` 残留 `waiting_on="主人"` / `state="waiting_owner"` 或提交 `status="needs_decision"` 但账本 `open_escalations=0`、`open_watches=0`、`running_lambs=0` 时未调 `sheepdog ask` 就交 `handled`/`waiting` 回执收工、`duty.set_work` 切回 `doing` 未自动清空残留 `waiting_on="主人"`，或受管会话在面板直聊回合结束（`fullyIdle=True`）最后一条 `PLANNER_RESPONSE` 写了非空 `- **等你定的事和回法...**` 却未同步调 `sheepdog ask` 落盘飞书决策卡造成死球真空（REG-044） | `test_canonical_topic_routing_782.TestCanonicalTopicRouting782.test_reg_044_receipt_rejects_dead_ball_vacuum_when_waiting_on_owner_without_open_ask` |
+
+## 7.84 飞书 batch_query 空 reaction_id 自点 Get 防误认回声与总线 at_me 真实动作门禁（REG-045 ~ REG-046）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.84 | 飞书 `im reactions batch_query` 返回聚合表情时不带 `reaction_id`（`reaction_id=""`），导致 `Collector._check_owner_reactions` 将 sheepdog 自己以主人身份（`acks` 表 `identity='user'`）自动点的确认表情（`Get`）误判为主人新点的表情，循环生成虚假 `📝 主人对这条消息点了 Get`（`sd_owner_context_*`）系统消息并污染 `owner_reactions` 表（REG-045） | `test_anti_self_get_and_bus_at_me_784.TestAntiSelfGetAndBusAtMe784.test_reg_045_self_ack_get_with_empty_reaction_id_not_mistaken_for_owner_reaction`、`test_anti_self_get_and_bus_at_me_784.TestAntiSelfGetAndBusAtMe784.test_reg_045_purge_self_ack_owner_reactions_cleans_polluted_rows` |
+| 7.84 | 总线 `tp_bus` 收到外部群聊点名 `@Matthew` 的真实待办/求确认消息（`reason='at_me'`）后，未执行 `forward` / `new-session` / `ask` / `report` / `reply` 真实路由动作（仅写 `noop` 或仅 `tell` 旁路会话）就交 `status="handled"` 回执将主人的待办静默吞没（REG-046） | `test_anti_self_get_and_bus_at_me_784.TestAntiSelfGetAndBusAtMe784.test_reg_046_bus_at_me_action_request_blocks_silent_noop_receipt` |
+
+## 7.85 forward --answers 双端绿卡同步与非卡片已答提问点击回调原地自愈（REG-047 ~ REG-048）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.85 | `sheepdog forward --answers` 与超时关闭（`_expire_escalations`）跨通道关结「需要你定」时，未同步触发 `decision_hub.sync_escalation_dual_cards` 刷绿业务原卡、全局聚合台镜像卡并刷新 1F 汇总卡，或未给转交消息打上 `escalation:<mid>` 标签（REG-047） | `test_forward_answers_and_card_heal_785.TestForwardAnswersAndCardHeal785.test_reg_047_forward_answers_patches_dual_green_cards` |
+| 7.85 | 当「需要你定」此前已通过非卡片回调路径（`prev_cb is None`，如 `forward --answers` 或 `resolve`）在 SQLite 标为 `answered_at/closed_at`、但主人仍在飞书橙卡上点击按钮或提交「其他」表单时，`process_card_action_event` 在防重 `drop` 返回前未调用 `decision_hub.sync_escalation_dual_cards` 原地自愈刷绿飞书双卡，导致「点提交没反应」的橙卡死锁（REG-048） | `test_forward_answers_and_card_heal_785.TestForwardAnswersAndCardHeal785.test_reg_048_card_callback_on_non_card_answered_escalation_self_heals_green_card` |
+

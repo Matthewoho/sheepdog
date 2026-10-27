@@ -1,36 +1,25 @@
 """命令行入口：doctor / poll / run / inbox / init / sessions / forward / spawn / watch / security-log / escalations /
 acks / new-session / close-session / push-rules / retire / actions / loops / redeliver / show / inject / reply-card /
-receipt / session-reset / work / tell / board / notices / ask / report / resolve / pending / reply / thread / lamb / hook。
+receipt / session-reset / work / tell / board / notices / ask / report / resolve / pending / reply / thread / lamb / roster / hook。
 """
-
 from __future__ import annotations
 
-import argparse
-import fcntl
-import json
-import logging
-import os
-import re
-import shutil
-import subprocess
-import sys
-import time
-import tomllib
-import uuid
+import argparse, fcntl, json, logging, os, re, shutil, subprocess, sys, time, tomllib, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import __version__, _git_run, actions, default_repo_dir, observe as obs, parse_version_tuple, version_info, version_watch
+from . import (__version__, _git_run, actions, decision_hub, default_repo_dir, duty, guard, identity as ident, lastgood,
+               observe as obs, outbound, parse_version_tuple, session as sm, version_info, version_watch)
 from .ack import Acker
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
-from . import lastgood, duty, guard, outbound, identity as ident, session as sm
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
                      bus_quote_verifier, cancel_lamb, close_session, complete_lamb, delivered_text, display_time,
                      duty_reset_key, escalation_summary, forward_messages, open_escalations, owner_quote_verifier,
                      register_lamb, unsent_notice_line, write_receipt)
 from .models import Message, Mention
+from .people_roster import add_roster_arguments, run_roster_cli
 from .playbook import PLAYBOOK_FILES, Playbook
 from .prompts import with_cli
 from .roster import Roster, RosterError, check_hosts, load_roster
@@ -48,11 +37,8 @@ from .store import Store, infer_topic_lifecycle, now_iso
 
 
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    import warnings; warnings.filterwarnings("ignore", category=ResourceWarning)
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 class _Abort(Exception):
@@ -200,7 +186,7 @@ def _sinks(cfg, store: Store, dry: bool) -> dict:
     return sinks
 
 
-def _notifier(cfg, source, args):
+def _notifier(cfg, source, args, store=None):
     """给主人的通知（在岗表中断 / 失联、attention 和恢复、危险命令报警、写锁提醒、登录失效）怎么送：
 
     - 配了 [notify] file：一律追加写进那个文件（带时间和通知类型），不发飞书（测试环境用；拉不拉 IM 都一样），不重试；
@@ -220,7 +206,7 @@ def _notifier(cfg, source, args):
         where = f"发进测试群 {cfg.threads.owner_chat_id}" if cfg.threads.owner_chat_id else "发私聊"
         how = "卡片" if cfg.notify.owner_card else "纯文本"
         return lambda text: print(f"[dryrun] 给主人{where}（{how}）：\n{text}\n")
-    return OwnerDM(source, cfg.self_open_id, cfg)
+    return OwnerDM(source, cfg.self_open_id, cfg, store=store)
 
 
 def notify_report(cfg) -> str:
@@ -869,7 +855,7 @@ def cmd_poll(args) -> int:
     collector = Collector(cfg, store, source, roster, security, acker)
     collector.dry_run = bool(getattr(args, "dry_run", False))
     dispatcher = None if args.no_dispatch else Dispatcher(cfg, store, sink, roster, security, acker,
-                                                          _notifier(cfg, source, args), _group_source(source, args))
+                                                          _notifier(cfg, source, args, store), _group_source(source, args))
     _wire_images(dispatcher, source, args)
     _cycle(collector, dispatcher)
     return 0
@@ -928,7 +914,7 @@ def _reload_config(old, args, store: Store, source, collector: Collector, dispat
         source.tz = new.timezone_offset
     collector.acker = dispatcher.acker = _acker(new, store, source, args)
     # 主人通知的去向跟着配置走（[notify] file 改了下一轮生效）
-    dispatcher.notifier = _notifier(new, source, args)
+    dispatcher.notifier = _notifier(new, source, args, store)
     return new
 
 
@@ -953,7 +939,7 @@ def cmd_run(args) -> int:
         acker = _acker(cfg, store, source, args)
         collector = Collector(cfg, store, source, roster, security, acker)
         collector.dry_run = bool(getattr(args, "dry_run", False))
-        dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args),
+        dispatcher = Dispatcher(cfg, store, sink, roster, security, acker, _notifier(cfg, source, args, store),
                                 _group_source(source, args))
         _wire_images(dispatcher, source, args)
         logging.info("sheepdog 常驻运行，间隔 %ss，宿主 %s", args.interval or cfg.poll_interval_seconds,
@@ -1298,11 +1284,10 @@ def cmd_receipt(args) -> int:
             store = Store(cfg.db_path)
             try:
                 if not outbound.lamb_violation_message(store, "receipt", topic_id=args.topic):
-                    if err := _reject_vip_needs_decision_without_floor_ask(
-                        cfg, store, args.topic, args.batch, str(receipt.get("status") or "")
-                    ):
-                        print(err, file=sys.stderr)
-                        return 2
+                    if err := (_reject_vip_needs_decision_without_floor_ask(cfg, store, args.topic, args.batch, str(receipt.get("status") or ""))
+                               or decision_hub.verify_receipt_no_dead_ball(cfg, store, args.topic, args.batch, receipt)
+                               or decision_hub.verify_bus_at_me_no_silent_drop(cfg, store, args.topic, args.batch, receipt)):
+                        print(err, file=sys.stderr); return 2
                     warn_msg = _check_monolithic_parent_turn(cfg, store, args.topic, args.batch)
             finally:
                 store.close()
@@ -1318,26 +1303,26 @@ def cmd_receipt(args) -> int:
 
 def cmd_forward(args) -> int:
     cfg = _load_cfg()
-    security = _security(cfg)
-    store = Store(cfg.db_path)
+    security, store = _security(cfg), Store(cfg.db_path)
     verify = bus_quote_verifier(store, security.quote_max_age_hours)
     try:
         ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
                                cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns, cfg.cli_command,
                                answers=getattr(args, "answers", "") or "")
     except ValueError as e:
-        print(f"转交被拒绝: {e}", file=sys.stderr)
-        return 2
-    # 7.47 第 1 条：已经送到这个会话的不重发，逐条说明；全部跳过也算成功（退出码 0），不用重试、不用再转
+        print(f"转交被拒绝: {e}", file=sys.stderr); return 2
     for mid, batch, sent_at in ids.skipped:
         print(f"`{mid}` {delivered_text(args.topic, batch, sent_at, cfg.timezone_offset)}，这次不重发")
     extra = "，附主人原话 / 总线备注" if args.quote or args.note else ""
-    if getattr(args, "answers", ""):
+    if ans := (getattr(args, "answers", "") or "").strip():
         print(f"已标记提问 `{args.answers}` 为已答（{args.topic}）")
-    if ids or extra or not ids.skipped:
-        print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）")
-    else:
-        print(f"没有要转交的：{len(ids.skipped)} 条都已经送到 {args.topic}，不用再转")
+        if cfg.source.enabled:
+            esc, m0 = store.get_escalation(ans), (store.get_message((ids or [s[0] for s in ids.skipped])[0]) if (ids or ids.skipped) else None)
+            raw_ans = " ".join(plain_text((m0["content"] if m0 is not None else "") or args.quote or args.note or "").split())[:60]
+            try: decision_hub.sync_escalation_dual_cards(cfg, store, _source(cfg), ans, chosen_display=f"已在其他聊天答复：{raw_ans}" if raw_ans else "已在其他聊天答复", topic_id=_topic_arg(args.topic), orig_text=(esc["text"] or "") if esc is not None else "")
+            except Exception: pass
+    print(f"已转交 {len(ids)} 条消息{extra}到 {args.topic}，sheepdog 下一轮投递（对方被主人接管时排队）" if (ids or extra or not ids.skipped)
+          else f"没有要转交的：{len(ids.skipped)} 条都已经送到 {args.topic}，不用再转")
     return 0
 
 
@@ -1862,6 +1847,9 @@ def cmd_work(args) -> int:
         return 2
     try:
         if args.work_cmd == "set":
+            from . import decision_hub
+            if decision_hub.hub_active(cfg, store):
+                setattr(store, "enforce_waiting_owner_ask", True)
             wid, others = duty.set_work(store, tid, args.key, title=args.title, state=args.state,
                                         waiting_on=args.waiting_on, until=args.until, expect=args.expect,
                                         to=_topic_arg(args.to), result=args.result)
@@ -2040,20 +2028,23 @@ def cmd_ask(args) -> int:
         return outbound.EXIT_INVALID
     floor = getattr(args, "floor", "") or ""
     floor_type = getattr(args, "floor_type", None)
+    ball, fyi = getattr(args, "ball", "") or "", bool(getattr(args, "fyi", False))
     vips = _ask_vips(cfg) if kind == outbound.ASK else {}
     if not cfg.source.enabled:
         if not outbound.target_ok(store, tid):
             print(f"{kind} 没发: {tid} 不是在投递的会话", file=sys.stderr)
             return outbound.EXIT_INVALID
-        if kind == outbound.ASK:
-            try:
+        try:
+            if kind == outbound.ASK:
                 if getattr(args, "about", None):
                     outbound.ask_sources(cfg, store, tid, args.about)
-                outbound.check_vip_floor(cfg, store, tid, getattr(args, "about", None), vips, floor, args.batch,
-                                         floor_type=floor_type)
-            except outbound.OutboundError as e:
-                print(f"{kind} 没发: {e}", file=sys.stderr)
-                return e.code
+                outbound.check_vip_floor(cfg, store, tid, getattr(args, "about", None), vips, floor, args.batch, floor_type=floor_type)
+            else:
+                from . import decision_hub
+                decision_hub.enforce_report_contract(cfg, store, tid, args.title, body, key=args.key, ball=ball, fyi=fyi)
+        except outbound.OutboundError as e:
+            print(f"{kind} 没发: {e}", file=sys.stderr)
+            return e.code
         try:
             _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
         except ValueError as e:
@@ -2065,7 +2056,7 @@ def cmd_ask(args) -> int:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
                                    about=getattr(args, "about", None) or None, track=getattr(args, "track", False),
                                    floor=floor, vips=vips, summary=summary, floor_type=floor_type,
-                                   options=getattr(args, "options", "") or "")
+                                   options=getattr(args, "options", "") or "", ball=ball, fyi=fyi)
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -2098,7 +2089,8 @@ def cmd_resolve(args) -> int:
     source = _source(cfg) if cfg.source.enabled else None
     try:
         r = outbound.resolve(cfg, store, source, tid, args.why or "", message_id=args.message_id or "", key=args.key or "",
-                             playbook=Playbook.from_config(cfg))
+                             playbook=Playbook.from_config(cfg), quote=getattr(args, "quote", "") or "",
+                             superseded_by=getattr(args, "superseded_by", "") or "")
     except outbound.OutboundError as e:
         print(f"resolve 没做: {e}", file=sys.stderr)
         return e.code
@@ -2392,12 +2384,19 @@ def cmd_hook_stop(args) -> int:
     return hook.stop_main(sys.stdin.buffer, sys.stdout)
 
 
+def cmd_roster(args) -> int:
+    try:
+        cfg = _load_cfg()
+    except Exception:
+        cfg = None
+    return run_roster_cli(args, cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("-V", "--version", action="store_true", help="显示版本信息（含常驻进程内存版本对比）")
     sub = p.add_subparsers(dest="cmd", required=False)
-
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
     sp = sub.add_parser("version", help="显示 CLI 代码版本与常驻进程内存版本")
     sp.add_argument("--json", action="store_true", help="输出 JSON")
@@ -2421,16 +2420,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--interval", type=int, default=0)
     sp.set_defaults(func=cmd_run)
     sp = sub.add_parser("inbox")
-    sp.add_argument("--chat", default="")
-    sp.add_argument("--limit", type=int, default=50)
-    sp.set_defaults(func=cmd_inbox)
+    sp.add_argument("--chat", default=""); sp.add_argument("--limit", type=int, default=50); sp.set_defaults(func=cmd_inbox)
     sp = sub.add_parser("inbox-clear")
-    sp.add_argument("--chat", default="")
-    sp.add_argument("--all", action="store_true")
-    sp.set_defaults(func=cmd_inbox_clear)
+    sp.add_argument("--chat", default=""); sp.add_argument("--all", action="store_true"); sp.set_defaults(func=cmd_inbox_clear)
     sp = sub.add_parser("init")
-    sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本")
-    sp.set_defaults(func=cmd_init)
+    sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本"); sp.set_defaults(func=cmd_init)
     sub.add_parser("sessions").set_defaults(func=cmd_sessions)
     sp = sub.add_parser("forward")
     sp.add_argument("--topic", required=True)
@@ -2440,24 +2434,17 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--answers", default="", help="7.53：主人这句是在回答哪条「需要你定」（提问的 om_，只能一个）：给了才关那一条；必须是 --topic 那个会话名下、还开着的")
     sp.set_defaults(func=cmd_forward)
     sp = sub.add_parser("spawn")
-    sp.add_argument("--key", required=True)
-    sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本")
-    sp.set_defaults(func=cmd_spawn)
+    sp.add_argument("--key", required=True); sp.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不写账本"); sp.set_defaults(func=cmd_spawn)
     sp = sub.add_parser("watch")
-    sp.add_argument("--topic", required=True)
-    sp.add_argument("--person", required=True, help="对方 open_id")
-    sp.add_argument("--chat", default="", help="只认这个聊天里的回复；不填 = 任意聊天")
-    sp.add_argument("--note", default="", help="在等什么")
+    sp.add_argument("--topic", required=True); sp.add_argument("--person", required=True, help="对方 open_id")
+    sp.add_argument("--chat", default="", help="只认这个聊天里的回复；不填 = 任意聊天"); sp.add_argument("--note", default="", help="在等什么")
     sp.set_defaults(func=cmd_watch)
     sp = sub.add_parser("watches")
-    sp.add_argument("--all", action="store_true", help="包括已结束的")
-    sp.set_defaults(func=cmd_watches)
+    sp.add_argument("--all", action="store_true", help="包括已结束的"); sp.set_defaults(func=cmd_watches)
     sp = sub.add_parser("security-log")
-    sp.add_argument("--since", default="24h", help="回看时长：30m / 24h / 7d")
-    sp.set_defaults(func=cmd_security_log)
+    sp.add_argument("--since", default="24h", help="回看时长：30m / 24h / 7d"); sp.set_defaults(func=cmd_security_log)
     sp = sub.add_parser("escalations")
-    sp.add_argument("--all", action="store_true", help="包括已答和已关闭的")
-    sp.add_argument("--topic", default="", help="只列这个会话（tp_x）名下的")
+    sp.add_argument("--all", action="store_true", help="包括已答和已关闭的"); sp.add_argument("--topic", default="", help="只列这个会话（tp_x）名下的")
     sp.set_defaults(func=cmd_escalations)
     sp = sub.add_parser("new-session")
     sp.add_argument("--key", required=True)
@@ -2492,7 +2479,6 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--batch", default="", help="按批次号重投")
     sp.add_argument("--topic", default="", help="按会话重投最近一批 uncertain 或未进会话记录的批次")
     sp.set_defaults(func=cmd_redeliver)
-
     sp = sub.add_parser("reply-card")
     sp.add_argument("--topic", default="", help="可选：调用方会话（tp_x）")
     g = sp.add_mutually_exclusive_group(required=True)
@@ -2593,6 +2579,9 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--floor-type", default=None, help="碰到哪类底线（7.65，必填枚举：credentials | destructive | vip_conflict）：为名册 VIP 本人发的消息找主人（或使用 --floor）时必须与 --floor 同时写")
             sp.add_argument("--floor", default="", help="碰到哪条底线（7.61 / 7.65）：为名册 VIP 本人发的消息找主人时必须与 --floor-type 一起写，不写就不发（退出码 2）。VIP 请求默认不等主人批：合理就办，不合理给方案，坚持就 report 后配合")
             sp.add_argument("--options", default="", help="显式指定卡片按钮选项（如 'A:同意发布|B:暂缓'、'auto' 或 'none'）")
+        else:
+            sp.add_argument("--ball", default="", help="球权归属（done=已办结 | doing=继续推进 | other=等第三方；球在主人脚下必须用 ask）")
+            sp.add_argument("--fyi", action="store_true", help="纯知会备案（含选项示例但无需主人拍板时显式声明）")
         sp.set_defaults(func=cmd_ask)
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")
@@ -2600,6 +2589,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--message-id", help="那条提问的消息号（om_）")
     g.add_argument("--key", help="钥匙：结掉这个话题里所有还开着的提问")
     sp.add_argument("--why", required=True, help="依据，一句话（主人在哪说了什么 / 你核实到什么）")
+    sp.add_argument("--quote", default="", help="主人在别处拍板的原话或消息号（om_...）")
+    sp.add_argument("--superseded-by", default="", help="替代本提问的新 ask 消息号（om_...）")
     sp.set_defaults(func=cmd_resolve)
     sp = sub.add_parser("pending", help="只读：待办清单（要主人定的、可能已处理的、各会话在等主人的）")
     sp.add_argument("--json", action="store_true")
@@ -2646,7 +2637,6 @@ def main(argv: list[str] | None = None) -> int:
     gm.add_argument("--topic", default="", help="可选：负责会话（tp_x）")
     gm.add_argument("--title", default="", help="可选：指定事项标题")
     sp.set_defaults(func=cmd_topic_group)
-
     sp = sub.add_parser("lamb", help="羔羊管理（7.63 / 7.72）：准备任务单、登记 subagent、派生后台 CLI 子进程、标记完工、查看、取消")
     lsub = sp.add_subparsers(dest="lamb_cmd", required=True)
     lp = lsub.add_parser("prepare", help="零敏感文件指针派单（7.72 REG-014）：落盘任务单并预登记羔羊")
@@ -2683,17 +2673,18 @@ def main(argv: list[str] | None = None) -> int:
     lc.add_argument("--reason", "--summary", dest="reason", default="", help="取消原因")
     lc.add_argument("--topic", default="", help="可选：母羊会话（tp_x）")
     sp.set_defaults(func=cmd_lamb)
-
     sp = sub.add_parser("hook", help="Antigravity 生命周期 hook（由 hooks.json 调用，不是给人敲的）")
     hsub = sp.add_subparsers(dest="hook", required=True)
     hsub.add_parser("stop", help="Stop：这一轮要结束时查这批交没交回执").set_defaults(func=cmd_hook_stop)
-
+    add_roster_arguments(sub)
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
     if getattr(args, "version", False):
         return cmd_version(args)
     if not getattr(args, "cmd", None):
         p.error("the following arguments are required: cmd")
+    if args.cmd == "roster":
+        return cmd_roster(args)
     global _FALLBACK
     _FALLBACK = args.func not in (cmd_run, cmd_init, cmd_doctor, cmd_hook_stop, cmd_observe)
     _FALLBACK_NOTED.clear()
@@ -2702,7 +2693,6 @@ def main(argv: list[str] | None = None) -> int:
     except _Abort:
         return 2
     except ConfigError as e:
-        # 带时间和 ERROR：常驻进程启动时配置就坏了会被反复拉起，sidecar.log 里每次一行，看得出是哪个文件哪一行、多久一次
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR 配置无效: {e}", file=sys.stderr)
         return 2
 

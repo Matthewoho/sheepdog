@@ -351,7 +351,7 @@ ECHO_REQUEST_REASONS = ("owner_reply", "owner_instruction", "recalled", "edited"
 ECHO_RELAY_PREFIX = "owner_relay:"                    # 这一批已经带回过：meta owner_relay:<批次号>
 ECHO_UNBOUND = dict.fromkeys(ECHO_RELAY_FIELDS)       # 这句重新送了一次：绑过的回执作废（_echo_sync）
 ECHO_EXCERPT_CHARS = 60
-RELAY_STATUS_LABEL = {"handled": "已处理", "done": "已完成", "needs_decision": "等你定", "waiting_external": "在等别人"}
+RELAY_STATUS_LABEL = {"handled": "已处理", "done": "已完成", "needs_decision": "等你定", "waiting_external": "在等别人", "waiting": "已派后台任务处理中"}
 
 
 def compaction_resend_key(topic_id: str) -> str:
@@ -1407,15 +1407,15 @@ class Collector:
         except Exception as e:
             log.warning("查主人表情失败: %s", e)
             return
-        acks = self.store.ack_reaction_ids()
+        acks, ack_emoji = self.store.ack_reaction_ids(), (self.cfg.ack.emoji_type or "Get").strip().lower()
         for mid, items in found.items():
-            r = rows.get(mid)
-            if r is None:
-                continue
+            if (r := rows.get(mid)) is None: continue
             for it in items:
                 emoji, op, rid = it.get("emoji_type", ""), it.get("operator_id", ""), it.get("reaction_id", "")
                 if op != me or not emoji or (rid and rid in acks):
                     continue  # 别人点的、或 sheepdog 自己点的确认表情
+                if not rid and ack_emoji and emoji.strip().lower() == ack_emoji and (ack := self.store.get_ack(mid)) is not None and (ack["identity"] or "user") == "user" and (ack["reaction_id"] or ""):
+                    continue
                 if self.store.owner_reaction_known(mid, emoji, op):
                     continue
                 self.store.add_owner_reaction(mid, emoji, op, rid, reported=not baseline)
@@ -1793,11 +1793,18 @@ class Collector:
             return d
         tags = [OWNER_VERIFIED_TAG]
         if self.cfg.escalation.owner_shortcut and tg.is_command(m.content, pend.PENDING_WORDS):
-            # 群里发「待办」：回一句「看置顶的索引卡」，不另开清单
             d = RouteDecision(DROP, "pending_query", tags)
             self.store.upsert_message(m, d.route, d.reason, tags)
-            # 索引卡就在这个群里：不给链接（话题链接打不开，见 topicgroup.chat_link）
             self._tg_note(m, "📋 待办看置顶的索引卡（群顶上那张）")
+            return d
+        from . import decision_hub
+        if decision_hub.is_hub_message(self.store, m):
+            if decision_hub.handle_hub_text_reply(self, m):
+                r = self.store.get_message(m.message_id)
+                return RouteDecision(DISPATCH, OWNER_REPLY, json.loads(r["tags_json"] or "[]") if r else tags)
+            d = RouteDecision(DROP, "decision_hub_hint", tags)
+            self.store.upsert_message(m, d.route, d.reason, tags)
+            self._tg_note(m, "请直接点击上方待拍板卡片按钮，或引用具体那张待拍板卡片回复")
             return d
         item = self._tg_find_item(m)
         if item is not None and item["root_message_id"] == m.message_id:
@@ -1837,10 +1844,10 @@ class Collector:
     def _tg_bot_message(self, m: Message) -> RouteDecision:
         """话题群里机器人发的：会话经 ask / report 发进事项话题的照旧登记（按发出时记的正文认，事件里的卡片没有正文）；
         牧羊犬自己的话、认不出的一律丢弃（不登记「需要你定」、不进 bot_outbox，7.51 第 8 条）。"""
-        from . import topicgroup as tg
+        from . import decision_hub, topicgroup as tg
         self._tg_learn(m)
         own = self.store.send_by_message(m.message_id)
-        if own is not None and own["kind"] in ("ask", "report"):
+        if own is not None and own["kind"] in ("ask", "report") and not (own["idem_key"] or "").startswith("hub_mirror:"):
             x = dataclasses.replace(m, content=own["text"] or m.content)
             hit = self._recognize_bot_owner_message(x)
             if hit is not None:
@@ -1850,7 +1857,9 @@ class Collector:
                 return d
         if own is not None and own["kind"] in OWN_SEND_KINDS:
             reason = f"sheepdog_{own['kind']}"
-        elif self.store.item_by_root(m.message_id) is not None or tg.index_info(self.store).get("message_id") == m.message_id:
+        elif (self.store.item_by_root(m.message_id) is not None or tg.index_info(self.store).get("message_id") == m.message_id
+              or decision_hub.get_hub_meta(self.store).get("root_message_id") == m.message_id
+              or self.store.get_escalation(m.message_id) is not None):
             reason = "sheepdog_tg"
         else:
             reason = "topic_group_bot_other"
@@ -3419,7 +3428,7 @@ class Dispatcher:
         for r in urgent:
             for tag in json.loads(r["tags_json"] or "[]"):
                 if tag.startswith(ESCALATION_TAG_PREFIX):
-                    self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
+                    self._answer_escalation_row(tag.removeprefix(ESCALATION_TAG_PREFIX), r)
         self.store.mark_batch(ids, batch_id, t["topic_id"], "acked")
         self.store.finish_dispatch(batch_id, PRIORITY_DISPATCH)
         try:  # 路由事实（7.20）。出错不挡投递
@@ -3440,10 +3449,12 @@ class Dispatcher:
             return bool(self.store.owner_sends_since(e["topic_id"], since_iso))
         if (since := _parse(since_iso or "")) is None or since.tzinfo is None:
             return False
-        for r in self.store.conn.execute("SELECT message_id, root_message_id, kind, sent_at FROM sends WHERE topic_id=? AND kind IN ('ask','report')", (e["topic_id"],)):
+        tid, msg = e["topic_id"] or "", self.store.get_message(e["message_id"])
+        base, tags = tid.split("#", 1)[0], (msg["tags_json"] or "") if msg is not None else ""
+        for r in self.store.conn.execute("SELECT message_id, root_message_id, kind, sent_at FROM sends WHERE (topic_id=? OR topic_id=? OR topic_id LIKE ?) AND kind IN ('ask','report')", (tid, base, f"{base}#%")):
             if self.store.item_by_root(r["root_message_id"] or r["message_id"]) is None and self.store.item_by_root(r["message_id"]) is None:
                 continue
-            if (at := _parse(r["sent_at"] or "")) is not None and at.tzinfo is not None and (at > since or (at == since and r["kind"] == "report")):
+            if (at := _parse(r["sent_at"] or "")) is not None and at.tzinfo is not None and (at > since or (at == since and f"escalation:{r['message_id']}" not in tags)):
                 return True
         return False
 
@@ -3569,13 +3580,7 @@ class Dispatcher:
         self._echo_alerts()
 
     def _echo_relay(self, t, batch_id: str, receipt: dict, status: str = "", summary: str | None = None) -> None:
-        """回执带回（7.52 第 1 条）第一步：会话交了回执，把这份回执（状态、summary）绑到该由它带回的主人的话上；真正发在
-        这一轮的回音账本里（_echo_relays，可按 owner_relay_after_minutes 推迟），发的就是绑上的这一份。绑哪几句：
-        - 这一批送进去的（账上的批次就是这份回执的批次）；
-        - 插话批次（p 开头，没有自己的回执）送进去的：送到以后的第一份回执。
-        每句只绑一次，绑上了后来的回执改不了（store.echo_bind_relay 只写还空着的）；别的普通批次送进去、还在等自己那份
-        回执的不碰（10-17 04:59：推迟期间总线又交了两份回执，每份都把 04:48 那句改记到最新那份上，卡片正文成了另一件事）。
-        这句被重新送了一次（转交、退回重投），_echo_sync 把绑过的作废，再按新的那一批绑。开关关着不绑。"""
+        """回执带回（7.52 第 1 条）第一步：会话交了回执，把状态与 summary 绑到该由它带回的主人消息上（每句只绑一次）。"""
         if not self.cfg.session.owner_receipt_relay:
             if batch_id:
                 self.store.set_meta(f"owner_relay_skipped:{batch_id}", "1")
@@ -3586,11 +3591,7 @@ class Dispatcher:
         bind_echo_relay(self.cfg, self.store, t["topic_id"], batch_id, receipt, status=status, summary=summary)
 
     def _echo_destination(self, e) -> tuple[str, bool]:
-        """这句主人的话，回音该回到哪：(去处键, 是否回到话题里)。
-        - 话题群里的：那件事的话题（item:T-n；认不出事项就按话题编号）；
-        - 找主人聊天里、在某个话题里的：那个话题（thread:<话题编号>）；
-        - 找主人聊天里、不在话题里的：找主人聊天的主时间线（main:<聊天>，卡片引用其中最近的一句）；
-        - 群里 @ 机器人的指令、撤回了的：找主人聊天里新起一条（new）。"""
+        """这句主人的话，回音该回到哪：(去处键, 是否回到话题里)。"""
         tgid = self.cfg.topic_group.chat_id
         chat = e["chat_id"] or ""
         r = self.store.get_message(e["message_id"])
@@ -3600,20 +3601,13 @@ class Dispatcher:
         m = row_to_message(r)
         if tgid and chat == tgid:
             item = next((t for t in json.loads(r["tags_json"] or "[]") if t.startswith("item:")), "")
-            return item or f"thread:{r['thread_id'] or m.root_id or r['message_id']}", True
+            return item or f"tg_thread:{r['thread_id'] or m.root_id or r['message_id']}", True
         if is_thread_reply(m):
             return f"thread:{r['thread_id']}", True
         return f"main:{chat}", False
 
     def _echo_relays(self) -> None:
-        """回执带回第二步：等着带回、还没还上的，到了 max(回执收到, 送到 + owner_relay_after_minutes) 就发卡片。卡片里的
-        状态和说明就是 _echo_relay 绑上的那份回执的，不看后来的回执。
-        按「去处」分组（_echo_destination）：一个会话一次回执里的几句，回到哪就各发一张，同一个去处的几句合成一张（P1C
-        10-17 03:59：找主人聊天的一句和话题群 T-3 的一句被合成一张、都发进了 T-3 话题）。每批、每个去处最多一次
-        （meta owner_relay:<批次>:<去处>；给主人的通知账本里的防重编号也按批次 + 去处定），所以一张卡片里有一句到点了，
-        就带上同一份回执、同一个去处的全部几句一起发：只发到点的那几句，后到点的就再也带不回、还会被报「没回音」。
-        发到哪：话题里的回到话题里；找主人聊天主时间线的引用其中最近的一句；群里 @ 机器人的指令在找主人聊天里新起一条，
-        不发进那个群。"""
+        """回执带回第二步：等着带回、还没还上的，按去处分组并在到点（waiting 或话题群 0 延迟）后原帖盖楼或私聊带回卡片。"""
         sc = self.cfg.session
         if not sc.owner_receipt_relay:
             return
@@ -3624,10 +3618,10 @@ class Dispatcher:
         for e in self.store.echo_open():
             if e["stage"] != ECHO_DELIVERED or not e["relay_batch"]:
                 continue
-            at = _parse(e["relay_at"] or "")
-            since = _parse(e["stage_at"] or "")
-            due = max(x for x in (at, since + timedelta(minutes=sc.owner_relay_after_minutes) if since else None) if x)
             dest, in_thread = self._echo_destination(e)
+            eff_wait = timedelta(0) if e["relay_status"] == "waiting" or dest.startswith(("item:", "tg_thread:")) else timedelta(minutes=sc.owner_relay_after_minutes)
+            at, since = _parse(e["relay_at"] or ""), _parse(e["stage_at"] or "")
+            due = max(x for x in (at, since + eff_wait if since else None) if x)
             dests[dest] = in_thread
             group = (e["topic_id"], e["relay_batch"], dest)
             groups.setdefault(group, []).append(e)
@@ -3712,15 +3706,24 @@ class Dispatcher:
         self._notify_owner(f"🐕 汇报 · 投递已恢复 [{BUS_TOPIC_ID}]\n「{title}」（topic `{tid}`）投递恢复了"
                            f"（之前连续失败 {rec.get('count')} 次），这一批送出 {sent} 条。", "投递恢复通知", tid)
 
+    def _answer_escalation_row(self, esc_mid: str, r) -> None:
+        self.store.answer_escalation(esc_mid, r["message_id"], allow_update=True)
+        from . import decision_hub
+        is_cb = "raw_json" in r.keys() and '"_sd_card_callback"' in (r["raw_json"] or "")
+        if decision_hub.hub_active(self.cfg, self.store) and not is_cb:
+            decision_hub.sync_escalation_dual_cards(
+                self.cfg, self.store, self.source, esc_mid,
+                chosen_display=" ".join(plain_text(r["content"] or "").split())[:60] or "主人文字批复",
+                answered_at=r["create_time"] or now_iso())
+
     def _complete_delivery(self, t, batch_id: str, signals: list, context: list, sent_at: str | None = None) -> dict:
         """批次已送达后的记账：标记消息、改会话状态、关闭被回答的「需要你定」、点确认表情。正常发送与崩溃恢复共用。"""
         ids = [r["message_id"] for r in signals]
         ctx_ids = [r["message_id"] for r in context]
-        # 主人的回复已送到提问的会话：对应的「需要你定」标记已答
         for r in signals:
             for tag in json.loads(r["tags_json"] or "[]"):
                 if tag.startswith(ESCALATION_TAG_PREFIX):
-                    self.store.answer_escalation(tag.removeprefix(ESCALATION_TAG_PREFIX), r["message_id"])
+                    self._answer_escalation_row(tag.removeprefix(ESCALATION_TAG_PREFIX), r)
         self.store.mark_batch(ctx_ids, batch_id, t["topic_id"], "context")
         out: dict = {"context": len(ctx_ids), "batch_id": batch_id}
         if not signals:
@@ -3990,69 +3993,16 @@ class Dispatcher:
         return self.notifier is not None and getattr(self.notifier, "ledger", True)
 
     def _send_notice(self, row) -> bool:
-        """发一次账本里的一条通知：正文用落账本时的那份字节、防重编号用落账本时定的那个。返回发出去没有。
-
-        先记「正在发」再调发送：要是发出去了、还没记成已发就崩溃，重启后用同一个防重编号补发，飞书去重。"""
-        nid, what = row["id"], row["kind"]
-        body = bytes(row["body"]).decode("utf-8")
-        self.store.owner_notice_start(nid)
-        try:
-            send = getattr(self.notifier, "send", None)
-            anchor = row["reply_to"] if "reply_to" in row.keys() else None
-            if callable(send) and anchor and _accepts(send, "reply_to"):
-                send(body, row["idem_key"], reply_to=anchor, in_thread=bool(row["in_thread"]))
-            elif callable(send):
-                send(body, row["idem_key"])
-            else:
-                self.notifier(body)
-        except Exception as e:
-            row = self.store.get_owner_notice(nid)
-            n = row["attempts"] or 1
-            err = " ".join(str(e).split())[-300:] or type(e).__name__
-            window = _parse(row["window_at"] or "")
-            if window is not None and _now() - window >= timedelta(hours=NOTICE_GIVE_UP_HOURS):
-                self._abandon_notice(row, err)
-                return False
-            delay = notice_backoff(n)
-            self.store.owner_notice_failed(nid, err, (_now() + delay).isoformat(timespec="seconds"))
-            log.warning("给主人发%s失败（通知 #%d，第 %d 次）：%s；%d 分钟后重试", what, nid, n, err,
-                        int(delay.total_seconds() // 60))
-            return False
-        self.store.owner_notice_sent(nid)
-        if (row["attempts"] or 0) >= 1 or row["inflight_at"]:
-            log.info("给主人的%s（通知 #%d）重试后发出去了", what, nid)
-        return True
+        from . import alert_group
+        return alert_group.send_owner_notice(self, row)
 
     def _abandon_notice(self, row, error: str) -> None:
-        self.store.owner_notice_abandon(row["id"], error)
-        log.error("给主人的%s（通知 #%d%s）没发出去，放弃：%s。`%s notices` 查看，确认没收到用 `%s notices --retry %d` 重发，"
-                  "处理过了用 `%s notices --ack %d`", row["kind"], row["id"],
-                  f"，topic {row['topic_id']}" if row["topic_id"] else "", error, self.cfg.cli_command,
-                  self.cfg.cli_command, row["id"], self.cfg.cli_command, row["id"])
+        from . import alert_group
+        alert_group.abandon_owner_notice(self, row, error)
 
     def _retry_owner_notices(self) -> None:
-        """每一轮：待发的通知到了重试时间就再发一次（重启以后也一样，状态在账本里）。
-
-        - 从落账本（或人工 --retry）起满 2 小时还没发出去：标放弃，记 ERROR，doctor / board 开头一直提示到有人处理；
-        - 上次发送中断（「正在发」还在，进程在发送途中没了）：不知道发出去没有。中断不到 NOTICE_RESEND_SAFE_MINUTES
-          就用同一个防重编号补发（发出去过的话飞书去重）；更久了飞书的防重窗口（1 小时）快过了，不自动补发，标放弃等人看。"""
-        now = _now()
-        for row in self.store.pending_owner_notices():
-            window = _parse(row["window_at"] or "")
-            inflight = _parse(row["inflight_at"] or "")
-            if inflight is not None:
-                if now - inflight >= timedelta(minutes=NOTICE_RESEND_SAFE_MINUTES):
-                    self._abandon_notice(row, f"{display_time(inflight, self.cfg.timezone_offset)}那次发送中断（进程在发送途中"
-                                              f"没了），不知道发出去没有；已超过飞书防重窗口，不自动补发")
-                    continue
-            elif window is not None and now - window >= timedelta(hours=NOTICE_GIVE_UP_HOURS):
-                self._abandon_notice(row, row["last_error"] or "2 小时内没发出去")
-                continue
-            elif (nxt := _parse(row["next_at"] or "")) is not None and now < nxt:
-                continue
-            if not self._notice_channel():
-                continue
-            self._send_notice(row)
+        from . import alert_group
+        alert_group.retry_owner_notices(self)
 
     def _login_notice(self, host: str, reason: str) -> None:
         """登录失效：经机器人给主人发一条「需要你重新登录」，同一宿主 24 小时只发一次。"""
@@ -5580,12 +5530,13 @@ class Dispatcher:
 
     def _expire_escalations(self) -> None:
         """超过 open_hours 未答的「需要你定」自动关闭（只关闭，不提醒）。"""
+        from . import decision_hub
         cutoff = _now() - timedelta(hours=self.cfg.escalation.open_hours)
         for e in self.store.open_escalations():
-            asked = _parse(e["asked_at"])
-            if asked is not None and asked.tzinfo is not None and asked < cutoff:
-                self.store.expire_escalation(e["message_id"])
-                log.info("「需要你定」%s（%s）超时未答，已关闭", e["message_id"], e["topic_id"])
+            if (asked := _parse(e["asked_at"])) is not None and asked.tzinfo is not None and asked < cutoff:
+                self.store.expire_escalation(e["message_id"]); log.info("「需要你定」%s（%s）超时未答，已关闭", e["message_id"], e["topic_id"])
+                if decision_hub.hub_active(self.cfg, self.store):
+                    decision_hub.sync_escalation_dual_cards(self.cfg, self.store, self.source, e["message_id"], chosen_display="已超时关闭", topic_id=e["topic_id"] or "", orig_text=e["text"] or "")
 
     def init(self) -> dict:
         """sheepdog init：同步名册；没有总线就建；给未 onboarding 的 managed 会话发 onboarding。可重复执行。"""
@@ -5815,11 +5766,10 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
         if i in held and SECURITY_RELEASE_TAG not in tags:
             tags.append(SECURITY_RELEASE_TAG)
-        if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION not in tags \
-                and OWNER_VERIFIED_TAG not in tags:
-            # 主人本人的消息（7.8）：带已核对标注，不需要 --quote。群里 @ 机器人的指令（7.45）转过去仍只标 🗣。
-            # 7.53：不再顺手关目标会话最近一条未结的「需要你定」（那是猜）；只认 --answers
-            tags.append(OWNER_VERIFIED_TAG)
+        if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION not in tags and OWNER_VERIFIED_TAG not in tags:
+            tags.append(OWNER_VERIFIED_TAG)  # 主人本人的消息（7.8）：带已核对标注；群里 @ 机器人的指令仍只标 🗣；只认 --answers（7.53）
+        if target_q is not None and (esc_tag := f"{ESCALATION_TAG_PREFIX}{answers}") not in tags:
+            tags.append(esc_tag)
         if target_q is not None and self_open_id and row["sender_id"] == self_open_id and store.item_by_root(i) is None:
             store.set_note(i, escalation_note(target_q))   # 7.51：话题群事项的开头那条保留话题群的说明
         store.forward_message(i, topic_id, tags)

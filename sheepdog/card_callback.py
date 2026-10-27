@@ -266,14 +266,20 @@ def _parse_item_int(raw_no) -> int | None:
 
 
 def resolve_callback_target(store, open_message_id: str = "", value: dict | None = None, *, message_id: str = "") -> dict:
-    """解析卡片回调归属目标：支持私聊提问、sends/bot_outbox 与话题群 tracked_items（T-n）。"""
+    """解析卡片回调归属目标：支持私聊提问、聚合台镜像卡、sends/bot_outbox 与话题群 tracked_items（T-n）。"""
     val = _parse_json_dict(value)
     card_mid = str(open_message_id or message_id or val.get("open_message_id") or val.get("message_id") or "").strip()
-    esc = store.get_escalation(card_mid) if card_mid and hasattr(store, "get_escalation") else None
-    send_row = store.send_by_message(card_mid) if card_mid and hasattr(store, "send_by_message") else None
-    out_row = store.get_bot_outbox(card_mid) if card_mid and hasattr(store, "get_bot_outbox") else None
-    orig_msg = store.get_message(card_mid) if card_mid and hasattr(store, "get_message") else None
-    item = store.item_by_root(card_mid) if card_mid and hasattr(store, "item_by_root") else None
+    origin_mid = str(val.get("origin_mid") or val.get("message_id") or "").strip()
+    esc = (store.get_escalation(origin_mid) if origin_mid and hasattr(store, "get_escalation") else None) or (
+        store.get_escalation(card_mid) if card_mid and hasattr(store, "get_escalation") else None
+    )
+    canon_mid = str(esc["message_id"]) if esc is not None and esc["message_id"] else (origin_mid or card_mid)
+    send_row = (store.send_by_message(canon_mid) or store.send_by_message(card_mid)) if card_mid and hasattr(store, "send_by_message") else None
+    out_row = (store.get_bot_outbox(canon_mid) or store.get_bot_outbox(card_mid)) if card_mid and hasattr(store, "get_bot_outbox") else None
+    orig_msg = (store.get_message(canon_mid) or store.get_message(card_mid)) if card_mid and hasattr(store, "get_message") else None
+    item = store.item_by_root(canon_mid) if canon_mid and hasattr(store, "item_by_root") else None
+    if item is None and esc is not None and "origin_root_id" in esc.keys() and esc["origin_root_id"] and hasattr(store, "item_by_root"):
+        item = store.item_by_root(esc["origin_root_id"])
     if item is None and send_row is not None and send_row["root_message_id"] and hasattr(store, "item_by_root"):
         item = store.item_by_root(send_row["root_message_id"])
     if item is None and orig_msg is not None:
@@ -282,7 +288,7 @@ def resolve_callback_target(store, open_message_id: str = "", value: dict | None
         item = store.get_item(ino)
     topic_id = ((esc["topic_id"] if esc is not None and esc["topic_id"] else "") or (send_row["topic_id"] if send_row is not None and send_row["topic_id"] else "") or (out_row["topic_id"] if out_row is not None and out_row["topic_id"] else "") or str(val.get("topic_id") or "").strip() or (item["owner_topic"] if item is not None and item["owner_topic"] else ""))
     item_no = item["item_no"] if item is not None else _parse_item_int(val.get("item_no"))
-    return {"topic_id": topic_id, "owner_topic_id": (item["owner_topic"] if item is not None and item["owner_topic"] else topic_id), "key": (send_row and send_row["key"]) or str(val.get("key") or "").strip(), "title": str(val.get("title") or (item["title"] if item is not None else "") or "").strip(), "open_message_id": card_mid, "card_message_id": card_mid, "item_no": item_no, "escalation": esc, "send": send_row, "outbox": out_row, "orig_message": orig_msg, "item": item}
+    return {"topic_id": topic_id, "owner_topic_id": (item["owner_topic"] if item is not None and item["owner_topic"] else topic_id), "key": (send_row and send_row["key"]) or str(val.get("key") or "").strip(), "title": str(val.get("title") or (item["title"] if item is not None else "") or "").strip(), "open_message_id": card_mid, "card_message_id": canon_mid, "item_no": item_no, "escalation": esc, "send": send_row, "outbox": out_row, "orig_message": orig_msg, "item": item}
 
 
 def record_card_callback_to_ledger(store, msg_or_event, *, target: dict | None = None, value: dict | None = None, cfg=None, source=None, route: str = "dispatch", reason: str = "owner_reply", received_by: str = "bot") -> Message | None:
@@ -387,36 +393,53 @@ def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | Non
     if extracted is None or not card_mid or not target_topic_id:
         return None
     choice_key, reply_content, chosen_display = extracted
-    already_answered = bool(esc is not None and (esc["answered_at"] or esc["closed_at"]))
-    has_dispatched = store.conn.execute("SELECT 1 FROM messages WHERE reply_to = ? AND route = 'dispatch' LIMIT 1", (card_mid,)).fetchone() is not None
-    if already_answered or has_dispatched:
+    canon_mid = str(esc["message_id"]) if esc is not None and esc["message_id"] else str(tgt.get("card_message_id") or card_mid)
+    orig_text = (send_row and send_row["text"]) or (esc and esc["text"]) or (out_row and out_row["text"]) or f"🐕 需要你定 · {tgt['title'] or '卡片提问'} [{target_topic_id}]\n{reply_content}"
+    prev_cb = store.conn.execute(
+        "SELECT content, create_time, dispatch_state FROM messages WHERE reply_to IN (?, ?) AND route = 'dispatch' ORDER BY create_time DESC, rowid DESC LIMIT 1",
+        (canon_mid, card_mid),
+    ).fetchone()
+    is_dup = False
+    if prev_cb is not None:
+        if prev_cb["content"] == reply_content:
+            is_dup = True
+        elif prev_cb["dispatch_state"] == "pending" and raw.get("timestamp"):
+            try:
+                is_dup = 0 <= (datetime.fromisoformat(create_time) - datetime.fromisoformat(prev_cb["create_time"])).total_seconds() <= 3
+            except Exception:
+                is_dup = False
+    elif esc is not None and (esc["answered_at"] or esc["closed_at"]):
+        is_dup = True
+    if is_dup:
+        if prev_cb is None and esc is not None:
+            from . import decision_hub
+            decision_hub.sync_escalation_dual_cards(cfg, store, source, canon_mid, chosen_display=chosen_display, topic_id=target_topic_id, answered_at=esc["answered_at"] or create_time, orig_text=orig_text)
         dup_m = Message(message_id=cb_msg_id, chat_id=resolved_chat_id, chat_name="", chat_type=resolved_chat_type,
                         sender_id=operator_id, sender_name="", sender_type="user", content=reply_content,
-                        msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw))
+                        msg_type="text", create_time=create_time, reply_to=canon_mid, raw=dict(raw))
         store.upsert_message(dup_m, "drop", "card_callback_duplicate", ["card_callback", "card_cb_dup"], topic_id=target_topic_id, received_by="bot")
         return None
     t_row = store.get_topic(target_topic_id)
     if t_row is not None and t_row["state"] == "closed":
         store.update_topic(target_topic_id, state="active")
-    orig_text = (send_row and send_row["text"]) or (esc and esc["text"]) or (out_row and out_row["text"]) or f"🐕 需要你定 · {tgt['title'] or '卡片提问'} [{target_topic_id}]\n{reply_content}"
     if esc is None:
         esc_at = (send_row and send_row["sent_at"]) or (out_row and out_row["sent_at"]) or create_time
-        store.add_escalation(card_mid, target_topic_id, resolved_chat_id, orig_text, esc_at)
+        store.add_escalation(canon_mid, target_topic_id, resolved_chat_id, orig_text, esc_at)
         if out_row is None and hasattr(store, "add_bot_outbox"):
-            store.add_bot_outbox(card_mid, target_topic_id, True, orig_text, esc_at)
-    if source is not None and hasattr(source, "patch_card"):
-        try:
-            source.patch_card(card_mid, build_answered_owner_card(orig_text, chosen_display=chosen_display, topic_id=target_topic_id, answered_at=create_time), identity="bot")
-        except Exception as e:
-            log.warning("回写已拍板卡片失败（%s）: %s", card_mid, e)
+            store.add_bot_outbox(canon_mid, target_topic_id, True, orig_text, esc_at)
+    from . import decision_hub
+    canon_mid = decision_hub.sync_escalation_dual_cards(
+        cfg, store, source, canon_mid, chosen_display=chosen_display, topic_id=target_topic_id, answered_at=create_time, orig_text=orig_text, answer_mid=cb_msg_id
+    )
+    green_card = build_answered_owner_card(orig_text, chosen_display=chosen_display, topic_id=target_topic_id, answered_at=create_time)
     resolved_thread_id = str(raw.get("thread_id") or (orig_msg and orig_msg["thread_id"]) or (item and item["thread_id"]) or "").strip()
     if not resolved_thread_id and send_row is not None and send_row["root_message_id"]:
         thr = store.thread_by_root(send_row["root_message_id"])
         resolved_thread_id = thr["thread_id"] if thr is not None and thr["thread_id"] else ""
-    cb_meta = {"topic_id": target_topic_id, "key": tgt["key"], "card_message_id": card_mid, "choice": choice_key, "chosen_display": chosen_display}
+    cb_meta = {"topic_id": target_topic_id, "key": tgt["key"], "card_message_id": canon_mid, "choice": choice_key, "chosen_display": chosen_display, "card": {"type": "raw", "data": green_card}}
     if tgt["item_no"] is not None:
         cb_meta["item_no"] = tgt["item_no"]
     return Message(message_id=cb_msg_id, chat_id=resolved_chat_id, chat_name=store.known_chat_name(resolved_chat_id) if resolved_chat_id else "",
                    chat_type=resolved_chat_type, sender_id=operator_id, sender_name="", sender_type="user",
-                   content=reply_content, msg_type="text", create_time=create_time, reply_to=card_mid,
+                   content=reply_content, msg_type="text", create_time=create_time, reply_to=canon_mid,
                    thread_id=resolved_thread_id, raw=dict(raw, _sd_card_callback=cb_meta))
