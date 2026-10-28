@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import default_repo_dir, version_info, version_watch
+from .alert_group import notify_watchdog_result, send_watchdog_lark_card as _send_lark_card
 from .config import Config, load_config
 from .guard import decode_command_line, normalize
 from .sink import agentapi
@@ -160,7 +161,7 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
 def _should_expect_ack(row: sqlite3.Row | dict, ack_reasons: set[str]) -> bool:
     """对齐 sheepdog/ack.py::Acker.identity_for 判断一条已分派消息是否应当点确认表情。"""
     r_dict = dict(row)
-    if r_dict.get("chat_type") == "system":
+    if r_dict.get("chat_type") == "system" or not str(r_dict.get("message_id") or "om_").startswith("om_"):
         return False
     reason = str(r_dict.get("reason") or "").strip()
     if not reason or reason == "owner_context":
@@ -180,46 +181,15 @@ def _should_expect_ack(row: sqlite3.Row | dict, ack_reasons: set[str]) -> bool:
     return any(c in ack_reasons for c in candidates)
 
 
-def _send_lark_card(chat_id: str, title: str, template: str, body_md: str) -> bool:
-    """用 lark-cli --as bot 直发飞书 Card 2.0 卡片；失败时自动回退纯文本。"""
-    lark_bin = "/opt/homebrew/bin/lark-cli" if Path("/opt/homebrew/bin/lark-cli").exists() else "lark-cli"
-    card = {
-        "schema": "2.0",
-        "header": {
-            "title": {"tag": "plain_text", "content": " ".join(title.split()).replace('"', "＂")},
-            "template": template,
-        },
-        "body": {"elements": [{"tag": "markdown", "content": body_md}]},
-    }
-    cmd_card = [
-        lark_bin, "im", "+messages-send",
-        "--as", "bot",
-        "--chat-id", chat_id,
-        "--msg-type", "interactive",
-        "--content", json.dumps(card, ensure_ascii=False),
-    ]
+def _is_waiting_batch(c: sqlite3.Connection, batch_id: str) -> bool:
+    row = c.execute("SELECT receipt FROM dispatches WHERE batch_id = ?", (batch_id,)).fetchone()
+    if not row or not row["receipt"]:
+        return False
     try:
-        r = subprocess.run(cmd_card, capture_output=True, text=True, timeout=20, check=False)
-        if r.returncode == 0:
-            return True
-        err1 = (r.stderr or r.stdout or f"rc={r.returncode}").strip()
-    except Exception as e:
-        err1 = str(e)
-    cmd_text = [
-        lark_bin, "im", "+messages-send",
-        "--as", "bot",
-        "--chat-id", chat_id,
-        "--text", f"{title}\n{body_md}",
-    ]
-    try:
-        r2 = subprocess.run(cmd_text, capture_output=True, text=True, timeout=20, check=False)
-        if r2.returncode == 0:
-            return True
-        err2 = (r2.stderr or r2.stdout or f"rc={r2.returncode}").strip()
-    except Exception as e:
-        err2 = str(e)
-    print(f"看门狗飞书发送失败（card: {err1}; text: {err2}）", file=sys.stderr)
-    return False
+        st = str((json.loads(row["receipt"]) or {}).get("status") or "").strip()
+        return st in ("waiting", "waiting_external")
+    except (TypeError, ValueError, KeyError):
+        return False
 
 
 def ask_jumps(c: sqlite3.Connection, at: datetime) -> list[tuple[str, str]]:
@@ -421,8 +391,7 @@ def run_observe(
     roster_file = roster_path or (cfg.roster_file if (cfg is not None and getattr(cfg, "roster_file", None)) else DEFAULT_ROSTER)
     media_dir = state_dir / "media" if state_dir else DEFAULT_MEDIA
     owner_id = cfg.self_open_id if (cfg is not None and getattr(cfg, "self_open_id", None)) else DEFAULT_OWNER
-    if not notify_chat_id and cfg is not None and getattr(cfg, "owner_chat_ids", None):
-        notify_chat_id = cfg.owner_chat_ids[0]
+    dm_chat_id = notify_chat_id or (cfg.owner_chat_ids[0] if (cfg is not None and getattr(cfg, "owner_chat_ids", None)) else "")
     bus_topic_id = "tp_bus"
     default_ack_reasons = set(_DEFAULT_ACK_REASONS)
     if cfg is not None and cfg.ack.enabled:
@@ -652,6 +621,8 @@ def run_observe(
                     "AND relay_batch IS NOT NULL AND batch_id != relay_batch AND batch_id NOT LIKE 'p%'",
                     (since,),
                 ):
+                    if "dispatches" in tabs and _is_waiting_batch(c, r["batch_id"]):
+                        continue
                     warn.append(
                         f"回音卡片贴错了回执：{r['message_id'][-8:]} 是批次 {r['batch_id']} 送的，"
                         f"卡片用的是 {r['relay_batch']} 的 summary（{r['settled_at'][11:16]}）"
@@ -833,7 +804,7 @@ def run_observe(
                       AND content NOT IN ('待办') AND COALESCE(msg_type,'') != 'interactive'
                       AND COALESCE(reason, '') != 'agent_reply_in_owner_chat'
                     """,
-                    (owner_id, notify_chat_id, since),
+                    (owner_id, dm_chat_id, since),
                 ).fetchall()
                 for r in rows:
                     if r["reason"] not in ("owner_instruction", "pending_query"):
@@ -956,77 +927,17 @@ def run_observe(
     if simulate_warn:
         warn.extend(simulate_warn)
 
-    prev_fp = st.get("active_alert_fp", "")
-    prev_at = st.get("last_alert_at", "")
     prev_warns = st.get("active_alert_warns", [])
-    active_alert_fp = prev_fp
-    last_alert_at = prev_at
-    active_alert_warns = prev_warns
-    notify_line = ""
-
-    if notify_lark:
-        fp = _fingerprint_warns(warn)
-        if fp != "":
-            need_send = (
-                (fp != prev_fp)
-                or (prev_at == "")
-                or ((age_min(prev_at, ref_now) or 999999) >= alert_cooldown_minutes)
-            )
-            if need_send:
-                title = f"🐕 看门狗告警 · 牧羊犬体检发现 {len(warn)} 个问题 [{bus_topic_id}]"
-                warn_lines = "\n".join(f"⚠ {w}" for w in warn)
-                info_lines = "\n".join(f"· {i}" for i in info if i)
-                body_parts = [
-                    f"**时间**：{ref_now.strftime('%Y-%m-%d %H:%M:%S')}",
-                    warn_lines,
-                ]
-                if info_lines:
-                    body_parts.append(f"**运行摘要**：\n{info_lines}")
-                body_parts.append(f"（同指纹告警冷却 {int(alert_cooldown_minutes)} 分钟；恢复正常后将自动通知）")
-                body_md = "\n\n".join(body_parts)
-                if _send_lark_card(notify_chat_id, title, "orange", body_md):
-                    active_alert_fp = fp
-                    last_alert_at = iso(ref_now)
-                    active_alert_warns = list(warn)
-                    notify_line = f"已发送飞书看门狗告警（fp={fp}）"
-            else:
-                active_alert_fp = prev_fp
-                last_alert_at = prev_at
-                active_alert_warns = list(warn)
-                notify_line = f"看门狗告警冷却中（上次发送于 {prev_at[11:16]}，fp={fp}）"
-        else:
-            if prev_fp != "":
-                title = f"🐕 看门狗恢复 · 牧羊犬体检已恢复正常 [{bus_topic_id}]"
-                prev_warn_lines = "\n".join(f"- {w}" for w in (prev_warns or ["（上一轮告警）"]))
-                info_lines = "\n".join(f"- · {i}" for i in info if i) or "- · 正常"
-                body_md = (
-                    f"**已解除的告警**：\n{prev_warn_lines}\n\n"
-                    f"**当前状态**：\n{info_lines}"
-                )
-                if _send_lark_card(notify_chat_id, title, "green", body_md):
-                    active_alert_fp = ""
-                    last_alert_at = ""
-                    active_alert_warns = []
-                    notify_line = "已发送飞书看门狗恢复通知"
-
-    if notify_line:
-        info.append(notify_line)
-
-    st_path.parent.mkdir(parents=True, exist_ok=True)
-    st_path.write_text(
-        json.dumps(
-            {
-                "since": iso(ref_now),
-                "checked_at": iso(ref_now),
-                "ask_jump": seen_ask_jump,
-                "version_mismatch_since": version_mismatch_since,
-                "active_alert_fp": active_alert_fp,
-                "last_alert_at": last_alert_at,
-                "active_alert_warns": active_alert_warns,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    st.update({
+        "since": iso(ref_now),
+        "checked_at": iso(ref_now),
+        "ask_jump": seen_ask_jump,
+        "version_mismatch_since": version_mismatch_since,
+    })
+    notify_watchdog_result(
+        cfg, db, st, st_path, warn, prev_warns, ref_now,
+        notify_lark=notify_lark, notify_chat_id=notify_chat_id,
+        alert_cooldown_minutes=alert_cooldown_minutes, infos=info, bus_topic_id=bus_topic_id,
     )
 
     return {

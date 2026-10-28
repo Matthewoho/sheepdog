@@ -54,8 +54,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.87")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 87))
+        self.assertEqual(cur_ver, "0.7.88")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 88))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -644,9 +644,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.87）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.88）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.87")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.88")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 

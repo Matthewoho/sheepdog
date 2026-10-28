@@ -1194,7 +1194,7 @@ class Collector:
         if row is None:
             return None
         if (row["route"] == DISPATCH and row["dispatch_state"] in DELIVERED_STATES and row["reason"] != OWNER_CONTEXT
-                and row["topic_id"] and self._live_topic(row["topic_id"])):
+                and row["topic_id"] and not (row["topic_id"] == BUS_TOPIC_ID and row["reason"] == "keyword") and self._live_topic(row["topic_id"])):
             tags = json.loads(row["tags_json"] or "[]")
             return row["topic_id"], ("forwarded" if any(t.startswith("forwarded_from:") for t in tags) else "delivered")
         return (so[0], "sent") if (so := self._sent_owner(row["message_id"])) is not None else None

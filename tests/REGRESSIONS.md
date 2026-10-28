@@ -384,3 +384,10 @@
 | 7.87 | 业务专席向 `tp_bus` 回传纯礼貌确认 `tell`（如「收到，已知悉」）引发留言乒乓、`send_mail` 落库后未触碰 `state_dir/.wakeup`、`sd_card_cb_*` 虚拟卡片回调消息误调飞书 `add_reaction` 报错，或超长 `---more---` 拍板卡同步到全局聚合台时超出 28KB 导致 `hub_message_id` 为空（REG-054） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_054_polite_mail_to_bus_blocked_wakeup_touched_and_virtual_msg_skips_reaction` |
 | 7.87 | 已投递过的 Antigravity 专席容器因宿主重启/GC 丢失 `transcript.jsonl` 变为空壳后，投递前与 2 分钟 `_check_receipt` 未自动新建容器继承记忆并重投当前批次（单批次最多换壳 1 次），或 `sync_roster` 把 `roster.toml` 里的死壳 `conversation_id` 刷回覆盖新容器（REG-055） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_055_recycled_antigravity_container_auto_rebuilds_and_redelivers_once` |
 
+## 7.88 虚拟消息排除 Ack SLA 巡检与总线 keyword 开头消息禁当 thread_owner（REG-056）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.88 | `observe._should_expect_ack` 未过滤非 `om_` 开头的合成虚拟消息（如 `sd_card_cb_*`）导致巡检误报 Ack 90s SLA 超时，或群话题开头消息仅以 `reason="keyword"` 投递给 `tp_bus` 且尚未转交时，`Collector._thread_owner` 从 `messages` 历史反查把群友在话题内的无关键词跟帖误以 `thread_owner` 派给 `tp_bus`（REG-056） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_056_virtual_msg_excluded_from_ack_sla_and_bus_keyword_root_not_thread_owner` |
+
+

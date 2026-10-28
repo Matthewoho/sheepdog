@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sheepdog import ack, decision_hub, duty, engine, outbound
+from sheepdog import ack, decision_hub, duty, engine, observe, outbound
 from sheepdog.config import Config, TopicGroupConfig
 from sheepdog.engine import Collector, Dispatcher
 from sheepdog.models import Message
@@ -225,6 +225,56 @@ class TestThreadClaimMailHubAndContainerRebuild787(unittest.TestCase):
 
             disp.sync_roster()
             self.assertEqual(self.store.get_topic("tp_alpha")["conversation_id"], "cid-rebuilt-2")
+
+    def test_reg_056_virtual_msg_excluded_from_ack_sla_and_bus_keyword_root_not_thread_owner(self) -> None:
+        self.assertFalse(
+            observe._should_expect_ack(
+                {"message_id": "sd_card_cb_056", "chat_type": "group", "reason": "owner_reply", "tags_json": '["owner_verified"]'},
+                {"owner_reply"},
+            )
+        )
+        self.assertTrue(
+            observe._should_expect_ack(
+                {"message_id": "om_real_056", "chat_type": "group", "reason": "owner_reply", "tags_json": '["owner_verified"]'},
+                {"owner_reply"},
+            )
+        )
+
+        ts = now_iso()
+        m_root = Message(
+            message_id="om_788_root_1", chat_id=OPS_CHAT, chat_name="运维群", chat_type="group",
+            sender_id="ou_user_1", sender_name="同事甲", sender_type="user",
+            content="紧急告警：数据库异常", msg_type="text", create_time=ts,
+            thread_id="omt_788_thr_1", thread_position="0",
+        )
+        self.store.upsert_message(m_root, "dispatch", "keyword", [], topic_id="tp_bus")
+        self.store.record_dispatch("b_bus_788", "tp_bus", ["om_788_root_1"])
+        self.store.mark_batch(["om_788_root_1"], "b_bus_788", "tp_bus", "delivered")
+
+        collector = Collector(self.cfg, self.store, self.source)
+        m_follow1 = Message(
+            message_id="om_788_follow_1", chat_id=OPS_CHAT, chat_name="运维群", chat_type="group",
+            sender_id="ou_user_2", sender_name="同事乙", sender_type="user",
+            content="我看了一下监控指标", msg_type="text", create_time=ts,
+            thread_id="omt_788_thr_1", thread_position="1", reply_to="om_788_root_1", root_id="om_788_root_1",
+        )
+        collector.ingest([m_follow1])
+        r_f1 = self.store.get_message("om_788_follow_1")
+        self.assertEqual(r_f1["route"], "inbox")
+        self.assertNotEqual(r_f1["reason"], "thread_owner")
+
+        engine.forward_messages(self.store, "tp_alpha", ["om_788_root_1"], self_open_id=OWNER_ID)
+        m_follow2 = Message(
+            message_id="om_788_follow_2", chat_id=OPS_CHAT, chat_name="运维群", chat_type="group",
+            sender_id="ou_user_3", sender_name="同事丙", sender_type="user",
+            content="已定位到连接池耗尽", msg_type="text", create_time=ts,
+            thread_id="omt_788_thr_1", thread_position="2", reply_to="om_788_root_1", root_id="om_788_root_1",
+        )
+        collector.ingest([m_follow2])
+        r_f2 = self.store.get_message("om_788_follow_2")
+        self.assertEqual(r_f2["route"], "dispatch")
+        self.assertEqual(r_f2["reason"], "thread_owner")
+        self.assertEqual(r_f2["topic_id"], "tp_alpha")
 
 
 if __name__ == "__main__":
