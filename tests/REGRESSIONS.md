@@ -390,4 +390,11 @@
 | --- | --- | --- |
 | 7.88 | `observe._should_expect_ack` 未过滤非 `om_` 开头的合成虚拟消息（如 `sd_card_cb_*`）导致巡检误报 Ack 90s SLA 超时，或群话题开头消息仅以 `reason="keyword"` 投递给 `tp_bus` 且尚未转交时，`Collector._thread_owner` 从 `messages` 历史反查把群友在话题内的无关键词跟帖误以 `thread_owner` 派给 `tp_bus`（REG-056） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_056_virtual_msg_excluded_from_ack_sla_and_bus_keyword_root_not_thread_owner` |
 
+## 7.89 事实出处严格归属、代码检索先定仓硬护栏与总线 runtime-context 放行（REG-057）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.89 | 业务专席跨源嫁接提问者截图注释或将本地静态代码误称为「查了测试/生产 DB」、对 `~/Code` 父目录裸跑全目录递归 `grep -rn` 超时半截放弃，或 `observe` 把 `tp_bus` 执行只读 `context_memory.py runtime-context` 与 `KeyboardInterrupt` 重启栈误判为越权/崩溃告警（REG-057） | `test_version_and_observe.VersionAndObserveTest.test_reg_057_source_attribution_and_targeted_repo_search_guard`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_057_source_attribution_and_targeted_repo_search_guard`） |
+
+
 

@@ -176,3 +176,15 @@ class Playbook:
 
     def missing(self) -> list[str]:
         return [n for n in PLAYBOOK_FILES if not self.read(n).strip()]
+
+
+def source_and_search_guard(topic_id: str, *, bus: bool = False) -> str:
+    """事实出处严格归属与定向代码检索硬护栏（7.89 / REG-057）：业务会话注入，总线不注入。"""
+    if bus:
+        return ""
+    return "\n".join([
+        "### 事实出处严格归属与定向代码检索（7.89 硬门禁 / REG-057）",
+        "- **事实出处与物理介质严格归属（严禁跨源嫁接与张冠李戴）**：回答「为什么这么写/当时怎么考量/当前配置是什么」时，必须严格区分并注明物理出处（**提问者原话或截图里的文字/注释** vs **本地 `MatthewNote` 笔记记录** vs **本地代码仓 `<repo>/<文件>:<行号>` 静态配置** vs **线上/测试 DB 或 `gcloud` 实时回读**）。严禁把提问者截图里的注释/假设嫁接成己方历史报告结论反向复述；严禁把只读了本地静态代码说成「查了测试/生产数据库（DB）」；命令超时或输出未读完时，严禁下「没有/不存在」的否定结论。",
+        "- **代码检索必先定仓（严禁 `~/Code` 全目录或大仓顶层裸跑 `grep -rn` 超时放弃）**：查代码或 Terraform 配置必须先用 `ls ~/Code` 或 `git -C <repo> ls-files` 定位具体仓库与子目录（如 `~/Code/<repo>/internal`），再进目标仓库子目录执行定向检索（`rg` 或 `git -C <repo> log -S`）；**严禁对 `~/Code`（或 `$HOME/Code`）父目录直接递归 `grep -r` / `rg` / `find`**；若检索超时或调用链未闭环，必须派生羔羊（`lamb`）查透再回复，严禁半截放弃凭猜测作答。",
+    ])
+

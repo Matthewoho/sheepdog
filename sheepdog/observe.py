@@ -41,8 +41,14 @@ TRANSCRIPT_TAIL_BYTES = 256 * 1024
 
 _BUS_FORBIDDEN_TOOLS = frozenset({"write_file", "edit_file", "notebook_edit"})
 _BUS_FORBIDDEN_CMD_RE = re.compile(
-    r"\b(?:gcloud|terraform|kubectl|context_memory\.py|pkm\.py|linear_task_memory\.py)\b"
+    r"\b(?:gcloud|terraform|kubectl|context_memory\.py(?!\s+runtime-context\b)|pkm\.py|linear_task_memory\.py)\b"
     r"|\blark-cli\s+(?:docs|drive|wiki|bitable|sheets)\b"
+)
+_CODE_ROOT_PAT = r"(?:/Users/[^/\s\"';|&]+|~|\$HOME|\$\{HOME\})/Code(?:/+(?:\*|\.)?)?(?=$|[\s\"';|&])"
+_UNBOUNDED_CODE_SEARCH_RE = re.compile(
+    rf"\b(?:grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive)\b|(?:rg|ripgrep|find)\b)[^;\n|&]*?{_CODE_ROOT_PAT}"
+    rf"|\bgrep\b[^;\n|&]*?{_CODE_ROOT_PAT}[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive)\b"
+    rf"|\bcd\s+{_CODE_ROOT_PAT}\s*(?:&&|;)\s*(?:rg|ripgrep|find|grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive))\b"
 )
 _QUOTED_STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _SHEEPDOG_SUBCMDS = frozenset({
@@ -158,6 +164,24 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
     return False
 
 
+def _is_unbounded_code_search(cmd_str: str) -> bool:
+    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057）。"""
+    if not cmd_str:
+        return False
+    norm = normalize(decode_command_line(cmd_str))
+    return bool(_UNBOUNDED_CODE_SEARCH_RE.search(cmd_str) or _UNBOUNDED_CODE_SEARCH_RE.search(norm))
+
+
+def _is_kb_interrupt_tb(lines: list[str], idx: int) -> bool:
+    for nxt in lines[idx + 1 :]:
+        if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", nxt) or "Traceback" in nxt:
+            break
+        if nxt.strip().startswith("KeyboardInterrupt"):
+            return True
+    return False
+
+
+
 def _should_expect_ack(row: sqlite3.Row | dict, ack_reasons: set[str]) -> bool:
     """对齐 sheepdog/ack.py::Acker.identity_for 判断一条已分派消息是否应当点确认表情。"""
     r_dict = dict(row)
@@ -239,20 +263,9 @@ def ask_jumps(c: sqlite3.Connection, at: datetime) -> list[tuple[str, str]]:
             hist_days = max(1.0, (cutoff_dt - first_dt).total_seconds() / 86400.0)
             daily_avg = prev / hist_days
             if d1 >= 2.0 * daily_avg:
-                out.append(
-                    (
-                        tid,
-                        f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次（历史未结案日均 {daily_avg:.1f} 次）",
-                    )
-                )
-        else:
-            if d1 >= 5:
-                out.append(
-                    (
-                        tid,
-                        f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次未结案提问积压",
-                    )
-                )
+                out.append((tid, f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次（历史未结案日均 {daily_avg:.1f} 次）"))
+        elif d1 >= 5:
+            out.append((tid, f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次未结案提问积压"))
     return out
 
 
@@ -362,25 +375,12 @@ def _write_self_heal_stop_marker(
 
 
 def run_observe(
-    cfg: Config | None = None,
-    *,
-    db_path: Path | None = None,
-    state_path: Path | None = None,
-    since_minutes: float = 20.0,
-    notify_lark: bool = False,
-    notify_chat_id: str = DEFAULT_OWNER_CHAT,
-    alert_cooldown_minutes: float = 60.0,
-    simulate_warn: list[str] | None = None,
-    self_heal: bool = False,
-    now_dt: datetime | None = None,
-    antigravity_brain_dir: Path | None = None,
-    repo_dir: Path | None = None,
-    check_processes: bool = True,
-    check_log: bool = True,
-    check_release_bot: bool = False,
-    ps_output: str | None = None,
-    log_path: Path | None = None,
-    roster_path: Path | None = None,
+    cfg: Config | None = None, *, db_path: Path | None = None, state_path: Path | None = None,
+    since_minutes: float = 20.0, notify_lark: bool = False, notify_chat_id: str = DEFAULT_OWNER_CHAT,
+    alert_cooldown_minutes: float = 60.0, simulate_warn: list[str] | None = None, self_heal: bool = False,
+    now_dt: datetime | None = None, antigravity_brain_dir: Path | None = None, repo_dir: Path | None = None,
+    check_processes: bool = True, check_log: bool = True, check_release_bot: bool = False,
+    ps_output: str | None = None, log_path: Path | None = None, roster_path: Path | None = None,
 ) -> dict:
     """执行 L1–L4 深度巡检并返回结构化字典。"""
     ref_now = now_dt or now_tz()
@@ -468,7 +468,7 @@ def run_observe(
                     cur = l[:19]
                 if cur >= since_log:
                     recent.append(l)
-            errs = [l for l in recent if " ERROR " in l or "Traceback" in l or " CRITICAL " in l]
+            errs = [l for i, l in enumerate(recent) if " ERROR " in l or " CRITICAL " in l or ("Traceback" in l and not _is_kb_interrupt_tb(recent, i))]
             if errs:
                 warn.append(f"日志里有 {len(errs)} 行 ERROR/Traceback，最近一行：{errs[-1][:200]}")
             media_fail = [l for l in recent if "图片" in l and ("失败" in l or "超限" in l)]
@@ -672,100 +672,63 @@ def run_observe(
 
                         # 探针 1: Prompt Filter 拦截 / 90s 投递黑洞
                         if batch_age_s >= 90 and t_path.exists():
-                            has_prompt_filter = any(
-                                "The prompt could not be submitted" in str(s.get("content") or "")
-                                or "The prompt could not be submitted" in str(s.get("error") or "")
-                                for s in post_steps
-                            )
-                            if has_prompt_filter:
-                                warn.append(
-                                    f"宿主 Prompt Filter 拦截：{tid} 批次 {batch_id} 出现 'The prompt could not be submitted'"
-                                )
+                            has_pf = any("The prompt could not be submitted" in str(s.get("content") or "") or "The prompt could not be submitted" in str(s.get("error") or "") for s in post_steps)
+                            if has_pf:
+                                warn.append(f"宿主 Prompt Filter 拦截：{tid} 批次 {batch_id} 出现 'The prompt could not be submitted'")
                             elif steps and not post_steps and running_lambs == 0:
-                                warn.append(
-                                    f"投递黑洞：{tid} 批次 {batch_id} 已送出 {int(batch_age_s)}s，但宿主 transcript 无任何新 step"
-                                )
+                                warn.append(f"投递黑洞：{tid} 批次 {batch_id} 已送出 {int(batch_age_s)}s，但宿主 transcript 无任何新 step")
 
                         # 探针 2: 假 running 僵尸锁 (batch_age >= 180s & PLANNER_RESPONSE DONE 静默 >= 90s)
                         if batch_age_s >= 180 and running_lambs == 0 and post_steps:
-                            has_receipt = False
-                            if "dispatches" in tabs and batch_id:
-                                d_row = c.execute(
-                                    "SELECT receipt FROM dispatches WHERE batch_id = ?",
-                                    (batch_id,),
-                                ).fetchone()
-                                if d_row and d_row["receipt"]:
-                                    has_receipt = True
+                            has_receipt = bool("dispatches" in tabs and batch_id and (d_row := c.execute("SELECT receipt FROM dispatches WHERE batch_id = ?", (batch_id,)).fetchone()) and d_row["receipt"])
                             receipt_file = state_dir / "receipts" / f"{tid}.json"
                             if not has_receipt and receipt_file.exists():
                                 try:
                                     rf_data = json.loads(receipt_file.read_text(encoding="utf-8"))
-                                    if not batch_id or rf_data.get("batch_id") in (None, "", batch_id):
-                                        has_receipt = True
+                                    has_receipt = not batch_id or rf_data.get("batch_id") in (None, "", batch_id)
                                 except (OSError, json.JSONDecodeError):
                                     pass
                             if not has_receipt:
                                 last_step = post_steps[-1]
-                                if (
-                                    last_step.get("type") == "PLANNER_RESPONSE"
-                                    and last_step.get("status") == "DONE"
-                                    and not last_step.get("tool_calls")
-                                ):
+                                if last_step.get("type") == "PLANNER_RESPONSE" and last_step.get("status") == "DONE" and not last_step.get("tool_calls"):
                                     silent_s = age_seconds(str(last_step.get("created_at") or ""), ref_now)
                                     if silent_s is not None and silent_s >= 90:
-                                        warn.append(
-                                            f"假 running 僵尸锁：{tid} 批次 {batch_id} 已跑 {int(batch_age_s // 60)} 分钟，"
-                                            f"transcript 最后一步 PLANNER_RESPONSE 已 DONE 静默 {int(silent_s)}s 但未交回执"
-                                        )
+                                        warn.append(f"假 running 僵尸锁：{tid} 批次 {batch_id} 已跑 {int(batch_age_s // 60)} 分钟，transcript 最后一步 PLANNER_RESPONSE 已 DONE 静默 {int(silent_s)}s 但未交回执")
                                         if self_heal and state_dir is not None:
                                             _write_self_heal_stop_marker(state_dir, tid, batch_id, ref_now)
                                             self_healed.append(f"{tid}:{batch_id}")
                                             info.append(f"已对 {tid} ({batch_id}) 写入 stop 自愈标记")
 
-                # 探针 3b: tp_bus 工具/命令越权扫描（仅检查当前在途批次或最近 since_minutes 窗口内）
-                bus_row = c.execute(
-                    "SELECT topic_id, conversation_id, host, state, pending_batch_id, dispatched_at "
-                    "FROM topics WHERE topic_id = ?",
-                    (bus_topic_id,),
-                ).fetchone()
-                if bus_row and (bus_row["host"] or "antigravity").strip().lower() in ("", "antigravity"):
-                    bus_cid = (bus_row["conversation_id"] or "").strip()
-                    if bus_cid:
-                        bus_t_path = _resolve_transcript_path(bus_cid, antigravity_brain_dir)
-                        bus_steps = _read_tail_steps(bus_t_path)
-                        bus_window_dt = ref_now - timedelta(minutes=since_minutes)
-                        in_flight_steps: set[int] = set()
-                        if (bus_row["state"] or "") == "running" and (bus_row["pending_batch_id"] or "").strip():
-                            for st_item in _extract_post_dispatch_steps(
-                                bus_steps,
-                                (bus_row["pending_batch_id"] or "").strip(),
-                                bus_row["dispatched_at"],
-                            ):
-                                in_flight_steps.add(id(st_item))
-                        bad_calls: list[str] = []
-                        for s in bus_steps:
-                            if s.get("type") != "PLANNER_RESPONSE":
+                # 探针 3b: tp_bus 工具/命令越权扫描 + REG-057 全目录盲扫代码探针
+                window_dt = ref_now - timedelta(minutes=since_minutes)
+                for tr in c.execute("SELECT topic_id, conversation_id, host, state, pending_batch_id, dispatched_at FROM topics").fetchall():
+                    t_tid, t_cid = tr["topic_id"], (tr["conversation_id"] or "").strip()
+                    if not t_cid or (tr["host"] or "antigravity").strip().lower() not in ("", "antigravity"):
+                        continue
+                    t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir))
+                    in_flight = {id(x) for x in _extract_post_dispatch_steps(t_steps, (tr["pending_batch_id"] or "").strip(), tr["dispatched_at"])} if (tr["state"] or "") == "running" and (tr["pending_batch_id"] or "").strip() else set()
+                    bad_calls: list[str] = []
+                    for s in t_steps:
+                        if s.get("type") != "PLANNER_RESPONSE":
+                            continue
+                        s_dt = parse_iso(str(s.get("created_at") or ""))
+                        if id(s) not in in_flight and (s_dt < window_dt if s_dt is not None else (tr["state"] or "") != "running"):
+                            continue
+                        for tc in s.get("tool_calls") or []:
+                            if not isinstance(tc, dict):
                                 continue
-                            s_dt = parse_iso(str(s.get("created_at") or ""))
-                            if id(s) not in in_flight_steps and (s_dt is None or s_dt < bus_window_dt):
-                                continue
-                            for tc in s.get("tool_calls") or []:
-                                if not isinstance(tc, dict):
-                                    continue
-                                t_name = str(tc.get("name") or tc.get("tool_name") or "")
-                                t_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
-                                if t_name in _BUS_FORBIDDEN_TOOLS:
-                                    bad_calls.append(t_name)
-                                elif t_name == "run_command":
-                                    cmd_str = normalize(
-                                        decode_command_line(t_args.get("CommandLine") or t_args.get("command") or "")
-                                    )
-                                    if _is_bus_forbidden_command(cmd_str):
-                                        bad_calls.append(f"run_command({cmd_str[:60]})")
-                        if bad_calls:
-                            warn.append(
-                                f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}"
-                            )
+                            t_name = str(tc.get("name") or tc.get("tool_name") or "")
+                            t_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                            if t_tid == bus_topic_id and t_name in _BUS_FORBIDDEN_TOOLS:
+                                bad_calls.append(t_name)
+                            elif t_name == "run_command":
+                                cmd_str = normalize(decode_command_line(t_args.get("CommandLine") or t_args.get("command") or ""))
+                                if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
+                                    bad_calls.append(f"run_command({cmd_str[:60]})")
+                                if _is_unbounded_code_search(cmd_str):
+                                    warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {cmd_str[:80]}")
+                    if bad_calls:
+                        warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
 
             # ==================== L4: 噪音剃刀与核心不变量 ====================
             # L4.2: ask_jumps 噪音剃刀（仅统计未结案/超时异常提问；持续入 warn 由指纹冷却防重复飞书通知与防假恢复）

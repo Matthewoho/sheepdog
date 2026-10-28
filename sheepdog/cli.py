@@ -1021,6 +1021,9 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 if any(pruned.values()):
                     logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,
                                  {k: v for k, v in pruned.items() if v})
+            _wait_next(args, collector, dispatcher)
+            if getattr(dispatcher, "restart_requested", False):
+                return 0
         except KeyboardInterrupt:
             return 0
         except Exception as e:  # 单轮失败不退出，下一轮从水位线续跑
@@ -1028,9 +1031,6 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 logging.exception("本轮失败")
             else:
                 logging.error("本轮失败（下一轮从水位线续跑）: %s: %s", type(e).__name__, e)
-        _wait_next(args, collector, dispatcher)
-        if getattr(dispatcher, "restart_requested", False):
-            return 0
 
 
 def cmd_inbox(args) -> int:

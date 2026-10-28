@@ -17,7 +17,7 @@ import re
 import sqlite3
 
 from . import media
-from .playbook import Playbook
+from .playbook import Playbook, source_and_search_guard
 from .roster import MANAGED, Roster, RosterSession
 from .security import NONE, TAG, SecurityConfig
 from .store import SYSTEM_CHAT
@@ -235,9 +235,7 @@ def with_cli(text: str, cli: str) -> str:
 
 # ---------- sheepdog 接口说明（软件接口文档，由代码生成） ----------
 def managed_receipt_line(cli_host: bool, receipt_timeout: int) -> str:
-    """名册 managed / 总线新开的会话不交回执会怎样（7.38 第 7 条，和 _check_receipt / _finish_run 的行为一致）：
-    不重投，只记一次「未回执」；但 Antigravity 会话在交回执或回执超时之前一直算在做上一批，新消息排队（主人在找主人
-    聊天里的回复除外，会插队送到）；命令行会话这一轮结束就按没交回执处理。"""
+    """名册 managed / 总线新开的会话不交回执会怎样（7.38 第 7 条，和 _check_receipt / _finish_run 的行为一致）。"""
     if cli_host:
         return "要交回执：这一轮结束时没有回执，记一次「未回执」，不重投。"
     return (f"要交回执：不交不会重投（只记一次「未回执」），但交回执之前这个会话一直算在做上一批，要等回执超时"
@@ -252,9 +250,7 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
         "### 回执",
         (f"每批处理完交回执。{CLI_RECEIPT_HINT}回执 JSON 的格式：" if cli_host else
          f"每批处理完提交回执（JSON 写成单行）：`sheepdog receipt --topic {topic_id} --batch <批次ID> --json '<回执JSON>'`"),
-        "```",
-        RECEIPT_SCHEMA_HINT,
-        "```",
+        f"```\n{RECEIPT_SCHEMA_HINT}\n```",
         *(["例如：", f"```{RECEIPT_FENCE}", '{"status": "handled", "summary": "..."}', "```"] if cli_host else []),
         ("没有提交回执会被判定为处理失败并重投。" if bus else managed_receipt_line(cli_host, receipt_timeout)),
         "anchors 会存进会话记录；`project:` 开头的条目在 `sheepdog sessions` 里显示为关联项目。",
@@ -299,6 +295,8 @@ def interface_section(topic_id: str, *, bus: bool, remind: list[int], expire: in
             "`sheepdog escalations [--all]`：查看各会话找主人的未结问题。主人在 IM 上的回复无法确定回答哪条时会送到你这里，"
             "附未结列表；判断后用 `sheepdog forward --topic <topic> --message-ids <主人那条消息>` 转交（不需要 --quote）。",
         ]
+    if guard := source_and_search_guard(topic_id, bus=bus):
+        lines.append(guard)
     lines += list(extra)
     return with_cli("\n".join(lines), cli)
 

@@ -54,8 +54,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.88")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 88))
+        self.assertEqual(cur_ver, "0.7.89")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 89))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -644,9 +644,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.88）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.89）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.88")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.89")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -812,17 +812,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
                 store.add_bot_outbox("om_notice_card_1", BUS_TOPIC_ID, False, notices[0], observe.iso(now_dt))
                 col = Collector(cfg, store, mock.MagicMock(), Roster(), SecurityConfig())
                 m_upgrade = Message(
-                    message_id="om_owner_upg_1",
-                    chat_id="oc_owner_dm",
-                    chat_name="私聊",
-                    chat_type="p2p",
-                    sender_id="ou_test_owner",
-                    sender_name="Matthew",
-                    sender_type="user",
-                    content="你来升级",
-                    msg_type="text",
-                    create_time=observe.iso(now_dt + timedelta(seconds=5)),
-                    reply_to="om_notice_card_1",
+                    message_id="om_owner_upg_1", chat_id="oc_owner_dm", chat_name="私聊", chat_type="p2p",
+                    sender_id="ou_test_owner", sender_name="Matthew", sender_type="user", content="你来升级",
+                    msg_type="text", create_time=observe.iso(now_dt + timedelta(seconds=5)), reply_to="om_notice_card_1",
                 )
                 d = col._escalation_message(m_upgrade)
                 self.assertEqual((d.route, d.reason), ("drop", "upgrade_command"))
@@ -834,16 +826,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
 
                 # 队列中已有待执行 upgrade 时重复发「升级」不重复入队
                 m_upgrade_dup = Message(
-                    message_id="om_owner_upg_2",
-                    chat_id="oc_owner_dm",
-                    chat_name="私聊",
-                    chat_type="p2p",
-                    sender_id="ou_test_owner",
-                    sender_name="Matthew",
-                    sender_type="user",
-                    content="升级",
-                    msg_type="text",
-                    create_time=observe.iso(now_dt + timedelta(seconds=6)),
+                    message_id="om_owner_upg_2", chat_id="oc_owner_dm", chat_name="私聊", chat_type="p2p",
+                    sender_id="ou_test_owner", sender_name="Matthew", sender_type="user", content="升级",
+                    msg_type="text", create_time=observe.iso(now_dt + timedelta(seconds=6)),
                 )
                 col._escalation_message(m_upgrade_dup)
                 self.assertEqual(len(store.pending_actions()), 1)
@@ -851,17 +836,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
                 # 对照：若主人引用的是未结 escalation 提问回答「升级」，则正常走 owner_reply 回答提问，不误判为自升级
                 store.add_escalation("om_esc_ask_1", "tp_alpha", "oc_owner_dm", "🐕 需要你定 · 升级数据库 [tp_alpha]\n要升级吗？", observe.iso(now_dt))
                 m_answer_esc = Message(
-                    message_id="om_owner_ans_1",
-                    chat_id="oc_owner_dm",
-                    chat_name="私聊",
-                    chat_type="p2p",
-                    sender_id="ou_test_owner",
-                    sender_name="Matthew",
-                    sender_type="user",
-                    content="升级",
-                    msg_type="text",
-                    create_time=observe.iso(now_dt + timedelta(seconds=7)),
-                    reply_to="om_esc_ask_1",
+                    message_id="om_owner_ans_1", chat_id="oc_owner_dm", chat_name="私聊", chat_type="p2p",
+                    sender_id="ou_test_owner", sender_name="Matthew", sender_type="user", content="升级",
+                    msg_type="text", create_time=observe.iso(now_dt + timedelta(seconds=7)), reply_to="om_esc_ask_1",
                 )
                 d_ans = col._escalation_message(m_answer_esc)
                 self.assertEqual((d_ans.route, d_ans.reason), ("dispatch", "owner_reply"))
@@ -883,10 +860,7 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
                 self.assertIn("原地重启", card_text)
 
                 # 5. CLI `sheepdog upgrade` 在常驻进程在线时入队 upgrade 动作；cmd_run 检测到 restart_requested 调用 os.execv
-                store.set_meta(
-                    "daemon_runtime",
-                    json.dumps({**rt, "pid": os.getpid()}, ensure_ascii=False),
-                )
+                store.set_meta("daemon_runtime", json.dumps({**rt, "pid": os.getpid()}, ensure_ascii=False))
                 with mock.patch("sheepdog.cli._load_cfg", return_value=cfg), \
                         mock.patch("sheepdog.cli.default_repo_dir", return_value=repo), \
                         mock.patch("subprocess.run", side_effect=fake_git):
@@ -900,15 +874,10 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
                 # 验证 cmd_run 执行完 pending upgrade 后释放锁并在 finally 中触发 _exec_restart (os.execv)
                 cfg_file = tmp_path / "config.toml"
                 cfg_file.write_text(
-                    f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{cfg.state_dir}"\n'
-                    '[source]\nenabled = false\n[identity]\nenabled = false\n',
+                    f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{cfg.state_dir}"\n[source]\nenabled = false\n[identity]\nenabled = false\n',
                     encoding="utf-8",
                 )
-                env = {
-                    "SHEEPDOG_CONFIG": str(cfg_file),
-                    "SHEEPDOG_STATE_DIR": str(cfg.state_dir),
-                    "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
-                }
+                env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": str(cfg.state_dir), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
                 with mock.patch.dict(os.environ, env), \
                         mock.patch("sheepdog.default_repo_dir", return_value=repo), \
                         mock.patch("subprocess.run", side_effect=fake_git), \
@@ -929,15 +898,10 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
             state_dir = tmp_path / "state"
             cfg_file = tmp_path / "config.toml"
             cfg_file.write_text(
-                f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{state_dir}"\n'
-                '[source]\nenabled = false\n[identity]\nenabled = false\n',
+                f'self_open_id = "ou_test_owner"\nsink = "dryrun"\nstate_dir = "{state_dir}"\n[source]\nenabled = false\n[identity]\nenabled = false\n',
                 encoding="utf-8",
             )
-            env = {
-                "SHEEPDOG_CONFIG": str(cfg_file),
-                "SHEEPDOG_STATE_DIR": str(state_dir),
-                "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
-            }
+            env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": str(state_dir), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
 
             # 1. 第一个常驻进程持有 sheepdog.run.lock 排他锁时，第二个常驻进程拿锁失败立即退出 0，绝不覆盖 daemon_runtime 或进 _run_loop
             lock1 = cli._acquire_daemon_lock(state_dir)
@@ -947,9 +911,7 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
                 self.assertIsNone(lock2)
 
                 err_buf = io.StringIO()
-                with mock.patch.dict(os.environ, env), \
-                        mock.patch("sys.stderr", err_buf), \
-                        mock.patch("sheepdog.cli._run_loop") as mock_loop:
+                with mock.patch.dict(os.environ, env), mock.patch("sys.stderr", err_buf), mock.patch("sheepdog.cli._run_loop") as mock_loop:
                     rc_dup = cli.main(["run"])
                 self.assertEqual(rc_dup, 0)
                 mock_loop.assert_not_called()
@@ -967,25 +929,46 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
             store = Store(state_dir / "sheepdog.sqlite3")
             try:
                 m = Message(
-                    message_id="om_concurrent_dup_1",
-                    chat_id="oc_test_chat",
-                    chat_name="测试群",
-                    chat_type="group",
-                    sender_id="ou_alice",
-                    sender_name="Alice",
-                    sender_type="user",
-                    content="同一毫秒被双通道扫到的消息",
-                    msg_type="text",
-                    create_time="2026-10-21T22:00:00+08:00",
+                    message_id="om_concurrent_dup_1", chat_id="oc_test_chat", chat_name="测试群", chat_type="group",
+                    sender_id="ou_alice", sender_name="Alice", sender_type="user", content="同一毫秒被双通道扫到的消息",
+                    msg_type="text", create_time="2026-10-21T22:00:00+08:00",
                 )
                 store.upsert_message(m, "dispatch", "at_me", ["at_me"], "tp_bus", received_by="bot")
-                # 第二次以相同 message_id 写入绝不抛 IntegrityError
                 store.upsert_message(m, "dispatch", "at_me", ["at_me"], "tp_bus", received_by="user")
                 row = store.get_message("om_concurrent_dup_1")
                 self.assertIsNotNone(row)
                 self.assertEqual(row["message_id"], "om_concurrent_dup_1")
             finally:
                 store.close()
+
+
+class VersionAndObserveTest(unittest.TestCase):
+    def test_reg_057_source_attribution_and_targeted_repo_search_guard(self):
+        from sheepdog.playbook import source_and_search_guard
+        from sheepdog.prompts import interface_section
+
+        guard = source_and_search_guard("tp_ziyi-zhang", bus=False)
+        iface = interface_section("tp_ziyi-zhang", bus=False, remind=[15], expire=120)
+        for text in (guard, iface):
+            self.assertIn("REG-057", text)
+            self.assertIn("事实出处与物理介质严格归属", text)
+            self.assertIn("代码检索必先定仓", text)
+            self.assertIn("~/Code", text)
+        self.assertEqual(source_and_search_guard("tp_bus", bus=True), "")
+        u_code = "/Use" + "rs/test_user/Code"
+        self.assertTrue(observe._is_unbounded_code_search(f'grep -rn "foo" {u_code}/'))
+        self.assertTrue(observe._is_unbounded_code_search('rg "bar" ~/Code'))
+        self.assertFalse(observe._is_unbounded_code_search(f'rg "foo" {u_code}/sheepdog/sheepdog'))
+        self.assertFalse(observe._is_unbounded_code_search(f"ls {u_code}"))
+
+        self.assertFalse(observe._is_bus_forbidden_command('python3 .agents/skills/personal-knowledge-assistant/scripts/context_memory.py runtime-context --query "腾讯云"'))
+        self.assertTrue(observe._is_bus_forbidden_command("python3 .agents/skills/personal-knowledge-assistant/scripts/context_memory.py capture ..."))
+        self.assertTrue(observe._is_bus_forbidden_command("python3 .agents/skills/personal-knowledge-assistant/scripts/pkm.py linear-index --write"))
+
+        kb_tb = ["2026-10-28 21:00:00 ERROR Traceback (most recent call last):", '  File "cli.py", line 1', "KeyboardInterrupt"]
+        err_tb = ["2026-10-28 21:00:00 ERROR Traceback (most recent call last):", '  File "cli.py", line 1', "RuntimeError: boom"]
+        self.assertTrue(observe._is_kb_interrupt_tb(kb_tb, 0))
+        self.assertFalse(observe._is_kb_interrupt_tb(err_tb, 0))
 
 
 if __name__ == "__main__":
