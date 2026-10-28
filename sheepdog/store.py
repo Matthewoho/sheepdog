@@ -128,24 +128,13 @@ CREATE INDEX IF NOT EXISTS idx_watch_person ON watches(person_id, closed_at);
 
 -- 「需要你定」（7.8）：会话以 bot 身份找主人的提问；主人在 IM 上的回复按它投回对应 topic
 CREATE TABLE IF NOT EXISTS escalations (
-    message_id        TEXT PRIMARY KEY,  -- 机器人那条提问
-    topic_id          TEXT NOT NULL,
-    chat_id           TEXT,
-    text              TEXT,
-    asked_at          TEXT NOT NULL,
-    answered_at       TEXT,
-    answer_message_id TEXT,
-    closed_at         TEXT,              -- 已答、会话结案或超过 open_hours 时写入；为空 = 未结
-    close_reason      TEXT,              -- answered | expired | resolved（会话自己结案，7.36）
-    resolved_by       TEXT,              -- 结案的会话（7.36）
-    resolve_note      TEXT,              -- 结案依据（会话写的一句话）
-    possibly_handled_at          TEXT,   -- 标「可能已处理」的时间（7.36）：主人在来源聊天里后来说过话 / 对来源消息点了表情 /
-                                         -- 同来源的另一条提问被答复或结案
-    possibly_handled_message_id  TEXT,   -- 触发的那条：主人的发言 / 被点表情的来源消息 / 同来源的另一条提问
-    possibly_handled_reason      TEXT,   -- 触发的是哪种：owner_spoke | owner_reaction | sibling_answered | sibling_resolved
-    possibly_handled_notified_at TEXT,   -- 已经给负责会话排了核实提醒（每条只提醒一次）
-    expiry_reminded_at           TEXT    -- 快到期提醒已排（[escalation] remind_before_hours，每条一次）
+    message_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, chat_id TEXT, text TEXT, asked_at TEXT NOT NULL,
+    answered_at TEXT, answer_message_id TEXT, closed_at TEXT, close_reason TEXT, resolved_by TEXT, resolve_note TEXT,
+    possibly_handled_at TEXT, possibly_handled_message_id TEXT, possibly_handled_reason TEXT,
+    possibly_handled_notified_at TEXT, expiry_reminded_at TEXT,
+    hub_message_id TEXT, origin_root_id TEXT, nudge_count INTEGER DEFAULT 0, last_nudged_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_escalations_hub ON escalations(hub_message_id);
 
 -- 「需要你定」为哪条消息问的（7.36）：ask 发成功后当场写；提问登记进 escalations 时按 ask_message_id 连上。
 -- 一行 = 一条提问的一条来源消息
@@ -417,6 +406,8 @@ CREATE TABLE IF NOT EXISTS sends (
     root_message_id   TEXT,            -- ask / report 带钥匙时：在哪个话题里（开头那条的消息号；新起的就是它自己）
     key               TEXT,
     norm_key          TEXT,
+    item_key          TEXT,
+    title             TEXT,
     target_message_id TEXT,            -- reply：回复的是哪条
     text              TEXT,            -- 发出去的正文（卡片记卡片正文）
     sent_at           TEXT NOT NULL,
@@ -582,28 +573,27 @@ ECHO_RELAY_FIELDS = ("relay_batch", "relay_at", "relay_status", "relay_summary")
 
 # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER（只加不删）
 MIGRATIONS = {
-    "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"),
-                 ("security_action", "TEXT"), ("message_position", "TEXT"), ("thread_position", "TEXT"),
-                 ("received_by", "TEXT"), ("root_id", "TEXT")],
+    "messages": [("note", "TEXT"), ("sender_tenant_key", "TEXT"), ("security_tags", "TEXT"), ("security_action", "TEXT"),
+                 ("message_position", "TEXT"), ("thread_position", "TEXT"), ("received_by", "TEXT"), ("root_id", "TEXT")],
     "topics": [("onboarded_at", "TEXT"), ("receipt_missed", "INTEGER DEFAULT 0"), ("spawned_at", "TEXT"),
-               ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"),
-               ("model", "TEXT"), ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"),
-               ("attention_reason", "TEXT"), ("lifecycle", "TEXT"), ("group_id", "TEXT NOT NULL DEFAULT ''")],
+               ("origin_note", "TEXT"), ("rules_hash", "TEXT"), ("host", "TEXT DEFAULT 'antigravity'"), ("model", "TEXT"),
+               ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"), ("attention_reason", "TEXT"),
+               ("lifecycle", "TEXT"), ("group_id", "TEXT NOT NULL DEFAULT ''")],
     "acks": [("identity", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
     "audit_hits": [("alert_id", "INTEGER"), ("merged", "INTEGER DEFAULT 0")],
-    "sends": [("identity", "TEXT"), ("sources_origin", "TEXT"), ("floor", "TEXT")],
+    "sends": [("identity", "TEXT"), ("sources_origin", "TEXT"), ("floor", "TEXT"), ("item_key", "TEXT"), ("title", "TEXT")],
     "owner_notices": [("reply_to", "TEXT"), ("in_thread", "INTEGER DEFAULT 0")],
     "escalations": [("resolved_by", "TEXT"), ("resolve_note", "TEXT"), ("possibly_handled_at", "TEXT"),
                     ("possibly_handled_message_id", "TEXT"), ("possibly_handled_reason", "TEXT"),
-                    ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT")],
-    "lambs": [("parent_topic_id", "TEXT"), ("kind", "TEXT"), ("task_title", "TEXT"),
-              ("conversation_id", "TEXT"), ("pid", "INTEGER"), ("state", "TEXT"),
-              ("started_at", "TEXT"), ("last_act_at", "TEXT"), ("finished_at", "TEXT"),
-              ("result_summary", "TEXT"), ("log_path", "TEXT"), ("reported_at", "TEXT"),
-              ("report_msg_id", "TEXT")],
+                    ("possibly_handled_notified_at", "TEXT"), ("expiry_reminded_at", "TEXT"),
+                    ("hub_message_id", "TEXT"), ("origin_root_id", "TEXT"),
+                    ("nudge_count", "INTEGER DEFAULT 0"), ("last_nudged_at", "TEXT")],
+    "lambs": [("parent_topic_id", "TEXT"), ("kind", "TEXT"), ("task_title", "TEXT"), ("conversation_id", "TEXT"),
+              ("pid", "INTEGER"), ("state", "TEXT"), ("started_at", "TEXT"), ("last_act_at", "TEXT"),
+              ("finished_at", "TEXT"), ("result_summary", "TEXT"), ("log_path", "TEXT"), ("reported_at", "TEXT"), ("report_msg_id", "TEXT")],
 }
 
 
@@ -659,23 +649,30 @@ class Store:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self._migrate()
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.purge_bus_group_threads()
+
+    def purge_bus_group_threads(self) -> int:
+        with self.tx() as c:
+            return c.execute("DELETE FROM group_threads WHERE topic_id = 'tp_bus'").rowcount
 
     def _migrate(self) -> None:
         for table, cols in MIGRATIONS.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if not have:
+                continue
             for name, decl in cols:
                 if name not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        if {r["name"] for r in self.conn.execute("PRAGMA table_info(escalations)")}:
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_escalations_hub ON escalations(hub_message_id)")
         self.conn.commit()
 
     @classmethod
     def snapshot(cls, path: Path) -> "Store":
-        """--dry-run 用：把账本复制进内存，之后的写入都不落盘。
-
-        否则 dry-run 会把假的 conversation_id、onboarded_at、水位线写进真实账本，正式运行时漏发 onboarding。
-        """
+        """--dry-run 用：把账本复制进内存，之后的写入都不落盘。"""
         mem = cls(":memory:")
         if Path(path).exists():
             src = sqlite3.connect(str(path))
@@ -683,7 +680,7 @@ class Store:
                 src.backup(mem.conn)
             finally:
                 src.close()
-            # backup 把内存库整个换成了老账本：新加的表（如在岗表，7.20）要再建一次，新加的列再补一次
+            mem._migrate()
             mem.conn.executescript(SCHEMA)
             mem._migrate()
         return mem
@@ -885,9 +882,10 @@ class Store:
                 c.execute("UPDATE messages SET is_read=? WHERE message_id=?", (int(r), mid))
 
     def pending_dispatch(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM messages WHERE route='dispatch' AND dispatch_state='pending' ORDER BY create_time"
-        ).fetchall()
+        return self.conn.execute("SELECT * FROM messages WHERE route='dispatch' AND dispatch_state='pending' ORDER BY create_time").fetchall()
+
+    def pending_for_topic(self, topic_id: str) -> list[sqlite3.Row]:
+        return [r for r in self.pending_dispatch() if r["topic_id"] == topic_id]
 
     def mark_batch(self, message_ids: list[str], batch_id: str, topic_id: str, state: str) -> None:
         with self.tx() as c:
@@ -1040,27 +1038,18 @@ class Store:
 
     def inbox_messages(self, chat_query: str, limit: int = 50) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT * FROM messages WHERE route='inbox' AND inbox_cleared=0 AND deleted=0
-                 AND (chat_id=? OR chat_name LIKE ?) ORDER BY create_time DESC LIMIT ?""",
-            (chat_query, f"%{chat_query}%", limit),
-        ).fetchall()
+            "SELECT * FROM messages WHERE route='inbox' AND inbox_cleared=0 AND deleted=0 AND (chat_id=? OR chat_name LIKE ?) ORDER BY create_time DESC LIMIT ?",
+            (chat_query, f"%{chat_query}%", limit)).fetchall()
 
     def inbox_clear(self, chat_query: str | None) -> int:
         with self.tx() as c:
             if chat_query is None:
-                cur = c.execute("UPDATE messages SET inbox_cleared=1 WHERE route='inbox' AND inbox_cleared=0")
-            else:
-                cur = c.execute(
-                    "UPDATE messages SET inbox_cleared=1 WHERE route='inbox' AND inbox_cleared=0 AND (chat_id=? OR chat_name LIKE ?)",
-                    (chat_query, f"%{chat_query}%"),
-                )
-            return cur.rowcount
+                return c.execute("UPDATE messages SET inbox_cleared=1 WHERE route='inbox' AND inbox_cleared=0").rowcount
+            return c.execute("UPDATE messages SET inbox_cleared=1 WHERE route='inbox' AND inbox_cleared=0 AND (chat_id=? OR chat_name LIKE ?)",
+                             (chat_query, f"%{chat_query}%")).rowcount
 
     def unread_inbox_ids(self, limit: int = 500) -> list[str]:
-        rows = self.conn.execute(
-            "SELECT message_id FROM messages WHERE route='inbox' AND inbox_cleared=0 AND (is_read IS NULL OR is_read=0) ORDER BY create_time DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = self.conn.execute("SELECT message_id FROM messages WHERE route='inbox' AND inbox_cleared=0 AND (is_read IS NULL OR is_read=0) ORDER BY create_time DESC LIMIT ?", (limit,)).fetchall()
         return [r["message_id"] for r in rows]
 
     # ---------- topics ----------
@@ -1077,25 +1066,18 @@ class Store:
                      lifecycle: str | None = None, group_id: str = "") -> None:
         ts = now_iso()
         with self.tx() as c:
-            c.execute(
-                """INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,lifecycle,group_id,created_at,last_active)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None,
-                 lifecycle or None, group_id or "", ts, ts),
-            )
+            c.execute("INSERT INTO topics(topic_id,title,kind,duty,state,host,model,effort,lifecycle,group_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (topic_id, title, kind, duty, state, host or "antigravity", model or None, effort or None, lifecycle or None, group_id or "", ts, ts))
 
     def count_topics_since(self, kind: str, since_iso: str) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM topics WHERE kind=? AND created_at >= ?",
-                                 (kind, since_iso)).fetchone()[0]
+        return self.conn.execute("SELECT COUNT(*) FROM topics WHERE kind=? AND created_at >= ?", (kind, since_iso)).fetchone()[0]
 
     def update_topic(self, topic_id: str, **fields) -> None:
         fields.pop("last_error", None)
-        if not fields:
-            return
+        if not fields: return
         fields.setdefault("last_active", now_iso())
         cols = ", ".join(f"{k}=?" for k in fields)
-        with self.tx() as c:
-            c.execute(f"UPDATE topics SET {cols} WHERE topic_id=?", (*fields.values(), topic_id))
+        with self.tx() as c: c.execute(f"UPDATE topics SET {cols} WHERE topic_id=?", (*fields.values(), topic_id))
 
     def refresh_topic_dispatched(self, topic_id: str, dispatched_at: str | None = None) -> None:
         """7.64：自动续跑唤醒成功后刷新会话 dispatched_at 与 last_active。"""
@@ -1104,14 +1086,10 @@ class Store:
 
     def upsert_topic(self, topic_id: str, **fields) -> None:
         if self.get_topic(topic_id) is None:
-            self.create_topic(
-                topic_id, fields.pop("title", topic_id), fields.pop("kind", "dynamic"), fields.pop("duty", ""),
-                fields.pop("state", "active"), fields.pop("host", "antigravity"), fields.pop("model", "") or "",
-                fields.pop("effort", "") or "", lifecycle=fields.pop("lifecycle", None),
-                group_id=fields.pop("group_id", "") or "",
-            )
-        if fields:
-            self.update_topic(topic_id, **fields)
+            self.create_topic(topic_id, fields.pop("title", topic_id), fields.pop("kind", "dynamic"), fields.pop("duty", ""),
+                              fields.pop("state", "active"), fields.pop("host", "antigravity"), fields.pop("model", "") or "",
+                              fields.pop("effort", "") or "", lifecycle=fields.pop("lifecycle", None), group_id=fields.pop("group_id", "") or "")
+        if fields: self.update_topic(topic_id, **fields)
 
     def get_group_topics(self, group_id: str, include_closed: bool = False) -> list[sqlite3.Row]:
         """按羊圈（group_id，7.49）列出组内会话：#1（不带 #）排第一，其余按 #2, #3 升序。"""
@@ -1142,8 +1120,8 @@ class Store:
                  f"WHERE t.group_id = ? AND t.state != 'closed' AND b.message_id IN ({ph}) ORDER BY b.sent_at DESC LIMIT 1",
                  (gid, *chain_ids)),
                 (f"SELECT e.topic_id FROM escalations e JOIN topics t ON t.topic_id = e.topic_id "
-                 f"WHERE t.group_id = ? AND t.state != 'closed' AND e.closed_at IS NULL AND e.message_id IN ({ph}) "
-                 f"ORDER BY e.asked_at DESC LIMIT 1", (gid, *chain_ids)),
+                 f"WHERE t.group_id = ? AND t.state != 'closed' AND e.closed_at IS NULL AND (e.message_id IN ({ph}) OR e.hub_message_id IN ({ph})) "
+                 f"ORDER BY e.asked_at DESC LIMIT 1", (gid, *chain_ids, *chain_ids)),
                 (f"SELECT m.topic_id FROM messages m JOIN topics t ON t.topic_id = m.topic_id "
                  f"WHERE t.group_id = ? AND t.state != 'closed' AND m.route = 'dispatch' AND m.topic_id IS NOT NULL "
                  f"AND (m.message_id IN ({ph}) OR m.root_id IN ({ph}) OR m.reply_to IN ({ph}) OR m.thread_id IN ({ph})) "
@@ -1279,10 +1257,14 @@ class Store:
             c.execute("UPDATE messages SET note=? WHERE message_id=?", (note, message_id))
 
     # ---------- escalations ----------
-    def add_escalation(self, message_id: str, topic_id: str, chat_id: str, text: str, asked_at: str) -> None:
+    def add_escalation(self, message_id: str, topic_id: str, chat_id: str, text: str, asked_at: str) -> bool:
+        if not message_id or self.conn.execute("SELECT 1 FROM escalations WHERE hub_message_id=?", (message_id,)).fetchone() is not None:
+            return False
+        if (raw_hub := self.get_meta("decision_hub")) and f'"{message_id}"' in raw_hub:
+            return False
         with self.tx() as c:
-            c.execute("""INSERT OR IGNORE INTO escalations(message_id,topic_id,chat_id,text,asked_at)
-                         VALUES(?,?,?,?,?)""", (message_id, topic_id, chat_id, text, asked_at))
+            return c.execute("""INSERT OR IGNORE INTO escalations(message_id,topic_id,chat_id,text,asked_at)
+                         VALUES(?,?,?,?,?)""", (message_id, topic_id, chat_id, text, asked_at)).rowcount > 0
 
     def add_bot_outbox(self, message_id: str, topic_id: str, is_question: bool, text: str, sent_at: str) -> None:
         with self.tx() as c:
@@ -1293,7 +1275,19 @@ class Store:
         return self.conn.execute("SELECT * FROM bot_outbox WHERE message_id=?", (message_id,)).fetchone()
 
     def get_escalation(self, message_id: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM escalations WHERE message_id=?", (message_id,)).fetchone()
+        return self.conn.execute(
+            "SELECT * FROM escalations WHERE message_id=? OR (hub_message_id IS NOT NULL AND hub_message_id != '' AND hub_message_id=?) "
+            "ORDER BY CASE WHEN hub_message_id IS NOT NULL AND hub_message_id != '' THEN 0 ELSE 1 END, asked_at ASC LIMIT 1",
+            (message_id, message_id)).fetchone()
+
+    get_escalation_by_any_mid = get_escalation
+
+    def set_escalation_hub(self, message_id: str, hub_message_id: str, origin_root_id: str = "") -> None:
+        with self.tx() as c:
+            if hub_message_id and hub_message_id != message_id:
+                c.execute("DELETE FROM escalations WHERE message_id=? AND message_id!=?", (hub_message_id, message_id))
+            c.execute("UPDATE escalations SET hub_message_id=?, origin_root_id=COALESCE(NULLIF(?,''), origin_root_id) WHERE message_id=?",
+                      (hub_message_id or None, origin_root_id or "", message_id))
 
     def open_escalations(self, topic_id: str | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM escalations WHERE closed_at IS NULL", []
@@ -1306,11 +1300,15 @@ class Store:
         where = "" if include_closed else "WHERE closed_at IS NULL"
         return self.conn.execute(f"SELECT * FROM escalations {where} ORDER BY asked_at DESC LIMIT ?", (limit,)).fetchall()
 
-    def answer_escalation(self, message_id: str, answer_message_id: str) -> bool:
+    def answer_escalation(self, message_id: str, answer_message_id: str, *, allow_update: bool = False) -> bool:
         ts = now_iso()
+        cond = "" if allow_update else " AND answered_at IS NULL"
         with self.tx() as c:
-            cur = c.execute("""UPDATE escalations SET answered_at=?, answer_message_id=?, closed_at=?, close_reason='answered'
-                               WHERE message_id=? AND closed_at IS NULL""", (ts, answer_message_id, ts, message_id))
+            cur = c.execute(
+                f"""UPDATE escalations SET answered_at=?, answer_message_id=?, closed_at=COALESCE(closed_at, ?),
+                           close_reason=COALESCE(close_reason, 'answered')
+                    WHERE (message_id=? OR (hub_message_id IS NOT NULL AND hub_message_id != '' AND hub_message_id=?)){cond}""",
+                (ts, answer_message_id, ts, message_id, message_id))
             return cur.rowcount > 0
 
     def expire_escalation(self, message_id: str) -> None:
@@ -1416,14 +1414,15 @@ class Store:
                                  (root_message_id,)).fetchall()
 
     def add_send(self, idem_key: str, kind: str, topic_id: str, message_id: str, text: str, *,
-                 root_message_id: str = "", key: str = "", norm_key: str = "", target_message_id: str = "",
-                 identity: str | None = None) -> None:
+                 root_message_id: str = "", key: str = "", norm_key: str = "", item_key: str = "", title: str = "",
+                 target_message_id: str = "", identity: str | None = None) -> None:
+        ik_val = item_key or norm_key or (key.replace(" ", "").upper() if key else "")
         with self.tx() as c:
             c.execute(
-                """INSERT OR IGNORE INTO sends(idem_key,kind,topic_id,message_id,root_message_id,key,norm_key,
-                       target_message_id,text,sent_at,identity) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (idem_key, kind, topic_id, message_id, root_message_id or None, key or None, norm_key or None,
-                 target_message_id or None, text, now_iso(), identity))
+                """INSERT OR IGNORE INTO sends(idem_key,kind,topic_id,message_id,root_message_id,key,norm_key,item_key,
+                       title,target_message_id,text,sent_at,identity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (idem_key, kind, topic_id, message_id, root_message_id or None, (key or item_key) or None,
+                 (norm_key or ik_val) or None, ik_val or None, title or None, target_message_id or None, text, now_iso(), identity))
 
     def set_send_sources_origin(self, message_id: str, origin: str) -> None:
         """ask 发出时定下的来源口径（7.36）：记了以后补来源不再动它，没记来源也是定过的。"""
@@ -1570,15 +1569,17 @@ class Store:
                 n += 1
         return n
 
-    # ---------- 群话题归属（7.45） ----------
+    # ---------- 群话题归属（7.45 / 7.87 REG-053） ----------
     def group_thread(self, thread_id: str) -> sqlite3.Row | None:
-        if not thread_id:
-            return None
-        return self.conn.execute("SELECT * FROM group_threads WHERE thread_id=?", (thread_id,)).fetchone()
+        return self.conn.execute("SELECT * FROM group_threads WHERE thread_id=? AND topic_id != 'tp_bus'", (thread_id,)).fetchone() if thread_id else None
 
-    def add_group_thread(self, thread_id: str, chat_id: str, topic_id: str, source: str, root_message_id: str,
-                         root_summary: str, last_activity_at: str) -> None:
-        """记下（或改记）一个群话题的归属。"""
+    def add_group_thread(self, thread_id: str, chat_id: str, topic_id: str, source: str = "sent",
+                         root_message_id: str = "", root_summary: str = "", last_activity_at: str = "") -> None:
+        """记下（或改记）一个群话题的归属（7.87 REG-053：绝不把 tp_bus 写死进 group_threads）。"""
+        if not thread_id or not topic_id or topic_id == "tp_bus":
+            return
+        if not last_activity_at and len(root_summary or "") >= 19 and root_summary[:4].isdigit() and "T" in root_summary[:11]:
+            last_activity_at, root_summary = root_summary, ""
         with self.tx() as c:
             c.execute(
                 """INSERT INTO group_threads(thread_id,chat_id,topic_id,source,root_message_id,root_summary,created_at,
@@ -1590,6 +1591,8 @@ class Store:
                 (thread_id, chat_id, topic_id, source, root_message_id or None, root_summary or None, now_iso(),
                  last_activity_at or now_iso()))
 
+    claim_group_thread = add_group_thread
+
     def touch_group_thread(self, thread_id: str, at: str) -> bool:
         """话题里又有人说话：最近活动时间往后挪（只往后不往前）。没记过这个话题返回 False。"""
         if not thread_id or not at:
@@ -1600,13 +1603,20 @@ class Store:
 
     def repoint_group_thread(self, thread_id: str, root_message_id: str, from_topics: set[str], topic_id: str) -> bool:
         """话题里的消息（或开头那条）被转交（forward）：原来归 from_topics 之一的话题改归 topic_id（source = forwarded）。"""
-        if not (thread_id or root_message_id) or not from_topics:
+        if not (thread_id or root_message_id) or not from_topics or topic_id == "tp_bus":
             return False
         with self.tx() as c:
-            return c.execute(
+            ok = c.execute(
                 "UPDATE group_threads SET topic_id=?, source='forwarded' WHERE (thread_id=? OR root_message_id=?) "
                 "AND topic_id IN (%s) AND topic_id != ?" % ",".join("?" * len(from_topics)),
                 (topic_id, thread_id or "", root_message_id or "", *sorted(from_topics), topic_id)).rowcount > 0
+        if not ok and thread_id and self.group_thread(thread_id) is None:
+            r = self.get_message(root_message_id)
+            self.add_group_thread(thread_id, (r["chat_id"] if r else "") or "", topic_id, "forwarded",
+                                  (r["root_id"] if r and "root_id" in r.keys() and r["root_id"] else root_message_id), "",
+                                  (r["create_time"] if r else "") or now_iso())
+            return True
+        return ok
 
     def thread_last_activity(self, thread_id: str, exclude_message_id: str = "") -> str:
         """账本里这个话题（含已知的开头那条）最近一条消息的时间；没有是空串。"""
@@ -2113,49 +2123,28 @@ class Store:
     )
 
     def create_lamb(
-        self,
-        lamb_id: str,
-        parent_topic_id: str = "",
-        kind: str = "native_subagent",
-        task_title: str = "",
-        *,
-        topic_id: str = "",
-        title: str = "",
-        conversation_id: str | None = None,
-        pid: int | None = None,
-        state: str = "running",
-        started_at: str | None = None,
-        last_act_at: str | None = None,
-        finished_at: str | None = None,
-        result_summary: str | None = None,
-        log_path: str | None = None,
-        reported_at: str | None = None,
-        report_msg_id: str | None = None,
+        self, lamb_id: str, parent_topic_id: str = "", kind: str = "native_subagent", task_title: str = "", *,
+        topic_id: str = "", title: str = "", conversation_id: str | None = None, pid: int | None = None,
+        state: str = "running", started_at: str | None = None, last_act_at: str | None = None,
+        finished_at: str | None = None, result_summary: str | None = None, log_path: str | None = None,
+        reported_at: str | None = None, report_msg_id: str | None = None,
     ) -> dict:
-        ptid = (parent_topic_id or topic_id).strip()
-        ttitle = (task_title or title or lamb_id).strip()
+        ptid, ttitle = (parent_topic_id or topic_id).strip(), (task_title or title or lamb_id).strip()
         ts = started_at or now_iso()
-        act = last_act_at if last_act_at is not None else ts
-        cid = (conversation_id or "").strip() or None
+        act, cid = (last_act_at if last_act_at is not None else ts), ((conversation_id or "").strip() or None)
         with self.tx() as c:
             c.execute(
                 """INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, conversation_id, pid, state,
                                      started_at, last_act_at, finished_at, result_summary, log_path, reported_at, report_msg_id)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(lamb_id) DO UPDATE SET
-                       parent_topic_id=excluded.parent_topic_id,
-                       kind=excluded.kind,
-                       task_title=excluded.task_title,
-                       conversation_id=COALESCE(excluded.conversation_id, lambs.conversation_id),
-                       pid=COALESCE(excluded.pid, lambs.pid),
-                       state=excluded.state,
-                       last_act_at=excluded.last_act_at,
+                   ON CONFLICT(lamb_id) DO UPDATE SET parent_topic_id=excluded.parent_topic_id, kind=excluded.kind,
+                       task_title=excluded.task_title, conversation_id=COALESCE(excluded.conversation_id, lambs.conversation_id),
+                       pid=COALESCE(excluded.pid, lambs.pid), state=excluded.state, last_act_at=excluded.last_act_at,
                        finished_at=COALESCE(excluded.finished_at, lambs.finished_at),
                        result_summary=COALESCE(excluded.result_summary, lambs.result_summary),
                        log_path=COALESCE(excluded.log_path, lambs.log_path),
                        report_msg_id=COALESCE(excluded.report_msg_id, lambs.report_msg_id)""",
-                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at, report_msg_id),
-            )
+                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at, report_msg_id))
         return self.get_lamb(lamb_id) or {}
 
     register_lamb = create_lamb
@@ -2165,32 +2154,20 @@ class Store:
         return dict(r) if r is not None else None
 
     def update_lamb(self, lamb_id: str, **fields) -> dict | None:
-        allowed = {k: v for k, v in fields.items() if k in self.LAMB_FIELDS}
-        if not allowed:
+        if not (allowed := {k: v for k, v in fields.items() if k in self.LAMB_FIELDS}):
             return self.get_lamb(lamb_id)
-        cols = ", ".join(f"{k}=?" for k in allowed)
         with self.tx() as c:
-            c.execute(f"UPDATE lambs SET {cols} WHERE lamb_id=?", (*allowed.values(), lamb_id))
+            c.execute(f"UPDATE lambs SET {', '.join(f'{k}=?' for k in allowed)} WHERE lamb_id=?", (*allowed.values(), lamb_id))
         return self.get_lamb(lamb_id)
 
     def get_active_lambs(self, parent_topic_id: str | None = None) -> list[dict]:
-        sql = "SELECT * FROM lambs WHERE state='running'"
-        args: list = []
+        sql, args = "SELECT * FROM lambs WHERE state='running'", ([parent_topic_id] if parent_topic_id else [])
         if parent_topic_id:
             sql += " AND parent_topic_id=?"
-            args.append(parent_topic_id)
-        rows = self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()]
 
-    def list_lambs(
-        self,
-        parent_topic_id: str | None = None,
-        state: str | None = None,
-        *,
-        include_finished: bool = True,
-    ) -> list[dict]:
-        sql = "SELECT * FROM lambs WHERE 1=1"
-        args: list = []
+    def list_lambs(self, parent_topic_id: str | None = None, state: str | None = None, *, include_finished: bool = True) -> list[dict]:
+        sql, args = "SELECT * FROM lambs WHERE 1=1", []
         if parent_topic_id:
             sql += " AND parent_topic_id=?"
             args.append(parent_topic_id)
@@ -2199,8 +2176,7 @@ class Store:
             args.append(state)
         elif not include_finished:
             sql += " AND state='running'"
-        rows = self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in self.conn.execute(sql + " ORDER BY started_at ASC, rowid ASC, lamb_id ASC", args).fetchall()]
 
     def find_lamb_by_cid(self, conversation_id: str) -> dict | None:
         cid = (conversation_id or "").strip()

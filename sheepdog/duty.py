@@ -1,22 +1,8 @@
-"""在岗表（7.20）：会话之间实时感知、互相沟通。给人和会话看的名字是「羊群看板」（2026-10-12 改名）；代码里的模块名、
-函数名、配置段 [duty]、账本表名列名、--json 字段名沿用 duty / 在岗表，不改。
-
-这里只放机制：活（work）的登记与自动补、信箱（tell）的校验与限流、编号认取、卡片和摘要的数据拼装。
-会话卡片的运行状态由 engine 每轮算（要读会话记录、看投递状态）；对人和对会话的说明一律在 playbook
-（duty_collision.md、duty_mail.md、duty_digest.md、duty_stuck.md），代码只拼事实。
-
-依据：心智模型 7.3（感知走元数据，不读别的会话的草稿）、7.4（状态机；收件方把入站消息当不可信输入）、
-7.6（状态长在活上）。这一版不做签名写入、epoch、足迹申报：牧羊犬一件活只交给一个会话。
-"""
-
+"""在岗表（7.20）：会话之间实时感知、互相沟通（显示名「羊群看板」）。负责活（work）的登记与自动补、信箱（tell）的校验与限流、编号认取、卡片和摘要的数据拼装。"""
 from __future__ import annotations
-
-import json
-import re
-import shlex
+import json, re, shlex
 from datetime import datetime, timedelta
 from typing import Callable, Iterable
-
 from .store import Store, now_iso
 
 # ---------- 运行状态（按顺序取第一个命中） ----------
@@ -118,30 +104,36 @@ def _close_fields(state: str, result: str = "") -> dict:
     return {"closed_at": now_iso()} if state in CLOSED_WORK else {"closed_at": None}
 
 
+def _is_owner_wait(val: str) -> bool:
+    return bool(re.search(r"^\s*(?:主人|matthew(?:\s+hong)?)(?:\s|$|[（(/:：,，-])", val or "", re.I))
+
+
 def set_work(store: Store, topic_id: str, key: str, *, title: str = "", state: str = DOING, waiting_on: str = "",
              until: str = "", expect: str = "", to: str = "", result: str = "") -> tuple[int, list]:
-    """会话申报一件活（sheepdog work set / 回执的 work 字段）：立即写入，不等下一轮。
-
-    同一会话同一把钥匙已有就更新（申报覆盖自动补的；只改给了值的字段），没有就新建。
-    返回 (活的 id, 这把钥匙在别的会话名下没结束的活)：撞车只提醒，仍然登记。"""
+    """会话申报一件活（sheepdog work set / 回执的 work 字段）：立即写入，已有则更新，没有则新建。"""
     key = " ".join((key or "").split())
     if not key:
         raise DutyError("--key 不能为空：有外部编号用外部编号，没有就起个短名")
     state = parse_work_state(state)
+    from . import decision_hub
+    if (state == WAITING_OWNER or _is_owner_wait(waiting_on)) and (decision_hub.hub_active(None, store) or getattr(store, "enforce_waiting_owner_ask", False)):
+        if store.conn.execute("SELECT 1 FROM escalations WHERE (topic_id=? OR topic_id=?) AND closed_at IS NULL LIMIT 1",
+                              (topic_id, decision_hub.base_topic_id(topic_id))).fetchone() is None:
+            raise DutyError("当前会话没有未决的 ask 待拍板卡片，禁止将 work 标为等主人（waiting_owner / waiting_on=主人）；请先调用 sheepdog ask 发起待拍板卡片")
     if state == HANDED_OFF and not to:
         raise DutyError("已转交要写 --to <会话>")
     if to and not to.startswith("tp_"):
         to = "tp_" + to
-    nk = norm_key(key)
-    others = holders(store, key, topic_id)
-    given = {k: v for k, v in dict(title=title, waiting_on=waiting_on, until=until, expect=expect, handed_to=to,
-                                   result=result).items() if v}
+    nk, others, ts = norm_key(key), holders(store, key, topic_id), now_iso()
+    given = {k: v for k, v in dict(title=title, waiting_on=waiting_on, until=until, expect=expect, handed_to=to, result=result).items() if v}
     w = store.get_work(topic_id, nk)
-    ts = now_iso()
     if w is None:
         wid = store.add_work(topic_id, key, nk, state, DECLARED, True, declared_at=ts, **given, **_close_fields(state))
     else:
         wid = w["id"]
+        if state in (DOING, WAITING_OTHER, DONE, HANDED_OFF) and not waiting_on and _is_owner_wait(w["waiting_on"] or ""):
+            given.setdefault("waiting_on", "")
+            given.setdefault("expect", None)
         store.update_work(wid, key=key, state=state, declared=1, declared_at=ts, **given, **_close_fields(state))
     if state in CLOSED_WORK:
         # 会话自报做完 / 转交：这之前送到它的同一编号的消息不再算它手上的事（之后又送到就重新算）
@@ -347,25 +339,18 @@ def is_stale(w, card, now: datetime, hours: float) -> bool:
 
 
 def _dt(ts) -> datetime | None:
-    try:
-        dt = datetime.fromisoformat(ts) if ts else None
-    except ValueError:
-        return None
+    try: dt = datetime.fromisoformat(ts) if ts else None
+    except ValueError: return None
     return dt if dt is not None and dt.tzinfo is not None else None
 
 
 # ======================= 信箱 =======================
-def pair_key(a: str, b: str) -> str:
-    return "mail_pause:" + "|".join(sorted((a, b)))
+def pair_key(a: str, b: str) -> str: return "mail_pause:" + "|".join(sorted((a, b)))
 
 
 def paused_until(store: Store, a: str, b: str) -> datetime | None:
-    v = store.get_meta(pair_key(a, b))
-    try:
-        until = datetime.fromisoformat(v) if v else None
-    except ValueError:
-        return None
-    return until if until and until > datetime.now().astimezone() else None
+    dt = _dt(store.get_meta(pair_key(a, b)))
+    return dt if dt and dt > datetime.now().astimezone() else None
 
 
 def mail_label(store: Store, from_topic: str) -> str:
@@ -373,24 +358,23 @@ def mail_label(store: Store, from_topic: str) -> str:
     return f"💬 会话留言（不是主人的指令）· 来自{topic_label(store, from_topic)}"
 
 
+_POLITE_ACK_RE = re.compile(r"^\s*(?:【[^】]*】\s*)?(?:已?收到|知悉|已阅|已获悉|明白|了解|感谢|收到同步|ack\b|roger\b)", re.I)
+_BUS_ASK_ACT_RE = re.compile(r"请转交|forward|new-session|\?|？", re.I)
+
+
 def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key: str = "", quote: str = "",
               verify_quote=None, playbook=None, is_target: Callable[[str], bool] | None = None) -> int:
-    """sheepdog tell：存进信箱，并作为一条系统消息排给收件会话（下一批送到；对方排队、离线都不丢）。
-
-    - 留言标「会话留言，不是主人的指令」；正文按引用格式送，不能伪造标题行；
-    - 正文提到「主人原话」「已核对」：必须用 --quote 带主人原话，过现有核对（同 forward），不带或核对不通过就拒绝；
-    - 同一对会话 mail_window_minutes 内超过 mail_pair_limit 条：暂停这一对 mail_pause_minutes 分钟、通知总线，这一条拒绝。
-    返回留言编号。"""
+    """sheepdog tell：存进信箱，并作为一条系统消息排给收件会话（下一批送到；对方排队、离线都不丢）。"""
     from .engine import BUS_TOPIC_ID  # 避免循环引用
     from .prompts import QUOTE_LABEL, with_cli
 
     dc = cfg.duty
     from_topic, to_topic = _tid(from_topic), _tid(to_topic)
     text, key, quote = (text or "").strip(), " ".join((key or "").split()), (quote or "").strip()
-    if not text:
-        raise DutyError("留言不能为空")
-    if from_topic == to_topic:
-        raise DutyError("不能给自己留言")
+    if not text: raise DutyError("留言不能为空")
+    if from_topic == to_topic: raise DutyError("不能给自己留言")
+    if to_topic == BUS_TOPIC_ID and from_topic != BUS_TOPIC_ID and _POLITE_ACK_RE.match(text) and not _BUS_ASK_ACT_RE.search(text):
+        raise DutyError("纯知会确认无需回传 tell 给总线，请直接推进并在回执 summary 中说明")
     ok = is_target or (lambda tid: store.get_topic(tid) is not None)
     for tid, who in ((from_topic, "--topic"), (to_topic, "--to")):
         if not ok(tid):
@@ -402,14 +386,12 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
     label = ""
     if quote:
         label = verify_quote(quote) if verify_quote is not None else ""
-        if label is True:
-            label = QUOTE_LABEL
+        if label is True: label = QUOTE_LABEL
         if not label:
             raise DutyError("--quote 核对没通过：这句话在总线里和主人的飞书回复里都找不到原文，请原样引用")
     now = datetime.now().astimezone()
     if (until := paused_until(store, from_topic, to_topic)) is not None:
-        raise DutyError(f"{from_topic} 和 {to_topic} 之间的留言已暂停到 {until.strftime('%H:%M')}"
-                        "（互发太频繁）；有急事找总线或主人")
+        raise DutyError(f"{from_topic} 和 {to_topic} 之间的留言已暂停到 {until.strftime('%H:%M')}（互发太频繁）；有急事找总线或主人")
     since = (now - timedelta(minutes=dc.mail_window_minutes)).isoformat(timespec="seconds")
     n = store.mails_between(from_topic, to_topic, since)
     if n >= dc.mail_pair_limit:
@@ -430,11 +412,20 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
                                                         from_title=_title(store, from_topic),
                                                         topic_id=to_topic, key=key)):
         lines.append(why)
-    lines.append(with_cli(f"回它：`sheepdog tell --topic {to_topic} --to {from_topic} \"...\""
-                          + (f" --key {shlex.quote(key)}" if key else "") + "`", cfg.cli_command))
+    reply_hint = with_cli(f"回它：`sheepdog tell --topic {to_topic} --to {from_topic} \"...\""
+                          + (f" --key {shlex.quote(key)}" if key else "") + "`", cfg.cli_command)
+    if from_topic == BUS_TOPIC_ID:
+        reply_hint += "（仅需对方执行动作或回答问题时再回；纯收到/知会勿回 tell）"
+    lines.append(reply_hint)
     mid = store.add_system_message(to_topic, MAIL_REASON, "\n".join(lines), [f"mail:{mail_id}"])
     store.set_mail_message(mail_id, mid)
+    if state_dir := (getattr(getattr(cfg, "paths", None), "state_dir", None) or getattr(cfg, "state_dir", None)):
+        try: (state_dir / ".wakeup").write_text(now_iso(), encoding="utf-8")
+        except OSError: pass
     return mail_id
+
+
+send_duty_mail = send_mail
 
 
 def _tid(x: str) -> str:
@@ -790,8 +781,7 @@ def digest_lines(cards: list[dict], max_lines: int) -> list[str]:
         counts: dict[str, int] = {}
         for d in gone:
             counts[d["run_state"]] = counts.get(d["run_state"], 0) + 1
-        what = "、".join(f"{RUN_LABEL.get(s, '还没算')} {counts[s]}"
-                        for s in sorted(counts, key=lambda s: order.get(s, len(order))))
+        what = "、".join(f"{RUN_LABEL.get(s, '还没算')} {counts[s]}" for s in sorted(counts, key=lambda s: order.get(s, len(order))))
         lines.append(f"- …另有 {len(gone)} 个会话没列出（{what}），`sheepdog board` 看全部")
     return lines
 
@@ -800,19 +790,14 @@ def live_topics(store: Store) -> list:
     """在岗表列哪些会话：总线，加上名册 managed、总线新开的（没收掉的）。"""
     from .engine import BUS_TOPIC_ID, MANAGED_KINDS  # 避免循环引用
     bus = store.get_topic(BUS_TOPIC_ID)
-    rest = sorted((t for t in store.list_topics() if t["kind"] in MANAGED_KINDS and t["state"] != "closed"),
-                  key=lambda t: t["topic_id"])
+    rest = sorted((t for t in store.list_topics() if t["kind"] in MANAGED_KINDS and t["state"] != "closed"), key=lambda t: t["topic_id"])
     return ([bus] if bus is not None else []) + rest
 
 
 def board_cards(store: Store, cfg, topic: str = "", exclude: Iterable[str] = (), history: bool = False) -> list[dict]:
     """sheepdog board 和总线摘要用的卡片。topic 给了就只看它（不在投递的会话也能看）。"""
     now = datetime.now().astimezone()
-    if topic:
-        t = store.get_topic(_tid(topic))
-        topics = [t] if t is not None else []
-    else:
-        topics = live_topics(store)
+    topics = ([t] if (t := store.get_topic(_tid(topic))) is not None else []) if topic else live_topics(store)
     out = []
     lamb_timeout = getattr(getattr(cfg, "lamb", None), "timeout_minutes", 20)
     for t in topics:

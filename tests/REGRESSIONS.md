@@ -376,3 +376,11 @@
 | 7.86 | `guard._extract_subagent_invocations` 未从 `Prompt="[lamb:lamb_xxx]"` 提取 `lamb_id` 导致 `_handle_lamb_line` 在 `Role` 与中文 `task_title` 不一致时未复用 `lamb prepare` 预建羔羊而派生第二只克隆羊，或母羊提交非 `waiting` 终态回执时未自动收口名下 `running` 的 `subagent` 羔羊（REG-051） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_051_subagent_lamb_id_extraction_reuses_prepared_lamb_and_auto_closes_on_receipt` |
 | 7.86 | 动态会话通过 `close_session` 或终态回执进入 `topics.state == "closed"` 后，`duty_cards.run_state` 仍残留 `"working"` / `queued > 0` 或活跃跟踪项未收口（REG-052） | `test_bus_quote_wakeup_lamb_and_closed_786.TestBusQuoteWakeupLambAndClosed786.test_reg_052_closed_topic_resets_duty_card_working_and_tracked_items` |
 
+## 7.87 总线禁锁群话题与专席夺回、纯知会 tell 防乒乓与拍板总台超长截断、Antigravity 空壳重建继承（REG-053 ~ REG-055）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.87 | `tp_bus` 只是分拣台却被写进 `group_threads` 永久霸占群话题归属，或业务专席通过 `forward` / `reply` 接手后未从 `tp_bus` 夺回 `group_threads` 归属（REG-053） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_053_bus_never_locks_group_threads_and_specialist_claims_thread` |
+| 7.87 | 业务专席向 `tp_bus` 回传纯礼貌确认 `tell`（如「收到，已知悉」）引发留言乒乓、`send_mail` 落库后未触碰 `state_dir/.wakeup`、`sd_card_cb_*` 虚拟卡片回调消息误调飞书 `add_reaction` 报错，或超长 `---more---` 拍板卡同步到全局聚合台时超出 28KB 导致 `hub_message_id` 为空（REG-054） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_054_polite_mail_to_bus_blocked_wakeup_touched_and_virtual_msg_skips_reaction` |
+| 7.87 | 已投递过的 Antigravity 专席容器因宿主重启/GC 丢失 `transcript.jsonl` 变为空壳后，投递前与 2 分钟 `_check_receipt` 未自动新建容器继承记忆并重投当前批次（单批次最多换壳 1 次），或 `sync_roster` 把 `roster.toml` 里的死壳 `conversation_id` 刷回覆盖新容器（REG-055） | `test_thread_claim_mail_hub_and_container_rebuild_787.TestThreadClaimMailHubAndContainerRebuild787.test_reg_055_recycled_antigravity_container_auto_rebuilds_and_redelivers_once` |
+

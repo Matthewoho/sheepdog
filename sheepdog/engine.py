@@ -1237,13 +1237,21 @@ class Collector:
         log.info("话题 %s：mget %d 条候选，%s", thread_id, len(cands), f"开头那条是 {found}" if found else "没对上")
         return (self.store.get_message(found), "mget") if found else (None, "")
 
-    def _group_thread_owner(self, m: Message, thread_id: str, exclude: str) -> dict | None:
-        """群话题归谁（7.45 第二节）：1 名册显式绑定 (chat_id, thread_id) → 2 已记下的话题归属 → 3 自动（开头那条送到过 /
-        转交给 / 是谁代发的）。2、3 过期（话题最近一次活动超过 group_owner_hours）不算；认出来的记进 group_threads。"""
+    def _group_thread_owner(self, m: Message, thread_id: str = "", exclude: str = "") -> dict | None:
+        """群话题归谁（7.45 / 7.87 REG-053）：1 名册绑定 → 2 专席已记归属/专席代发 → 3 开头那条或话题内业务专席（tp_bus 仅内存兜底不锁表）。"""
+        thread_id = thread_id or m.thread_id
+        if not thread_id:
+            return None
         if self.roster is not None and (hit := self.roster.thread_owner(m.chat_id, thread_id)) is not None:
             return {"topic": hit[0].topic_id, "source": "roster", "thread": thread_id, "root": "", "summary": ""}
         rec = self.store.group_thread(thread_id)
         last = max(rec["last_activity_at"] if rec is not None else "", self.store.thread_last_activity(thread_id, exclude))
+        for ref in (m.reply_to, m.root_id):
+            if ref and (so := self._sent_owner(ref)) is not None and so[0] != BUS_TOPIC_ID and not self._expired(max(last, so[1]), m):
+                if rec is None or rec["topic_id"] != so[0]:
+                    r_mid = m.root_id or ref
+                    self.store.add_group_thread(thread_id, m.chat_id, so[0], "sent", r_mid, so[2], max(last, so[1]) or m.create_time or now_iso())
+                    return {"topic": so[0], "source": "sent", "thread": thread_id, "root": r_mid, "summary": so[2]}
         if rec is not None:
             if self._expired(last, m):
                 log.info("话题 %s 最近活动 %s，超过 %g 小时，不再自动归属", thread_id, last, self.cfg.threads.group_owner_hours)
@@ -1264,6 +1272,18 @@ class Collector:
             log.info("话题 %s 最近活动 %s，超过 %g 小时，不再自动归属", thread_id, last, self.cfg.threads.group_owner_hours)
             return None
         owner = self._message_owner(root)
+        if owner is None or owner[0] == BUS_TOPIC_ID:
+            for r in self.store.thread_messages_in_ledger(thread_id, root["message_id"]):
+                if (mo := self._message_owner(r)) is not None and mo[0] != BUS_TOPIC_ID:
+                    owner = mo; break
+                if (so := self._sent_owner(r["message_id"])) is not None and so[0] != BUS_TOPIC_ID:
+                    owner = (so[0], "sent"); break
+            if owner is None or owner[0] == BUS_TOPIC_ID:
+                s_row = self.store.conn.execute(
+                    "SELECT topic_id FROM sends WHERE target_message_id=? AND topic_id != ? ORDER BY rowid DESC LIMIT 1",
+                    (root["message_id"], BUS_TOPIC_ID)).fetchone()
+                if s_row is not None and self._live_topic(s_row["topic_id"]):
+                    owner = (s_row["topic_id"], "sent")
         if owner is None:
             return None
         summary = duty.short(first_line(root["content"] or ""), 60)   # first_line 先把卡片还原（7.48）
@@ -1271,6 +1291,8 @@ class Collector:
                                     last or m.create_time or now_iso())
         log.info("话题 %s 归 %s（%s，开头那条 %s 靠 %s 找到）", thread_id, owner[0], owner[1], root["message_id"], how)
         return {"topic": owner[0], "source": owner[1], "thread": thread_id, "root": root["message_id"], "summary": summary}
+
+    _thread_owner = _group_thread_owner
 
     def _quote_owner(self, m: Message, exclude: str) -> dict | None:
         """引用归属：被引用的那条在某个话题里 → 那个话题的归属；否则它送到过 / 转交给 / 是谁代发的 → 那个会话。"""
@@ -1546,8 +1568,8 @@ class Collector:
         if ok:
             self.store.add_bot_outbox(m.message_id, topic, bool(question), text, m.create_time or now_iso())
         if question and ok:
-            self.store.add_escalation(m.message_id, topic, m.chat_id, text, m.create_time or now_iso())
-            log.info("登记「需要你定」%s -> %s", m.message_id, topic)
+            if self.store.add_escalation(m.message_id, topic, m.chat_id, text, m.create_time or now_iso()):
+                log.info("登记「需要你定」%s -> %s", m.message_id, topic)
             try:
                 from . import pending as pend
                 pend.ensure_sources(self.cfg, self.store, self.store.get_escalation(m.message_id))
@@ -2417,6 +2439,9 @@ class Dispatcher:
     def sink(self) -> Sink:
         return self.sinks[ANTIGRAVITY]
 
+    def _sink(self, host: str = ANTIGRAVITY) -> Sink | None:
+        return self.sinks.get(host)
+
     # ---------- 宿主（7.18） ----------
     @staticmethod
     def topic_host(t) -> str:
@@ -2527,7 +2552,10 @@ class Dispatcher:
                 report["created"].append(s.topic_id)
             chat_ids = [c.chat_id for c in s.chats]
             keep = [a for a in json.loads(t["anchors_json"] or "[]") if not a.startswith("oc_") and a not in chat_ids]
-            cid = (t["conversation_id"] if t["spawned_at"] else None) if s.to_spawn else (s.conversation_id or None)
+            keep_spawned = bool(t["spawned_at"] and t["conversation_id"]) and (
+                s.to_spawn or (s.host == ANTIGRAVITY and bool(s.conversation_id) and not transcript_path(s.conversation_id).is_file())
+            )
+            cid = t["conversation_id"] if keep_spawned else (None if s.to_spawn else (s.conversation_id or None))
             fields = {
                 "title": s.display_title, "kind": s.kind, "duty": s.duty, "conversation_id": cid,
                 "anchors_json": json.dumps(chat_ids + sorted(set(keep)), ensure_ascii=False),
@@ -2656,6 +2684,11 @@ class Dispatcher:
                 and sent is not None and now - sent >= timedelta(minutes=vmins)
                 and not self._batch_in_record(t, batch)
                 and not self._record_active_since(t, sent)):
+            if self._is_zombie_antigravity(t, from_uncertain=True) and (
+                new_t := self._rebuild_recycled_container(t, "uncertain_container_recycled", requeue_batch=batch)
+            ) is not None:
+                self._dispatch_topic(new_t, self.store.pending_for_topic(t["topic_id"]))
+                return
             self.store.set_dispatch_state(batch, "uncertain", error="agentapi 返回成功，但会话记录里找不到这个批次")
             self.store.mark_batch_state(batch, "uncertain")
             self.store.update_topic(t["topic_id"], state=sm.ACTIVE, pending_batch_id=None)
@@ -3224,6 +3257,54 @@ class Dispatcher:
             out = "\n".join([*out.splitlines(), *[f"  - {s}" for s in snap]][:10])
         return out
 
+    def _is_zombie_antigravity(self, t, from_uncertain: bool = False) -> bool:
+        if (self.cfg.session.verify_transcript_minutes <= 0 or self.topic_host(t) != ANTIGRAVITY
+                or t["kind"] not in MANAGED_KINDS or not (cid := (t["conversation_id"] or ""))
+                or transcript_path(cid).is_file()):
+            return False
+        if from_uncertain:
+            return True
+        if not t["dispatched_at"]:
+            return False
+        cur = self.store.get_cursor(t["topic_id"], DUTY)
+        return (conversation_dir(cid).is_dir() or (cur is not None and (cur["byte_offset"] or 0) > 0)
+                or getattr(self._sink(ANTIGRAVITY), "name", "") == "agentapi")
+
+    def _rebuild_recycled_container(self, t, why: str, requeue_batch: str = ""):
+        if requeue_batch and self.store.get_meta(f"respawned_batch:{requeue_batch}"):
+            return None
+        s = self._rules_session(t) or RosterSession(
+            key=t["topic_id"].removeprefix("tp_"), mode=MANAGED, title=t["title"] or t["topic_id"],
+            duty=t["duty"] or "", chats=[], host=ANTIGRAVITY)
+        full_title = f"{self.cfg.session.title_prefix} {s.display_title}".strip()
+        w = self.cfg.watch
+        boot = adopted_bootstrap(self.playbook, s, full_title, "", w.remind_minutes, w.expire_minutes)
+        mem = [x for x in (f"- 历史职责：{t['duty']}" if t["duty"] else "",
+                           f"- 上次进度摘要：{t['summary']}" if t["summary"] else "",
+                           f"- 历史锚点：{t['anchors_json']}" if t["anchors_json"] and t["anchors_json"] != "[]" else "") if x]
+        if mem:
+            boot += "\n\n## 容器换壳恢复上下文\n" + "\n".join(mem)
+        try:
+            new_cid = self._new_conversation(ANTIGRAVITY, t["topic_id"], full_title, boot, t["model"] or "", t["effort"] or "")
+        except Exception as e:
+            log.warning("topic %s 自动换壳新建会话失败: %s", t["topic_id"], e)
+            return None
+        if requeue_batch:
+            self.store.set_meta(f"respawned_batch:{requeue_batch}", new_cid)
+            self.store.set_dispatch_state(requeue_batch, "redelivered", error=why)
+            if (d := self.store.get_dispatch(requeue_batch)) is not None and (mids := json.loads(d["message_ids"] or "[]")):
+                self.store.requeue_messages(mids)
+            with self.store.tx() as c:
+                c.execute("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=?", (requeue_batch,))
+        ts, old_cid = now_iso(), t["conversation_id"]
+        self.store.update_topic(t["topic_id"], conversation_id=new_cid, spawned_at=ts, onboarded_at=ts,
+                                dispatched_at=None, pending_batch_id=None, state=sm.ACTIVE, retries=0,
+                                rules_hash=self.rules_hash(t), compacted_at=None)
+        if (card := self.store.get_card(t["topic_id"])) is not None and card["run_state"] in duty.STUCK:
+            self.store.upsert_card(t["topic_id"], run_state=duty.IDLE, detail="", no_record=0, stuck_since=None, idle_since=ts)
+        log.info("topic %s 僵尸容器 %s 已自动换壳 -> %s (%s)", t["topic_id"], old_cid, new_cid, why)
+        return self.store.get_topic(t["topic_id"])
+
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
@@ -3231,6 +3312,8 @@ class Dispatcher:
                 return self._dispatch_priority(t, urgent, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
+        if self._is_zombie_antigravity(t):
+            t = self._rebuild_recycled_container(t, "pre_dispatch_container_recycled") or t
         adopted = t["kind"] in MANAGED_KINDS
         if adopted and not t["conversation_id"] and "#" not in t["topic_id"]:
             log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
@@ -3247,27 +3330,21 @@ class Dispatcher:
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))
             res["queued"] = why
             return res
-        busy = self._busy(t) if t["conversation_id"] else ""
-        if busy:
+        if busy := (self._busy(t) if t["conversation_id"] else ""):
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], busy, len(rows))
             res["queued"] = busy
             return res
         roster_update, batch_id = "", ""
         try:
             if adopted and not t["conversation_id"] and "#" in t["topic_id"]:
-                s_mem = self.roster.by_topic(t["topic_id"])
-                if s_mem is None:
+                if (s_mem := self.roster.by_topic(t["topic_id"])) is None:
                     log.info("topic %s 等待 sheepdog spawn 新建会话，%d 条信号排队中", t["topic_id"], len(rows))
                     res["waiting_spawn"] = True
                     return res
-                w = self.cfg.watch
-                title = f"{self.cfg.session.title_prefix} {s_mem.display_title}".strip()
+                w, title = self.cfg.watch, f"{self.cfg.session.title_prefix} {s_mem.display_title}".strip()
                 boot = adopted_bootstrap(self.playbook, s_mem, title, "", w.remind_minutes, w.expire_minutes)
-                cid = self._new_conversation(self.topic_host(t), t["topic_id"], title, boot,
-                                             t["model"] or "", t["effort"] or "")
-                ts = now_iso()
-                self.store.update_topic(t["topic_id"], conversation_id=cid, spawned_at=ts, onboarded_at=ts,
-                                        rules_hash=self.rules_hash(t), compacted_at=None)
+                cid, ts = self._new_conversation(self.topic_host(t), t["topic_id"], title, boot, t["model"] or "", t["effort"] or ""), now_iso()
+                self.store.update_topic(t["topic_id"], conversation_id=cid, spawned_at=ts, onboarded_at=ts, rules_hash=self.rules_hash(t), compacted_at=None)
                 t = self.store.get_topic(t["topic_id"])
             if t["kind"] == ADOPTED and not t["onboarded_at"]:
                 res.update(onboarding=self.send_onboarding(t), state=sm.RUNNING)
@@ -3276,31 +3353,23 @@ class Dispatcher:
             if not adopted:
                 t = self._ensure_bus_conversation(t)
                 if self.store.get_meta("roster_notify_bus") == "1":
-                    roster_update = roster_table(self.roster, open_dynamic_topics(self.store),
-                                                 closed_dynamic_topics(self.store, self.roster))
+                    roster_update = roster_table(self.roster, open_dynamic_topics(self.store), closed_dynamic_topics(self.store, self.roster))
             batch_id = self._new_batch_id("b", t["topic_id"])
-            signals = [r for r in rows if not _is_pure_owner_context(r)]
-            context = [r for r in rows if _is_pure_owner_context(r)]
-            waiting = t["summary"] if t["state"] == sm.WAITING_HUMAN else ""
-            inbox = [] if adopted else self.store.inbox_summary(self.cfg.self_open_id)
+            signals, context = [r for r in rows if not _is_pure_owner_context(r)], [r for r in rows if _is_pure_owner_context(r)]
+            waiting, inbox = (t["summary"] if t["state"] == sm.WAITING_HUMAN else ""), ([] if adopted else self.store.inbox_summary(self.cfg.self_open_id))
             new_hash = self.rules_hash(t)
             rules_update = self.standing_rules(t) if new_hash and new_hash != t["rules_hash"] else ""
-            quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"]))
-                      for r in rows if "reply_to" in r.keys() and r["reply_to"]}
+            quotes = {r["message_id"]: quote_line(self.store.get_message(r["reply_to"])) for r in rows if "reply_to" in r.keys() and r["reply_to"]}
             notes = self._collision_notes(t, rows)
             for mid in self.store.seen_before_send_ids(t["topic_id"], [r["message_id"] for r in rows]):
                 notes.setdefault(mid, []).append(SEEN_BEFORE_SEND_NOTE)
             digest, digest_fp = self._duty_digest(t) if t["topic_id"] == BUS_TOPIC_ID else ("", "")
-            images = self._images(rows)
-            peer_status = self._group_peer_status(t)
-            prompt = batch_prompt(self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t),
-                                  waiting, roster_update=roster_update,
-                                  security=self.security, rules_update=rules_update, context_only=not signals,
-                                  quotes=quotes, max_lines=self.cfg.session.max_message_lines,
-                                  cli_host=self.topic_host(t) != ANTIGRAVITY,
-                                  rules_note=self._compaction_note(t) if rules_update else "",
-                                  reminder=self.reminder(t), notes=notes, digest=digest, images=images,
-                                  vips=self._vips(), peer_status=peer_status)
+            prompt = batch_prompt(
+                self.playbook, t["topic_id"], batch_id, rows, inbox, self._session_title(t), waiting, roster_update=roster_update,
+                security=self.security, rules_update=rules_update, context_only=not signals, quotes=quotes,
+                max_lines=self.cfg.session.max_message_lines, cli_host=self.topic_host(t) != ANTIGRAVITY,
+                rules_note=self._compaction_note(t) if rules_update else "", reminder=self.reminder(t), notes=notes,
+                digest=digest, images=self._images(rows), vips=self._vips(), peer_status=self._group_peer_status(t))
             self.store.record_dispatch(batch_id, t["topic_id"], [r["message_id"] for r in rows], state="sending")
             self._send(t, prompt, batch_id)
         except SinkError as e:
@@ -3308,21 +3377,16 @@ class Dispatcher:
                 return res
             if batch_id and self.store.get_dispatch(batch_id) is not None:
                 self.store.set_dispatch_state(batch_id, "failed", str(e))
-            self._fail(t, None, str(e), ATTN_SEND_FAILED)
-            self._send_failed(t, str(e))
+            self._fail(t, None, str(e), ATTN_SEND_FAILED); self._send_failed(t, str(e))
             res["error"] = str(e)
             return res
-
         self.store.set_dispatch_state(batch_id, "sent")
-        self._send_ok(t, len([r for r in rows if not _is_pure_owner_context(r)]))
-        if roster_update:
-            self.store.set_meta("roster_notify_bus", "0")
-        if digest_fp:
-            self.store.set_meta(DIGEST_META, digest_fp)
+        self._send_ok(t, len(signals))
+        if roster_update: self.store.set_meta("roster_notify_bus", "0")
+        if digest_fp: self.store.set_meta(DIGEST_META, digest_fp)
         if rules_update:
             self.store.update_topic(t["topic_id"], rules_hash=new_hash, compacted_at=None)
-            log.info("topic %s: 规则已更新，随批次 %s 送达%s", t["topic_id"], batch_id,
-                     "（压缩后重推）" if t["compacted_at"] else "")
+            log.info("topic %s: 规则已更新，随批次 %s 送达%s", t["topic_id"], batch_id, "（压缩后重推）" if t["compacted_at"] else "")
         res.update(self._complete_delivery(t, batch_id, signals, context))
         return res
 
@@ -4252,23 +4316,18 @@ class Dispatcher:
             existing_by_cid = self.store.find_lamb_by_cid(cid)
             if existing_by_cid is not None:
                 if existing_by_cid["parent_topic_id"] == tid:
-                    dup_empty = next((
-                        lb for lb in self.store.get_active_lambs(tid)
-                        if lb["lamb_id"] != existing_by_cid["lamb_id"]
-                        and lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
-                    ), None)
+                    dup_empty = next((lb for lb in self.store.get_active_lambs(tid)
+                                      if lb["lamb_id"] != existing_by_cid["lamb_id"]
+                                      and lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None)
                     if dup_empty is not None:
                         merged_title = existing_by_cid["task_title"]
                         if (not merged_title or merged_title in ("subagent", existing_by_cid["lamb_id"])) and dup_empty["task_title"]:
                             merged_title = dup_empty["task_title"]
                         self.store.update_lamb(existing_by_cid["lamb_id"], task_title=merged_title)
-                        with self.store.tx() as c:
-                            c.execute("DELETE FROM lambs WHERE lamb_id=?", (dup_empty["lamb_id"],))
+                        with self.store.tx() as c: c.execute("DELETE FROM lambs WHERE lamb_id=?", (dup_empty["lamb_id"],))
                 continue
-            matched = next((
-                lb for lb in self.store.get_active_lambs(tid)
-                if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
-            ), None)
+            matched = next((lb for lb in self.store.get_active_lambs(tid)
+                            if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None)
             ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
             if matched is not None:
                 self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
@@ -4276,8 +4335,7 @@ class Dispatcher:
             else:
                 lid = f"lamb_{hashlib.sha1(f'{tid}:{off}:{cid}'.encode('utf-8')).hexdigest()[:8]}"
                 if self.store.get_lamb(lid) is None:
-                    self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent", conversation_id=cid,
-                                           state="running", started_at=ts, last_act_at=ts)
+                    self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent", conversation_id=cid, state="running", started_at=ts, last_act_at=ts)
                     discovered.append(lid)
                     log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
 
@@ -4288,61 +4346,43 @@ class Dispatcher:
                 continue
             active = [lb for lb in self.store.get_active_lambs(tid) if lb["lamb_id"] not in new_lids_in_line]
             raw_id = (inv.lamb_id or "").strip()
-            matched = next((lb for lb in active if raw_id and lb["lamb_id"] == raw_id), None) or next((
-                lb for lb in active if lb["task_title"] == inv.task_title
-                and (not (lb["conversation_id"] or "").strip() or lb["conversation_id"] == inv.conversation_id)
-            ), None) or next((
-                lb for lb in active if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()
-            ), None)
+            matched = (next((lb for lb in active if raw_id and lb["lamb_id"] == raw_id), None)
+                       or next((lb for lb in active if lb["task_title"] == inv.task_title and (not (lb["conversation_id"] or "").strip() or lb["conversation_id"] == inv.conversation_id)), None)
+                       or next((lb for lb in active if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None))
             if matched is not None:
                 new_lids_in_line.add(matched["lamb_id"])
                 if inv.conversation_id and not matched["conversation_id"]:
                     self.store.update_lamb(matched["lamb_id"], conversation_id=inv.conversation_id, last_act_at=inv.at or now_iso())
                 continue
-            if raw_id.startswith("lamb_") and self.store.get_lamb(raw_id) is None:
-                lid = raw_id
-            else:
-                digest = hashlib.sha1(f"{tid}:{off}:{inv.step}:{inv.task_title}:{inv.conversation_id}".encode("utf-8")).hexdigest()[:8]
-                lid = f"lamb_{digest}"
+            lid = raw_id if (raw_id.startswith("lamb_") and self.store.get_lamb(raw_id) is None) else f"lamb_{hashlib.sha1(f'{tid}:{off}:{inv.step}:{inv.task_title}:{inv.conversation_id}'.encode('utf-8')).hexdigest()[:8]}"
             if self.store.get_lamb(lid) is not None:
                 continue
             ts = inv.at or now_iso()
-            self.store.create_lamb(lid, tid, kind="subagent", task_title=inv.task_title or "subagent",
-                                   conversation_id=inv.conversation_id or None, state="running", started_at=ts, last_act_at=ts)
-            new_lids_in_line.add(lid)
-            discovered.append(lid)
+            self.store.create_lamb(lid, tid, kind="subagent", task_title=inv.task_title or "subagent", conversation_id=inv.conversation_id or None, state="running", started_at=ts, last_act_at=ts)
+            new_lids_in_line.add(lid); discovered.append(lid)
             log.info("topic %s: 从 transcript 自动发现 invoke_subagent -> %s (%s)", tid, lid, inv.task_title)
         self._bind_subagent_cids(tid, host, off, d, discovered)
         if host == ANTIGRAVITY and d.get("type") == "GENERIC":
             err_low = f"{d.get('content') or ''}\n{d.get('error') or ''}".lower()
-            if (str(d.get("status") or "").upper() == "ERROR"
-                    or "denied by pre-tool hook" in err_low
-                    or "encountered error in step execution" in err_low):
+            if str(d.get("status") or "").upper() == "ERROR" or "denied by pre-tool hook" in err_low or "encountered error in step execution" in err_low:
                 for lb in self.store.get_active_lambs(tid):
                     if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip():
-                        complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错",
-                                      state="failed", report_msg_id="subagent_spawn_error")
+                        complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错", state="failed", report_msg_id="subagent_spawn_error")
         for ret in subagent_returns_in(host, d):
-            cands = [lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id] or [
-                lb for lb in self.store.list_lambs(tid, include_finished=True)
-                if lb["state"] == "timeout" and (lb["conversation_id"] or "").strip() == ret.conversation_id
-            ]
+            cands = ([lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id]
+                     or [lb for lb in self.store.list_lambs(tid, include_finished=True) if lb["state"] == "timeout" and (lb["conversation_id"] or "").strip() == ret.conversation_id])
             for matched in cands:
                 lid = matched["lamb_id"]
-                summary = ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成"
-                complete_lamb(self.store, lid, summary=summary, state="done", report_msg_id="native_system_message")
+                complete_lamb(self.store, lid, summary=ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成", state="done", report_msg_id="native_system_message")
                 log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
         kill_all, killed_cids = subagent_kills_in(host, d)
         if kill_all or killed_cids:
             killed_set = set(killed_cids)
             for lb in self.store.get_active_lambs(tid):
-                if lb["kind"] not in ("subagent", "native_subagent"):
-                    continue
+                if lb["kind"] not in ("subagent", "native_subagent"): continue
                 cid = (lb["conversation_id"] or "").strip()
-                if (kill_all and lb["lamb_id"] in new_lids_in_line and cid not in killed_set) or (not kill_all and cid not in killed_set):
-                    continue
-                complete_lamb(self.store, lb["lamb_id"], summary=lb["result_summary"] or "已由母羊销毁",
-                              state="done", report_msg_id=lb["report_msg_id"] or "killed_by_parent")
+                if (kill_all and lb["lamb_id"] in new_lids_in_line and cid not in killed_set) or (not kill_all and cid not in killed_set): continue
+                complete_lamb(self.store, lb["lamb_id"], summary=lb["result_summary"] or "已由母羊销毁", state="done", report_msg_id=lb["report_msg_id"] or "killed_by_parent")
                 log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lb["lamb_id"], cid)
 
     def _scan_lambs(self) -> list[str]:
@@ -5737,20 +5777,17 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     if "#" not in topic_id and not (answers or "").strip():
         first_row = next(iter(rows.values()), None)
         topic_id = route_within_group(
-            store, roster, topic_id,
-            chat_id=(first_row["chat_id"] or "") if first_row is not None else "",
+            store, roster, topic_id, chat_id=(first_row["chat_id"] or "") if first_row is not None else "",
             root_id=(first_row["root_id"] or "") if first_row is not None and "root_id" in first_row.keys() else "",
             reply_to_msg_id=(first_row["reply_to"] or "") if first_row is not None and "reply_to" in first_row.keys() else "",
             thread_id=(first_row["thread_id"] or "") if first_row is not None and "thread_id" in first_row.keys() else "",
-            sender_id=(first_row["sender_id"] or "") if first_row is not None else "",
-        )
+            sender_id=(first_row["sender_id"] or "") if first_row is not None else "")
     skipped = []
     for i in list(rows):
         if (got := delivered_to(store, rows[i])) is not None and got[0] == topic_id:
             if rows[i]["dispatch_state"] == "delivered" and _batch_unverified_in_transcript(store, topic_id, got[1]):
                 continue
-            skipped.append((i, got[1], got[2]))
-            del rows[i]
+            skipped.append((i, got[1], got[2])); del rows[i]
     target_q = None
     answers = (answers or "").strip()
     if answers:
@@ -5769,18 +5806,14 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         raise ValueError(QUOTE_NOT_FOUND)
     src_batches: set[tuple[str, str]] = set()
     for i, row in rows.items():
-        src = row["topic_id"] or BUS_TOPIC_ID
-        old_bid = row["batch_id"] or ""
-        if old_bid:
-            src_batches.add((src, old_bid))
+        src, old_bid = row["topic_id"] or BUS_TOPIC_ID, row["batch_id"] or ""
+        if old_bid: src_batches.add((src, old_bid))
         tags = [x for x in json.loads(row["tags_json"] or "[]") if not x.startswith(("owner:", "forwarded_from:"))]
         tags += [f"owner:{topic_id.removeprefix('tp_')}", f"forwarded_from:{src}"]
-        if i in held and SECURITY_RELEASE_TAG not in tags:
-            tags.append(SECURITY_RELEASE_TAG)
+        if i in held and SECURITY_RELEASE_TAG not in tags: tags.append(SECURITY_RELEASE_TAG)
         if self_open_id and row["sender_id"] == self_open_id and OWNER_INSTRUCTION not in tags and OWNER_VERIFIED_TAG not in tags:
             tags.append(OWNER_VERIFIED_TAG)  # 主人本人的消息（7.8）：带已核对标注；群里 @ 机器人的指令仍只标 🗣；只认 --answers（7.53）
-        if target_q is not None and (esc_tag := f"{ESCALATION_TAG_PREFIX}{answers}") not in tags:
-            tags.append(esc_tag)
+        if target_q is not None and (esc_tag := f"{ESCALATION_TAG_PREFIX}{answers}") not in tags: tags.append(esc_tag)
         if target_q is not None and self_open_id and row["sender_id"] == self_open_id and store.item_by_root(i) is None:
             store.set_note(i, escalation_note(target_q))   # 7.51：话题群事项的开头那条保留话题群的说明
         store.forward_message(i, topic_id, tags)
@@ -5790,58 +5823,40 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     for src_tid, old_bid in src_batches:
         src_t = store.get_topic(src_tid)
         if src_t is not None and src_t["pending_batch_id"] == old_bid:
-            rem = store.conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE topic_id=? AND batch_id=? AND dispatch_state IN ('delivered','sending')",
-                (src_tid, old_bid),
-            ).fetchone()[0]
+            rem = store.conn.execute("SELECT COUNT(*) FROM messages WHERE topic_id=? AND batch_id=? AND dispatch_state IN ('delivered','sending')", (src_tid, old_bid)).fetchone()[0]
             if rem == 0:
-                new_st = sm.ACTIVE if src_t["state"] == sm.RUNNING else src_t["state"]
-                store.update_topic(src_tid, state=new_st, pending_batch_id=None)
+                store.update_topic(src_tid, state=sm.ACTIVE if src_t["state"] == sm.RUNNING else src_t["state"], pending_batch_id=None)
                 store.set_meta(duty_reset_key(src_tid), now_iso())
-                old_d = store.get_dispatch(old_bid)
-                if old_d is not None and old_d["state"] == "sent":
-                    if src_tid == topic_id:
-                        store.set_dispatch_state(old_bid, "redelivered", error="forward redeliver")
-                    else:
-                        store.set_dispatch_state(old_bid, "acked", error=f"forwarded:{topic_id}")
+                if (old_d := store.get_dispatch(old_bid)) is not None and old_d["state"] == "sent":
+                    store.set_dispatch_state(old_bid, "redelivered" if src_tid == topic_id else "acked", error="forward redeliver" if src_tid == topic_id else f"forwarded:{topic_id}")
     pats = key_patterns if key_patterns is not None else DutyConfig().patterns
     by_src: dict[str, list] = {}
-    for i, row in rows.items():
-        by_src.setdefault(row["topic_id"] or BUS_TOPIC_ID, []).append(row)
+    for i, row in rows.items(): by_src.setdefault(row["topic_id"] or BUS_TOPIC_ID, []).append(row)
     for src, rs in by_src.items():
         if src != topic_id:
-            try:
-                duty.forward_work(store, src, topic_id, rs, pats)
-            except Exception as e:  # 在岗表出错不挡转交
-                log.warning("转交记进羊群看板出错: %s", e)
+            try: duty.forward_work(store, src, topic_id, rs, pats)
+            except Exception as e: log.warning("转交记进羊群看板出错: %s", e)  # 在岗表出错不挡转交
     try:  # 7.51：转交的是话题群里某件事项的消息：负责会话跟着改、编号带过去、话题里说一句「已交给 …」。出错不挡转交
         from . import topicgroup as tg
         tg.on_forward(store, topic_id, list(rows.values()), cli)
-    except Exception as e:
-        log.warning("转交记进话题群事项出错: %s", e)
-    done = [i for i, _, _ in skipped]
-    ids = [i for i in ids if i in rows]
+    except Exception as e: log.warning("转交记进话题群事项出错: %s", e)
+    done, ids = [i for i, _, _ in skipped], [i for i in ids if i in rows]
     if target_q is not None:
         # 7.53：总线写明了这是在回答哪一条：关那一条（答复记成转交的第一条消息；只带 --quote / --note 时记 forward）
-        by = next((i for i in [*ids, *done] if self_open_id and (store.get_message(i) or {"sender_id": ""})["sender_id"]
-                   == self_open_id), (ids or done or ["forward"])[0])
+        by = next((i for i in [*ids, *done] if self_open_id and (store.get_message(i) or {"sender_id": ""})["sender_id"] == self_open_id), (ids or done or ["forward"])[0])
         store.answer_escalation(answers, by)
         log.info("转交时写明回答提问 %s（%s），已关", answers, topic_id)
     if quote or note:
-        extra = f"（随附转交的消息：{', '.join(ids)}）" if ids else ""
-        if done:
-            extra += f"（已经送到过你这里、这次不重发：{', '.join(done)}）"
+        extra = (f"（随附转交的消息：{', '.join(ids)}）" if ids else "") + (f"（已经送到过你这里、这次不重发：{', '.join(done)}）" if done else "")
         store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))
-    log.info("转交 %d 条消息%s -> %s%s", len(ids), "（含转达）" if quote or note else "", topic_id,
-             f"；{len(done)} 条已送到过、不重发" if done else "")
+    log.info("转交 %d 条消息%s -> %s%s", len(ids), "（含转达）" if quote or note else "", topic_id, f"；{len(done)} 条已送到过、不重发" if done else "")
     touch_wakeup(store)
     return ForwardResult(ids, skipped)
 
 
 def touch_wakeup(target) -> Path | None:
     sd = getattr(target, "state_dir", None) or Path(getattr(target, "db_path", None) or getattr(target, "path", "") or "").parent
-    if not sd or str(sd) == ".":
-        return None
+    if not sd or str(sd) == ".": return None
     p = Path(sd) / ".wakeup"
     try: p.parent.mkdir(parents=True, exist_ok=True); p.touch(); return p
     except OSError: return None
@@ -5859,22 +5874,17 @@ def _reset_closed_topic(store: Store, topic_id: str, why: str = "会话已关闭
         store.upsert_card(topic_id, run_state=duty.IDLE, detail="", stuck_since=None, spinning=0, queued=0, idle_since=now_iso())
     if topic_id not in (BUS_TOPIC_ID, "tp_release"):
         from . import topicgroup as tg
-        for w in store.open_work(topic_id):
-            store.update_work(w["id"], state=duty.DONE, result=why, closed_at=now_iso())
+        for w in store.open_work(topic_id): store.update_work(w["id"], state=duty.DONE, result=why, closed_at=now_iso())
         for item in store.list_items(("active",)):
-            if item["owner_topic"] == topic_id:
-                tg.close(store, item, "system", why)
+            if item["owner_topic"] == topic_id: tg.close(store, item, "system", why)
 
 
 def close_session(store: Store, topic_id: str) -> None:
     """手动收掉总线新开的会话（7.10）。名册里的会话、known、总线、前任都不能这样关。"""
     t = store.get_topic(topic_id)
-    if t is None:
-        raise ValueError(f"topic {topic_id} 不存在")
-    if t["kind"] != DYNAMIC:
-        raise ValueError(f"{topic_id} 不是总线新开的会话（kind={t['kind']}），不能用 close-session 关")
-    if t["state"] == sm.CLOSED:
-        raise ValueError(f"{topic_id} 已经收掉了")
+    if t is None: raise ValueError(f"topic {topic_id} 不存在")
+    if t["kind"] != DYNAMIC: raise ValueError(f"{topic_id} 不是总线新开的会话（kind={t['kind']}），不能用 close-session 关")
+    if t["state"] == sm.CLOSED: raise ValueError(f"{topic_id} 已经收掉了")
     store.update_topic(topic_id, state=sm.CLOSED, pending_batch_id=None)
     _reset_closed_topic(store, topic_id, "会话已手动关闭")
     store.set_meta("roster_notify_bus", "1")
@@ -5884,14 +5894,10 @@ def close_session(store: Store, topic_id: str) -> None:
 def add_watch(store: Store, topic_id: str, person_id: str, chat_id: str = "", note: str = "") -> int:
     """登记一条等待（7.4）。总线和 managed 会话都可以登记。"""
     from . import outbound
-    if msg := outbound.lamb_violation_message(store, "watch", topic_id=topic_id):
-        raise ValueError(msg)
-    if topic_id != BUS_TOPIC_ID:
-        _check_target(store, topic_id, "登记等待")
-    elif store.get_topic(BUS_TOPIC_ID) is None:
-        raise ValueError("总线还没建：先 sheepdog init 或 run")
-    if not person_id.strip():
-        raise ValueError("--person 不能为空")
+    if msg := outbound.lamb_violation_message(store, "watch", topic_id=topic_id): raise ValueError(msg)
+    if topic_id != BUS_TOPIC_ID: _check_target(store, topic_id, "登记等待")
+    elif store.get_topic(BUS_TOPIC_ID) is None: raise ValueError("总线还没建：先 sheepdog init 或 run")
+    if not person_id.strip(): raise ValueError("--person 不能为空")
     return store.add_watch(topic_id, person_id.strip(), (chat_id or "").strip(), note)
 
 
@@ -5900,46 +5906,35 @@ def settle_watches_after_receipt(store: Store, topic_id: str, batch_id: str, anc
     回复随这个批次送达、但没被确认的 → 回到 waiting，从回复时间重新计时。"""
     done = {int(a.removeprefix("watch_done:")) for a in anchors if isinstance(a, str) and a.startswith("watch_done:") and a.removeprefix("watch_done:").isdigit()}
     for w in store.open_watches():
-        if w["topic_id"] != topic_id:
-            continue
+        if w["topic_id"] != topic_id: continue
         if w["id"] in done:
-            store.close_watch(w["id"], "done")
-            log.info("等待 #%s 经回执确认已等到", w["id"])
+            store.close_watch(w["id"], "done"); log.info("等待 #%s 经回执确认已等到", w["id"])
         elif w["status"] == "replied" and w["last_reply_message_id"]:
             if (r := store.get_message(w["last_reply_message_id"])) is not None and r["batch_id"] == batch_id:
-                store.reset_watch_waiting(w["id"])
-                log.info("等待 #%s 的回复没被确认，回到 waiting", w["id"])
+                store.reset_watch_waiting(w["id"]); log.info("等待 #%s 的回复没被确认，回到 waiting", w["id"])
 
 
 def bind_echo_relay(cfg: Config, store: Store, topic_id: str, batch_id: str, receipt: dict,
                     status: str = "", summary: str | None = None) -> None:
     """回执带回绑定（write_receipt 与 Dispatcher._echo_relay 共用单一写入逻辑）。"""
     if not cfg.session.owner_receipt_relay:
-        if batch_id:
-            store.set_meta(f"owner_relay_skipped:{batch_id}", "1")
+        if batch_id: store.set_meta(f"owner_relay_skipped:{batch_id}", "1")
         return
-    if not batch_id:
-        return
+    if not batch_id: return
     now = _now().isoformat(timespec="seconds")
     for e in store.echo_open():
-        if e["stage"] == ECHO_UNDELIVERED or (r := store.get_message(e["message_id"])) is None:
-            continue
+        if e["stage"] == ECHO_UNDELIVERED or (r := store.get_message(e["message_id"])) is None: continue
         tid, st = r["topic_id"] or "", r["dispatch_state"]
-        if r["route"] != DISPATCH or tid != topic_id:
-            continue
-        if tid != e["topic_id"]:
-            store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now, **ECHO_UNBOUND)
+        if r["route"] != DISPATCH or tid != topic_id: continue
+        if tid != e["topic_id"]: store.echo_update(e["message_id"], topic_id=tid, alerted="", stage_at=now, **ECHO_UNBOUND)
         if st in ECHO_DELIVERED_STATES and (e["stage"] != ECHO_DELIVERED or e["batch_id"] != r["batch_id"]):
             d_row = store.get_dispatch(r["batch_id"]) if r["batch_id"] else None
-            store.echo_update(
-                e["message_id"], stage=ECHO_DELIVERED, stage_at=now, batch_id=r["batch_id"],
-                delivered_at=(d_row["sent_at"] if d_row is not None and d_row["sent_at"] else now),
-                priority=int(bool(r["batch_id"]) and r["batch_id"].startswith(PRIORITY_PREFIX)),
-                **(ECHO_UNBOUND if e["batch_id"] != r["batch_id"] else {}),
-            )
+            store.echo_update(e["message_id"], stage=ECHO_DELIVERED, stage_at=now, batch_id=r["batch_id"],
+                              delivered_at=(d_row["sent_at"] if d_row is not None and d_row["sent_at"] else now),
+                              priority=int(bool(r["batch_id"]) and r["batch_id"].startswith(PRIORITY_PREFIX)),
+                              **(ECHO_UNBOUND if e["batch_id"] != r["batch_id"] else {}))
     eff_status = status or (receipt.get("status") if isinstance(receipt, dict) else "") or "handled"
-    if summary is None:
-        summary = receipt.get("summary") if isinstance(receipt, dict) else ""
+    if summary is None: summary = receipt.get("summary") if isinstance(receipt, dict) else ""
     summary_clean = " ".join(str(summary or "").split())
     for e in store.echo_open():
         if e["stage"] == ECHO_DELIVERED and e["topic_id"] == topic_id and not e["relay_batch"]:

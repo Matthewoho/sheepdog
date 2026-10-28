@@ -61,7 +61,7 @@ class Acker:
         if not self.enabled:
             return
         for r in rows:
-            if r["chat_type"] == SYSTEM_CHAT:
+            if r["chat_type"] == SYSTEM_CHAT or not str(r["message_id"] or "").startswith("om_"):
                 continue
             identity = self.identity_for(r)
             if identity is None:

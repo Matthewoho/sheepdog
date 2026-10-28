@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import logging
-import os
-import re
-import sqlite3
+import hashlib, logging, os, re, sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from . import duty
-from . import identity as ident
-from . import pending as pend
-from . import session as sm
+from . import duty, identity as ident, pending as pend, session as sm
 from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes, resolve_summary_and_body
 from .config import Config
 from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, has_reply_suffix, is_agent_reply,
@@ -21,6 +14,7 @@ from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time,
 from .models import Message
 from .source import SourceError
 from .source.lark import LarkTimeout
+from .source.tat_cache import is_transient_lark_error
 from .store import Store, now_iso
 
 log = logging.getLogger("sheepdog")
@@ -84,16 +78,12 @@ def target_ok(store: Store, topic_id: str) -> bool:
 def lamb_violation_message(store: Store | None, cmd: str, *, topic_id: str = "", lamb_id: str = "", cid: str = "") -> str | None:
     """7.63 羔羊越权硬拦截：判定当前调用方是否为羔羊（环境变量 SHEEPDOG_LAMB_ID / 会话 conversation_id / lambs 表匹配）。"""
     lid = (lamb_id or os.environ.get("SHEEPDOG_LAMB_ID") or "").strip()
-    conv_id = (
-        cid or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or os.environ.get("SHEEPDOG_CONVERSATION_ID")
-        or os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
-    ).strip()
-    tid = (topic_id or "").strip()
-    matched_lid, parent_tid = "", ""
+    conv_id = (cid or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or os.environ.get("SHEEPDOG_CONVERSATION_ID")
+               or os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    tid, matched_lid, parent_tid = (topic_id or "").strip(), "", ""
     if lid:
         lb = store.get_lamb(lid) if store is not None and hasattr(store, "get_lamb") else None
-        matched_lid = lb["lamb_id"] if lb else lid
-        parent_tid = (lb["parent_topic_id"] if lb else "") or tid or "unknown"
+        matched_lid, parent_tid = (lb["lamb_id"] if lb else lid), ((lb["parent_topic_id"] if lb else "") or tid or "unknown")
     elif conv_id and store is not None and hasattr(store, "find_lamb_by_cid"):
         if (lb := store.find_lamb_by_cid(conv_id)) is not None:
             matched_lid, parent_tid = lb["lamb_id"], lb["parent_topic_id"]
@@ -103,9 +93,7 @@ def lamb_violation_message(store: Store | None, cmd: str, *, topic_id: str = "",
             if c.startswith("lamb:"):
                 candidates.append(c.removeprefix("lamb:"))
         for cand in candidates:
-            lb = (store.get_lamb(cand) if hasattr(store, "get_lamb") else None) or (
-                store.find_lamb_by_cid(cand) if hasattr(store, "find_lamb_by_cid") else None
-            )
+            lb = (store.get_lamb(cand) if hasattr(store, "get_lamb") else None) or (store.find_lamb_by_cid(cand) if hasattr(store, "find_lamb_by_cid") else None)
             if lb is not None:
                 matched_lid, parent_tid = lb["lamb_id"], lb["parent_topic_id"]
                 break
@@ -289,54 +277,55 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
                   key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
                   floor: str = "", vips: dict | None = None, summary: str = "",
-                  floor_type: str | None = None, options: str = "") -> SendResult:
+                  floor_type: str | None = None, options: str = "", ball: str = "", fyi: bool = False) -> SendResult:
     """ask / report：以机器人身份私聊主人（或发进话题群），ask 发前核 VIP 底线并当场记来源与 floor。"""
-    from . import topicgroup as tg
+    from . import decision_hub, topicgroup as tg
     check_not_lamb(store, kind, topic_id=topic_id)
-    if track and not _one_line(key):
+    canon_mode = decision_hub.canonical_group_mode(cfg, store)
+    if track and not _one_line(key) and not canon_mode:
         raise OutboundError(EXIT_INVALID, "--track 要和 --key 一起用：长期跟踪的事要有钥匙")
-    if kind not in (ASK, REPORT):
-        raise OutboundError(EXIT_INVALID, f"未知种类 {kind!r}")
+    if kind not in (ASK, REPORT): raise OutboundError(EXIT_INVALID, f"未知种类 {kind!r}")
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
-    if not _one_line(title):
-        raise OutboundError(EXIT_INVALID, "--title 不能为空：一句话说是什么事")
-    if not (body or "").strip():
-        raise OutboundError(EXIT_INVALID, "正文为空")
+    if not _one_line(title): raise OutboundError(EXIT_INVALID, "--title 不能为空：一句话说是什么事")
+    if not (body or "").strip(): raise OutboundError(EXIT_INVALID, "正文为空")
     if not cfg.self_open_id and not cfg.threads.owner_chat_id:
         raise OutboundError(EXIT_INVALID, "配置里没有 self_open_id，不知道主人是谁")
     key = _one_line(key)
+    if not key and (canon_mode or (not track and tg.configured(cfg) and cfg.topic_group.enabled and decision_hub.find_canonical_session_item(store, topic_id) is not None)):
+        key = decision_hub.base_topic_id(topic_id).removeprefix("tp_") or topic_id
     nk = duty.norm_key(key) if key else ""
-    raw_floor = floor if kind == ASK else ""
-    floor = _one_line(raw_floor) if kind == ASK else ""
-    if kind == ASK:
-        check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)   # 7.61 / 7.65：只读，拒绝时什么都没写
-    try:
-        _, _, resolved_body = resolve_summary_and_body(
-            body, summary, require_summary=cfg.notify.require_summary, hoist_at=False
-        )
-    except ValueError as e:
-        raise OutboundError(EXIT_INVALID, str(e))
-    text = compose(cfg, kind, topic_id, title, resolved_body)
-    ik = idem_key(kind, topic_id, nk, batch or current_batch(store, topic_id), text)
+    raw_floor, floor = (floor if kind == ASK else ""), (_one_line(floor) if kind == ASK else "")
+    if kind == ASK: check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
+    else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, body, key=key, ball=ball, fyi=fyi)
+    try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
+    except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
+    text, eff_batch = compose(cfg, kind, topic_id, title, resolved_body), (batch or current_batch(store, topic_id))
+    ik = idem_key(kind, topic_id, nk, eff_batch, text)
     origin, srcs, n_chats = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [], 0)
-    prev = store.get_send(ik)
-    if prev is not None:
-        res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text,
-                         batch_chats=n_chats)
+    if (prev := store.get_send(ik)) is not None:
+        res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text, batch_chats=n_chats)
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
+    if kind == ASK and nk and decision_hub.hub_active(cfg, store):
+        _, ask_card = owner_content(cfg, text, at=True, kind=ASK, topic_id=topic_id, key=key, title=title, options=options)
+        if (patched := decision_hub.try_patch_open_ask(cfg, store, source, topic_id, key, nk, title, text, ask_card, options_spec=options)) is not None:
+            res = SendResult(patched["message_id"], already=True, root_message_id=patched["root_message_id"], text=text, batch_chats=n_chats)
+            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
     route = tg.route_for_send(cfg, store, topic_id, key, track, kind=kind, title=title, batch_id=batch)
     if route.group:
         try:
-            res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route, options=options)
+            res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route, options=options, batch_id=eff_batch)
             res.batch_chats = n_chats
+            if kind == REPORT:
+                decision_hub.apply_report_ball_state(store, topic_id, key or (route.item and tg.label(route.item["item_no"])) or "", ball)
             return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
         except _GroupDown as e:
             route = tg.SendRoute(note=f"话题群发不进去（{e}），已退回私聊，这条发进了私聊")
     res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik, options=options)
     res.batch_chats, res.note = n_chats, route.note
+    if kind == REPORT: decision_hub.apply_report_ball_state(store, topic_id, key, ball)
     return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
 
 
@@ -345,18 +334,17 @@ class _GroupDown(Exception):
 
 
 def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str,
-                   text: str, ik: str, route, *, options: str = "") -> SendResult:
+                   text: str, ik: str, route, *, options: str = "", batch_id: str = "") -> SendResult:
     """7.51 / 7.74：发进话题群里那件事的话题。已有 root_message_id 的老事项不受 tg_down 阻断，回复成功自动清除 down。"""
-    from . import topicgroup as tg
+    from . import decision_hub, topicgroup as tg
     item, created = route.item, False
     if item is None:
-        item = tg.open_item(store, title, topic_id, topic_id, tg.ORIGIN_TRACK, cfg.topic_group.chat_id, key=key,
-                            topic_id=topic_id, related=route.related)
-        created = True
+        item, created = tg.open_item(store, title, topic_id, topic_id, tg.ORIGIN_TRACK, cfg.topic_group.chat_id, key=key,
+                                     topic_id=topic_id, related=route.related), True
     elif key:
         tg.bind_alias_key(store, item["item_no"], key, topic_id)
     try:
-        item = tg.ensure_title(cfg, store, source, item, "", key)   # 副标题「<会话显示名>开的」按事项现算
+        item = tg.ensure_title(cfg, store, source, item, "", key)
         plain, card = owner_content(cfg, text, at=kind == ASK, kind=kind, topic_id=topic_id, key=key, title=title, options=options)
         res = send_owner(
             lambda tx, c: (source.reply_to(item["root_message_id"], identity="bot", idem_key=ik, text=tx, card=c, in_thread=True)
@@ -366,23 +354,24 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
     except LarkTimeout as e:
         raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
     except (SourceError, RuntimeError) as e:
-        if created and not store.get_item(item["item_no"])["root_message_id"]:
-            store.delete_item(item["item_no"])
+        if created and not store.get_item(item["item_no"])["root_message_id"]: store.delete_item(item["item_no"])
+        if is_transient_lark_error(e):
+            raise OutboundError(EXIT_SEND_FAILED, f"发送受限流或网络抖动暂败（{e}）：请用同样参数重试，防重编号保证只发一条") from e
         why = " ".join(str(e).split())[:200]
-        tg.mark_down(cfg, store, f"往话题群发消息失败：{why}")
-        raise _GroupDown(why)
-    tg.clear_down(cfg, store)
-    mid = res["message_id"]
-    reopened = tg.reopen(store, item)
-    tg.touch(store, item["item_no"])
-    tg.mark_dirty(store)
+        tg.mark_down(cfg, store, f"往话题群发消息失败：{why}"); raise _GroupDown(why)
+    tg.clear_down(cfg, store); mid = res["message_id"]
+    reopened = tg.reopen(store, item); tg.touch(store, item["item_no"]); tg.mark_dirty(store)
     if not item["thread_id"] and res.get("thread_id"):
-        store.update_item(item["item_no"], thread_id=res["thread_id"])
+        store.update_item(item["item_no"], thread_id=res["thread_id"]); item = store.get_item(item["item_no"])
     store.add_send(ik, kind, topic_id, mid, text, root_message_id=item["root_message_id"], key=key, norm_key=nk,
-                   identity=ident.BOT if cfg.identity.enabled else None)
+                   title=title, identity=ident.BOT if cfg.identity.enabled else None)
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
+    if kind == ASK:
+        decision_hub.mirror_ask_to_hub(cfg, store, source, origin_mid=mid, origin_root_id=item["root_message_id"],
+                                       topic_id=topic_id, key=key, title=title, shown=text, options_spec=options, item_no=item["item_no"])
     if not (created and text.endswith("\n?")):
         tg.sync_title_card(store, cfg, source, item["item_no"], latest_text=text, kind=kind)
+    tg.post_origin_signposts(cfg, store, source, item, topic_id, batch_id)
     return SendResult(mid, root_message_id=item["root_message_id"], new_thread=created, text=text,
                       item=tg.label(item["item_no"]), new_item=created, reopened=reopened)
 
@@ -390,6 +379,7 @@ def _send_to_group(cfg: Config, store: Store, source, kind: str, topic_id: str, 
 def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, key: str, nk: str, text: str,
              ik: str, *, options: str = "") -> SendResult:
     """私聊主人（7.22 一事一串，原来的路）。"""
+    from . import decision_hub
     root = store.thread_by_key(topic_id, nk) if nk else None
     plain, card = owner_content(cfg, text, at=root is not None, kind=kind, topic_id=topic_id, key=key, title=title, options=options)
     if source is None:
@@ -397,34 +387,31 @@ def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title:
     else:
         try:
             if root is not None:
-                res = send_owner(lambda t, c: source.reply_to(root["root_message_id"], identity="bot", idem_key=ik,
-                                                              text=t, card=c, in_thread=True), plain, card)
+                res = send_owner(lambda t, c: source.reply_to(root["root_message_id"], identity="bot", idem_key=ik, text=t, card=c, in_thread=True), plain, card)
             elif cfg.threads.owner_chat_id:
-                res = send_owner(lambda t, c: source.send_to_chat(cfg.threads.owner_chat_id, t, ik, "bot", **_card_kw(c)),
-                                 plain, card)
+                res = send_owner(lambda t, c: source.send_to_chat(cfg.threads.owner_chat_id, t, ik, "bot", **_card_kw(c)), plain, card)
             else:
-                res = send_owner(lambda t, c: source.send_to_user(cfg.self_open_id, t, ik, "bot", **_card_kw(c)),
-                                 plain, card)
+                res = send_owner(lambda t, c: source.send_to_user(cfg.self_open_id, t, ik, "bot", **_card_kw(c)), plain, card)
         except LarkTimeout as e:
             raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
         except SourceError as e:
             raise OutboundError(EXIT_SEND_FAILED, f"发送失败：{e}")
-    mid = res["message_id"]
-    new_thread = False
+    mid, new_thread = res["message_id"], False
     if root is not None:
         root_mid = root["root_message_id"]
         store.touch_thread(root_mid)
         if not store.set_thread_id(root_mid, res.get("thread_id") or "") and not root["thread_id"]:
             learn_thread_id(store, source, root_mid)
     elif nk:
-        root_mid = mid
-        new_thread = store.add_thread(mid, topic_id, key, nk, _one_line(title), ASK, res.get("thread_id") or "")
+        root_mid, new_thread = mid, store.add_thread(mid, topic_id, key, nk, _one_line(title), ASK, res.get("thread_id") or "")
     else:
         root_mid = ""
     store.add_send(ik, kind, topic_id, mid, text, root_message_id=root_mid, key=key, norm_key=nk,
-                   identity=ident.BOT if cfg.identity.enabled else None)
-    # 7.15：发给主人的每条都记来源，主人引用回复它时按这里送回（拉取到这条时还会按第一行再认一次，重复记不变）
+                   title=title, identity=ident.BOT if cfg.identity.enabled else None)
     store.add_bot_outbox(mid, topic_id, kind == ASK, text, now_iso())
+    if kind == ASK:
+        decision_hub.mirror_ask_to_hub(cfg, store, source, origin_mid=mid, origin_root_id=root_mid,
+                                       topic_id=topic_id, key=key, title=title, shown=text, options_spec=options)
     return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
 
 
@@ -495,7 +482,7 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
             ).fetchall()
             roots = list(dict.fromkeys(r["root_message_id"] for r in rows if r["root_message_id"]))
         from . import topicgroup as tg
-        item = tg.find_by_key(store, key) if cfg.topic_group.chat_id else None
+        item = tg.find_by_key(store, key, topic_id=topic_id, allow_cross_session=True) if cfg.topic_group.chat_id else None
         if item is not None and item["root_message_id"]:
             root = item["root_message_id"]
             in_thread = {s["message_id"] for s in store.sends_in_thread(root)} | {root}
@@ -525,9 +512,9 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
 
 
 def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, message_id: str = "", key: str = "",
-            playbook=None) -> ResolveResult:
-    """会话结案：只结自己名下、还开着的；结案后机器人在那条提问的话题里补一句「已结案：依据（会话）」。
-    先发那句话（带防重编号，超时原样重试只发一条），发成了再在账本里结案；source 为 None（测试环境）只结案、不发。"""
+            playbook=None, quote: str = "", superseded_by: str = "") -> ResolveResult:
+    """会话结案：只结自己名下、还开着的；结案后机器人在那条提问的话题里补一句「已结案：依据（会话）」。"""
+    from . import decision_hub
     check_not_lamb(store, "resolve", topic_id=topic_id)
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
@@ -547,6 +534,8 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
             return ResolveResult([], prev["message_id"], already=True, text=text)
         raise OutboundError(EXIT_INVALID, "没有还开着的「需要你定」可结（已答、已结或已过期的不用再结）"
                             + (f"：钥匙 {key} 的话题里没有开着的" if key else ""))
+    if quote or superseded_by or decision_hub.hub_active(cfg, store) or any((e["hub_message_id"] if "hub_message_id" in e.keys() else "") for e in targets):
+        decision_hub.verify_resolve_allowed(cfg, store, targets, quote=quote, superseded_by=superseded_by)
     shown, card = owner_content(cfg, text, at=cfg.escalation.resolve_notice_at)
     mid, err = "", ""
     if source is None:
@@ -555,11 +544,9 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
         mid = prev["message_id"]
     else:
         try:
-            res = send_owner(lambda t, c: source.reply_to(notice_to, identity="bot", idem_key=ik, text=t, card=c,
-                                                          in_thread=True), shown, card)
+            res = send_owner(lambda t, c: source.reply_to(notice_to, identity="bot", idem_key=ik, text=t, card=c, in_thread=True), shown, card)
         except LarkTimeout as e:
-            raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话发送超时，不确定发出去没有（{e}），还没结案：用同样的参数重试，"
-                                                  "防重编号保证只发一条")
+            raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话发送超时，不确定发出去没有（{e}），还没结案：用同样的参数重试，防重编号保证只发一条")
         except SourceError as e:
             raise OutboundError(EXIT_SEND_FAILED, f"「已结案」那句话没发出去，还没结案：{e}")
         mid = res["message_id"]
@@ -569,11 +556,10 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
                 learn_thread_id(store, source, root)
         store.add_send(ik, pend.SEND_RESOLVE, topic_id, mid, text, root_message_id=root or notice_to,
                        target_message_id=notice_to, identity=ident.BOT if cfg.identity.enabled else None)
-        # 主人引用这句话回复（比如「还没办完」）时送回这个会话；is_question = 0，不是新提问
         store.add_bot_outbox(mid, topic_id, False, text, now_iso())
-    # resolved_by 记结案的会话（总线替收掉的会话结时记总线）；topic_id 不改
-    closed = [e["message_id"] for e in targets
-              if store.resolve_escalation(e["message_id"], e["topic_id"], why, resolved_by=topic_id)]
+    closed = [e["message_id"] for e in targets if store.resolve_escalation(e["message_id"], e["topic_id"], why, resolved_by=topic_id)]
+    if closed:
+        decision_hub.on_escalations_resolved(cfg, store, source, targets, why=why)
     return ResolveResult(closed, mid, notice_error=err, text=text)
 
 
@@ -731,6 +717,9 @@ def owner_spoke_since(cfg: Config, store: Store, source, target: sqlite3.Row) ->
     return OwnerSpoke(hits, since)
 
 
+def owner_chats(cfg: Config) -> set[str]:
+    return {c for c in [*(getattr(cfg, "owner_side_chat_ids", None) or []), *(getattr(cfg, "owner_chat_ids", None) or []), getattr(getattr(cfg, "topic_group", None), "chat_id", "")] if c}
+
 def reject_owner_chat(cfg: Config, topic_id: str, chat_id: str) -> None:
     """10-13 热修：要回复的那条在「找主人」聊天里（[escalation] chat_ids、[threads] owner_chat_id）就拒绝。
     sheepdog reply 是以主人身份回别人的；在找主人聊天里用它，等于以主人身份回主人自己，还会被当成主人亲自回复投回会话。"""
@@ -770,75 +759,73 @@ def reply_idem(store: Store, topic_id: str, target_id: str, shown: str) -> str:
 
 @dataclass
 class ReplyResult:
-    message_id: str = ""
-    already: bool = False
-    spoke: OwnerSpoke | None = None
-    newly_seen: int = 0
-    text: str = ""
-    identity: str = ""      # 7.26：用哪个身份发的（user | bot）；[identity] 关着时是 user
-    why: str = ""           # 为什么用这个身份（identity.WHY_*）
+    message_id: str = ""; already: bool = False; spoke: OwnerSpoke | None = None
+    newly_seen: int = 0; text: str = ""; identity: str = ""; why: str = ""
 
 
 def _send_reply(source, target_id: str, ik: str, shown: str, card: dict | None, identity: str) -> dict:
+    txt = "" if card is not None else shown
     try:
-        return source.reply_to(target_id, identity=identity, idem_key=ik, text="" if card is not None else shown,
-                               card=card)
+        if target_id.startswith("oc_"):
+            return (source.post_to(target_id, identity=identity, idem_key=ik, text=txt, card=card) if hasattr(source, "post_to")
+                    else source.send_to_chat(target_id, txt, ik, identity, **_card_kw(card)))
+        return source.reply_to(target_id, identity=identity, idem_key=ik, text=txt, card=card)
     except LarkTimeout as e:
         raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
 
 
 def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, text: str = "", card_text: str = "",
           summary: str = "", even_if_owner_replied: bool = False) -> ReplyResult:
-    """代回：先查重（发过同样的就不再发），再发前检查（主人说过话就不发、记「发送前已看到」），最后发。
-    [identity] 关着以主人身份发；开着按 identity.choose_reply_identity 选身份（7.26）。"""
+    """代回：先查重，再发前检查（om_ 消息号），支持 om_ 消息回复与 oc_ 群顶层主动发话（Bot 优先，230002 自动退回 user）。"""
     check_not_lamb(store, "reply", topic_id=topic_id)
     if not target_ok(store, topic_id):
         raise OutboundError(EXIT_INVALID, f"{topic_id} 不是在投递的会话（总线、名册 managed、总线新开的）")
     target_id = (target_id or "").strip()
-    if not target_id.startswith("om_"):
-        raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号，收到 {target_id!r}")
+    is_chat = target_id.startswith("oc_")
+    if not (target_id.startswith("om_") or is_chat):
+        raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号或 oc_ 开头的群 chat_id，收到 {target_id!r}")
     check_bus_not_forwarded_reply(store, topic_id, target_id)
-    enabled = cfg.identity.enabled
-    target = store.get_message(target_id)
-    if target is not None and ((text or "").strip() or (card_text or "").strip()):
-        reject_owner_chat(cfg, topic_id, target["chat_id"])   # 热修：找主人聊天里一律拒绝，在选身份之前，不管开没开 [identity]
-    try:
-        shown, card = reply_body(cfg, text, card_text, summary=summary)
-    except ValueError as e:
-        raise OutboundError(EXIT_INVALID, str(e))
-    ik = reply_idem(store, topic_id, target_id, shown)   # 两个身份正文一样（都带标记）：230002 退回本人时编号不变
-    prev = store.get_send(ik)
-    if prev is not None:
-        return ReplyResult(prev["message_id"], already=True, text=shown,
-                           identity=(prev["identity"] or ident.USER) if enabled else ident.USER)  # 同样的内容已经发过（重试）
-    if not even_if_owner_replied:
+    enabled, target = cfg.identity.enabled, (None if is_chat else store.get_message(target_id))
+    chat_id = target_id if is_chat else (target["chat_id"] if target is not None else "")
+    if chat_id and ((text or "").strip() or (card_text or "").strip()):
+        reject_owner_chat(cfg, topic_id, chat_id)
+    try: shown, card = reply_body(cfg, text, card_text, summary=summary)
+    except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
+    ik = reply_idem(store, topic_id, target_id, shown)
+    if (prev := store.get_send(ik)) is not None:
+        return ReplyResult(prev["message_id"], already=True, text=shown, identity=(prev["identity"] or ident.USER) if enabled else ident.USER)
+    if not is_chat and not even_if_owner_replied:
         if target is None:
-            raise OutboundError(EXIT_INVALID, f"账本里没有 {target_id}，没法做发前检查（以账本里这条消息的时间为准）。"
-                                              "确认消息号；是 sheepdog 送给你的消息就一定在账本里")
-        spoke = owner_spoke_since(cfg, store, source, target)
-        if spoke.messages:
-            n = sum(store.add_seen_before_send(topic_id, m.message_id, target_id) for m in spoke.messages)
-            return ReplyResult(spoke=spoke, newly_seen=n, text=shown)
-    who, why = ident.choose_reply_identity(cfg, store, source, target)
-    if enabled and why == ident.WHY_NOT_IN_CHAT and target is not None:
-        store.note_bot_absent(target["chat_id"], target["chat_name"] or "", why)
-    try:
-        res = _send_reply(source, target_id, ik, shown, card, who)
+            raise OutboundError(EXIT_INVALID, f"账本里没有 {target_id}，没法做发前检查（以账本里这条消息的时间为准）。确认消息号；是 sheepdog 送给你的消息就一定在账本里")
+        if (spoke := owner_spoke_since(cfg, store, source, target)).messages:
+            return ReplyResult(spoke=spoke, newly_seen=sum(store.add_seen_before_send(topic_id, m.message_id, target_id) for m in spoke.messages), text=shown)
+    if is_chat:
+        if not enabled: who, why = ident.USER, ident.WHY_DISABLED
+        else:
+            ok, why = ident.bot_in_chat(cfg, store, source, target_id)
+            if not ok and why == ident.WHY_LIST_FAILED and getattr(source, "bot_chat_ids", None) is None:
+                ok, why = True, ident.WHY_IN_CHAT
+            who = ident.BOT if ok else ident.USER
+            if not ok and why == ident.WHY_NOT_IN_CHAT: store.note_bot_absent(target_id, "", why)
+    else:
+        who, why = ident.choose_reply_identity(cfg, store, source, target)
+        if enabled and why == ident.WHY_NOT_IN_CHAT and target is not None:
+            store.note_bot_absent(target["chat_id"], target["chat_name"] or "", why)
+    try: res = _send_reply(source, target_id, ik, shown, card, who)
     except SourceError as e:
         if not (enabled and who == ident.BOT and ident.is_not_in_chat_error(e)):
             raise OutboundError(EXIT_SEND_FAILED, f"发送失败：{e}")
-        # 7.26：机器人发送报不在群里（230002）：缓存作废，这一条退回主人本人，内容和防重编号都不变
         ident.invalidate_bot_chats(store)
-        if target is not None:
-            store.note_bot_absent(target["chat_id"], target["chat_name"] or "", ident.WHY_230002)
+        if chat_id: store.note_bot_absent(chat_id, "" if is_chat else (target["chat_name"] or ""), ident.WHY_230002)
         who, why = ident.USER, ident.WHY_230002
-        try:
-            res = _send_reply(source, target_id, ik, shown, card, who)
+        try: res = _send_reply(source, target_id, ik, shown, card, who)
         except SourceError as e2:
             raise OutboundError(EXIT_SEND_FAILED, f"发送失败（机器人不在群里，退回主人本人也没发出去）：{e2}")
     mid = res["message_id"]
     store.add_send(ik, REPLY, topic_id, mid, shown, target_message_id=target_id, identity=who if enabled else None)
     store.add_bot_outbox(mid, topic_id, False, shown, now_iso())
+    if topic_id != BUS_TOPIC_ID and (thr_id := (res.get("thread_id") or (target["thread_id"] if target is not None and "thread_id" in target.keys() else "") or "")):
+        store.add_group_thread(thr_id, chat_id, topic_id, "sent", mid, now_iso())
     return ReplyResult(mid, text=shown, identity=who, why=why)
 
 
@@ -846,21 +833,16 @@ def spoke_text(cfg: Config, spoke: OwnerSpoke) -> str:
     """把主人的话原样打印给会话（时间 + 内容）。"""
     lines = [f"主人已经在这个聊天里说过话（从 {display_time(_parse(spoke.since), cfg.timezone_offset)}起），这条代回没发："]
     for m in spoke.messages:
-        lines.append(f"- {display_time(_parse(m.create_time), cfg.timezone_offset)}（message_id {m.message_id}）：")
-        lines += ["  " + ln for ln in (m.content or "").splitlines() or [""]]
-    lines.append("这些发言之后会照常作为背景送到你这里，会注明「你发送前已经看到过」，不是新的提醒。")
-    lines.append("先读他的话再决定：不用回了就不回；要改就改了再发；确实还要照样发，加 --even-if-owner-replied。")
+        lines += [f"- {display_time(_parse(m.create_time), cfg.timezone_offset)}（message_id {m.message_id}）：", *("  " + ln for ln in (m.content or "").splitlines() or [""])]
+    lines += ["这些发言之后会照常作为背景送到你这里，会注明「你发送前已经看到过」，不是新的提醒。",
+              "先读他的话再决定：不用回了就不回；要改就改了再发；确实还要照样发，加 --even-if-owner-replied。"]
     return "\n".join(lines)
 
 
 # ======================= thread：只读看整个话题 =======================
 @dataclass
 class ThreadView:
-    thread: sqlite3.Row | None
-    thread_id: str
-    root_message_id: str
-    items: list[dict]
-    warning: str = ""
+    thread: sqlite3.Row | None; thread_id: str; root_message_id: str; items: list[dict]; warning: str = ""
 
 
 def find_thread(store: Store, topic_id: str, key: str = "", thread: str = "") -> tuple[sqlite3.Row | None, str, str]:
@@ -871,7 +853,7 @@ def find_thread(store: Store, topic_id: str, key: str = "", thread: str = "") ->
     if key:
         thr = store.thread_by_key(topic_id, duty.norm_key(key))
         from . import topicgroup as tg
-        item = tg.find_by_key(store, key) if thr is None else None
+        item = tg.find_by_key(store, key, topic_id=topic_id, allow_cross_session=True) if thr is None else None
         if item is not None and item["root_message_id"]:
             return None, item["thread_id"] or "", item["root_message_id"]
         if thr is None:

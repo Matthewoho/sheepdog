@@ -8,17 +8,15 @@
 
 from __future__ import annotations
 
-import json
-import logging
-import shutil
-import subprocess
-import time
+import json, logging, shutil, subprocess, time
 from datetime import datetime, timedelta, timezone
 
 from ..models import Mention, Message
 from . import SourceError
+from .tat_cache import inject_bot_tat_env, invalidate_tat_cache, is_token_invalid_error
 
 log = logging.getLogger("sheepdog")
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 
 class LarkTimeout(SourceError):
@@ -30,49 +28,36 @@ _AT_ALL_IDS = {"all", "@_all"}
 
 def _norm_time(t: str, tz: str) -> str:
     """lark-cli 返回 'YYYY-MM-DD HH:MM'（本地时区）→ ISO8601。"""
-    t = (t or "").strip()
-    if not t:
-        return ""
-    if "T" in t:
+    if not (t := (t or "").strip()) or "T" in t:
         return t
-    if len(t) == 16:
-        t += ":00"
-    return t.replace(" ", "T") + tz
+    return (t + ":00" if len(t) == 16 else t).replace(" ", "T") + tz
+
+
+def _parse_mentions(raw: dict) -> list[Mention]:
+    return [Mention(id=(mid := m.get("id") or ""), name=m.get("name") or "",
+                    is_all=(mid in _AT_ALL_IDS or (m.get("key") or "") in _AT_ALL_IDS))
+            for m in raw.get("mentions") or []]
 
 
 def parse_message(raw: dict, tz: str = "+08:00") -> Message:
     sender = raw.get("sender") or {}
-    mentions = []
-    for m in raw.get("mentions") or []:
-        mid = m.get("id") or ""
-        key = m.get("key") or ""
-        mentions.append(Mention(id=mid, name=m.get("name") or "", is_all=(mid in _AT_ALL_IDS or key in _AT_ALL_IDS)))
     content = raw.get("content")
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
     return Message(
-        message_id=raw.get("message_id", ""),
-        chat_id=raw.get("chat_id", ""),
-        chat_name=raw.get("chat_name") or "",
-        chat_type=raw.get("chat_type") or "",
-        sender_id=sender.get("id") or "",
-        sender_name=sender.get("name") or "",
-        sender_type=sender.get("sender_type") or "",
-        content=content or "",
-        msg_type=raw.get("msg_type") or "",
-        create_time=_norm_time(raw.get("create_time", ""), tz),
-        mentions=mentions,
-        reply_to=raw.get("reply_to") or raw.get("parent_id") or "",
-        thread_id=raw.get("thread_id") or "",
-        link=raw.get("message_app_link") or "",
-        deleted=bool(raw.get("deleted")),
-        updated=bool(raw.get("updated")),
+        message_id=raw.get("message_id", ""), chat_id=raw.get("chat_id", ""),
+        chat_name=raw.get("chat_name") or "", chat_type=raw.get("chat_type") or "",
+        sender_id=sender.get("id") or "", sender_name=sender.get("name") or "",
+        sender_type=sender.get("sender_type") or "", content=content or "",
+        msg_type=raw.get("msg_type") or "", create_time=_norm_time(raw.get("create_time", ""), tz),
+        mentions=_parse_mentions(raw), reply_to=raw.get("reply_to") or raw.get("parent_id") or "",
+        thread_id=raw.get("thread_id") or "", link=raw.get("message_app_link") or "",
+        deleted=bool(raw.get("deleted")), updated=bool(raw.get("updated")),
         update_time=_norm_time(raw.get("update_time", ""), tz),
         sender_tenant_key=sender.get("tenant_key") or "",
         message_position=str(raw.get("message_position") or ""),
         thread_position="" if raw.get("thread_message_position") is None else str(raw.get("thread_message_position")),
-        root_id=raw.get("root_id") or "",
-        raw=raw,
+        root_id=raw.get("root_id") or "", raw=raw,
     )
 
 
@@ -97,58 +82,56 @@ def parse_event(raw: dict, tz: str = "+08:00") -> Message:
     机器人发的 sender_type 是 bot（搜索结果里是 app）。
     回复关系（7.45 按 lark-cli 的事件定义核实）：reply_to = 直接回复的那条（parent），root_id = 回复链 / 话题开头那条。
     话题里的回复两样都有（在话题里没点「回复」某条时 reply_to 就是开头那条）；搜索结果里话题回复两样都没有。"""
-    mentions = []
-    for m in raw.get("mentions") or []:
-        mid = m.get("id") or ""
-        key = m.get("key") or ""
-        mentions.append(Mention(id=mid, name=m.get("name") or "", is_all=(mid in _AT_ALL_IDS or key in _AT_ALL_IDS)))
     content = raw.get("content")
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
     sender_type = raw.get("sender_type") or ""
     return Message(
-        message_id=raw.get("message_id") or raw.get("id") or "",
-        chat_id=raw.get("chat_id") or "",
-        chat_name="",
-        chat_type=raw.get("chat_type") or "",
-        sender_id=raw.get("sender_id") or "",
-        sender_name="",
-        sender_type="app" if sender_type == "bot" else sender_type,
-        content=content or "",
-        msg_type=raw.get("message_type") or "",
-        create_time=_event_time(raw.get("create_time", ""), tz),
-        mentions=mentions,
-        reply_to=raw.get("reply_to") or "",
-        thread_id=raw.get("thread_id") or "",
-        root_id=raw.get("root_id") or "",
-        raw=raw,
+        message_id=raw.get("message_id") or raw.get("id") or "", chat_id=raw.get("chat_id") or "",
+        chat_name="", chat_type=raw.get("chat_type") or "", sender_id=raw.get("sender_id") or "",
+        sender_name="", sender_type="app" if sender_type == "bot" else sender_type,
+        content=content or "", msg_type=raw.get("message_type") or "",
+        create_time=_event_time(raw.get("create_time", ""), tz), mentions=_parse_mentions(raw),
+        reply_to=raw.get("reply_to") or "", thread_id=raw.get("thread_id") or "",
+        root_id=raw.get("root_id") or "", raw=raw,
     )
 
 
+def _exec_cli(cmd: list[str], *, timeout: float, identity: str | None = None) -> subprocess.CompletedProcess:
+    if identity == "bot" and (subprocess.run is _REAL_SUBPROCESS_RUN or getattr(subprocess.run, "_accepts_env", False)):
+        if (env := inject_bot_tat_env()) is not None:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+            if is_token_invalid_error(proc.stdout or proc.stderr):
+                invalidate_tat_cache()
+                env = inject_bot_tat_env(force_refresh=True)
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **({"env": env} if env else {}))
+            return proc
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
 class LarkCliSource:
-    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3):
-        self.tz = tz
-        self.binary = shutil.which(binary) or binary
-        self.max_pages = max_pages
+    def __init__(self, tz: str = "+08:00", binary: str = "lark-cli", max_pages: int = 100, retries: int = 3,
+                 retry_wait: float = 2.0):
+        self.tz, self.binary, self.max_pages, self.retries = tz, shutil.which(binary) or binary, max_pages, retries
         # 可重试错误的首次退避秒数，之后每次翻倍
-        self.backoff = 2.0
+        self.backoff = self.retry_wait = retry_wait
+        self.timeout, self.identity = 120, "user"
         # 最近一次 fetch_since 是否没拉完（7.16）：has_more 却缺 page_token，或翻到上限仍 has_more
         self.last_fetch_partial = False
-        self.retries = retries
 
     # ---------- 底层调用 ----------
     @staticmethod
     def _retryable(err: dict) -> bool:
         """限流、标了 retryable 的，以及网络类错误（如 TLS handshake timeout）都按退避重试。"""
-        subtype = str(err.get("subtype") or "").lower()
-        return bool(err.get("retryable")) or subtype == "rate_limit" or err.get("type") == "network" or "timeout" in subtype
+        subtype, msg = str(err.get("subtype") or "").lower(), str(err.get("message") or err.get("msg") or "").lower()
+        return (bool(err.get("retryable")) or subtype == "rate_limit" or err.get("type") == "network"
+                or "timeout" in subtype or err.get("code") in (429, 99991400) or "429" in msg or "rate limit" in msg)
 
     def _run(self, args: list[str], identity: str = "user") -> dict:
-        delay = self.backoff
         last_err = ""
-        for attempt in range(self.retries):
+        for attempt in range(max(1, self.retries)):
             try:
-                proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=120)
+                proc = _exec_cli([self.binary, *args, "--as", identity], timeout=120, identity=identity)
             except subprocess.TimeoutExpired as e:
                 raise LarkTimeout(f"lark-cli 超时 {args[:2]}（{e.timeout:g} 秒）") from e
             out = proc.stdout.strip() or proc.stderr.strip()
@@ -161,9 +144,9 @@ class LarkCliSource:
             err = data.get("error") or {}
             last_err = f"{err.get('type')}/{err.get('subtype')}: {err.get('message')}"
             if self._retryable(err) and attempt + 1 < self.retries:
+                delay = (self.retry_wait if self.retry_wait != 2.0 else self.backoff) * (2 ** attempt)
                 log.warning("lark-cli %s 第 %d 次失败（%s），%.0f 秒后重试", " ".join(args[:2]), attempt + 1, last_err, delay)
                 time.sleep(delay)
-                delay *= 2
                 continue
             break
         raise SourceError(f"lark-cli 调用失败 {args[:2]}: {last_err}")
@@ -173,35 +156,28 @@ class LarkCliSource:
         args = ["im", "+messages-search", "--start", start_iso, "--page-size", "50", "--format", "json", "--no-reactions"]
         if end_iso:
             args += ["--end", end_iso]
-        out: list[Message] = []
-        token = ""
-        more = False
+        out, token, more = [], "", False
         for _ in range(self.max_pages):
             data = self._run(args + (["--page-token", token] if token else []))
             out += [parse_message(m, self.tz) for m in data.get("messages") or []]
-            token = data.get("page_token") or ""
-            more = bool(data.get("has_more"))
+            token, more = data.get("page_token") or "", bool(data.get("has_more"))
             if not more or not token:
                 break
         self.last_fetch_partial = more
         return out
 
     def _chat_ids(self, extra: list[str], identity: str = "user") -> set[str]:
-        ids: set[str] = set()
-        token = ""
+        ids, token = set(), ""
         for _ in range(self.max_pages):
             args = ["im", "+chat-list", "--page-size", "100", *extra]
             data = self._run(args + (["--page-token", token] if token else []), identity)
             ids |= {c.get("chat_id") for c in data.get("chats") or [] if c.get("chat_id")}
-            token = data.get("page_token") or ""
-            if not data.get("has_more") or not token:
+            if not data.get("has_more") or not (token := data.get("page_token") or ""):
                 break
         return ids
 
     def muted_chat_ids(self) -> set[str]:
-        all_ids = self._chat_ids([])
-        unmuted = self._chat_ids(["--exclude-muted"])
-        return all_ids - unmuted
+        return self._chat_ids([]) - self._chat_ids(["--exclude-muted"])
 
     # ---------- 机器人身份（7.26），只读 ----------
     def bot_chat_ids(self) -> set[str]:
@@ -230,46 +206,51 @@ class LarkCliSource:
             proc = subprocess.run([self.binary, "config", "show"], capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired as e:
             raise LarkTimeout(f"lark-cli config show 超时（{e.timeout:g} 秒）") from e
-        out = proc.stdout or ""
-        end = out.rfind("}")
+        out, end = proc.stdout or "", (proc.stdout or "").rfind("}")
         try:
             data = json.loads(out[out.find("{"): end + 1]) if end >= 0 else {}
         except json.JSONDecodeError:
             data = {}
-        app = (data or {}).get("appId") or ""
-        if not app:
+        if not (app := (data or {}).get("appId") or ""):
             raise SourceError(f"lark-cli config show 没有 appId: {out[:200]}")
         return str(app)
 
     def read_status(self, message_ids: list[str]) -> dict[str, bool]:
         result: dict[str, bool] = {}
         for i in range(0, len(message_ids), 50):
-            chunk = message_ids[i : i + 50]
-            data = self._run(["im", "+messages-read-status", "--message-ids", ",".join(chunk)])
+            data = self._run(["im", "+messages-read-status", "--message-ids", ",".join(message_ids[i : i + 50])])
             for item in data.get("items") or []:
                 result[item["message_id"]] = bool(item.get("is_read"))
         return result
 
-    # ---------- 写：确认表情（7.9），默认 user 身份，只试一次不重试 ----------
+    # ---------- 写：确认表情（7.9），默认 user 身份，限流/网络瞬态按退避重试 ----------
     def _run_once(self, args: list[str], identity: str = "user", timeout: float = 60) -> dict:
         if identity not in ("user", "bot"):
             raise SourceError(f"未知身份 {identity!r}")
-        try:
-            proc = subprocess.run([self.binary, *args, "--as", identity], capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as e:
-            raise LarkTimeout(f"lark-cli 超时 {args[:3]}（{e.timeout:g} 秒）") from e
-        out = proc.stdout.strip() or proc.stderr.strip()
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            raise SourceError(f"lark-cli 输出无法解析 rc={proc.returncode}: {out[:300]}")
-        # 既接受 {"ok":..,"data":..} 外层，也接受原始 API 的 {"code":0,"data":..} 或直接返回数据
-        if not isinstance(data, dict):
-            raise SourceError(f"lark-cli 输出不是对象: {out[:300]}")
-        if data.get("ok") is False or data.get("error") or (data.get("code") not in (None, 0)) or proc.returncode != 0:
-            err = data.get("error") or data.get("msg") or out[:300]
-            raise SourceError(f"lark-cli 调用失败 {args[:3]}: {err}")
-        return data
+        for attempt in range(max(1, self.retries)):
+            try:
+                proc = _exec_cli([self.binary, *args, "--as", identity], timeout=timeout, identity=identity)
+            except subprocess.TimeoutExpired as e:
+                raise LarkTimeout(f"lark-cli 超时 {args[:3]}（{e.timeout:g} 秒）") from e
+            out = proc.stdout.strip() or proc.stderr.strip()
+            try:
+                data = json.loads(out)
+            except json.JSONDecodeError:
+                raise SourceError(f"lark-cli 输出无法解析 rc={proc.returncode}: {out[:300]}")
+            # 既接受 {"ok":..,"data":..} 外层，也接受原始 API 的 {"code":0,"data":..} 或直接返回数据
+            if not isinstance(data, dict):
+                raise SourceError(f"lark-cli 输出不是对象: {out[:300]}")
+            if data.get("ok") is False or data.get("error") or (data.get("code") not in (None, 0)) or proc.returncode != 0:
+                err = data.get("error") or data.get("msg") or out[:300]
+                err_d = err if isinstance(err, dict) else {"code": data.get("code"), "message": str(err)}
+                if self._retryable(err_d) and attempt + 1 < self.retries:
+                    delay = (self.retry_wait if self.retry_wait != 2.0 else self.backoff) * (2 ** attempt)
+                    log.warning("lark-cli %s 第 %d 次失败（%s），%.0f 秒后重试", " ".join(args[:3]), attempt + 1, err, delay)
+                    time.sleep(delay)
+                    continue
+                raise SourceError(f"lark-cli 调用失败 {args[:3]}: {err}")
+            return data
+        raise SourceError(f"lark-cli 调用失败 {args[:3]}")
 
     @staticmethod
     def _find(data: dict, key: str):
@@ -283,6 +264,7 @@ class LarkCliSource:
         return None
 
     def add_reaction(self, message_id: str, emoji_type: str, identity: str = "user") -> str:
+        if not str(message_id or "").startswith("om_"): return ""
         data = self._run_once(["im", "reactions", "create",
                                "--params", json.dumps({"message_id": message_id}),
                                "--data", json.dumps({"reaction_type": {"emoji_type": emoji_type}})], identity)
@@ -454,3 +436,6 @@ class LarkCliSource:
             for m in data.get("messages") or data.get("items") or []:
                 result[m.get("message_id", "")] = (m.get("sender") or {}).get("id", "")
         return result
+
+
+LarkSource = LarkCliSource
