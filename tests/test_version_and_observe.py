@@ -7,15 +7,7 @@
 
 from __future__ import annotations
 
-import importlib.util
-import io
-import json
-import os
-import subprocess
-import sys
-import tempfile
-import tomllib
-import unittest
+import importlib.util, io, json, os, subprocess, sys, tempfile, tomllib, unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -54,15 +46,12 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.89")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 89))
+        self.assertEqual(cur_ver, "0.7.90")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 90))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
-        self.assertEqual(
-            pyproject["tool"]["setuptools"]["dynamic"]["version"]["attr"],
-            "sheepdog.__version__",
-        )
+        self.assertEqual(pyproject["tool"]["setuptools"]["dynamic"]["version"]["attr"], "sheepdog.__version__")
 
         # 2. release_gate.check_specs 强校验 --specs 7.68 与 sheepdog/__init__.py 版本对齐
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,14 +61,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             (repo / "sheepdog").mkdir(parents=True)
 
             def git(*args: str) -> str:
-                return subprocess.run(
-                    [
-                        "git", "-C", str(repo),
-                        "-c", "user.name=test", "-c", "user.email=test@example.invalid",
-                        *args,
-                    ],
-                    capture_output=True, text=True, check=True,
-                ).stdout.strip()
+                cmd = ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args]
+                return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 
             git("init", "-q")
             (repo / "tests" / "test_ok.py").write_text(OK_TEST_CODE, encoding="utf-8")
@@ -90,10 +73,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             sha_mismatch = git("rev-parse", "HEAD")
 
             problems_bad = gate.check_specs(repo, sha_mismatch, ["7.68"], sys.executable)
-            self.assertTrue(
-                any("版本号未对齐" in p and "0.7.68" in p for p in problems_bad),
-                f"Expected version mismatch error, got: {problems_bad}",
-            )
+            self.assertTrue(any("版本号未对齐" in p and "0.7.68" in p for p in problems_bad), f"Expected version mismatch error, got: {problems_bad}")
 
             (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.68"\n', encoding="utf-8")
             git("add", "-A")
@@ -162,26 +142,12 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 return real_run(cmd, *a, **kw)
 
             with mock.patch("subprocess.run", side_effect=has_remote_tag):
-                sent_remote1 = cli._check_version_update(
-                    cfg,
-                    store,
-                    fake_dispatcher,
-                    runtime_info=rt,
-                    repo_dir=repo,
-                    now=now_dt + timedelta(minutes=35),
-                )
+                sent_remote1 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=35))
                 self.assertEqual(len(sent_remote1), 1)
                 self.assertIn("v0.7.99", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
-                sent_remote2 = cli._check_version_update(
-                    cfg,
-                    store,
-                    fake_dispatcher,
-                    runtime_info=rt,
-                    repo_dir=repo,
-                    now=now_dt + timedelta(minutes=70),
-                )
+                sent_remote2 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=70))
                 self.assertEqual(sent_remote2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
@@ -295,13 +261,7 @@ class ObserveWaterflowSlaTest(unittest.TestCase):
             )
             store.conn.commit()
 
-            res = observe.run_observe(
-                cfg,
-                now_dt=ref_now,
-                since_minutes=30.0,
-                check_processes=False,
-                check_log=False,
-            )
+            res = observe.run_observe(cfg, now_dt=ref_now, since_minutes=30.0, check_processes=False, check_log=False)
             warns = res["warns"]
             self.assertTrue(
                 any("Ingest Ack SLA）：1 条" in w and "no_ack_01"[-8:] in w for w in warns),
@@ -312,13 +272,7 @@ class ObserveWaterflowSlaTest(unittest.TestCase):
                 f"keyword reason should NOT trigger Ingest Ack SLA, got: {warns}",
             )
             # 10 秒后第 2 轮巡检（since 已推进）：30 分钟滚动窗口仍能捕获该未点表情消息，不从 warns 中消失
-            res_second = observe.run_observe(
-                cfg,
-                now_dt=ref_now + timedelta(seconds=10),
-                since_minutes=30.0,
-                check_processes=False,
-                check_log=False,
-            )
+            res_second = observe.run_observe(cfg, now_dt=ref_now + timedelta(seconds=10), since_minutes=30.0, check_processes=False, check_log=False)
             self.assertTrue(
                 any("Ingest Ack SLA）：1 条" in w and "no_ack_01"[-8:] in w for w in res_second["warns"]),
                 f"Ingest Ack SLA warn must persist across consecutive runs via rolling window, got: {res_second['warns']}",
@@ -400,14 +354,7 @@ class ObserveTranscriptProbesTest(unittest.TestCase):
             ]
             t_zombie.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in zombie_steps) + "\n", encoding="utf-8")
 
-            res = observe.run_observe(
-                cfg,
-                now_dt=ref_now,
-                self_heal=True,
-                antigravity_brain_dir=brain_dir,
-                check_processes=False,
-                check_log=False,
-            )
+            res = observe.run_observe(cfg, now_dt=ref_now, self_heal=True, antigravity_brain_dir=brain_dir, check_processes=False, check_log=False)
             warns = res["warns"]
             self.assertTrue(
                 any("Prompt Filter" in w and "tp_filter" in w for w in warns),
@@ -438,14 +385,7 @@ class ObserveTranscriptProbesTest(unittest.TestCase):
 
             # 若催交后仍静默满 200s，下一轮 observe --self-heal 保留 auto_resumed=True 并推进 passed_at，常驻进程立即解锁批次
             round2_now = ref_now + timedelta(seconds=200)
-            observe.run_observe(
-                cfg,
-                now_dt=round2_now,
-                self_heal=True,
-                antigravity_brain_dir=brain_dir,
-                check_processes=False,
-                check_log=False,
-            )
+            observe.run_observe(cfg, now_dt=round2_now, self_heal=True, antigravity_brain_dir=brain_dir, check_processes=False, check_log=False)
             handled_round2 = dispatcher._check_stopped_in_flight(
                 store.get_topic("tp_zombie"), "b-zombie-1", ref_now, round2_now, True
             )
@@ -501,14 +441,7 @@ class ObserveBusBoundaryAndNoiseTest(unittest.TestCase):
                 )
             store.conn.commit()
 
-            res1 = observe.run_observe(
-                cfg,
-                now_dt=ref_now,
-                since_minutes=20.0,
-                antigravity_brain_dir=brain_dir,
-                check_processes=False,
-                check_log=False,
-            )
+            res1 = observe.run_observe(cfg, now_dt=ref_now, since_minutes=20.0, antigravity_brain_dir=brain_dir, check_processes=False, check_log=False)
             warns1 = res1["warns"]
             self.assertTrue(
                 any("总线超时运行" in w and "tp_bus" in w for w in warns1),
@@ -568,15 +501,8 @@ class ObserveBusBoundaryAndNoiseTest(unittest.TestCase):
             st_file = tmp_path / "state" / "cursor-cooldown.json"
             with mock.patch("sheepdog.observe._send_lark_card", side_effect=fake_send_card):
                 res2 = observe.run_observe(
-                    cfg,
-                    state_path=st_file,
-                    now_dt=ref_now + timedelta(seconds=10),
-                    since_minutes=20.0,
-                    notify_lark=True,
-                    notify_chat_id="oc_test_owner",
-                    antigravity_brain_dir=brain_dir,
-                    check_processes=False,
-                    check_log=False,
+                    cfg, state_path=st_file, now_dt=ref_now + timedelta(seconds=10), since_minutes=20.0,
+                    notify_lark=True, notify_chat_id="oc_test_owner", antigravity_brain_dir=brain_dir, check_processes=False, check_log=False,
                 )
                 warns2 = res2["warns"]
                 self.assertFalse(
@@ -592,15 +518,8 @@ class ObserveBusBoundaryAndNoiseTest(unittest.TestCase):
 
                 # 5 秒后第 2 次运行：告警仍存在，warns 不变空，命中指纹冷却，绝不发送绿色恢复卡片
                 res3 = observe.run_observe(
-                    cfg,
-                    state_path=st_file,
-                    now_dt=ref_now + timedelta(seconds=15),
-                    since_minutes=20.0,
-                    notify_lark=True,
-                    notify_chat_id="oc_test_owner",
-                    antigravity_brain_dir=brain_dir,
-                    check_processes=False,
-                    check_log=False,
+                    cfg, state_path=st_file, now_dt=ref_now + timedelta(seconds=15), since_minutes=20.0,
+                    notify_lark=True, notify_chat_id="oc_test_owner", antigravity_brain_dir=brain_dir, check_processes=False, check_log=False,
                 )
                 self.assertTrue(
                     any("ask_jumps" in w and "tp_work" in w for w in res3["warns"]),
@@ -634,31 +553,20 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
 
     def test_reg_006_reply_card_version_signature_and_legacy_anti_echo(self):
         from sheepdog.card import build_reply_card
-        from sheepdog.config import (
-            LEGACY_REPLY_SUFFIX,
-            OwnerContextConfig,
-            SessionConfig,
-            default_reply_suffix,
-            load_config,
-        )
+        from sheepdog.config import LEGACY_REPLY_SUFFIX, OwnerContextConfig, SessionConfig, default_reply_suffix, load_config
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.89）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.90）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.89")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.90")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
         card = build_reply_card("收到，马上处理", SessionConfig().reply_suffix)
         self.assertEqual(
             card["body"]["elements"][-1],
-            {
-                "tag": "markdown",
-                "content": f"<font color='grey'>{expected_sig}</font>",
-                "text_align": "right",
-                "text_size": "notation",
-            },
+            {"tag": "markdown", "content": f"<font color='grey'>{expected_sig}</font>", "text_align": "right", "text_size": "notation"},
         )
 
         # 2. 旧配置文件写死 [🐕Sheepdog Reply] 自动升级为动态版本签名；自定义标记原样保留
@@ -726,13 +634,7 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.models import Message
 
         # 1. 升级口令识别（剥离 <at> 标签、标点、大小写不敏感）
-        for valid_cmd in (
-            "你来升级",
-            "升级！",
-            "重启生效。",
-            "<at id=ou_bot>@牧羊犬</at> 你来升级~",
-            "  SHEEPDOG UPGRADE ",
-        ):
+        for valid_cmd in ("你来升级", "升级！", "重启生效。", "<at id=ou_bot>@牧羊犬</at> 你来升级~", "  SHEEPDOG UPGRADE "):
             self.assertTrue(is_upgrade_command(valid_cmd), valid_cmd)
         for non_cmd in ("生产服务刚完成了升级", "帮我看看升级方案", "待办"):
             self.assertFalse(is_upgrade_command(non_cmd), non_cmd)
@@ -743,14 +645,8 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
             (repo / "sheepdog").mkdir(parents=True)
 
             def git(*args: str) -> str:
-                return subprocess.run(
-                    [
-                        "git", "-C", str(repo),
-                        "-c", "user.name=test", "-c", "user.email=test@example.invalid",
-                        *args,
-                    ],
-                    capture_output=True, text=True, check=True,
-                ).stdout.strip()
+                cmd = ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args]
+                return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 
             git("init", "-q")
             (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.68"\n', encoding="utf-8")
@@ -969,6 +865,75 @@ class VersionAndObserveTest(unittest.TestCase):
         err_tb = ["2026-10-28 21:00:00 ERROR Traceback (most recent call last):", '  File "cli.py", line 1', "RuntimeError: boom"]
         self.assertTrue(observe._is_kb_interrupt_tb(kb_tb, 0))
         self.assertFalse(observe._is_kb_interrupt_tb(err_tb, 0))
+
+    def test_reg_058_owner_reaction_cleared_on_report_and_handled_receipt(self):
+        from sheepdog import outbound
+        from sheepdog.engine import write_receipt
+        from sheepdog.models import Message
+        from sheepdog.source.lark import LarkCliSource
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(self_open_id="ou_owner", state_dir=Path(tmp) / "state")
+            cfg.source.enabled = False
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            store.upsert_topic("tp_bus", title="总线", kind="bus", conversation_id="cid_bus")
+            store.upsert_topic("tp_alpha", title="Alpha 专席", kind="adopted", conversation_id="cid_alpha")
+            store.upsert_topic("tp_beta", title="Beta 专席", kind="adopted", conversation_id="cid_beta")
+
+            # 1) owner_reply (p2p) + owner_instruction (group) 投递给 tp_alpha，status='waiting' 不撤，send_to_owner('report') 自动撤下
+            m1 = Message(message_id="om_p2p_1", chat_id="oc_dm", chat_name="私聊", chat_type="p2p", sender_id="ou_owner", sender_name="Matthew", sender_type="user", content="私聊回复", msg_type="text", create_time="2026-10-30T05:00:00+08:00")
+            m2 = Message(message_id="om_grp_1", chat_id="oc_grp", chat_name="群聊", chat_type="group", sender_id="ou_owner", sender_name="Matthew", sender_type="user", content="群里指令", msg_type="text", create_time="2026-10-30T05:00:01+08:00")
+            store.upsert_message(m1, "dispatch", "owner_reply", ["owner_verified"], "tp_alpha")
+            store.upsert_message(m2, "dispatch", "owner_instruction", ["owner_verified", "owner_instruction"], "tp_alpha")
+            store.record_dispatch("b_alpha_1", "tp_alpha", ["om_p2p_1", "om_grp_1"])
+            store.mark_batch(["om_p2p_1", "om_grp_1"], "b_alpha_1", "tp_alpha", "delivered")
+            store.update_topic("tp_alpha", state="running", pending_batch_id="b_alpha_1", dispatched_at="2026-10-30T05:00:02+08:00")
+            store.add_ack("om_p2p_1", "oc_dm", "p2p", "ou_owner", "owner_reply", "rx_p2p_1", None, "bot")
+            store.add_ack("om_grp_1", "oc_grp", "group", "ou_owner", "owner_instruction", "rx_grp_1", None, "bot")
+
+            write_receipt(cfg, "tp_alpha", "b_alpha_1", {"status": "waiting", "summary": "后台处理中"})
+            self.assertEqual(store.get_message("om_p2p_1")["dispatch_state"], "acked")
+            self.assertIsNone(store.get_ack("om_p2p_1")["removed_at"])
+            self.assertIsNone(store.get_ack("om_grp_1")["removed_at"])
+
+            removed_calls: list[tuple[str, str, str]] = []
+            im_src = mock.MagicMock()
+            im_src.remove_reaction.side_effect = lambda mid, rid, ident="user": removed_calls.append((mid, rid, ident))
+            im_src.send_to_user.return_value = {"message_id": "om_rep_1", "thread_id": ""}
+            outbound.send_to_owner(cfg, store, im_src, "report", "tp_alpha", "处理完毕", "已完成任务", fyi=True)
+            self.assertEqual(removed_calls, [("om_p2p_1", "rx_p2p_1", "bot"), ("om_grp_1", "rx_grp_1", "bot")])
+            self.assertIsNotNone(store.get_ack("om_p2p_1")["removed_at"])
+            self.assertIsNotNone(store.get_ack("om_grp_1")["removed_at"])
+
+            # 2) tp_beta 已投递的 owner_reply 与 tp_bus 转交后尚处 pending 的 owner_instruction：tp_bus 交 handled 不误撤，tp_beta 交 handled 仅撤已投递那条
+            m3 = Message(message_id="om_top_1", chat_id="oc_tg", chat_name="话题群", chat_type="group", sender_id="ou_owner", sender_name="Matthew", sender_type="user", content="话题回复", msg_type="text", create_time="2026-10-30T05:01:00+08:00")
+            m4 = Message(message_id="om_fwd_1", chat_id="oc_grp", chat_name="群聊", chat_type="group", sender_id="ou_owner", sender_name="Matthew", sender_type="user", content="待转交指令", msg_type="text", create_time="2026-10-30T05:01:01+08:00")
+            store.upsert_message(m3, "dispatch", "owner_reply", ["owner_verified"], "tp_beta")
+            store.upsert_message(m4, "dispatch", "owner_instruction", ["owner_verified", "owner_instruction"], "tp_bus")
+            store.record_dispatch("b_beta_1", "tp_beta", ["om_top_1"])
+            store.mark_batch(["om_top_1"], "b_beta_1", "tp_beta", "delivered")
+            store.add_ack("om_top_1", "oc_tg", "group", "ou_owner", "owner_reply", "rx_top_1", None, "bot")
+            store.add_ack("om_fwd_1", "oc_grp", "group", "ou_owner", "owner_instruction", "rx_fwd_1", None, "bot")
+            store.forward_message("om_fwd_1", "tp_beta", ["owner_verified", "owner_instruction"])
+
+            write_receipt(cfg, "tp_bus", "b_bus_1", {"status": "handled", "summary": "已转交 Beta"})
+            self.assertIsNone(store.get_ack("om_fwd_1")["removed_at"])
+            write_receipt(cfg, "tp_beta", "b_beta_1", {"status": "handled", "summary": "已处理话题回复"})
+            self.assertIsNotNone(store.get_ack("om_top_1")["removed_at"])
+            self.assertIsNone(store.get_ack("om_fwd_1")["removed_at"])
+
+            store.record_dispatch("b_beta_2", "tp_beta", ["om_fwd_1"])
+            store.mark_batch(["om_fwd_1"], "b_beta_2", "tp_beta", "delivered")
+            write_receipt(cfg, "tp_beta", "b_beta_2", {"status": "handled", "summary": "转交指令已办结"})
+            self.assertIsNotNone(store.get_ack("om_fwd_1")["removed_at"])
+
+            # 3) LarkCliSource.remove_reaction 将 identity 透传给 _run_once
+            src = LarkCliSource(tz="+08:00", binary="lark-cli")
+            with mock.patch.object(src, "_run_once") as m_run:
+                src.remove_reaction("om_1", "rx_1", "bot")
+                m_run.assert_called_once_with(["im", "reactions", "delete", "--params", json.dumps({"message_id": "om_1", "reaction_id": "rx_1"})], "bot")
 
 
 if __name__ == "__main__":

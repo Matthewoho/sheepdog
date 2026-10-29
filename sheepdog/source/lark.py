@@ -402,9 +402,9 @@ class LarkCliSource:
             return out  # 查到了就够判断；没查完的部分只会更多
         raise SourceError(f"发前检查没查完（{chat_id} 从 {start_iso} 起翻页到上限仍有更多）")
 
-    def remove_reaction(self, message_id: str, reaction_id: str) -> None:
+    def remove_reaction(self, message_id: str, reaction_id: str, identity: str = "user") -> None:
         self._run_once(["im", "reactions", "delete",
-                        "--params", json.dumps({"message_id": message_id, "reaction_id": reaction_id})])
+                        "--params", json.dumps({"message_id": message_id, "reaction_id": reaction_id})], identity or "user")
 
     # ---------- 读：消息上的表情（7.13 补充），user 身份，只读 ----------
     REACTION_BATCH = 20

@@ -396,5 +396,9 @@
 | --- | --- | --- |
 | 7.89 | 业务专席跨源嫁接提问者截图注释或将本地静态代码误称为「查了测试/生产 DB」、对 `~/Code` 父目录裸跑全目录递归 `grep -rn` 超时半截放弃，或 `observe` 把 `tp_bus` 执行只读 `context_memory.py runtime-context` 与 `KeyboardInterrupt` 重启栈误判为越权/崩溃告警（REG-057） | `test_version_and_observe.VersionAndObserveTest.test_reg_057_source_attribution_and_targeted_repo_search_guard`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_057_source_attribution_and_targeted_repo_search_guard`） |
 
+## 7.90 主人回复与指令确认表情在会话汇报或提交 handled/done 回执时自动撤下（REG-058）
 
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.90 | 主人在机器人私聊、话题群或外部群聊发的回复与指令（`owner_reply` / `owner_instruction` / `owner_verified`）在消息投递会话后由 bot 身份点了确认表情（`OnIt`），但会话通过 `report` / `ask` / `reply` / `resolve` 或提交 `status="handled"` / `"done"` 回执处理完毕后未自动调飞书 `im reactions delete`（`identity="bot"`）撤下确认表情并标 `acks.removed_at`，或 `status="waiting"` 时提前误撤、或 `tp_bus` `forward` 转交后仍在 `pending` 排队未送达目标专席前被 `tp_bus` 回执提前误撤（REG-058） | `test_version_and_observe.VersionAndObserveTest.test_reg_058_owner_reaction_cleared_on_report_and_handled_receipt`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_058_owner_reaction_cleared_on_report_and_handled_receipt`） |
 

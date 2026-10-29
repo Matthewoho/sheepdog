@@ -127,8 +127,52 @@ class Acker:
                 print(f"[dryrun] 撤表情 {a['reaction_id']} <- {a['message_id']}（主人发了 {m.message_id}）")
                 continue
             try:
-                self.im.remove_reaction(a["message_id"], a["reaction_id"])
+                try:
+                    self.im.remove_reaction(a["message_id"], a["reaction_id"], a["identity"] or "user")
+                except TypeError:
+                    self.im.remove_reaction(a["message_id"], a["reaction_id"])
                 self.store.mark_ack_removed(a["message_id"])
             except Exception as e:  # 失败只记录，不重试
                 self.store.set_ack_error(a["message_id"], f"撤表情失败: {str(e)[:500]}")
                 log.warning("撤表情失败 %s: %s", a["message_id"], e)
+
+
+def clear_handled_owner_reactions(store: Store, im, topic_id: str, batch_id: str = "") -> list[str]:
+    """REG-058：会话通过 report/ask/reply/resolve 或提交 handled/done 回执处理完毕时，撤下名下已投递/已签收的主人消息确认表情。"""
+    raw = (topic_id or "").strip()
+    if not raw:
+        return []
+    tid = raw if raw.startswith("tp_") else f"tp_{raw}"
+    base = tid.split("#", 1)[0]
+    rows = store.conn.execute(
+        """SELECT a.message_id, a.reaction_id, COALESCE(NULLIF(a.identity, ''), 'bot') AS identity
+           FROM acks a
+           JOIN messages m ON m.message_id = a.message_id
+           WHERE a.reaction_id IS NOT NULL AND a.removed_at IS NULL AND a.error IS NULL
+             AND (a.reason IN ('owner_reply', 'owner_instruction')
+                  OR m.reason IN ('owner_reply', 'owner_instruction')
+                  OR COALESCE(m.tags_json, '') LIKE '%"owner_verified"%'
+                  OR COALESCE(m.tags_json, '') LIKE '%"owner_instruction"%')
+             AND (m.topic_id = ? OR m.topic_id = ? OR m.topic_id LIKE ?)
+             AND m.dispatch_state IN ('delivered', 'acked')
+           ORDER BY a.added_at""",
+        (tid, base, f"{base}#%"),
+    ).fetchall()
+    cleared: list[str] = []
+    for a in rows:
+        mid, rid, ident = a["message_id"], a["reaction_id"], a["identity"] or "bot"
+        try:
+            if im is not None and hasattr(im, "remove_reaction"):
+                try:
+                    im.remove_reaction(mid, rid, ident)
+                except TypeError:
+                    im.remove_reaction(mid, rid)
+            store.mark_ack_removed(mid)
+            cleared.append(mid)
+        except Exception as e:
+            store.set_ack_error(mid, f"撤表情失败: {str(e)[:500]}")
+            log.warning("撤表情失败 %s: %s", mid, e)
+    return cleared
+
+
+_clear_handled_owner_reactions = clear_handled_owner_reactions

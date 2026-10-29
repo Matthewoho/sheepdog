@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import (__version__, _git_run, actions, decision_hub, default_repo_dir, duty, guard, identity as ident, lastgood,
                observe as obs, outbound, parse_version_tuple, session as sm, version_info, version_watch)
-from .ack import Acker
+from .ack import Acker, _clear_handled_owner_reactions, clear_handled_owner_reactions
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
 from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_STATE_LABEL, RETIRED, Collector,
@@ -1021,9 +1021,6 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 if any(pruned.values()):
                     logging.info("清理超过 %d 天的数据: %s", cfg.retention_days,
                                  {k: v for k, v in pruned.items() if v})
-            _wait_next(args, collector, dispatcher)
-            if getattr(dispatcher, "restart_requested", False):
-                return 0
         except KeyboardInterrupt:
             return 0
         except Exception as e:  # 单轮失败不退出，下一轮从水位线续跑
@@ -1031,6 +1028,9 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 logging.exception("本轮失败")
             else:
                 logging.error("本轮失败（下一轮从水位线续跑）: %s: %s", type(e).__name__, e)
+        _wait_next(args, collector, dispatcher)
+        if getattr(dispatcher, "restart_requested", False):
+            return 0
 
 
 def cmd_inbox(args) -> int:
@@ -2045,11 +2045,11 @@ def cmd_ask(args) -> int:
         except outbound.OutboundError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return e.code
-        try:
-            _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
+        try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
         except ValueError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID
+        if cfg.notify_path is not None: clear_handled_owner_reactions(store, None, tid)
         return _test_env_write(cfg, "需要你定" if kind == outbound.ASK else "汇报",
                                outbound.compose(cfg, kind, tid, args.title, resolved_body))
     try:
@@ -2150,11 +2150,11 @@ def cmd_reply(args) -> int:
         except outbound.OutboundError as e:
             print(f"代回没发: {e}", file=sys.stderr)
             return e.code
-        try:
-            shown, _ = outbound.reply_body(cfg, args.text or "", card_text, summary=summary)
+        try: shown, _ = outbound.reply_body(cfg, args.text or "", card_text, summary=summary)
         except ValueError as e:
             print(f"代回没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID
+        if cfg.notify_path is not None: clear_handled_owner_reactions(store, None, tid)
         return _test_env_write(cfg, "代回", f"回复 {args.to}：\n{shown}")
     try:
         r = outbound.reply(cfg, store, _source(cfg), tid, args.to, text=args.text or "", card_text=card_text,

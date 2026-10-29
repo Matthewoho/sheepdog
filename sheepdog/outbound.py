@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import duty, identity as ident, pending as pend, session as sm
+from .ack import clear_handled_owner_reactions
 from .card import build_owner_card, build_reply_card, card_fits, card_request_bytes, resolve_summary_and_body
 from .config import Config
 from .engine import (BUS_TOPIC_ID, MANAGED_KINDS, PRIORITY_PREFIX, display_time, has_reply_suffix, is_agent_reply,
@@ -274,10 +275,9 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
     return hits
 
 
-def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str,
-                  key: str = "", batch: str = "", about: list[str] | None = None, track: bool = False,
-                  floor: str = "", vips: dict | None = None, summary: str = "",
-                  floor_type: str | None = None, options: str = "", ball: str = "", fyi: bool = False) -> SendResult:
+def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str, key: str = "",
+                  batch: str = "", about: list[str] | None = None, track: bool = False, floor: str = "",
+                  vips: dict | None = None, summary: str = "", floor_type: str | None = None, options: str = "", ball: str = "", fyi: bool = False) -> SendResult:
     """ask / report：以机器人身份私聊主人（或发进话题群），ask 发前核 VIP 底线并当场记来源与 floor。"""
     from . import decision_hub, topicgroup as tg
     check_not_lamb(store, kind, topic_id=topic_id)
@@ -307,26 +307,25 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         res = SendResult(prev["message_id"], already=True, root_message_id=prev["root_message_id"] or "", text=text, batch_chats=n_chats)
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
-        return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
+        return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
     if kind == ASK and nk and decision_hub.hub_active(cfg, store):
         _, ask_card = owner_content(cfg, text, at=True, kind=ASK, topic_id=topic_id, key=key, title=title, options=options)
         if (patched := decision_hub.try_patch_open_ask(cfg, store, source, topic_id, key, nk, title, text, ask_card, options_spec=options)) is not None:
             res = SendResult(patched["message_id"], already=True, root_message_id=patched["root_message_id"], text=text, batch_chats=n_chats)
-            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
+            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
     route = tg.route_for_send(cfg, store, topic_id, key, track, kind=kind, title=title, batch_id=batch)
     if route.group:
         try:
             res = _send_to_group(cfg, store, source, kind, topic_id, title, key, nk, text, ik, route, options=options, batch_id=eff_batch)
             res.batch_chats = n_chats
-            if kind == REPORT:
-                decision_hub.apply_report_ball_state(store, topic_id, key or (route.item and tg.label(route.item["item_no"])) or "", ball)
-            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
+            if kind == REPORT: decision_hub.apply_report_ball_state(store, topic_id, key or (route.item and tg.label(route.item["item_no"])) or "", ball)
+            return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
         except _GroupDown as e:
             route = tg.SendRoute(note=f"话题群发不进去（{e}），已退回私聊，这条发进了私聊")
     res = _send_dm(cfg, store, source, kind, topic_id, title, key, nk, text, ik, options=options)
     res.batch_chats, res.note = n_chats, route.note
     if kind == REPORT: decision_hub.apply_report_ball_state(store, topic_id, key, ball)
-    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor)
+    return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
 
 
 class _GroupDown(Exception):
@@ -415,14 +414,12 @@ def _send_dm(cfg: Config, store: Store, source, kind: str, topic_id: str, title:
     return SendResult(mid, root_message_id=root_mid, new_thread=new_thread, text=text)
 
 
-def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: str, origin: str,
-                        srcs: list, floor: str = "") -> SendResult:
+def _record_ask_sources(cfg: Config, store: Store, res: SendResult, topic_id: str, origin: str, srcs: list, floor: str = "", *, source=None) -> SendResult:
     """ask 发出去了（或之前已经发过）：记来源，查同一来源有没有别的会话在问；带了 --floor 记进 sends.floor（7.61）。
     report 不记。"""
-    if not origin:
-        return res
-    if srcs:
-        store.add_escalation_sources(res.message_id, topic_id, srcs, origin)
+    clear_handled_owner_reactions(store, source, topic_id)
+    if not origin: return res
+    if srcs: store.add_escalation_sources(res.message_id, topic_id, srcs, origin)
     # 来源这就定了（没记也是定了：一批来自多个聊天故意不记）；之后每轮补来源不再补它
     store.set_send_sources_origin(res.message_id, origin)
     store.set_send_floor(res.message_id, floor)
@@ -558,8 +555,8 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
                        target_message_id=notice_to, identity=ident.BOT if cfg.identity.enabled else None)
         store.add_bot_outbox(mid, topic_id, False, text, now_iso())
     closed = [e["message_id"] for e in targets if store.resolve_escalation(e["message_id"], e["topic_id"], why, resolved_by=topic_id)]
-    if closed:
-        decision_hub.on_escalations_resolved(cfg, store, source, targets, why=why)
+    if closed: decision_hub.on_escalations_resolved(cfg, store, source, targets, why=why)
+    clear_handled_owner_reactions(store, source, topic_id)
     return ResolveResult(closed, mid, notice_error=err, text=text)
 
 
@@ -823,7 +820,7 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
             raise OutboundError(EXIT_SEND_FAILED, f"发送失败（机器人不在群里，退回主人本人也没发出去）：{e2}")
     mid = res["message_id"]
     store.add_send(ik, REPLY, topic_id, mid, shown, target_message_id=target_id, identity=who if enabled else None)
-    store.add_bot_outbox(mid, topic_id, False, shown, now_iso())
+    store.add_bot_outbox(mid, topic_id, False, shown, now_iso()); clear_handled_owner_reactions(store, source, topic_id)
     if topic_id != BUS_TOPIC_ID and (thr_id := (res.get("thread_id") or (target["thread_id"] if target is not None and "thread_id" in target.keys() else "") or "")):
         store.add_group_thread(thr_id, chat_id, topic_id, "sent", mid, now_iso())
     return ReplyResult(mid, text=shown, identity=who, why=why)

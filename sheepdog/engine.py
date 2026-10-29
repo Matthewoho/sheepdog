@@ -13,12 +13,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import session as sm
+from . import duty, identity, media, session as sm
+from .ack import clear_handled_owner_reactions
 from .config import (ANTIGRAVITY, BUILTIN_REPLY_SUFFIX_RE, LEGACY_REPLY_SUFFIX, NORMAL, OWNER_SIDE, Config, DutyConfig,
                      RoutingConfig)
 from .models import Message
-from . import duty
-from . import media
 from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTIVITY_TAIL, activity_at, commands_in,
                     first_match, human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts,
@@ -39,8 +38,7 @@ from .sink.agentapi import conversation_dir, transcript_contains, transcript_pat
 from .sink.cli_host import NO_RESULT, RECEIPT_FENCE, extract_receipt
 from .store import (ECHO_RELAY_FIELDS, LIFECYCLES, ONESHOT, STANDING, SYSTEM_CHAT, SYSTEM_ID_PREFIX, Store,
                     infer_topic_lifecycle, is_standing_topic, now_iso, row_to_message)
-from .source.lark import LarkTimeout, parse_event, parse_message as parse_thread_reply
-from . import identity
+from .source.lark import LarkCliSource, LarkTimeout, parse_event, parse_message as parse_thread_reply
 
 log = logging.getLogger("sheepdog")
 
@@ -2639,8 +2637,7 @@ class Dispatcher:
             hook.clear_stop_state(self.cfg.state_dir, t["topic_id"])
             receipt = json.loads(p.read_text(encoding="utf-8"))
             status = receipt.get("status", "handled")
-            if is_standing_topic(t) and status == "done":
-                status = "handled"
+            if is_standing_topic(t) and status == "done": status = "handled"
             summary = receipt.get("summary", t["summary"])
             answered = ""
             if status == "needs_decision" and (answered := self._answered_by_priority(t)):
@@ -2656,11 +2653,12 @@ class Dispatcher:
             self.store.mark_batch_state(batch, "acked")
             fields = {"state": new_state, "pending_batch_id": None, "retries": 0, "summary": summary}
             self._watches_after_receipt(t["topic_id"], batch, receipt.get("anchors") or [])
-            if anchors := self._receipt_anchors(t, receipt):
-                fields["anchors_json"] = anchors
+            if anchors := self._receipt_anchors(t, receipt): fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
             if status != "waiting":
                 _auto_close_topic_subagents(self.store, t["topic_id"])
+            if status in ("handled", "done"):
+                clear_handled_owner_reactions(self.store, getattr(self.acker, "im", None) or self.source, t["topic_id"], batch)
             self._receipt_duty(t["topic_id"], batch, {**receipt, "status": status, "summary": summary} if answered else receipt)
             log.info("回执 %s/%s: %s -> %s", t["topic_id"], batch, status, new_state)
             try:  # 7.52 回执带回：出错不挡收回执
@@ -3529,8 +3527,7 @@ class Dispatcher:
         """按账本里消息的现状推进欠账：待推 → queued；送到 → delivered；送到后会话发过 ask/report → report；会话关闭 → topic_closed。"""
         live, now = set(self._live_tids()), _now().isoformat(timespec="seconds")
         for e in self.store.echo_open():
-            if e["stage"] == ECHO_UNDELIVERED:
-                continue
+            if e["stage"] == ECHO_UNDELIVERED: continue
             if (r := self.store.get_message(e["message_id"])) is None:
                 self.store.echo_settle([e["message_id"]], "gone")
                 continue
@@ -3554,6 +3551,7 @@ class Dispatcher:
                 self.store.echo_settle([e["message_id"]], "topic_closed")
             elif self._echo_reported(e, e["delivered_at"] or e["stage_at"] or now):
                 self.store.echo_settle([e["message_id"]], "report")
+                clear_handled_owner_reactions(self.store, getattr(self.acker, "im", None) or self.source, e["topic_id"])
             elif self.cfg.session.owner_receipt_relay and not e["relay_batch"] and e["batch_id"] and not self.store.get_meta(f"owner_relay_skipped:{e['batch_id']}"):
                 if (d := self.store.get_dispatch(e["batch_id"])) is not None and d["state"] in ("acked", ACKED_LATE) and d["receipt"]:
                     try:
@@ -3676,8 +3674,7 @@ class Dispatcher:
     def _echo_relays(self) -> None:
         """回执带回第二步：等着带回、还没还上的，按去处分组并在到点（waiting 或话题群 0 延迟）后原帖盖楼或私聊带回卡片。"""
         sc = self.cfg.session
-        if not sc.owner_receipt_relay:
-            return
+        if not sc.owner_receipt_relay: return
         now = _now()
         groups: dict[tuple, list] = {}
         dests: dict[str, bool] = {}
@@ -3692,8 +3689,7 @@ class Dispatcher:
             dests[dest] = in_thread
             group = (e["topic_id"], e["relay_batch"], dest)
             groups.setdefault(group, []).append(e)
-            if now >= due:
-                ready.add(group)
+            if now >= due: ready.add(group)
         from .outbound import idem_key
         for (tid, batch_id, dest), rows in groups.items():
             if (tid, batch_id, dest) not in ready:
@@ -3712,9 +3708,11 @@ class Dispatcher:
             in_thread = dests[dest] and bool(anchor)
             ids = [e["message_id"] for e in rows]
 
-            def settle(ids=ids, key=key) -> None:
+            def settle(ids=ids, key=key, tid=tid, st=last["relay_status"]) -> None:
                 self.store.echo_settle(ids, "relay")
                 self.store.set_meta(key, now_iso())
+                if st in ("handled", "done", ""):
+                    clear_handled_owner_reactions(self.store, getattr(self.acker, "im", None) or self.source, tid)
 
             if self._notify_owner("\n".join(lines), "回执带回", tid, before_send=settle, reply_to=anchor,
                                   in_thread=in_thread, idem_key=idem_key("relay", tid, batch_id, dest)):
@@ -5944,11 +5942,10 @@ def bind_echo_relay(cfg: Config, store: Store, topic_id: str, batch_id: str, rec
 
 
 def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> Path:
-    from . import outbound
+    from . import hook, outbound
     store = Store(cfg.db_path) if cfg.db_path.exists() else None
     try:
-        if msg := outbound.lamb_violation_message(store, "receipt", topic_id=topic_id):
-            raise ValueError(msg)
+        if msg := outbound.lamb_violation_message(store, "receipt", topic_id=topic_id): raise ValueError(msg)
         status = receipt.get("status")
         if status not in sm.RECEIPT_EVENTS:
             raise ValueError(f"status 必须是 {sorted(sm.RECEIPT_EVENTS)} 之一，收到 {status!r}")
@@ -5957,12 +5954,14 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
         p = d / f"{batch_id}.json"
         receipt = {**receipt, "received_at": now_iso()}
         p.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
-        from . import hook
         hook.clear_stop_state(cfg.state_dir, topic_id)
         anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
         has_lamb_anchor = any(isinstance(a, str) and a.startswith("lamb:") for a in anchors)
         if store is not None and status != "waiting":
             _auto_close_topic_subagents(store, topic_id)
+        if store is not None and status in ("handled", "done"):
+            im = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages) if cfg.source.enabled else None
+            clear_handled_owner_reactions(store, im, topic_id, batch_id)
         if store is not None and (status == "waiting" or has_lamb_anchor):
             t = store.get_topic(topic_id)
             if t is not None and t["pending_batch_id"] == batch_id and t["state"] == sm.RUNNING:
