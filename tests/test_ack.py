@@ -378,6 +378,49 @@ class BotAckTest(Base):
         self.assertEqual(self.im.added, [])
         self.assertEqual(load_config_default_bot_reasons(), [])
 
+    def test_reg_059_bot_reaction_231002_falls_back_to_user_and_clears_on_handled(self):
+        from sheepdog.ack import clear_handled_owner_reactions
+        self.cfg.owner_context.enabled = True
+
+        # 模拟主人在 1v1 真人私聊（如与同事私聊）里点名 sheepdog 触发 owner_instruction，
+        # 机器人不在该私聊，bot 点表情返回 231002 (Bot has NO permission)，自动降级为 user 点表情并记入 bot_absent_chats
+        calls = []
+        orig_add = self.im.add_reaction
+
+        def add_with_bot_231002(message_id, emoji_type, identity="user"):
+            calls.append((message_id, identity))
+            if identity == "bot" and message_id in ("om_test_reg059_1", "om_test_reg059_2"):
+                raise SourceError('{"code": 231002, "msg": "Bot has NO permission of the reaction to this message."}')
+            return orig_add(message_id, emoji_type, identity)
+
+        self.im.add_reaction = add_with_bot_231002
+        self.poll([msg(message_id="om_test_reg059_1", chat_type="p2p", chat_id="oc_human_p2p",
+                       sender_id=ME, content="sheepdog 跟进这单")])
+        ack1 = self.store.get_ack("om_test_reg059_1")
+        self.assertIsNotNone(ack1)
+        self.assertEqual(ack1["identity"], "user")
+        self.assertIsNotNone(ack1["reaction_id"])
+        self.assertIsNone(ack1["error"])
+        self.assertEqual(calls, [("om_test_reg059_1", "bot"), ("om_test_reg059_1", "user")])
+        self.assertIn("oc_human_p2p", {x["chat_id"] for x in self.store.bot_absent_chats()})
+
+        # 同一私聊后续消息已知 bot 不在，直接走 user 点表情，不再撞 231002
+        calls.clear()
+        self.poll([msg(message_id="om_test_reg059_2", chat_type="p2p", chat_id="oc_human_p2p",
+                       sender_id=ME, content="sheepdog 顺便看下进度")])
+        ack2 = self.store.get_ack("om_test_reg059_2")
+        self.assertEqual(ack2["identity"], "user")
+        self.assertIsNotNone(ack2["reaction_id"])
+        self.assertEqual(calls, [("om_test_reg059_2", "user")])
+
+        # 投递后办结（clear_handled_owner_reactions）能以 user 身份撤下，并清理历史遗留 231002 error 行
+        self.d.dispatch_once()
+        target_tid = self.store.get_message("om_test_reg059_1")["topic_id"]
+        cleared = clear_handled_owner_reactions(self.store, self.im, target_tid)
+        self.assertIn("om_test_reg059_1", cleared)
+        self.assertIn("om_test_reg059_2", cleared)
+        self.assertIsNotNone(self.store.get_ack("om_test_reg059_1")["removed_at"])
+
 
 def load_config_default_bot_reasons():
     with tempfile.TemporaryDirectory() as d:

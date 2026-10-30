@@ -1678,9 +1678,15 @@ class Store:
     def add_ack(self, message_id: str, chat_id: str, chat_type: str, sender_id: str, reason: str,
                 reaction_id: str | None, error: str | None, identity: str = "user") -> None:
         with self.tx() as c:
-            c.execute("""INSERT OR IGNORE INTO acks(message_id,chat_id,chat_type,sender_id,reason,identity,reaction_id,
-                                                    added_at,error)
-                         VALUES(?,?,?,?,?,?,?,?,?)""",
+            c.execute("""INSERT INTO acks(message_id,chat_id,chat_type,sender_id,reason,identity,reaction_id,
+                                          added_at,error)
+                         VALUES(?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(message_id) DO UPDATE SET
+                             identity=excluded.identity,
+                             reaction_id=COALESCE(excluded.reaction_id, acks.reaction_id),
+                             added_at=excluded.added_at,
+                             error=excluded.error
+                         WHERE acks.reaction_id IS NULL""",
                       (message_id, chat_id, chat_type, sender_id, reason, identity, reaction_id, now_iso(), error))
 
     def removable_acks(self, chat_id: str) -> list[sqlite3.Row]:

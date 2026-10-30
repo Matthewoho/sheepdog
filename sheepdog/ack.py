@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from .config import AckConfig
 from .models import Message
 from .security import HOLD
-from .store import SYSTEM_CHAT, Store
+from .store import SYSTEM_CHAT, Store, now_iso
 
 log = logging.getLogger("sheepdog")
 
@@ -60,25 +60,56 @@ class Acker:
         """一批消息投递成功后调用。"""
         if not self.enabled:
             return
+        absent_chats = (
+            {x["chat_id"] for x in self.store.bot_absent_chats()}
+            if hasattr(self.store, "bot_absent_chats")
+            else set()
+        )
         for r in rows:
-            if r["chat_type"] == SYSTEM_CHAT or not str(r["message_id"] or "").startswith("om_"):
+            mid = r["message_id"]
+            if r["chat_type"] == SYSTEM_CHAT or not str(mid or "").startswith("om_"):
                 continue
             identity = self.identity_for(r)
             if identity is None:
                 continue
             if r["security_action"] == HOLD:
                 continue  # 被安全规则拦截的消息不向发送方示意「已看到」
-            if self.store.get_ack(r["message_id"]) is not None:
-                continue  # 每条只点一次（含之前点失败的，不重试）
+            prev_ack = self.store.get_ack(mid)
+            if prev_ack is not None:
+                # REG-059：若首次以 bot 点表情撞上 231002/230002（机器人不在会话），允许自动降级 user 重试一次
+                prev_err = str(prev_ack["error"] or "")
+                can_retry_user = (
+                    prev_ack["reaction_id"] is None
+                    and prev_ack["identity"] == "bot"
+                    and any(tok in prev_err for tok in ("231002", "230002", "Bot has NO permission", "not in chat"))
+                )
+                if not can_retry_user:
+                    continue  # 每条只点一次（含之前点失败的，不重试）
+            if identity == "bot" and (r["chat_id"] in absent_chats or prev_ack is not None):
+                identity = "user"
             if self.dry_run:
-                print(f"[dryrun] 点表情 {self.cfg.emoji_type}（{identity}）-> {r['message_id']}（{r['reason']}）")
+                print(f"[dryrun] 点表情 {self.cfg.emoji_type}（{identity}）-> {mid}（{r['reason']}）")
                 continue
             try:
-                rid, err = self.im.add_reaction(r["message_id"], self.cfg.emoji_type, identity), None
+                rid, err = self.im.add_reaction(mid, self.cfg.emoji_type, identity), None
             except Exception as e:  # 失败只记录，不影响投递
-                rid, err = None, str(e)[:500]
-                log.warning("点表情失败 %s: %s", r["message_id"], err)
-            self.store.add_ack(r["message_id"], r["chat_id"], r["chat_type"], r["sender_id"], r["reason"], rid, err,
+                err_s = str(e)
+                if identity == "bot" and any(
+                    tok in err_s for tok in ("231002", "230002", "Bot has NO permission", "not in chat")
+                ):
+                    if r["chat_id"] and hasattr(self.store, "note_bot_absent"):
+                        self.store.note_bot_absent(r["chat_id"], "", "231002")
+                        absent_chats.add(r["chat_id"])
+                    identity = "user"
+                    try:
+                        rid, err = self.im.add_reaction(mid, self.cfg.emoji_type, identity), None
+                    except Exception as e2:
+                        rid, err = None, str(e2)[:500]
+                        log.warning("点表情失败 %s（bot 不在会话退回 user 仍失败）: %s", mid, err)
+                else:
+                    rid, err = None, err_s[:500]
+                    log.warning("点表情失败 %s: %s", mid, err)
+            self.store.add_ack(mid, r["chat_id"], r["chat_type"], r["sender_id"], r["reason"], rid, err,
                                identity)
 
     def identity_for(self, r) -> str | None:
@@ -172,6 +203,21 @@ def clear_handled_owner_reactions(store: Store, im, topic_id: str, batch_id: str
         except Exception as e:
             store.set_ack_error(mid, f"撤表情失败: {str(e)[:500]}")
             log.warning("撤表情失败 %s: %s", mid, e)
+    # REG-059：清理该会话名下早期因 bot 231002/230002 未点上表情但已办结的存量 error 行
+    stale_rows = store.conn.execute(
+        """SELECT a.message_id
+           FROM acks a
+           JOIN messages m ON m.message_id = a.message_id
+           WHERE a.reaction_id IS NULL AND a.removed_at IS NULL
+             AND (a.error LIKE '%231002%' OR a.error LIKE '%230002%' OR a.error LIKE '%Bot has NO permission%')
+             AND (m.topic_id = ? OR m.topic_id = ? OR m.topic_id LIKE ?)
+             AND m.dispatch_state IN ('delivered', 'acked')""",
+        (tid, base, f"{base}#%"),
+    ).fetchall()
+    for sr in stale_rows:
+        smid = sr["message_id"]
+        with store.tx() as c:
+            c.execute("UPDATE acks SET error=NULL, removed_at=? WHERE message_id=?", (now_iso(), smid))
     return cleared
 
 

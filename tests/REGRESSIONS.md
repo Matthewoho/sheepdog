@@ -402,3 +402,9 @@
 | --- | --- | --- |
 | 7.90 | 主人在机器人私聊、话题群或外部群聊发的回复与指令（`owner_reply` / `owner_instruction` / `owner_verified`）在消息投递会话后由 bot 身份点了确认表情（`OnIt`），但会话通过 `report` / `ask` / `reply` / `resolve` 或提交 `status="handled"` / `"done"` 回执处理完毕后未自动调飞书 `im reactions delete`（`identity="bot"`）撤下确认表情并标 `acks.removed_at`，或 `status="waiting"` 时提前误撤、或 `tp_bus` `forward` 转交后仍在 `pending` 排队未送达目标专席前被 `tp_bus` 回执提前误撤（REG-058） | `test_version_and_observe.VersionAndObserveTest.test_reg_058_owner_reaction_cleared_on_report_and_handled_receipt`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_058_owner_reaction_cleared_on_report_and_handled_receipt`） |
 
+## 7.91 机器人不在的真人单聊/群聊点名指令确认表情 231002 自动降级 user 与存量报错清理（REG-059）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.91 | 主人在机器人不在场的真人 1v1 私聊或外部群聊里文字点名 `sheepdog` 升格为 `owner_instruction` 后，`Acker.on_delivered` 强行以 `identity="bot"` 调飞书 `im reactions create` 撞上 `231002`（`Bot has NO permission of the reaction to this message`）或 `230002` 导致未点上确认表情并在 `acks.error` 留脏报错，未自动记入 `bot_absent_chats` 并降级为 `identity="user"` 重试及在办结时撤下（REG-059） | `test_ack.BotAckTest.test_reg_059_bot_reaction_231002_falls_back_to_user_and_clears_on_handled`（`tests/test_ack.py::BotAckTest::test_reg_059_bot_reaction_231002_falls_back_to_user_and_clears_on_handled`） |
+
