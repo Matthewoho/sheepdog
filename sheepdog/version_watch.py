@@ -480,7 +480,17 @@ def rollback_repo_to_target(root: Path, target_sha: str, timeout: float = 15.0) 
 def _resolve_rollback_info(store, root: Path, prev_ver: str, prev_sha: str, prev_disp: str, after_sha: str) -> dict:
     """确定并持久化升级完成卡片上可供一键回滚的上一版本目标。"""
     if prev_sha and after_sha and prev_sha != after_sha:
-        info = {"version": prev_ver, "git_sha": prev_sha, "git_short": prev_sha[:7], "display": prev_disp, "saved_at": now_iso()}
+        ver_at_sha = ""
+        if (root / ".git").exists():
+            rf = _git_run(["git", "-C", str(root), "show", f"{prev_sha}:sheepdog/__init__.py"], timeout=3.0)
+            if rf is not None and rf.returncode == 0 and rf.stdout:
+                m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', rf.stdout)
+                ver_at_sha = m.group(1).strip() if m else ""
+        if not ver_at_sha and prev_disp:
+            md = re.match(r"^([vV]?[0-9]+\.[0-9]+\.[0-9]+)", prev_disp.strip())
+            ver_at_sha = md.group(1).lstrip("vV") if md else ""
+        final_ver = ver_at_sha or prev_ver
+        info = {"version": final_ver, "git_sha": prev_sha, "git_short": prev_sha[:7], "display": prev_disp, "saved_at": now_iso()}
         if store is not None:
             store.set_meta("version_rollback_target", json.dumps(info, ensure_ascii=False))
         return info
