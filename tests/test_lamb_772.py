@@ -137,3 +137,107 @@ class Lamb772Test(DutyBase):
         self.assertIn("在跑羔羊 lamb_a1: 查日志", rendered)
         self.assertIn("[20:15] `tp_ops` reply -> om_101: 已回 Sam 正在核查", rendered)
         self.assertIn("[20:16] `tp_ops` [lamb:lamb_a1] running: 排查 Cloud Run 502", rendered)
+
+    def test_reg_062_reused_subagent_cid_binding_and_tail_backfill_prevents_false_timeout(self):
+        t = self.store.get_topic("tp_alpha")
+        parent_cid = t["conversation_id"]
+        parent_tp = transcript_path(parent_cid)
+        parent_tp.parent.mkdir(parents=True, exist_ok=True)
+
+        cid_reused = "06a8c3ff-11b5-479f-8374-6000c1ba1341"
+        cid_already_done = "11111111-2222-3333-4444-555555555555"
+
+        # 1. Historical finished lamb on the same subagent cid_reused (from an earlier task)
+        self.store.create_lamb(
+            "lamb_old_done",
+            "tp_alpha",
+            kind="subagent",
+            task_title="旧任务已结案",
+            conversation_id=cid_reused,
+            state="done",
+            started_at=utc(ago(120)),
+            last_act_at=utc(ago(100)),
+            finished_at=utc(ago(100)),
+        )
+
+        # 2. Parent transcript has an earlier finished subagent cid_already_done (30m ago)
+        #    and then at 25.5m ago sends send_message to reuse cid_reused BEFORE lamb prepare runs at 25m ago.
+        t_start = ago(25)
+        parent_lines = [
+            {
+                "step_index": 10,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": utc(t_start - timedelta(seconds=90)),
+                "tool_calls": [{"name": "send_message", "args": {"Recipient": cid_already_done, "Message": "do quick check"}}],
+            },
+            {
+                "step_index": 11,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": utc(t_start - timedelta(seconds=60)),
+                "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp={utc(t_start - timedelta(seconds=60))} sender={cid_already_done} content=quick check done\n</SYSTEM_MESSAGE>",
+            },
+            {
+                "step_index": 12,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": utc(t_start - timedelta(seconds=45)),
+                "content": f"上一轮子代理 [{cid_already_done}](conversation://{cid_already_done}) 已完成。",
+                "tool_calls": [{"name": "send_message", "args": {"Recipient": cid_reused, "Message": "implement OpenAI and Azure routing"}}],
+            },
+            {
+                "step_index": 13,
+                "source": "SYSTEM",
+                "type": "GENERIC",
+                "created_at": utc(t_start - timedelta(seconds=20)),
+                "content": f'Created At: {utc(t_start - timedelta(seconds=20))}\nCompleted At: {utc(t_start - timedelta(seconds=19))}\nMessage sent to "{cid_reused}".',
+            },
+        ]
+        parent_tp.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in parent_lines), encoding="utf-8")
+
+        # Advance LAMB_DISCOVERY cursor BEFORE lamb prepare registers lamb_reused_1 (simulating daemon tick between send_message and lamb prepare)
+        self.d._scan_lambs()
+
+        # Now lamb prepare creates lamb_reused_1 at t_start (25 minutes ago, > 20m timeout_minutes) with conversation_id=None
+        self.store.create_lamb(
+            "lamb_reused_1",
+            "tp_alpha",
+            kind="subagent",
+            task_title="在model-manager-decision-service实现OpenAI与Azure多通道路由及测试验证",
+            conversation_id=None,
+            state="running",
+            started_at=utc(t_start),
+            last_act_at=utc(t_start),
+        )
+
+        # Child subagent cid_reused has active transcript writes 2 minutes ago
+        child_tp = transcript_path(cid_reused)
+        child_tp.parent.mkdir(parents=True, exist_ok=True)
+        child_tp.write_text(
+            json.dumps({"step_index": 500, "type": "PLANNER_RESPONSE", "created_at": utc(ago(2)), "content": "coding azureresponses"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # 3. Run _tick_lambs(): tail backfill must bind cid_reused (NOT cid_already_done) and refresh heartbeat from child_tp, preventing false 20m timeout!
+        self.d._tick_lambs()
+        lb = self.store.get_lamb("lamb_reused_1")
+        self.assertEqual(lb["conversation_id"], cid_reused)
+        self.assertEqual(lb["state"], "running")
+        self.assertGreater(lb["last_act_at"], utc(ago(5)))
+
+        # 4. When child subagent returns via SYSTEM_MESSAGE, lamb_reused_1 auto-completes as done
+        parent_lines.append({
+            "step_index": 14,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "created_at": utc(ago(0)),
+            "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp={utc(ago(0))} sender={cid_reused} content=OpenAI and Azure multi-provider routing verified.\n</SYSTEM_MESSAGE>",
+        })
+        parent_tp.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in parent_lines), encoding="utf-8")
+        self.d._tick_lambs()
+        lb_after = self.store.get_lamb("lamb_reused_1")
+        self.assertEqual(lb_after["state"], "done")
+        self.assertEqual(lb_after["report_msg_id"], "native_system_message")
+        self.assertIn("OpenAI and Azure multi-provider routing verified", lb_after["result_summary"])
+

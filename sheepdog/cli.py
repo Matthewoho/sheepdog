@@ -2324,7 +2324,8 @@ def _lamb_prepare(cfg, store: Store, args) -> int:
         spec_body = (args.spec if getattr(args, "spec", None) else
                      (sys.stdin.read() if args.spec_file == "-" else Path(args.spec_file).read_text(encoding="utf-8")) if getattr(args, "spec_file", None) else
                      sys.stdin.read() if getattr(args, "spec_stdin", False) else title)
-        lid = register_lamb(store, tid, title, kind=args.kind or "subagent", lamb_id=args.lamb_id or None)
+        lid = register_lamb(store, tid, title, kind=args.kind or "subagent",
+                            conversation_id=getattr(args, "cid", None) or None, lamb_id=args.lamb_id or None)
     except (OSError, ValueError) as e:
         print(f"lamb prepare 被拒绝: {e}", file=sys.stderr)
         return 2
@@ -2684,6 +2685,7 @@ def main(argv: list[str] | None = None) -> int:
     lp.add_argument("--spec-file", default="", help="详细任务文件路径（- 表示 stdin）")
     lp.add_argument("--spec-stdin", action="store_true", help="从标准输入读取详细任务")
     lp.add_argument("--kind", choices=("subagent", "cli"), default="subagent", help="羔羊类型（默认 subagent）")
+    lp.add_argument("--cid", "--conversation-id", dest="cid", default="", help="可选：复用或已知 subagent 的 conversation_id")
     lp.add_argument("--lamb-id", "--id", dest="lamb_id", default="", help="指定 lamb_id（不填自动生成）")
     lp.add_argument("--json", action="store_true", help="输出 JSON")
     lr = lsub.add_parser("register", help="登记一只 subagent 羔羊")

@@ -420,5 +420,12 @@
 | --- | --- | --- |
 | 7.93 | `🐕 汇报 · 升级完成 [tp_bus]` 卡片仅报一句版本号变更而未说明本次更新了什么、解决了什么问题（未支持 `--notes` 或从 `tests/REGRESSIONS.md` / `git log` 自动提炼更新与问题修复摘要），或升级完成卡片未通过 `outbound.owner_content` 注入 `⏪ 回滚至 <上一版>` 交互式胶囊按钮（`sd_action="version_rollback"`）与 `meta["version_rollback_target"]` 持久化，或主人点击回滚按钮 / 发「回滚」/ 跑 `sheepdog upgrade --rollback` 未安全将代码库回退至上一版本并触发常驻进程原地热重启（REG-061） | `test_version_and_observe.VersionAndObserveTest.test_reg_061_upgrade_notice_changelog_and_interactive_rollback`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_061_upgrade_notice_changelog_and_interactive_rollback`） |
 
+## 7.94 复用长生命周期 Subagent（send_message / conversation://）与异步 lamb prepare 时序下自动回填 conversation_id 防 20 分钟假超时（REG-062）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.94 | 母羊通过 `send_message(Recipient=<cid>)` / `Message sent to "<cid>"` / `conversation://<cid>` 复用曾完成过旧任务的子代理并调 `sheepdog lamb prepare` 登记新羔羊时，因 `find_lamb_by_cid` 未过滤历史已结案记录、`guard` 未识别复用信号、或单向游标 `LAMB_DISCOVERY` 先于 `lamb prepare` 扫过母羊 transcript，导致新羔羊 `conversation_id` 恒为 `None`，无法读取子代理自身活跃 `transcript.jsonl` 心跳而在满 20 分钟时误判 `超过 20 分钟无心跳，已超时` 并强行打断母羊（REG-062） | `test_lamb_772.Lamb772Test.test_reg_062_reused_subagent_cid_binding_and_tail_backfill_prevents_false_timeout`（`tests/test_lamb_772.py::Lamb772Test::test_reg_062_reused_subagent_cid_binding_and_tail_backfill_prevents_false_timeout`） |
+
+
 
 

@@ -67,6 +67,9 @@ _NEEDLES = {
     LAMB_DISCOVERY: (
         b"invoke_subagent",
         b"Created the following subagent",
+        b"send_message",
+        b"Message sent to",
+        b"conversation://",
         b"SYSTEM_MESSAGE",
         b"[Message]",
         b"manage_subagents", b"denied by pre-tool hook", b"Encountered error in step execution",
@@ -394,6 +397,8 @@ def one_sentence(text: str, limit: int = 80) -> str:
 _UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.I)
 _CREATED_SUBAGENT_HDR_RE = re.compile(r"Created the following subagent(?:\(s\)|s)?:\s*\n", re.I)
 _CREATED_SUBAGENT_CID_RE = re.compile(r'"?conversationId"?\s*:\s*"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"?', re.I)
+_MESSAGE_SENT_CID_RE = re.compile(r'Message sent to\s+"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"?', re.I)
+_CONV_LINK_CID_RE = re.compile(r'conversation://([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I)
 _TRUNCATED_SUBAGENT_ROLE_RE = re.compile(r'(?:\\?"Role\\?"|\\?"TaskTitle\\?")\s*:\s*\\?"([^"\\]+)')
 _SUBAGENT_RETURN_BLOCK_RE = re.compile(
     r"<SYSTEM_MESSAGE>\s*\[Message\]\s+timestamp=([^\s]+)\s+sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s)[^\n]*?\bcontent=(.*?)(?:</SYSTEM_MESSAGE>|\Z)",
@@ -517,6 +522,66 @@ def subagent_created_cids_in(host: str, d: dict) -> list[str]:
         return []
     cids = [m.group(1).strip() for m in _CREATED_SUBAGENT_CID_RE.finditer(text[m_hdr.end():]) if m.group(1).strip()]
     return list(dict.fromkeys(cids))
+
+
+def subagent_reused_cids_in(host: str, d: dict, parent_cid: str = "", *, include_conv_links: bool = True) -> list[str]:
+    """7.94 REG-062：从 Antigravity PLANNER_RESPONSE (send_message / conversation://<cid>) 或 GENERIC ('Message sent to \"<cid>\"') 提取复用/续派的子代理 conversationId。"""
+    cids: list[str] = []
+    dtype = d.get("type")
+    if dtype == "PLANNER_RESPONSE":
+        for tc in d.get("tool_calls") or []:
+            if not isinstance(tc, dict) or tc.get("name") != "send_message":
+                continue
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else (tc.get("input") if isinstance(tc.get("input"), dict) else {})
+            recip = _pick_str(args.get("Recipient"), args.get("recipient"), args.get("conversation_id"), args.get("ConversationId"))
+            if m := _UUID_RE.search(recip):
+                cids.append(m.group(1).strip())
+        if include_conv_links:
+            raw_content = d.get("content")
+            text = (_decoded(raw_content) or raw_content) if isinstance(raw_content, str) else ""
+            if "conversation://" in text:
+                cids.extend(m.group(1).strip() for m in _CONV_LINK_CID_RE.finditer(text))
+    elif dtype == "GENERIC":
+        raw_content = d.get("content")
+        text = (_decoded(raw_content) or raw_content) if isinstance(raw_content, str) else ""
+        if "Command exited with code" not in text and "Message sent to" in text:
+            cids.extend(m.group(1).strip() for m in _MESSAGE_SENT_CID_RE.finditer(text))
+    p_norm = (parent_cid or "").strip().lower()
+    return list(dict.fromkeys(c for c in cids if c and c.lower() != p_norm))
+
+
+def recent_subagent_cids_since(host: str, path: Path | None, since_iso: str, parent_cid: str = "",
+                               *, ref_since_iso: str = "") -> list[tuple[str, str]]:
+    """7.94 REG-062：从母羊 transcript 尾部提取 since_iso 之后派发/复用的活跃子代理 (conversation_id, at) 列表（若随后已收到该 cid 的回传通知则自动剔除）。"""
+    since_dt = _iso_dt(since_iso)
+    ref_dt = _iso_dt(ref_since_iso) if ref_since_iso else since_dt
+    found: dict[str, str] = {}
+    p_norm = (parent_cid or "").strip().lower()
+    for off, line in enumerate(_tail_lines(path)):
+        if not any(k in line for k in ("invoke_subagent", "Created the following subagent", "send_message", "Message sent to", "conversation://", "[Message]")):
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        ts = str(d.get("created_at") or d.get("timestamp") or "")
+        created_dt = _iso_dt(ts)
+        for ret in subagent_returns_in(host, d):
+            if since_dt is None or created_dt is None or created_dt >= since_dt:
+                found.pop(ret.conversation_id.strip(), None)
+        if since_dt is not None and created_dt is not None and created_dt < since_dt:
+            continue
+        allow_ref = ref_dt is None or created_dt is None or created_dt >= ref_dt
+        cids = [inv.conversation_id for inv in subagent_invocations_in(host, d, off) if inv.conversation_id]
+        cids.extend(subagent_created_cids_in(host, d))
+        cids.extend(subagent_reused_cids_in(host, d, parent_cid=parent_cid, include_conv_links=allow_ref))
+        for cid in cids:
+            c = (cid or "").strip()
+            if c and c.lower() != p_norm:
+                found[c] = ts
+    return list(found.items())
 
 
 def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:

@@ -21,8 +21,9 @@ from .models import Message
 from .card import plain_text
 from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTIVITY_TAIL, activity_at, commands_in,
                     first_match, human_input_at, is_compaction, last_activity_at, local_hhmm, one_sentence, parse_ts,
-                    record_time, redact, scan_jsonl, subagent_created_cids_in, subagent_invocations_in,
-                    subagent_kills_in, subagent_returns_in, tool_actions, user_turn)
+                    recent_subagent_cids_since, record_time, redact, scan_jsonl, subagent_created_cids_in,
+                    subagent_invocations_in, subagent_kills_in, subagent_returns_in, subagent_reused_cids_in,
+                    tool_actions, user_turn)
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
                       adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
@@ -4319,7 +4320,7 @@ class Dispatcher:
     def _bind_subagent_cids(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
         for cid in subagent_created_cids_in(host, d):
             existing_by_cid = self.store.find_lamb_by_cid(cid)
-            if existing_by_cid is not None:
+            if existing_by_cid is not None and existing_by_cid["state"] == "running":
                 if existing_by_cid["parent_topic_id"] == tid:
                     dup_empty = next((lb for lb in self.store.get_active_lambs(tid)
                                       if lb["lamb_id"] != existing_by_cid["lamb_id"]
@@ -4343,11 +4344,22 @@ class Dispatcher:
                     self.store.create_lamb(lid, tid, kind="subagent", task_title="subagent", conversation_id=cid, state="running", started_at=ts, last_act_at=ts)
                     discovered.append(lid)
                     log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
+        parent_cid = (t["conversation_id"] or "") if (t := self.store.get_topic(tid)) is not None else ""
+        for cid in subagent_reused_cids_in(host, d, parent_cid=parent_cid):
+            if any((lb["conversation_id"] or "").strip() == cid for lb in self.store.get_active_lambs(tid)):
+                continue
+            matched = next((lb for lb in self.store.get_active_lambs(tid)
+                            if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None)
+            if matched is not None:
+                ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
+                self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
+                log.info("topic %s: 从 send_message/引用 关联复用 subagent conversation_id %s -> %s (%s)",
+                         tid, cid, matched["lamb_id"], matched["task_title"])
 
     def _handle_lamb_line(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
         new_lids_in_line: set[str] = set()
         for inv in subagent_invocations_in(host, d, off):
-            if inv.conversation_id and self.store.find_lamb_by_cid(inv.conversation_id) is not None:
+            if inv.conversation_id and (ex := self.store.find_lamb_by_cid(inv.conversation_id)) is not None and ex["state"] == "running":
                 continue
             active = [lb for lb in self.store.get_active_lambs(tid) if lb["lamb_id"] not in new_lids_in_line]
             raw_id = (inv.lamb_id or "").strip()
@@ -4432,6 +4444,24 @@ class Dispatcher:
                     complete_lamb(self.store, lid, summary=summary, state=st)
                     log.info("CLI 羔羊 %s（母羊 %s，pid=%s）进程已退出，自动按 %s 收尾", lid, tid, lb["pid"], st)
                     continue
+            if not lb["conversation_id"] and lb["kind"] in ("subagent", "native_subagent"):
+                pt = self.store.get_topic(tid)
+                if pt is not None and pt["conversation_id"]:
+                    pt_tp = transcript_path(pt["conversation_id"])
+                    start_dt = _parse(lb["started_at"] or "")
+                    window_iso = (start_dt - timedelta(seconds=120)).isoformat() if start_dt else ""
+                    ref_iso = (start_dt - timedelta(seconds=5)).isoformat() if start_dt else ""
+                    busy_cids = {(x["conversation_id"] or "").strip() for x in self.store.get_active_lambs(tid)
+                                 if x["lamb_id"] != lid and (x["conversation_id"] or "").strip()}
+                    cands = [c for c in recent_subagent_cids_since(self.topic_host(pt), pt_tp, window_iso,
+                                                                   parent_cid=pt["conversation_id"], ref_since_iso=ref_iso)
+                             if c[0] not in busy_cids]
+                    if cands:
+                        cid, cid_ts = cands[-1]
+                        lb["conversation_id"] = cid
+                        self.store.update_lamb(lid, conversation_id=cid, last_act_at=cid_ts or lb["last_act_at"] or now_iso())
+                        log.info("topic %s: 从母羊近期 transcript 自动补绑 subagent conversation_id %s -> %s (%s)",
+                                 tid, cid, lid, lb["task_title"])
             last_dt = _parse(lb["last_act_at"] or "") or _parse(lb["started_at"] or "")
             if lb["conversation_id"]:
                 tp = transcript_path(lb["conversation_id"])
@@ -6038,7 +6068,7 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
     if kind not in ("subagent", "cli"):
         raise ValueError(f"kind 必须是 subagent 或 cli，收到 {kind!r}")
     cid, ts = (conversation_id or "").strip() or None, now_iso()
-    if cid and (existing := store.find_lamb_by_cid(cid)) is not None and existing["parent_topic_id"] == parent_topic_id:
+    if cid and (existing := store.find_lamb_by_cid(cid)) is not None and existing["parent_topic_id"] == parent_topic_id and existing["state"] == "running":
         existing_id = existing["lamb_id"]
         title = (task_title or "").strip() or existing["task_title"] or existing_id
         store.update_lamb(existing_id, task_title=title, conversation_id=cid, last_act_at=ts)
