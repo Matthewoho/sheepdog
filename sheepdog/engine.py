@@ -4444,6 +4444,9 @@ class Dispatcher:
                     complete_lamb(self.store, lid, summary=summary, state=st)
                     log.info("CLI 羔羊 %s（母羊 %s，pid=%s）进程已退出，自动按 %s 收尾", lid, tid, lb["pid"], st)
                     continue
+                act_iso = now.astimezone().isoformat(timespec="seconds")
+                self.store.update_lamb(lid, last_act_at=act_iso)
+                lb["last_act_at"] = act_iso
             if not lb["conversation_id"] and lb["kind"] in ("subagent", "native_subagent"):
                 pt = self.store.get_topic(tid)
                 if pt is not None and pt["conversation_id"]:

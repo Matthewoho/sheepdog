@@ -851,11 +851,10 @@ def run_observe(
                 dup_cids = c.execute(
                     """
                     SELECT parent_topic_id, conversation_id, count(*) n FROM lambs
-                    WHERE COALESCE(conversation_id, '') != ''
+                    WHERE state = 'running' AND COALESCE(conversation_id, '') != ''
                     GROUP BY parent_topic_id, conversation_id
-                    HAVING count(*) > 1 AND max(started_at) >= ?
-                    """,
-                    (since,),
+                    HAVING count(*) > 1
+                    """
                 ).fetchall()
                 for r in dup_cids:
                     warn.append(
@@ -863,8 +862,9 @@ def run_observe(
                     )
                 for r in c.execute(
                     """
-                    SELECT lamb_id, parent_topic_id, pid, started_at FROM lambs
-                    WHERE state = 'running' AND kind IN ('cli', 'bash_worker') AND pid IS NOT NULL AND started_at < ?
+                    SELECT lamb_id, parent_topic_id, pid, started_at, last_act_at FROM lambs
+                    WHERE state = 'running' AND kind IN ('cli', 'bash_worker') AND pid IS NOT NULL
+                      AND COALESCE(NULLIF(last_act_at, ''), started_at) < ?
                     """,
                     (iso(ref_now - timedelta(minutes=2)),),
                 ).fetchall():

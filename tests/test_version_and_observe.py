@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.96")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 96))
+        self.assertEqual(cur_ver, "0.7.97")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 97))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -557,9 +557,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.96）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.97）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.96")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.97")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -1109,6 +1109,49 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(len(sent_notices), 1)
             self.assertIn("⏪ 已从", sent_notices[0])
             self.assertIn("回滚至 **0.7.92", sent_notices[0])
+
+    def test_reg_065_observe_reused_subagent_cid_and_cli_lamb_exit_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = Config(self_open_id="ou_test_owner", state_dir=tmp_path / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            ref_now = datetime(2026, 10, 31, 22, 45, 0, tzinfo=observe.TZ)
+
+            store.upsert_topic("tp_jev", title="Decision 服务", kind="dynamic", conversation_id="cid_jev_parent")
+            store.upsert_topic("tp_rel", title="生产发版", kind="adopted", conversation_id="cid_rel_parent")
+
+            cid_reused = "06a8c3ff-11b5-479f-8374-6000c1ba1341"
+            # 1) 同一 subagent conversation_id 跨 3 次历史已完结任务（done / timeout / done）+ 1 次当前 running 任务顺序复用：
+            #    绝对不触发「羔羊同一 conversation_id 重复登记」误报
+            store.create_lamb("lamb_hist_1", "tp_jev", kind="subagent", task_title="PR 7832 核查", conversation_id=cid_reused, state="done", started_at=observe.iso(ref_now - timedelta(days=4)), last_act_at=observe.iso(ref_now - timedelta(days=4)), finished_at=observe.iso(ref_now - timedelta(days=4)))
+            store.create_lamb("lamb_hist_2", "tp_jev", kind="subagent", task_title="实现多通道路由", conversation_id=cid_reused, state="timeout", started_at=observe.iso(ref_now - timedelta(hours=4)), last_act_at=observe.iso(ref_now - timedelta(hours=3, minutes=40)), finished_at=observe.iso(ref_now - timedelta(hours=3, minutes=40)))
+            store.create_lamb("lamb_hist_3", "tp_jev", kind="subagent", task_title="部署测试环境验证", conversation_id=cid_reused, state="done", started_at=observe.iso(ref_now - timedelta(hours=3, minutes=30)), last_act_at=observe.iso(ref_now - timedelta(hours=3)), finished_at=observe.iso(ref_now - timedelta(hours=3)))
+            store.create_lamb("lamb_cur_run", "tp_jev", kind="subagent", task_title="千次并发压测", conversation_id=cid_reused, state="running", started_at=observe.iso(ref_now - timedelta(minutes=10)), last_act_at=observe.iso(ref_now - timedelta(minutes=1)))
+
+            # 2) 长周期 CLI 羔羊（started_at 在 12 分钟前，进程在世期间由 _tick_lambs 刷新过 last_act_at，刚退出 10 秒）：
+            #    首先验证 _tick_lambs 对存活 PID 会刷新 last_act_at
+            disp = Dispatcher(cfg, store, DryRunSink(), Roster(), SecurityConfig())
+            store.create_lamb("lamb_cli_long", "tp_rel", kind="cli", task_title="执行 202610310018 DAG", pid=os.getpid(), state="running", started_at=observe.iso(ref_now - timedelta(minutes=12)), last_act_at=observe.iso(ref_now - timedelta(minutes=12)))
+            with mock.patch("sheepdog.engine._now", return_value=ref_now - timedelta(seconds=10)):
+                disp._tick_lambs()
+            lb_refreshed = store.get_lamb("lamb_cli_long")
+            self.assertEqual(lb_refreshed["state"], "running")
+            self.assertEqual(lb_refreshed["last_act_at"], observe.iso(ref_now - timedelta(seconds=10)))
+
+            # 进程在 4 秒前刚退出（PID 不存在），但距最近一次存活心跳（last_act_at）仅 10 秒（< 2 分钟）：observe 处于正常收割窗口，绝不误报
+            dead_pid = 999991
+            store.update_lamb("lamb_cli_long", pid=dead_pid)
+            res_ok = observe.run_observe(cfg, now_dt=ref_now, since_minutes=60.0, check_processes=False, check_log=False)
+            self.assertEqual(res_ok["warns"], [], f"Expected 0 warns for sequential subagent reuse & just-exited CLI lamb, got: {res_ok['warns']}")
+
+            # 3) 正向检出：若出现 2 条同时处于 running 的相同 conversation_id，且死掉的 CLI 羔羊距 last_act_at 已超过 2 分钟未收割，必须双双精准告警
+            store.create_lamb("lamb_dup_run", "tp_jev", kind="subagent", task_title="并发重复登记", conversation_id=cid_reused, state="running", started_at=observe.iso(ref_now - timedelta(minutes=2)), last_act_at=observe.iso(ref_now - timedelta(minutes=1)))
+            store.update_lamb("lamb_cli_long", last_act_at=observe.iso(ref_now - timedelta(minutes=3)))
+            res_warn = observe.run_observe(cfg, now_dt=ref_now, since_minutes=60.0, check_processes=False, check_log=False)
+            self.assertTrue(any("羔羊同一 conversation_id 重复登记 2 行：tp_jev cid=06a8c3ff" in w for w in res_warn["warns"]), res_warn["warns"])
+            self.assertTrue(any(f"CLI 羔羊 lamb_cli_long（tp_rel，pid={dead_pid}）进程已退出但状态仍为 running" in w for w in res_warn["warns"]), res_warn["warns"])
 
 
 if __name__ == "__main__":

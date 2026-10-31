@@ -438,6 +438,13 @@
 | --- | --- | --- |
 | 7.96 | 跨会话接力同一把业务钥匙（如 `tp_john -> tp_3x-ui-ops` 共用 `john-second-claude-vpn-line`）时，主人在上游已通过 `sd_card_cb_*` 卡片回调批准总方案，下游专席发出子问题 `ask` 后经当事人与上游留言确认直接命中原批准分支并交付完毕，但下游调 `sheepdog resolve --quote <sd_card_cb_*>` 时因 `verify_resolve_allowed` 仅认 `om_` 前缀且死卡 `create_time >= asked_at` 被拒，导致已办结事项的决策卡沦为幽灵待办持续催办；或专席在非 VIP 活跃批次（如 `patrol`）发带新单号的普通知会 `tell`（仅提及 VIP 姓名但尚无该单号 VIP 授权）时误从历史批次捞取无关旧 VIP 消息盖章（REG-064） | `test_duty.MailTest.test_reg_064_prior_quote_corroboration_resolve_and_inactive_vip_tell_guard`（`tests/test_duty.py::MailTest::test_reg_064_prior_quote_corroboration_resolve_and_inactive_vip_tell_guard`） |
 
+## 7.97 看门狗 observe 兼容长生命周期 Subagent 顺序复用（仅查并发 running 重复）与长周期 CLI 羔羊存活心跳刷新防刚退出误报（REG-065）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.97 | 母羊按 `7.94 (REG-062)` 顺序复用同一个长生命周期 Subagent `conversation_id` 完成多轮先后任务（历史记录已 `done`/`timeout`）后，`observe` 因未过滤 `state='running'` 把历史完结记录与新任务合在一起误报 `羔羊同一 conversation_id 重复登记 N 行`；或长周期 CLI 羔羊（如运行 11 分钟的发版 DAG）在进程存活期间 `_tick_lambs` 未刷新 `last_act_at`，且 `observe` 仅按 `started_at < now - 2m` 判定，导致子进程刚退出 4 秒尚未到下一轮 `_tick_lambs` 收割窗口就被误报 `CLI 羔羊进程已退出但状态仍为 running`（REG-065） | `test_version_and_observe.VersionAndObserveTest.test_reg_065_observe_reused_subagent_cid_and_cli_lamb_exit_grace`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_065_observe_reused_subagent_cid_and_cli_lamb_exit_grace`） |
+
+
 
 
 
