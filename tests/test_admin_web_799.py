@@ -231,6 +231,16 @@ class TestAdminWeb799(unittest.TestCase):
                 with urlopen(base + p, timeout=5) as r:
                     return json.loads(r.read().decode("utf-8"))
 
+            with urlopen(base + "/", timeout=5) as r:
+                ui_html = r.read().decode("utf-8")
+            self.assertIn("--ground: #f6f6f3", ui_html)
+            self.assertIn("--surface: #ffffff", ui_html)
+            self.assertIn("IBM Plex Sans", ui_html)
+            self.assertIn('class="page-h1"', ui_html)
+            self.assertIn('class="kpi-divided-strip"', ui_html)
+            self.assertNotIn("#0b0f19", ui_html.lower())
+            self.assertNotIn("#6366f1", ui_html.lower())
+
             def _post(payload: dict) -> dict:
                 req = Request(
                     base + "/api/action",
