@@ -57,7 +57,7 @@ _SHEEPDOG_SUBCMDS = frozenset({
     "thread", "board", "escalations", "pending", "resolve", "tell", "track",
     "topic-group", "lamb", "inbox", "inbox-clear", "doctor", "version", "upgrade", "observe",
     "acks", "notices", "actions", "loops", "redeliver", "push-rules", "retire",
-    "close-session", "session-reset", "security-log", "poll", "run", "init", "inject", "hook",
+    "close-session", "session-reset", "security-log", "poll", "run", "init", "inject", "hook", "roster", "web",
 })
 _SHEEPDOG_CMD_SEGMENT_RE = re.compile(
     r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"

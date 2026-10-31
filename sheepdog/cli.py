@@ -2429,6 +2429,13 @@ def cmd_roster(args) -> int:
     return run_roster_cli(args, cfg)
 
 
+def cmd_web(args) -> int:
+    from .admin_web import run_web_server
+    cfg = _load_cfg()
+    return run_web_server(host=args.host, port=args.port, cfg=cfg)
+
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sheepdog", description="工作助理：把 IM 上的工作分给负责的 Agent session")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -2717,6 +2724,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("hook", help="Antigravity 生命周期 hook（由 hooks.json 调用，不是给人敲的）")
     hsub = sp.add_subparsers(dest="hook", required=True)
     hsub.add_parser("stop", help="Stop：这一轮要结束时查这批交没交回执").set_defaults(func=cmd_hook_stop)
+    sp = sub.add_parser("web", help="启动管理与可观测工作台 Web 服务（默认 http://127.0.0.1:8788）")
+    sp.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    sp.add_argument("--port", type=int, default=8788, help="监听端口（默认 8788）")
+    sp.set_defaults(func=cmd_web)
     add_roster_arguments(sub)
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

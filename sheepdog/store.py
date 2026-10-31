@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_msg_route ON messages(route, dispatch_state);
 CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, create_time);
+CREATE INDEX IF NOT EXISTS idx_msg_first_seen ON messages(first_seen DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -105,7 +106,8 @@ CREATE TABLE IF NOT EXISTS dispatches (
                                        -- | acked_late（判过回执超时以后回执才到，7.21；error 保留当时的超时原因）
                                        -- | priority（主人插话批次，7.37：送到即终态，不要回执、不算超时）
     receipt     TEXT,
-    error       TEXT
+    error       TEXT,
+    acked_at    TEXT
 );
 
 -- 等别人回复（7.4）：对方回复优先归给登记的 topic；15/30 分钟提醒，60 分钟到期
@@ -419,6 +421,7 @@ CREATE TABLE IF NOT EXISTS sends (
 );
 CREATE INDEX IF NOT EXISTS idx_sends_message ON sends(message_id);
 CREATE INDEX IF NOT EXISTS idx_sends_root ON sends(root_message_id);
+CREATE INDEX IF NOT EXISTS idx_sends_target ON sends(target_message_id, kind, sent_at);
 
 -- 发前再看一眼（7.22）：sheepdog reply 发送前查到主人已经在这个聊天里说过话、没发，记下「这个会话发送前已经看到过
 -- 这条主人发言」。同一会话同一条只记一次；这条发言之后作为背景送到这个会话时注明，不重复提醒
@@ -580,6 +583,7 @@ MIGRATIONS = {
                ("effort", "TEXT"), ("compacted_at", "TEXT"), ("attention_at", "TEXT"), ("attention_reason", "TEXT"),
                ("lifecycle", "TEXT"), ("group_id", "TEXT NOT NULL DEFAULT ''")],
     "acks": [("identity", "TEXT")],
+    "dispatches": [("acked_at", "TEXT")],
     "watches": [("status", "TEXT"), ("last_reply_at", "TEXT"), ("last_reply_message_id", "TEXT")],
     "duty_cards": [("idle_since", "TEXT"), ("no_record", "INTEGER DEFAULT 0")],
     "work_items": [("declared_at", "TEXT")],
@@ -1242,9 +1246,44 @@ class Store:
             c.executemany("UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id=?",
                           [(m,) for m in message_ids])
 
-    def finish_dispatch(self, batch_id: str, state: str, receipt: str = "", error: str = "") -> None:
+    def finish_dispatch(self, batch_id: str, state: str, receipt: str = "", error: str = "", acked_at: str | None = None) -> None:
+        ts = acked_at or (now_iso() if state in ("acked", "acked_late") else None)
         with self.tx() as c:
-            c.execute("UPDATE dispatches SET state=?, receipt=?, error=? WHERE batch_id=?", (state, receipt, error, batch_id))
+            c.execute(
+                "UPDATE dispatches SET state=?, receipt=?, error=?, acked_at=COALESCE(?, acked_at) WHERE batch_id=?",
+                (state, receipt, error, ts, batch_id),
+            )
+
+    def backfill_dispatch_acked_at(self) -> int:
+        """7.99：从 duty_history (kind='receipt') 与 owner_echoes.relay_at 回填历史批次的 acked_at。"""
+        missing = {
+            r["batch_id"]
+            for r in self.conn.execute(
+                "SELECT batch_id FROM dispatches WHERE state IN ('acked','acked_late') AND (acked_at IS NULL OR acked_at='')"
+            ).fetchall()
+        }
+        if not missing:
+            return 0
+        updates: dict[str, str] = {}
+        for r in self.conn.execute("SELECT text, at FROM duty_history WHERE kind='receipt' AND at IS NOT NULL AND at != '' ORDER BY id ASC"):
+            txt = (r["text"] or "").strip()
+            bid = txt.split(" ", 1)[0].strip() if txt else ""
+            if bid in missing and bid not in updates:
+                updates[bid] = r["at"]
+        for r in self.conn.execute(
+            "SELECT relay_batch, relay_at FROM owner_echoes WHERE relay_batch IS NOT NULL AND relay_at IS NOT NULL AND relay_at != ''"
+        ):
+            bid = (r["relay_batch"] or "").strip()
+            if bid in missing and bid not in updates:
+                updates[bid] = r["relay_at"]
+        if not updates:
+            return 0
+        with self.tx() as c:
+            c.executemany(
+                "UPDATE dispatches SET acked_at=? WHERE batch_id=? AND (acked_at IS NULL OR acked_at='')",
+                [(at, bid) for bid, at in updates.items()],
+            )
+        return len(updates)
 
     def set_reason(self, message_id: str, route: str, reason: str, tags: list[str]) -> None:
         """改一条已入账消息的去向（7.48：找主人聊天里机器人身份先收到的卡片，主人身份搜到正文后重新认出来）。不碰投递状态。"""

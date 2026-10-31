@@ -450,6 +450,13 @@
 | --- | --- | --- |
 | 7.98 | 羔羊完工收口（`done`/`failed`/`timeout`）并关闭母羊 `work_items` 中的 `lamb:<id>` 后，母羊处理 `lamb_report` 批次提交非 `waiting` 结案回执（`status='handled'/'needs_decision'`）且在 `anchors` 带上 `lamb:<id>` 做追溯锚点时，`duty.apply_receipt_work` 未检查回执状态与 `lambs` 表真实终态，无条件将已完结的 `lamb:<id>` 重新写回 `state='waiting_other'` 变成永久僵尸在办项；或母羊锚点粘连中文括号（如 `lamb:lamb_291f3a40（母羊`）导致钥匙失配无法收口（REG-066） | `test_lamb.LambTest.test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile`（`tests/test_lamb.py::LambTest::test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile`） |
 
+## 7.99 Sheepdog 管理与可观测工作台：三级会话状态树、T0-T5 全链路与会话内步进耗时瀑布流、三层决策对账与自治晋升推荐（REG-067）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.99 | `dispatches` 表缺少 `acked_at` 完结时间戳及历史回填导致无法精确统计 `T3->T4` 会话执行耗时；或缺少统一 Web 管理与可观测工作台（`sheepdog web`）集中观测 `Session Group -> Session -> Subagent/Lamb + Stop Hook` 三级实时状态、`T0 飞书发出 -> T1 扫到 -> T2 点 Get -> T3a/T3 投递 -> T4 会话回执 -> T5 回复飞书` 及会话内 `transcript.jsonl` 步进耗时瀑布流、找人决策 `Accepted vs Overridden 错题本 vs Auto-Resolved` 对账与连续采纳免问自治晋升推荐，以及 VIP 花名册与在办台账干预闭环（REG-067） | `test_admin_web_799.TestAdminWeb799.test_reg_067_end_to_end_workbench_observability_and_actions`（`tests/test_admin_web_799.py::TestAdminWeb799::test_reg_067_end_to_end_workbench_observability_and_actions`） |
+
+
 
 
 
