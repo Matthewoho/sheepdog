@@ -123,19 +123,36 @@ def _ts_not_before(msg_ts: str, asked_ts: str) -> bool:
     try: return datetime.fromisoformat(msg_ts) >= datetime.fromisoformat(asked_ts)
     except ValueError: return msg_ts >= asked_ts
 
-def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", superseded_by: str = "") -> None:
-    """7.81 严禁自关未答提问硬门禁：answered_at 为空时必须提供可验真的 --quote 或 --superseded-by。"""
+def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", superseded_by: str = "", vips: dict | None = None) -> None:
+    """7.81 / 7.92 严禁自关未答提问硬门禁：answered_at 为空时必须提供可验真的 --quote（主人或非底线提问的 VIP 批复）或 --superseded-by。"""
     q, sup_id, me = (quote or "").strip(), (superseded_by or "").strip(), getattr(cfg, "self_open_id", "") or ""
+    eff_vips = dict(vips) if vips is not None else {}
+    if vips is None and cfg is not None and hasattr(cfg, "roster_file"):
+        try:
+            from .roster import load_roster
+            eff_vips = load_roster(cfg.roster_file, False).vips(exclude=me)
+        except Exception:
+            eff_vips = {}
+    from .prompts import vip_of
     for e in targets:
         if e["answered_at"]: continue
         if not q and not sup_id:
-            raise _outbound_err(f"禁止自关未答提问（{e['message_id']}）：主人尚未拍板（answered_at IS NULL）。若主人已在别处批复请传 --quote <主人消息ID或原话>；若已被新 ask 替代请传 --superseded-by <新ask消息ID>")
+            raise _outbound_err(f"禁止自关未答提问（{e['message_id']}）：主人尚未拍板（answered_at IS NULL）。若主人或 VIP 已在别处批复请传 --quote <消息ID或原话>；若已被新 ask 替代请传 --superseded-by <新ask消息ID>")
         if q:
-            ok = bool(q.startswith("om_") and (m := store.get_message(q)) is not None and ((me and m["sender_id"] == me) or ("owner_verified" in (m["tags_json"] or ""))) and _ts_not_before(m["create_time"] or "", e["asked_at"] or ""))
+            s_row = store.send_by_message(e["message_id"]) if hasattr(store, "send_by_message") else None
+            has_floor = bool(s_row is not None and "floor" in s_row.keys() and (s_row["floor"] or "").strip())
+            def _auth_ok(m_row) -> bool:
+                if m_row is None or not _ts_not_before(m_row["create_time"] or "", e["asked_at"] or ""): return False
+                if (me and m_row["sender_id"] == me) or ("owner_verified" in (m_row["tags_json"] or "")): return True
+                return bool(not has_floor and eff_vips and vip_of(m_row, eff_vips))
+            ok = bool(q.startswith("om_") and _auth_ok(store.get_message(q)))
             if not ok:
-                rows = store.conn.execute("SELECT message_id, create_time, content, sender_id, tags_json FROM messages WHERE (sender_id=? OR tags_json LIKE '%owner_verified%') AND create_time >= ? ORDER BY create_time DESC LIMIT 50", (me, e["asked_at"] or "")).fetchall()
-                ok = any(_ts_not_before(r["create_time"] or "", e["asked_at"] or "") and (q == r["message_id"] or q in (r["content"] or "") or q in plain_text(r["content"] or "")) for r in rows)
-            if not ok: raise _outbound_err(f"resolve --quote 验真失败：账本中未找到主人在 {e['asked_at']} 之后发送的匹配消息（{q}）")
+                sids = [sid for sid in [me, *(list(eff_vips) if not has_floor else [])] if sid]
+                ph = ",".join("?" * len(sids))
+                where_sender = f"(sender_id IN ({ph}) OR tags_json LIKE '%owner_verified%')" if sids else "tags_json LIKE '%owner_verified%'"
+                rows = store.conn.execute(f"SELECT message_id, create_time, content, sender_id, sender_name, sender_type, chat_type, reason, tags_json FROM messages WHERE {where_sender} AND create_time >= ? ORDER BY create_time DESC LIMIT 80", (*sids, e["asked_at"] or "")).fetchall()
+                ok = any(_auth_ok(r) and (q == r["message_id"] or q in (r["content"] or "") or q in plain_text(r["content"] or "")) for r in rows)
+            if not ok: raise _outbound_err(f"resolve --quote 验真失败：账本中未找到主人{'' if has_floor else '或已授权 VIP '}在 {e['asked_at']} 之后发送的匹配消息（{q}）")
         if sup_id and ((sup := store.get_escalation(sup_id) or store.send_by_message(sup_id)) is None or sup["message_id"] == e["message_id"]):
             raise _outbound_err(f"resolve --superseded-by 验真失败：未找到替代提问 {sup_id}")
 

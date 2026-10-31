@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.91")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 91))
+        self.assertEqual(cur_ver, "0.7.92")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 92))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -557,9 +557,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.91）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.92）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.91")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.92")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -854,6 +854,11 @@ class VersionAndObserveTest(unittest.TestCase):
         u_code = "/Use" + "rs/test_user/Code"
         self.assertTrue(observe._is_unbounded_code_search(f'grep -rn "foo" {u_code}/'))
         self.assertTrue(observe._is_unbounded_code_search('rg "bar" ~/Code'))
+        self.assertTrue(observe._is_unbounded_code_search(f'find {u_code} -name "*fe-admin*"'))
+        self.assertTrue(observe._is_unbounded_code_search(f'find {u_code} -maxdepth 4 -name "*fe-admin*"'))
+        self.assertFalse(observe._is_unbounded_code_search(f'find {u_code} -maxdepth 2 -name "*fe-admin*"'))
+        self.assertFalse(observe._is_unbounded_code_search(f'cd {u_code} && find . -maxdepth 2 -name "*fe-admin*"'))
+        self.assertTrue(observe._is_unbounded_code_search(f'find {u_code} -maxdepth 2 -name "*fe-admin*" && rg "bar" {u_code}'))
         self.assertFalse(observe._is_unbounded_code_search(f'rg "foo" {u_code}/sheepdog/sheepdog'))
         self.assertFalse(observe._is_unbounded_code_search(f"ls {u_code}"))
 
@@ -934,6 +939,55 @@ class VersionAndObserveTest(unittest.TestCase):
             with mock.patch.object(src, "_run_once") as m_run:
                 src.remove_reaction("om_1", "rx_1", "bot")
                 m_run.assert_called_once_with(["im", "reactions", "delete", "--params", json.dumps({"message_id": "om_1", "reaction_id": "rx_1"})], "bot")
+
+    def test_reg_060_vip_resolve_quote_symmetry_and_shallow_find_exemption(self):
+        from sheepdog import outbound
+        from sheepdog.models import Message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            roster_file = tmp_path / "roster.toml"
+            roster_file.write_text(
+                '[[person]]\nopen_id = "ou_vip_sammy"\nname = "Sammy Shi"\ntier = "vip"\nauthority = "2026-10-21 合理就办"\n',
+                encoding="utf-8",
+            )
+            cfg = Config(self_open_id="ou_owner", state_dir=tmp_path / "state", roster_path=str(roster_file))
+            cfg.source.enabled = False
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            store.upsert_topic("tp_release", title="生产发版", kind="adopted", conversation_id="cid_rel")
+
+            # 1) 非底线提问（floor=""）：普通同事消息不可 resolve，VIP 在 asked_at 之前发的消息不可 resolve，VIP 在 asked_at 之后发的消息（按 ID 或正文子串）可 resolve
+            store.add_send("ik_ask_1", "ask", "tp_release", "om_ask_no_floor", "🐕 需要你定 · 超集合发确认 [tp_release]\n请确认", root_message_id="om_ask_no_floor", key="202610310001", norm_key="202610310001", title="超集合发确认")
+            store.add_escalation("om_ask_no_floor", "tp_release", "oc_tg", "🐕 需要你定 · 超集合发确认 [tp_release]\n请确认", "2026-10-31T11:11:27+08:00")
+
+            m_early_vip = Message(message_id="om_vip_early", chat_id="oc_rel", chat_name="发布群", chat_type="group", sender_id="ou_vip_sammy", sender_name="Sammy Shi", sender_type="user", content="早前的同意", msg_type="text", create_time="2026-10-31T10:00:00+08:00")
+            m_non_vip = Message(message_id="om_non_vip", chat_id="oc_rel", chat_name="发布群", chat_type="group", sender_id="ou_klaus", sender_name="Klaus", sender_type="user", content="同意合发", msg_type="text", create_time="2026-10-31T12:00:00+08:00")
+            m_valid_vip = Message(message_id="om_vip_ok", chat_id="oc_rel", chat_name="发布群", chat_type="group", sender_id="ou_vip_sammy", sender_name="Sammy Shi", sender_type="user", content="按超集 v1.9.0 直接发", msg_type="text", create_time="2026-10-31T12:41:59+08:00")
+            for m in (m_early_vip, m_non_vip, m_valid_vip):
+                store.upsert_message(m, "dispatch", "vip_sender", [], "tp_release")
+
+            with self.assertRaises(outbound.OutboundError):
+                outbound.resolve(cfg, store, None, "tp_release", "普通人不可销假", message_id="om_ask_no_floor", quote="om_non_vip")
+            with self.assertRaises(outbound.OutboundError):
+                outbound.resolve(cfg, store, None, "tp_release", "提问前的VIP消息不可销假", message_id="om_ask_no_floor", quote="om_vip_early")
+
+            res_ok = outbound.resolve(cfg, store, None, "tp_release", "VIP Sammy 已授权合发", message_id="om_ask_no_floor", quote="om_vip_ok")
+            self.assertEqual(res_ok.closed, ["om_ask_no_floor"])
+            self.assertEqual(store.get_escalation("om_ask_no_floor")["close_reason"], "resolved")
+
+            # 2) 触碰底线的提问（sends.floor 非空）：VIP 消息严禁越权 resolve，只有主人本人消息可 resolve
+            store.add_send("ik_ask_2", "ask", "tp_release", "om_ask_with_floor", "🐕 需要你定 · 删库确认 [tp_release]\n请确认", root_message_id="om_ask_with_floor", key="DEL1", norm_key="DEL1", title="删库确认")
+            store.set_send_floor("om_ask_with_floor", "destructive: 删除旧表")
+            store.add_escalation("om_ask_with_floor", "tp_release", "oc_tg", "🐕 需要你定 · 删库确认 [tp_release]\n请确认", "2026-10-31T11:11:27+08:00")
+            with self.assertRaises(outbound.OutboundError):
+                outbound.resolve(cfg, store, None, "tp_release", "VIP不可结底线单", message_id="om_ask_with_floor", quote="om_vip_ok")
+
+            m_owner = Message(message_id="om_owner_ok", chat_id="oc_tg", chat_name="话题群", chat_type="group", sender_id="ou_owner", sender_name="Matthew", sender_type="user", content="同意删除旧表", msg_type="text", create_time="2026-10-31T12:50:00+08:00")
+            store.upsert_message(m_owner, "dispatch", "owner_reply", ["owner_verified"], "tp_release")
+            res_floor_ok = outbound.resolve(cfg, store, None, "tp_release", "主人已拍板删表", message_id="om_ask_with_floor", quote="同意删除旧表")
+            self.assertEqual(res_floor_ok.closed, ["om_ask_with_floor"])
 
 
 if __name__ == "__main__":

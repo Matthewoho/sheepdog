@@ -509,7 +509,7 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
 
 
 def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, message_id: str = "", key: str = "",
-            playbook=None, quote: str = "", superseded_by: str = "") -> ResolveResult:
+            playbook=None, quote: str = "", superseded_by: str = "", vips: dict | None = None) -> ResolveResult:
     """会话结案：只结自己名下、还开着的；结案后机器人在那条提问的话题里补一句「已结案：依据（会话）」。"""
     from . import decision_hub
     check_not_lamb(store, "resolve", topic_id=topic_id)
@@ -532,7 +532,7 @@ def resolve(cfg: Config, store: Store, source, topic_id: str, why: str, *, messa
         raise OutboundError(EXIT_INVALID, "没有还开着的「需要你定」可结（已答、已结或已过期的不用再结）"
                             + (f"：钥匙 {key} 的话题里没有开着的" if key else ""))
     if quote or superseded_by or decision_hub.hub_active(cfg, store) or any((e["hub_message_id"] if "hub_message_id" in e.keys() else "") for e in targets):
-        decision_hub.verify_resolve_allowed(cfg, store, targets, quote=quote, superseded_by=superseded_by)
+        decision_hub.verify_resolve_allowed(cfg, store, targets, quote=quote, superseded_by=superseded_by, vips=vips)
     shown, card = owner_content(cfg, text, at=cfg.escalation.resolve_notice_at)
     mid, err = "", ""
     if source is None:

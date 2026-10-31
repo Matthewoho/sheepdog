@@ -5860,14 +5860,18 @@ def touch_wakeup(target) -> Path | None:
     except OSError: return None
 
 
-def _auto_close_topic_subagents(store: Store, topic_id: str, summary: str = "随母羊本轮回执自动收口") -> None:
+def _auto_close_topic_subagents(store: Store, topic_id: str, summary: str = "随母羊本轮回执自动收口", *, force: bool = False) -> None:
     for lb in store.get_active_lambs(topic_id):
         if lb["kind"] in ("subagent", "native_subagent"):
+            if not force:
+                w = store.get_work(topic_id, duty.norm_key(f"lamb:{lb['lamb_id']}"))
+                if w is not None and not w["closed_at"] and w["state"] == duty.WAITING_OTHER:
+                    continue
             complete_lamb(store, lb["lamb_id"], summary=summary, state="done", report_msg_id="parent_receipt_auto_close")
 
 
 def _reset_closed_topic(store: Store, topic_id: str, why: str = "会话已关闭") -> None:
-    _auto_close_topic_subagents(store, topic_id, summary=why)
+    _auto_close_topic_subagents(store, topic_id, summary=why, force=True)
     if (card := store.get_card(topic_id)) is not None and (card["run_state"] != duty.IDLE or card["queued"] or card["spinning"]):
         store.upsert_card(topic_id, run_state=duty.IDLE, detail="", stuck_since=None, spinning=0, queued=0, idle_since=now_iso())
     if topic_id not in (BUS_TOPIC_ID, "tp_release"):

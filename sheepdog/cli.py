@@ -2090,7 +2090,7 @@ def cmd_resolve(args) -> int:
     try:
         r = outbound.resolve(cfg, store, source, tid, args.why or "", message_id=args.message_id or "", key=args.key or "",
                              playbook=Playbook.from_config(cfg), quote=getattr(args, "quote", "") or "",
-                             superseded_by=getattr(args, "superseded_by", "") or "")
+                             superseded_by=getattr(args, "superseded_by", "") or "", vips=_ask_vips(cfg))
     except outbound.OutboundError as e:
         print(f"resolve 没做: {e}", file=sys.stderr)
         return e.code

@@ -408,3 +408,10 @@
 | --- | --- | --- |
 | 7.91 | 主人在机器人不在场的真人 1v1 私聊或外部群聊里文字点名 `sheepdog` 升格为 `owner_instruction` 后，`Acker.on_delivered` 强行以 `identity="bot"` 调飞书 `im reactions create` 撞上 `231002`（`Bot has NO permission of the reaction to this message`）或 `230002` 导致未点上确认表情并在 `acks.error` 留脏报错，未自动记入 `bot_absent_chats` 并降级为 `identity="user"` 重试及在办结时撤下（REG-059） | `test_ack.BotAckTest.test_reg_059_bot_reaction_231002_falls_back_to_user_and_clears_on_handled`（`tests/test_ack.py::BotAckTest::test_reg_059_bot_reaction_231002_falls_back_to_user_and_clears_on_handled`） |
 
+## 7.92 VIP 授权消息 resolve --quote 对称结案（非底线提问放行、底线提问拒放）与浅层定仓 find -maxdepth [0-3] 免误报（REG-060）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.92 | 非 VIP 发起事务先触发会话 `sheepdog ask`（未触碰 `credentials/destructive/vip_conflict` 底线，`sends.floor` 为空），随后名册 `tier="vip"` 关键人在提问之后发消息明确授权拍板并由会话办结，但会话调 `sheepdog resolve --quote <VIP消息ID或原话>` 销假时被 `verify_resolve_allowed` 死卡「未找到主人发送的匹配消息」导致已办结卡片长期挂在 `open_escalations` 反复催办；或反过来让 VIP 消息越权结掉带 `sends.floor` 的底线提问；或 `observe._is_unbounded_code_search` 将显式带 `-maxdepth [0-3]` 的 `<20ms` 浅层找仓 `find` 误报为 `REG-057` 全目录盲扫（REG-060） | `test_version_and_observe.VersionAndObserveTest.test_reg_060_vip_resolve_quote_symmetry_and_shallow_find_exemption`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_060_vip_resolve_quote_symmetry_and_shallow_find_exemption`） |
+
+

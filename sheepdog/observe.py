@@ -164,12 +164,16 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
     return False
 
 
+_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?\s-maxdepth\s+[0-3]\b)")
+
+
 def _is_unbounded_code_search(cmd_str: str) -> bool:
-    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057）。"""
+    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057；豁免显式带 -maxdepth [0-3] 的浅层定仓 find）。"""
     if not cmd_str:
         return False
-    norm = normalize(decode_command_line(cmd_str))
-    return bool(_UNBOUNDED_CODE_SEARCH_RE.search(cmd_str) or _UNBOUNDED_CODE_SEARCH_RE.search(norm))
+    san_raw = _SHALLOW_FIND_SEG_RE.sub("shallow_find", cmd_str)
+    norm = _SHALLOW_FIND_SEG_RE.sub("shallow_find", normalize(decode_command_line(cmd_str)))
+    return bool(_UNBOUNDED_CODE_SEARCH_RE.search(san_raw) or _UNBOUNDED_CODE_SEARCH_RE.search(norm))
 
 
 def _is_kb_interrupt_tb(lines: list[str], idx: int) -> bool:
