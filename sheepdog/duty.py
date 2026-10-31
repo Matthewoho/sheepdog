@@ -173,6 +173,23 @@ def record_closed(store: Store, w) -> None:
     store.add_history(w["topic_id"], "work", f"{w['key']} {short(w['title'] or '', 40)}（{what}）{tail}".strip())
 
 
+_LAMB_ANCHOR_ID_RE = re.compile(
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|lamb_[0-9a-zA-Z_-]+)",
+    re.I,
+)
+
+
+def clean_lamb_anchor_id(raw: str) -> str:
+    """7.98：从 lamb:<id> 或 waiting_on 文本中提取纯净 lamb_id / UUID，剥离尾部粘连括号备注（如 'lamb_291f3a40（母羊'）。"""
+    s = (raw or "").strip()
+    if s.startswith("羔羊 "):
+        s = s.removeprefix("羔羊 ").strip()
+    elif s.startswith("lamb:"):
+        s = s.removeprefix("lamb:").strip()
+    m = _LAMB_ANCHOR_ID_RE.match(s)
+    return m.group(1) if m else s
+
+
 def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> list[str]:
     """回执里的 work 字段（Codex 等命令行会话写不了账本，可以在回执块里带）：效果同 work set。
     格式：{"work": {...}} 或 {"work": [{...}, ...]}，字段 key title state waiting_on until expect to result。
@@ -198,10 +215,11 @@ def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> 
                 if log is not None:
                     log.warning("会话 %s 回执里的 work 条目不合格，跳过：%s（%s）", topic_id, e, json.dumps(it, ensure_ascii=False))
     anchors = receipt.get("anchors")
+    rcp_status = str(receipt.get("status") or "").strip()
     if isinstance(anchors, list):
         for a in anchors:
             if isinstance(a, str) and a.startswith("lamb:"):
-                lid = a.removeprefix("lamb:").strip()
+                lid = clean_lamb_anchor_id(a)
                 if not lid:
                     continue
                 lb = store.get_lamb(lid)
@@ -209,6 +227,14 @@ def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> 
                     lb = store.find_lamb_by_cid(lid)
                     if lb is not None:
                         lid = lb["lamb_id"]
+                if (lb is not None and lb["state"] != "running") or (rcp_status and rcp_status != "waiting"):
+                    if (w := store.get_work(topic_id, norm_key(f"lamb:{lid}"))) is not None and not w["closed_at"]:
+                        ts = (lb["finished_at"] if lb and lb["finished_at"] else None) or now_iso()
+                        res = (lb["result_summary"] if lb and lb["result_summary"] else None) or w["result"] or str(receipt.get("summary") or "羔羊已完成")
+                        store.update_work(w["id"], state=DONE, result=res, declared=1, declared_at=ts, closed_at=ts)
+                        store.close_route(topic_id, norm_key(f"lamb:{lid}"), "羔羊已完成", ts)
+                        record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+                    continue
                 ttitle = (lb["task_title"] if lb else "") or str(receipt.get("summary") or lid)
                 waiting_on = f"羔羊 {lid} ({ttitle})"
                 try:
@@ -218,6 +244,34 @@ def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> 
                     if log is not None:
                         log.warning("会话 %s 回执里的 lamb anchor %s 写进看板出错：%s", topic_id, a, e)
     return done
+
+
+def reconcile_lamb_work(store: Store, now: datetime | None = None, orphan_grace_minutes: float = 5.0) -> list[int]:
+    """7.98：将母羊看板里未关闭的 lamb:<id> 在办项与权威 lambs 表对齐：
+    对应羔羊已非 running（done/failed/timeout），或无 lambs 记录且超过宽限期的孤儿项，自动收口为 done（REG-066）。"""
+    if not hasattr(store, "get_lamb"):
+        return []
+    now = now or datetime.now().astimezone()
+    closed_ids: list[int] = []
+    rows = store.conn.execute(
+        "SELECT * FROM work_items WHERE closed_at IS NULL AND (key LIKE 'lamb:%' OR waiting_on LIKE '羔羊 lamb_%') ORDER BY id"
+    ).fetchall()
+    for w in rows:
+        lid = clean_lamb_anchor_id(w["key"] if (w["key"] or "").startswith("lamb:") else (w["waiting_on"] or ""))
+        lb = (store.get_lamb(lid) or store.find_lamb_by_cid(lid)) if lid else None
+        if lb is not None and lb["state"] == "running":
+            continue
+        if lb is None:
+            age_min = minutes_ago(w["updated_at"] or w["created_at"] or "", now)
+            if age_min is not None and age_min <= orphan_grace_minutes:
+                continue
+        ts = (lb["finished_at"] if lb and lb["finished_at"] else None) or now.isoformat(timespec="seconds")
+        res = (lb["result_summary"] if lb and lb["result_summary"] else None) or w["result"] or f"羔羊 {lid or w['key']} 已结束"
+        store.update_work(w["id"], state=DONE, result=res, declared=1, declared_at=ts, closed_at=ts)
+        store.close_route(w["topic_id"], w["norm_key"], "羔羊已完成", ts)
+        record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+        closed_ids.append(w["id"])
+    return closed_ids
 
 
 def auto_work(store: Store, topic_id: str, key: str, ref: str, source: str, state: str, **fields) -> None:

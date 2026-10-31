@@ -5055,6 +5055,8 @@ class Dispatcher:
         # 会话自报过的：活不替会话结束，但它等的提问都关了、又是关之前报的，就不再算等主人（改成进行中）
         for wid in duty.release_owner_waits(self.store, waited_on):
             log.info("羊群看板：活 #%d 等的「需要你定」已关，不再算等主人", wid)
+        for wid in duty.reconcile_lamb_work(self.store):
+            log.info("羊群看板：活 #%d 对应的羔羊已结束，自动收口为 done", wid)
 
     def _receipt_duty(self, topic_id: str, batch_id: str, receipt: dict) -> None:
         """回执进在岗表：work 字段同 work set；回执摘要记进履历。"""
@@ -6115,6 +6117,7 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
             store.update_work(w["id"], state=duty.DONE, result=summary, declared=1, declared_at=ts, closed_at=ts)
             store.close_route(pt_id, nk, close_why, ts)
             duty.record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+    duty.reconcile_lamb_work(store)
     mid = ""
     if not already_reported:
         pt = store.get_topic(pt_id)

@@ -444,6 +444,12 @@
 | --- | --- | --- |
 | 7.97 | 母羊按 `7.94 (REG-062)` 顺序复用同一个长生命周期 Subagent `conversation_id` 完成多轮先后任务（历史记录已 `done`/`timeout`）后，`observe` 因未过滤 `state='running'` 把历史完结记录与新任务合在一起误报 `羔羊同一 conversation_id 重复登记 N 行`；或长周期 CLI 羔羊（如运行 11 分钟的发版 DAG）在进程存活期间 `_tick_lambs` 未刷新 `last_act_at`，且 `observe` 仅按 `started_at < now - 2m` 判定，导致子进程刚退出 4 秒尚未到下一轮 `_tick_lambs` 收割窗口就被误报 `CLI 羔羊进程已退出但状态仍为 running`（REG-065） | `test_version_and_observe.VersionAndObserveTest.test_reg_065_observe_reused_subagent_cid_and_cli_lamb_exit_grace`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_065_observe_reused_subagent_cid_and_cli_lamb_exit_grace`） |
 
+## 7.98 母羊结案回执禁重开已完结羔羊在办项、脏锚点归一与权威 lambs 表对账自愈（REG-066）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.98 | 羔羊完工收口（`done`/`failed`/`timeout`）并关闭母羊 `work_items` 中的 `lamb:<id>` 后，母羊处理 `lamb_report` 批次提交非 `waiting` 结案回执（`status='handled'/'needs_decision'`）且在 `anchors` 带上 `lamb:<id>` 做追溯锚点时，`duty.apply_receipt_work` 未检查回执状态与 `lambs` 表真实终态，无条件将已完结的 `lamb:<id>` 重新写回 `state='waiting_other'` 变成永久僵尸在办项；或母羊锚点粘连中文括号（如 `lamb:lamb_291f3a40（母羊`）导致钥匙失配无法收口（REG-066） | `test_lamb.LambTest.test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile`（`tests/test_lamb.py::LambTest::test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile`） |
+
 
 
 

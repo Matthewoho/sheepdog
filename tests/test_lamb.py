@@ -831,3 +831,52 @@ class LambTest(DutyBase):
         self.assertEqual(w_closed["state"], duty.DONE)
         self.assertIsNotNone(w_closed["closed_at"])
 
+    def test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile(self):
+        """规格 7.98（REG-066）：
+        1. 母羊在 waiting 回执传入带括号后缀的脏锚点（如 'lamb:lamb_291f3a40（母羊'）时，clean_lamb_anchor_id 自动归一为 'lamb:lamb_291f3a40'；
+        2. 羔羊完工收口（done）后，母羊处理 lamb_report 批次提交非 waiting 结案回执（status='handled'/'needs_decision'）且仍带 'anchors': ['lamb:lamb_291f3a40'] 时，
+           apply_receipt_work 绝不将已完结的 lamb 在办项反向重开为 waiting_other；
+        3. reconcile_lamb_work 自动将权威 lambs 表已完结（done/failed/timeout）或超时孤儿的未关闭 lamb:* work_items 收口为 done。
+        """
+        from sheepdog.engine import register_lamb, complete_lamb
+
+        lid = register_lamb(self.store, "tp_alpha", "执行 202610310023 构建审批与切流", kind="cli", lamb_id="lamb_291f3a40", pid=88195)
+        self.assertEqual(lid, "lamb_291f3a40")
+
+        # 1. 母羊交 waiting 回执时锚点粘连了中文括号 'lamb:lamb_291f3a40（母羊'
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "waiting", "summary": "已派后台羔羊", "anchors": ["lamb:lamb_291f3a40（母羊"]},
+        )
+        self.assertIsNone(self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_291f3a40（母羊")))
+        w_wait = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_291f3a40"))
+        self.assertIsNotNone(w_wait)
+        self.assertEqual(w_wait["state"], duty.WAITING_OTHER)
+        self.assertIsNone(w_wait["closed_at"])
+
+        # 2. 羔羊完工收口 -> work_items 中的 lamb:lamb_291f3a40 变为 done
+        complete_lamb(self.store, "lamb_291f3a40", summary="构建与切流 100% 完成", state="done")
+        w_done = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_291f3a40"))
+        self.assertEqual(w_done["state"], duty.DONE)
+        self.assertIsNotNone(w_done["closed_at"])
+
+        # 3. 母羊随后处理 lamb_report 批次，提交 status='handled' 回执并顺带附了 anchors: ['lamb:lamb_291f3a40']
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "handled", "summary": "已核对切流并办结审批单", "anchors": ["lamb:lamb_291f3a40"]},
+        )
+        w_after_rcp = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_291f3a40"))
+        self.assertEqual(w_after_rcp["state"], duty.DONE)
+        self.assertIsNotNone(w_after_rcp["closed_at"])
+
+        # 4. 模拟历史存量僵尸项（work_items 仍为 waiting_other / closed_at=None，但 lambs 表已 done）
+        self.store.update_work(w_after_rcp["id"], state=duty.WAITING_OTHER, closed_at=None)
+        closed_ids = duty.reconcile_lamb_work(self.store)
+        self.assertIn(w_after_rcp["id"], closed_ids)
+        w_reconciled = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_291f3a40"))
+        self.assertEqual(w_reconciled["state"], duty.DONE)
+        self.assertIsNotNone(w_reconciled["closed_at"])
+
+
