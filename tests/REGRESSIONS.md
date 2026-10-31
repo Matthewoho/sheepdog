@@ -432,6 +432,13 @@
 | --- | --- | --- |
 | 7.95 | 专属会话（如 `tp_sammy-shi`）收到 VIP 私聊指令后通过 `sheepdog tell` 协同专席（如 `tp_release`）办理时，因 `duty_mail` 未自动核对并附带账本中该会话持有的 VIP 原消息与 `👑 VIP` 印章，导致收件专席打回要求补跑 `sheepdog forward`（多耗 2～3 轮往返与百秒延迟）；或会话凭空伪造 VIP 授权未被拦截；或已 `forward` 原消息后又发重复『已调用 forward 转交』留言造成二次唤醒；或专席间在结单后互发『收到，…感谢！』纯礼貌致谢唤醒对方（REG-063） | `test_duty.MailTest.test_reg_063_vip_tell_provenance_redundant_forward_and_peer_ack_guard`（`tests/test_duty.py::MailTest::test_reg_063_vip_tell_provenance_redundant_forward_and_peer_ack_guard`） |
 
+## 7.96 跨专席同钥匙前序主人/VIP 批复（含 sd_card_cb_*）后置佐证 resolve --quote 结案与非活跃批次普通知会 tell 防误盖 VIP 章（REG-064）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.96 | 跨会话接力同一把业务钥匙（如 `tp_john -> tp_3x-ui-ops` 共用 `john-second-claude-vpn-line`）时，主人在上游已通过 `sd_card_cb_*` 卡片回调批准总方案，下游专席发出子问题 `ask` 后经当事人与上游留言确认直接命中原批准分支并交付完毕，但下游调 `sheepdog resolve --quote <sd_card_cb_*>` 时因 `verify_resolve_allowed` 仅认 `om_` 前缀且死卡 `create_time >= asked_at` 被拒，导致已办结事项的决策卡沦为幽灵待办持续催办；或专席在非 VIP 活跃批次（如 `patrol`）发带新单号的普通知会 `tell`（仅提及 VIP 姓名但尚无该单号 VIP 授权）时误从历史批次捞取无关旧 VIP 消息盖章（REG-064） | `test_duty.MailTest.test_reg_064_prior_quote_corroboration_resolve_and_inactive_vip_tell_guard`（`tests/test_duty.py::MailTest::test_reg_064_prior_quote_corroboration_resolve_and_inactive_vip_tell_guard`） |
+
+
 
 
 

@@ -814,6 +814,83 @@ class MailTest(DutyBase):
         rc, out = self.cli("tell", "--topic", "tp_bus", "--to", "tp_alpha", "收到！我已启动回滚脚本并正在拉起新实例，完成后同步。")
         self.assertEqual(rc, 0, out)
 
+    def test_reg_064_prior_quote_corroboration_resolve_and_inactive_vip_tell_guard(self):
+        """REG-064（7.96）：
+        1. 跨会话同钥匙接力（如 tp_john -> tp_3x-ui-ops）中，主人在上游会话已通过 sd_card_cb_* 卡片回调批准总方案，
+           下游专席发出子问题 ask 后，若无新进展不能直接用旧回调自关；一旦收到后置协同留言/消息引述该回调或推进同钥匙，
+           即可凭 --quote sd_card_cb_* 成功 resolve 结案；
+        2. 专席在非 VIP 活跃批次（如 patrol 巡检）发普通知会 tell 仅提及 VIP 姓名但单号尚未获 VIP 消息授权时，
+           不误从历史旧批次捞取无关 VIP 消息盖章。"""
+        from sheepdog import decision_hub
+        from sheepdog.roster import parse_roster
+        from test_roster import roster_data
+        vip_id = "ou_test_vip_sammy"
+        vip_name = "Sammy Shi"
+        auth = "2026-10-18 主人原话：「他的需求合理就办」"
+        r_file = Path(self.cfg.roster_file)
+        r_file.write_text(
+            '[[session]]\nkey = "alpha"\ntitle = "Alpha 需求"\nmode = "managed"\nconversation_id = "conv_test_alpha"\n'
+            f'[[person]]\nopen_id = "{vip_id}"\nname = "{vip_name}"\ntier = "vip"\nauthority = "{auth}"\n',
+            encoding="utf-8",
+        )
+        self.roster = parse_roster(roster_data(person=[{"open_id": vip_id, "name": vip_name, "tier": "vip", "authority": auth}]))
+        self.d.roster = self.roster
+
+        now_dt = datetime.now().astimezone()
+        t_cb = (now_dt - timedelta(minutes=10)).isoformat(timespec="seconds")
+        t_ask = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+        t_post = (now_dt - timedelta(minutes=1)).isoformat(timespec="seconds")
+
+        # 上游 ask 与主人在 T-32 的卡片回调批复（早于下游子问题 ask）
+        self.store.add_send(
+            "sda-upstream", "ask", "tp_bus", "om_upstream_ask", "John 申请第 2 条专线",
+            root_message_id="om_upstream_ask", key="john-second-claude-vpn-line", norm_key="JOHN-SECOND-CLAUDE-VPN-LINE",
+            identity="bot",
+        )
+        self.store.upsert_message(
+            msg(message_id="sd_card_cb_test_owner_ok", chat_id="oc_test_tg", chat_type="group",
+                sender_id=self.cfg.self_open_id, content="[卡片回调] A：批准为 John 新增第 2 条专线（由 tp_alpha 匹配下发）",
+                create_time=t_cb, reply_to="om_upstream_ask"),
+            "dispatch", "owner_reply", ["owner_verified", "card_callback"], topic_id="tp_bus",
+        )
+        # 下游专席 tp_alpha 发起子问题 ask
+        self.store.add_send(
+            "sda-subask", "ask", "tp_alpha", "om_sub_ask", "🐕 需要你定 · 泰国KYC走美区还是新购",
+            root_message_id="om_upstream_ask", key="john-second-claude-vpn-line", norm_key="JOHN-SECOND-CLAUDE-VPN-LINE",
+            identity="bot",
+        )
+        self.store.add_escalation("om_sub_ask", "tp_alpha", "oc_test_tg", "🐕 需要你定 · 泰国KYC走美区还是新购", t_ask)
+        targets = [self.store.get_escalation("om_sub_ask")]
+
+        # (a) 尚无任何 asked_at 之后的新消息/留言佐证时，不允许直接拿前序回调自关
+        with self.assertRaises( Exception ):
+            decision_hub.verify_resolve_allowed(self.cfg, self.store, targets, quote="sd_card_cb_test_owner_ok")
+
+        # (b) 收到 asked_at 之后的协同留言（引用 sd_card_cb_test_owner_ok 说明当事人已接受独立美区方案）后，允许凭该回调结案
+        self.store.conn.execute(
+            "INSERT INTO mailbox(from_topic, to_topic, key, body, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?)",
+            ("tp_bus", "tp_alpha", "john-second-claude-vpn-line",
+             "John 确认可走独立美区专线，请直接按 Matthew 批准（sd_card_cb_test_owner_ok）签发 lsg6", t_post, "sd_duty_mail_post1"),
+        )
+        self.store.conn.commit()
+        decision_hub.verify_resolve_allowed(self.cfg, self.store, targets, quote="sd_card_cb_test_owner_ok")
+
+        # (c) 历史批次曾收过 Sammy 关于旧单 202610300027 的消息，当前批次无 VIP 消息时发新单 202610310018 的巡检知会 tell，不应误盖 VIP 章
+        self.store.upsert_message(
+            msg(message_id="om_test_vip_old_rel", chat_id="oc_test_sammy_p2p", chat_type="p2p",
+                sender_id=vip_id, sender_name=vip_name, content="请放行旧单", create_time=t_cb),
+            "dispatch", "p2p", [], topic_id="tp_alpha",
+        )
+        rc, out = self.cli(
+            "tell", "--topic", "tp_alpha", "--to", "tp_bus", "--key", "202610310018",
+            "巡检发现 Sammy Shi 刚提交的发版单 202610310018，已完成阶段 A 体检并私聊 Sammy 进行发前确认。",
+        )
+        self.assertEqual(rc, 0, out)
+        self.d.dispatch_once()
+        delivered_patrol = self.sink.to("conv_test_bus")[-1]
+        self.assertNotIn("👑 VIP", delivered_patrol)
+        self.assertNotIn("om_test_vip_old_rel", delivered_patrol)
+
 
 # ======================= 活：work set / done、回执、forward =======================
 class WorkTest(DutyBase):

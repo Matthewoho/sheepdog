@@ -456,15 +456,17 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
             if anchor_keys and any(ak in c_l for ak in anchor_keys):
                 return r, vname
 
-    # 第二优先级：当前会话候选集（无其它单号冲突时按 VIP 姓名或当前活跃批次匹配）
+    # 第二优先级：当前会话候选集（活跃批次直通；非活跃历史批次须无单号锚点且显式宣称 VIP 授权词）
+    has_vip_claim = any(w.lower() in text_l for w in VIP_CLAIM_WORDS)
     for r, vname in cand_rows:
         c_raw = r["content"] or ""
-        if anchor_keys and re.search(r"\b20\d{10}\b", c_raw):
+        in_active = r["message_id"] in active_set
+        if anchor_keys and (not in_active or re.search(r"\b20\d{10}\b", c_raw)):
+            continue
+        if not in_active and not has_vip_claim:
             continue
         vip_tokens = [tok.lower() for tok in re.split(r"[\s·/()（）_-]+", vname) if len(tok) >= 2] + ["vip"]
-        if any(tok in text_l for tok in vip_tokens) or (
-            r["message_id"] in active_set and any(w.lower() in text_l for w in VIP_CLAIM_WORDS)
-        ):
+        if any(tok in text_l for tok in vip_tokens) or (in_active and has_vip_claim):
             return r, vname
     return None, ""
 

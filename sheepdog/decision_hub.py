@@ -123,9 +123,42 @@ def _ts_not_before(msg_ts: str, asked_ts: str) -> bool:
     try: return datetime.fromisoformat(msg_ts) >= datetime.fromisoformat(asked_ts)
     except ValueError: return msg_ts >= asked_ts
 
+def _has_prior_quote_corroboration(store, e, s_row, m_row, max_age_hours: float = 24.0) -> bool:
+    """7.96 跨会话同钥匙接力佐证：若引用的主人/VIP 批复早于当前子提问 asked_at（但在有效期内），
+    须满足：① asked_at 之后本会话收到的消息/留言显式引用了该批复 ID；或 ② 该批复与当前提问同属一个 norm_key 且 asked_at 后本会话已有新进展。"""
+    m_ts, a_ts = (m_row["create_time"] or ""), (e["asked_at"] or "")
+    if not m_ts or not a_ts: return False
+    try:
+        if (datetime.fromisoformat(a_ts) - datetime.fromisoformat(m_ts)).total_seconds() > max_age_hours * 3600:
+            return False
+    except ValueError:
+        return False
+    mid, tid = m_row["message_id"], e["topic_id"]
+    if store.conn.execute("SELECT 1 FROM mailbox WHERE to_topic=? AND created_at >= ? AND body LIKE ? LIMIT 1", (tid, a_ts, f"%{mid}%")).fetchone():
+        return True
+    if store.conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND first_seen >= ? AND content LIKE ? LIMIT 1", (tid, a_ts, f"%{mid}%")).fetchone():
+        return True
+    nk = (s_row["norm_key"] if s_row is not None and "norm_key" in s_row.keys() and s_row["norm_key"] else "") or ""
+    if not nk: return False
+    m_keys = set(m_row.keys())
+    rep_to = (m_row["reply_to"] if "reply_to" in m_keys and m_row["reply_to"] else "") or ""
+    same_key = nk.lower() in (m_row["content"] or "").lower() or nk.lower() in ((m_row["note"] if "note" in m_keys else "") or "").lower()
+    if not same_key and rep_to and hasattr(store, "send_by_message"):
+        rep_s = store.send_by_message(rep_to)
+        if rep_s is not None and "norm_key" in rep_s.keys() and (rep_s["norm_key"] or "") == nk:
+            same_key = True
+    if not same_key: return False
+    has_post = bool(
+        store.conn.execute("SELECT 1 FROM mailbox WHERE to_topic=? AND created_at >= ? LIMIT 1", (tid, a_ts)).fetchone()
+        or store.conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND first_seen >= ? LIMIT 1", (tid, a_ts)).fetchone()
+        or store.conn.execute("SELECT 1 FROM sends WHERE topic_id=? AND sent_at >= ? AND kind IN ('reply', 'report') LIMIT 1", (tid, a_ts)).fetchone()
+    )
+    return has_post
+
 def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", superseded_by: str = "", vips: dict | None = None) -> None:
-    """7.81 / 7.92 严禁自关未答提问硬门禁：answered_at 为空时必须提供可验真的 --quote（主人或非底线提问的 VIP 批复）或 --superseded-by。"""
+    """7.81 / 7.92 / 7.96 严禁自关未答提问硬门禁：answered_at 为空时必须提供可验真的 --quote（主人或非底线提问的 VIP 批复）或 --superseded-by。"""
     q, sup_id, me = (quote or "").strip(), (superseded_by or "").strip(), getattr(cfg, "self_open_id", "") or ""
+    max_age_h = float(getattr(getattr(cfg, "security", None), "quote_max_age_hours", 24) or 24)
     eff_vips = dict(vips) if vips is not None else {}
     if vips is None and cfg is not None and hasattr(cfg, "roster_file"):
         try:
@@ -142,17 +175,19 @@ def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", supers
             s_row = store.send_by_message(e["message_id"]) if hasattr(store, "send_by_message") else None
             has_floor = bool(s_row is not None and "floor" in s_row.keys() and (s_row["floor"] or "").strip())
             def _auth_ok(m_row) -> bool:
-                if m_row is None or not _ts_not_before(m_row["create_time"] or "", e["asked_at"] or ""): return False
-                if (me and m_row["sender_id"] == me) or ("owner_verified" in (m_row["tags_json"] or "")): return True
-                return bool(not has_floor and eff_vips and vip_of(m_row, eff_vips))
-            ok = bool(q.startswith("om_") and _auth_ok(store.get_message(q)))
+                if m_row is None: return False
+                is_auth = bool((me and m_row["sender_id"] == me) or ("owner_verified" in (m_row["tags_json"] or "")) or (not has_floor and eff_vips and vip_of(m_row, eff_vips)))
+                if not is_auth: return False
+                if _ts_not_before(m_row["create_time"] or "", e["asked_at"] or ""): return True
+                return _has_prior_quote_corroboration(store, e, s_row, m_row, max_age_h)
+            ok = bool(_auth_ok(store.get_message(q)))
             if not ok:
                 sids = [sid for sid in [me, *(list(eff_vips) if not has_floor else [])] if sid]
                 ph = ",".join("?" * len(sids))
                 where_sender = f"(sender_id IN ({ph}) OR tags_json LIKE '%owner_verified%')" if sids else "tags_json LIKE '%owner_verified%'"
-                rows = store.conn.execute(f"SELECT message_id, create_time, content, sender_id, sender_name, sender_type, chat_type, reason, tags_json FROM messages WHERE {where_sender} AND create_time >= ? ORDER BY create_time DESC LIMIT 80", (*sids, e["asked_at"] or "")).fetchall()
+                rows = store.conn.execute(f"SELECT message_id, create_time, content, sender_id, sender_name, sender_type, chat_type, reason, tags_json, reply_to, note FROM messages WHERE {where_sender} ORDER BY create_time DESC LIMIT 120", (*sids,)).fetchall()
                 ok = any(_auth_ok(r) and (q == r["message_id"] or q in (r["content"] or "") or q in plain_text(r["content"] or "")) for r in rows)
-            if not ok: raise _outbound_err(f"resolve --quote 验真失败：账本中未找到主人{'' if has_floor else '或已授权 VIP '}在 {e['asked_at']} 之后发送的匹配消息（{q}）")
+            if not ok: raise _outbound_err(f"resolve --quote 验真失败：账本中未找到主人{'' if has_floor else '或已授权 VIP '}在 {e['asked_at']} 之后发送（或同钥匙前序批复且有后置佐证）的匹配消息（{q}）")
         if sup_id and ((sup := store.get_escalation(sup_id) or store.send_by_message(sup_id)) is None or sup["message_id"] == e["message_id"]):
             raise _outbound_err(f"resolve --superseded-by 验真失败：未找到替代提问 {sup_id}")
 
