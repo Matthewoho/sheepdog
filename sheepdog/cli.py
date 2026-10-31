@@ -1911,7 +1911,8 @@ def cmd_tell(args) -> int:
     verify = owner_quote_verifier(store, security.quote_max_age_hours, cfg.self_open_id) if args.quote else None
     try:
         mail_id = duty.send_mail(store, cfg, _topic_arg(args.topic), _topic_arg(args.to), args.text, args.key,
-                                 args.quote, verify, Playbook.from_config(cfg), _duty_target_ok(store))
+                                 args.quote, verify, Playbook.from_config(cfg), _duty_target_ok(store),
+                                 vips=_ask_vips(cfg))
     except duty.DutyError as e:
         print(f"tell 被拒绝: {e}", file=sys.stderr); return 2
     touch_wakeup(cfg)

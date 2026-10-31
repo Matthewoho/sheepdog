@@ -426,6 +426,13 @@
 | --- | --- | --- |
 | 7.94 | 母羊通过 `send_message(Recipient=<cid>)` / `Message sent to "<cid>"` / `conversation://<cid>` 复用曾完成过旧任务的子代理并调 `sheepdog lamb prepare` 登记新羔羊时，因 `find_lamb_by_cid` 未过滤历史已结案记录、`guard` 未识别复用信号、或单向游标 `LAMB_DISCOVERY` 先于 `lamb prepare` 扫过母羊 transcript，导致新羔羊 `conversation_id` 恒为 `None`，无法读取子代理自身活跃 `transcript.jsonl` 心跳而在满 20 分钟时误判 `超过 20 分钟无心跳，已超时` 并强行打断母羊（REG-062） | `test_lamb_772.Lamb772Test.test_reg_062_reused_subagent_cid_binding_and_tail_backfill_prevents_false_timeout`（`tests/test_lamb_772.py::Lamb772Test::test_reg_062_reused_subagent_cid_binding_and_tail_backfill_prevents_false_timeout`） |
 
+## 7.95 跨会话 tell 自动账本验真附带 👑 VIP 原消息印章、拦截 forward 后重复 tell 与专席间纯礼貌致谢回传（REG-063）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.95 | 专属会话（如 `tp_sammy-shi`）收到 VIP 私聊指令后通过 `sheepdog tell` 协同专席（如 `tp_release`）办理时，因 `duty_mail` 未自动核对并附带账本中该会话持有的 VIP 原消息与 `👑 VIP` 印章，导致收件专席打回要求补跑 `sheepdog forward`（多耗 2～3 轮往返与百秒延迟）；或会话凭空伪造 VIP 授权未被拦截；或已 `forward` 原消息后又发重复『已调用 forward 转交』留言造成二次唤醒；或专席间在结单后互发『收到，…感谢！』纯礼貌致谢唤醒对方（REG-063） | `test_duty.MailTest.test_reg_063_vip_tell_provenance_redundant_forward_and_peer_ack_guard`（`tests/test_duty.py::MailTest::test_reg_063_vip_tell_provenance_redundant_forward_and_peer_ack_guard`） |
+
+
 
 
 

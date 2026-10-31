@@ -88,7 +88,18 @@ def batch_sources(cfg, store: Store, batch_id: str) -> list[tuple[str, str]]:
     owner_chats = set(cfg.owner_side_chat_ids)
     out: list[tuple[str, str]] = []
     for mid in ids:
-        if not mid or mid.startswith(SYSTEM_ID_PREFIX):
+        if not mid:
+            continue
+        if mid.startswith(SYSTEM_ID_PREFIX):
+            r_sys = store.get_message(mid)
+            if r_sys is not None and r_sys["reason"] == "duty_mail":
+                for t in json.loads(r_sys["tags_json"] or "[]"):
+                    if t.startswith("vip_relay:"):
+                        parts = t.split(":", 2)
+                        if len(parts) == 3 and parts[2]:
+                            r_vip = store.get_message(parts[2])
+                            if r_vip is not None and r_vip["chat_id"] not in owner_chats:
+                                out.append((r_vip["message_id"], r_vip["chat_id"]))
             continue
         r = store.get_message(mid)
         if r is None or r["chat_id"] in owner_chats:

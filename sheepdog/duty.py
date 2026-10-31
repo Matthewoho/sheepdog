@@ -53,6 +53,7 @@ MAIL_REASON = "duty_mail"
 MAIL_PAUSED_REASON = "duty_mail_paused"
 # 留言正文里出现这些字样就必须走主人原话核对（--quote），否则拒绝：会话留言不能冒充主人
 OWNER_CLAIM_WORDS = ("主人原话", "已核对")
+VIP_CLAIM_WORDS = ("👑 VIP", "VIP 授权", "VIP 指令", "VIP 放行", "已核实的 👑 VIP")
 OWNER_NAME_FIELD = "主人"
 
 
@@ -360,13 +361,120 @@ def mail_label(store: Store, from_topic: str) -> str:
 
 _POLITE_ACK_RE = re.compile(r"^\s*(?:【[^】]*】\s*)?(?:已?收到|知悉|已阅|已获悉|明白|了解|感谢|收到同步|ack\b|roger\b)", re.I)
 _BUS_ASK_ACT_RE = re.compile(r"请转交|forward|new-session|\?|？", re.I)
+_PEER_CLOSE_ACK_RE = re.compile(r"(?:感谢|多谢|谢谢|辛苦|已闭环|全链路.*办结|无需再回)", re.I)
+_PEER_SUBSTANTIVE_RE = re.compile(r"正在|已启动|已向|已在|已代回|已通知|已将|已拉起|已锁定|已同步|请|待|需要|若.*会|如果.*会|1\.|2\.|\n", re.I)
+_REDUNDANT_FORWARD_TELL_RE = re.compile(r"^\s*已(?:调用|用|通过|执行)?\s*(?:sheepdog\s+)?forward\b.*转交", re.I)
+
+
+def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key: str = "", quote: str = "",
+                             vips: dict[str, str] | None = None) -> tuple:
+    """7.95（REG-063）：核查 from_topic 在发起 tell 时是否关联了账本中已验真的 VIP 本人原消息。
+    返回 (vip_row, vip_name)；未命中返回 (None, "")。"""
+    from .card import plain_text
+    from .prompts import vip_of
+
+    if vips is not None:
+        eff_vips = dict(vips)
+    elif cfg is not None and getattr(cfg, "roster_file", None):
+        try:
+            from .roster import load_roster
+            eff_vips = load_roster(cfg.roster_file, False).vips(exclude=getattr(cfg, "self_open_id", "") or "")
+        except Exception:
+            eff_vips = {}
+    else:
+        eff_vips = {}
+    if not eff_vips:
+        return None, ""
+
+    for mid in dict.fromkeys(re.findall(r"\bom_[A-Za-z0-9_]+\b", f"{text} {quote}")):
+        r = store.get_message(mid)
+        if r is not None and (vname := vip_of(r, eff_vips)):
+            return r, vname
+
+    cand_ids: list[str] = []
+    active_set: set[str] = set()
+    t_row = store.get_topic(from_topic)
+    active_bid = (t_row["pending_batch_id"] or "") if t_row is not None else ""
+    if active_bid:
+        d_row = store.get_dispatch(active_bid)
+        if d_row is not None and d_row["message_ids"]:
+            for m in json.loads(d_row["message_ids"] or "[]"):
+                if m and not m.startswith("sd_"):
+                    cand_ids.append(m)
+                    active_set.add(m)
+    max_age_h = getattr(getattr(cfg, "security", None), "quote_max_age_hours", 24) or 24
+    age_since = (datetime.now().astimezone() - timedelta(hours=max_age_h)).isoformat(timespec="seconds")
+    for (mids_json,) in store.conn.execute(
+        "SELECT message_ids FROM dispatches WHERE topic_id=? AND sent_at >= ? ORDER BY sent_at DESC LIMIT 30",
+        (from_topic, age_since),
+    ).fetchall():
+        for m in json.loads(mids_json or "[]"):
+            if m and not m.startswith("sd_") and m not in cand_ids:
+                cand_ids.append(m)
+    for (m,) in store.conn.execute(
+        "SELECT message_id FROM messages WHERE topic_id=? AND first_seen >= ? ORDER BY rowid DESC LIMIT 30",
+        (from_topic, age_since),
+    ).fetchall():
+        if m and not m.startswith("sd_") and m not in cand_ids:
+            cand_ids.append(m)
+
+    text_l = text.lower()
+    cand_rows: list[tuple] = []
+    for mid in cand_ids:
+        r = store.get_message(mid)
+        if r is not None and (vname := vip_of(r, eff_vips)):
+            cand_rows.append((r, vname))
+
+    sids = [s for s in eff_vips if s]
+    all_vip_tokens = {
+        tok.lower()
+        for v in eff_vips.values()
+        for tok in re.split(r"[\s·/()（）_-]+", v or "")
+        if len(tok) >= 2
+    } | {w.lower() for w in VIP_CLAIM_WORDS} | {"vip"}
+    need_recent_scan = bool(sids and (quote or key or any(tok in text_l for tok in all_vip_tokens)))
+    recent_vip_rows: list[tuple] = list(cand_rows)
+    if need_recent_scan:
+        seen_mids = {r["message_id"] for r, _ in recent_vip_rows}
+        ph = ",".join("?" * len(sids))
+        for r in store.conn.execute(
+            f"SELECT * FROM messages WHERE sender_id IN ({ph}) AND create_time >= ? ORDER BY create_time DESC LIMIT 500",
+            (*sids, age_since),
+        ).fetchall():
+            if r["message_id"] not in seen_mids and (vname := vip_of(r, eff_vips)):
+                recent_vip_rows.append((r, vname))
+                seen_mids.add(r["message_id"])
+
+    # 第一优先级：精确锚点匹配（quote 或 --key 或正文中的 12 位审批单号）
+    anchor_keys = [k.lower() for k in ([key] if key and len(key) >= 3 else []) + re.findall(r"\b20\d{10}\b", text)]
+    if quote or anchor_keys:
+        for r, vname in recent_vip_rows:
+            c_raw = r["content"] or ""
+            c_l = c_raw.lower()
+            if quote and (quote in c_raw or quote in plain_text(c_raw)):
+                return r, vname
+            if anchor_keys and any(ak in c_l for ak in anchor_keys):
+                return r, vname
+
+    # 第二优先级：当前会话候选集（无其它单号冲突时按 VIP 姓名或当前活跃批次匹配）
+    for r, vname in cand_rows:
+        c_raw = r["content"] or ""
+        if anchor_keys and re.search(r"\b20\d{10}\b", c_raw):
+            continue
+        vip_tokens = [tok.lower() for tok in re.split(r"[\s·/()（）_-]+", vname) if len(tok) >= 2] + ["vip"]
+        if any(tok in text_l for tok in vip_tokens) or (
+            r["message_id"] in active_set and any(w.lower() in text_l for w in VIP_CLAIM_WORDS)
+        ):
+            return r, vname
+    return None, ""
 
 
 def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key: str = "", quote: str = "",
-              verify_quote=None, playbook=None, is_target: Callable[[str], bool] | None = None) -> int:
+              verify_quote=None, playbook=None, is_target: Callable[[str], bool] | None = None,
+              vips: dict[str, str] | None = None) -> int:
     """sheepdog tell：存进信箱，并作为一条系统消息排给收件会话（下一批送到；对方排队、离线都不丢）。"""
     from .engine import BUS_TOPIC_ID  # 避免循环引用
-    from .prompts import QUOTE_LABEL, with_cli
+    from .prompts import QUOTE_LABEL, VIP_STAMP, with_cli
 
     dc = cfg.duty
     from_topic, to_topic = _tid(from_topic), _tid(to_topic)
@@ -375,10 +483,32 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
     if from_topic == to_topic: raise DutyError("不能给自己留言")
     if to_topic == BUS_TOPIC_ID and from_topic != BUS_TOPIC_ID and _POLITE_ACK_RE.match(text) and not _BUS_ASK_ACT_RE.search(text):
         raise DutyError("纯知会确认无需回传 tell 给总线，请直接推进并在回执 summary 中说明")
+    if (to_topic != BUS_TOPIC_ID and _POLITE_ACK_RE.match(text) and not _BUS_ASK_ACT_RE.search(text)
+            and len(text) <= 90 and _PEER_CLOSE_ACK_RE.search(text) and not _PEER_SUBSTANTIVE_RE.search(text)):
+        raise DutyError("纯礼貌收到/结单致谢无需回传 tell 唤醒对方会话，请在回执 summary 中说明即可")
     ok = is_target or (lambda tid: store.get_topic(tid) is not None)
     for tid, who in ((from_topic, "--topic"), (to_topic, "--to")):
         if not ok(tid):
             raise DutyError(f"{who} {tid} 不是在投递的会话（总线、名册 managed、总线新开的）")
+    if _REDUNDANT_FORWARD_TELL_RE.search(text):
+        f_mids = re.findall(r"\bom_[A-Za-z0-9_]+\b", text)
+        if f_mids and all(
+            (mr := store.get_message(m)) is not None
+            and mr["topic_id"] == to_topic
+            and f"forwarded_from:{from_topic}" in (mr["tags_json"] or "")
+            for m in f_mids
+        ):
+            raise DutyError(
+                f"原消息 {', '.join(f_mids)} 已通过 forward 转交给 {to_topic}（sheepdog 会直接投递带印章的原消息），"
+                "无需再发重复的『已调用 forward 转交』留言；如需附言请在 forward 时使用 --note"
+            )
+    vip_row, vip_name = _resolve_vip_mail_source(store, cfg, from_topic, text, key, quote, vips=vips)
+    v_claims = [w for w in VIP_CLAIM_WORDS if w.lower() in text.lower()]
+    if v_claims and vip_row is None:
+        raise DutyError(
+            f"留言里提到「{'」「'.join(v_claims)}」：会话留言不能凭空宣称 VIP 授权（账本中未找到匹配的 VIP 本人原消息）。"
+            "请在当前 VIP 批次内调用 tell、在正文中写明原消息 om_ 编号、用 --quote 引用 VIP 原话，或直接用 sheepdog forward 转交原消息"
+        )
     claims = [w for w in OWNER_CLAIM_WORDS if w in text]
     if claims and not quote:
         raise DutyError(f"留言里提到「{'」「'.join(claims)}」：会话留言不能代替主人说话。要转达主人的话，用 --quote "
@@ -387,7 +517,7 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
     if quote:
         label = verify_quote(quote) if verify_quote is not None else ""
         if label is True: label = QUOTE_LABEL
-        if not label:
+        if not label and vip_row is None:
             raise DutyError("--quote 核对没通过：这句话在总线里和主人的飞书回复里都找不到原文，请原样引用")
     now = datetime.now().astimezone()
     if (until := paused_until(store, from_topic, to_topic)) is not None:
@@ -405,6 +535,14 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
                         f"{until.strftime('%H:%M')}，已通知总线；这一条没有发出")
     mail_id = store.add_mail(from_topic, to_topic, key, text)
     lines = [mail_label(store, from_topic) + (f" · 钥匙 {key}" if key else "") + f" · 留言 #{mail_id}"]
+    if vip_row is not None:
+        vip_body = (vip_row["content"] or "").strip().splitlines()[:40] or ["(空)"]
+        lines += [
+            VIP_STAMP.format(name=vip_name),
+            f"✅ VIP 原消息（sheepdog 已核对：账本消息 `{vip_row['message_id']}` 发送人为 VIP 本人 {vip_name}（{vip_row['sender_id']}），时间 {vip_row['create_time']}）：",
+            *("> " + ln for ln in vip_body),
+            "留言正文（会话自己的话）：",
+        ]
     if label:
         lines += [f"{label}：", *("> " + ln for ln in quote.splitlines() or [""]), "留言正文（会话自己的话）："]
     lines += ["> " + ln for ln in text.splitlines()] or ["> (空)"]
@@ -412,12 +550,19 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
                                                         from_title=_title(store, from_topic),
                                                         topic_id=to_topic, key=key)):
         lines.append(why)
+    if vip_row is not None:
+        lines.append(
+            f"（✅ 账本验真：上方『👑 VIP：{vip_name}』及原消息 `{vip_row['message_id']}` 已由 sheepdog 从飞书账本核对无误，"
+            "具有与 forward 原消息同等的 👑 VIP 授权效力，请按本批末尾《👑 VIP 规则》直接核实办理，无需再让对方重复调用 sheepdog forward。）"
+        )
     reply_hint = with_cli(f"回它：`sheepdog tell --topic {to_topic} --to {from_topic} \"...\""
                           + (f" --key {shlex.quote(key)}" if key else "") + "`", cfg.cli_command)
-    if from_topic == BUS_TOPIC_ID:
-        reply_hint += "（仅需对方执行动作或回答问题时再回；纯收到/知会勿回 tell）"
+    reply_hint += "（仅需对方执行动作或回答问题时再回；纯收到/知会勿回 tell）"
     lines.append(reply_hint)
-    mid = store.add_system_message(to_topic, MAIL_REASON, "\n".join(lines), [f"mail:{mail_id}"])
+    mail_tags = [f"mail:{mail_id}"]
+    if vip_row is not None:
+        mail_tags.append(f"vip_relay:{vip_row['sender_id']}:{vip_row['message_id']}")
+    mid = store.add_system_message(to_topic, MAIL_REASON, "\n".join(lines), mail_tags)
     store.set_mail_message(mail_id, mid)
     if state_dir := (getattr(getattr(cfg, "paths", None), "state_dir", None) or getattr(cfg, "state_dir", None)):
         try: (state_dir / ".wakeup").write_text(now_iso(), encoding="utf-8")

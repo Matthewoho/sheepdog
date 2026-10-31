@@ -29,7 +29,7 @@ DROP_PREFIX = "FX-DROP·"
 
 def test_config(state_dir: Path) -> Config:
     """测试配置：playbook 指向 tests/fixtures/playbook（只含标记和占位符，不含业务文字）。"""
-    cfg = Config(self_open_id=ME, state_dir=state_dir)
+    cfg = Config(self_open_id=ME, state_dir=state_dir, config_path=state_dir / "config.toml")
     cfg.playbook_dir = str(FIXTURES)
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     return cfg

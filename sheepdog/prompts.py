@@ -120,18 +120,26 @@ _OWNER_REASONS = ("owner_context", "owner_reply", "owner_instruction")
 
 
 def vip_of(row, vips: dict | None) -> str:
-    """这条消息是不是 VIP 本人发的（7.61）：是就返回盖章用的名字，不是返回空串。投递盖章和 `sheepdog ask --floor` 都只用它判。
+    """这条消息是不是 VIP 本人发的（7.61 / 7.95）：是就返回盖章用的名字，不是返回空串。投递盖章和 `sheepdog ask --floor` 都只用它判。
 
-    只认发送人本身（sender_id），不看正文：别人转述「某某让你…」不算。不算 VIP 的：sheepdog 自己的消息、机器人 / Agent
-    发的、主人本人的（背景、回复、指令）。vips 是 open_id → 名字（Roster.vips，已排除主人自己）；空 = 名册没有 VIP。"""
+    只认发送人本身（sender_id）或 sheepdog 账本验真签发的 `vip_relay:<open_id>:<om_id>` 标签（7.95），不看正文：别人转述「某某让你…」不算。
+    不算 VIP 的：普通系统消息、机器人 / Agent 发的、主人本人的（背景、回复、指令）。vips 是 open_id → 名字（Roster.vips，已排除主人自己）；空 = 名册没有 VIP。"""
     if not vips or row is None:
         return ""
+    tags = json.loads(row["tags_json"] or "[]")
+    if row["chat_type"] == SYSTEM_CHAT:
+        if row["reason"] == "duty_mail":
+            for t in tags:
+                if t.startswith("vip_relay:"):
+                    parts = t.split(":", 2)
+                    if len(parts) >= 2 and parts[1] in vips:
+                        return vips[parts[1]] or parts[1]
+        return ""
     sid = (row["sender_id"] or "").strip()
-    if not sid or sid not in vips or row["chat_type"] == SYSTEM_CHAT:
+    if not sid or sid not in vips:
         return ""
     if (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
         return ""
-    tags = json.loads(row["tags_json"] or "[]")
     if "agent_sender" in tags or any(t in tags for t in _OWNER_TAGS):
         return ""
     return vips[sid] or (row["sender_name"] or "").strip() or sid
