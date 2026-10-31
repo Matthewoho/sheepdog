@@ -482,7 +482,10 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
     root = (repo_dir or default_repo_dir()).resolve()
     no_pull = bool(getattr(args, "no_pull", False))
     dry_run = bool(getattr(args, "dry_run", False))
-    channel = "beta" if getattr(args, "beta", False) else "stable"
+    rollback = bool(getattr(args, "rollback", False))
+    target_sha = str(getattr(args, "to", "") or "").strip()
+    notes = str(getattr(args, "notes", "") or "").strip()
+    channel = "rollback" if rollback else ("beta" if getattr(args, "beta", False) else "stable")
     disk_before = version_info(root, prefer_disk_version=True)
     if dry_run:
         store = Store(cfg.db_path) if cfg.db_path.exists() else None
@@ -491,11 +494,14 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
         finally:
             if store is not None:
                 store.close()
-        pull_plan = "跳过 git pull" if (no_pull or disk_before["dirty"]) else f"git -C {root} pull --ff-only"
+        if rollback:
+            pull_plan = f"回滚至 {target_sha or '上一版本'}"
+        else:
+            pull_plan = "跳过 git pull" if (no_pull or disk_before["dirty"]) else f"git -C {root} pull --ff-only"
         print(f"[dry-run] upgrade (channel={channel}): {pull_plan}；{st['summary_line']}")
         return 0
 
-    if not no_pull and (root / ".git").exists():
+    if not rollback and not no_pull and (root / ".git").exists():
         if not disk_before["dirty"]:
             pulled, _out, err_msg = version_watch.pull_repo_for_channel(root, channel=channel, timeout=15.0)
             if not pulled and err_msg != "git 命令执行失败":
@@ -506,13 +512,42 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
 
     store = Store(cfg.db_path)
     try:
+        st_before = get_version_status(store, root)
+        daemon_info = st_before.get("daemon") if isinstance(st_before.get("daemon"), dict) else {}
+        from_sha = str(daemon_info.get("git_sha") or disk_before.get("git_sha") or "").strip()
+        from_display = str(daemon_info.get("display") or disk_before.get("display") or "").strip()
+
+        if rollback and not st_before["daemon_alive"]:
+            rb_ref = target_sha
+            if not rb_ref:
+                saved = version_watch._safe_json(store.get_meta("version_rollback_target"))
+                rb_ref = str(saved.get("git_sha") or "") if isinstance(saved, dict) else ""
+            ok, _out, err_msg = version_watch.rollback_repo_to_target(root, rb_ref or "HEAD~1")
+            if not ok:
+                print(f"版本回滚失败：{err_msg}", file=sys.stderr)
+                return 1
+
         st = get_version_status(store, root)
         if st["daemon_alive"]:
             existing = [a for a in store.pending_actions() if a["kind"] == "upgrade"]
-            cmd_str = "sheepdog upgrade --beta" if channel == "beta" else "sheepdog upgrade"
-            aid = existing[0]["id"] if existing else actions.enqueue(
-                store, "upgrade", {"no_pull": True, "channel": channel, "command": cmd_str}
-            )
+            cmd_str = "sheepdog upgrade --rollback" if rollback else ("sheepdog upgrade --beta" if channel == "beta" else "sheepdog upgrade")
+            payload: dict = {"no_pull": True, "channel": channel, "command": cmd_str}
+            if rollback:
+                payload["rollback"] = True
+                if target_sha:
+                    payload["target_sha"] = target_sha
+            if from_sha:
+                payload["from_sha"] = from_sha
+            if from_display:
+                payload["from_display"] = from_display
+            if notes:
+                payload["notes"] = notes
+            if existing:
+                aid = existing[0]["id"]
+                with store.conn:
+                    store.conn.execute("UPDATE actions SET args_json = ? WHERE id = ?", (json.dumps(payload, ensure_ascii=False), aid))
+            else:
+                aid = actions.enqueue(store, "upgrade", payload)
             print(f"已提交常驻进程原地热重启（动作 #{aid}，channel={channel}，目标版本 {st['cli']['display']}，当前常驻 {st['daemon_display']}）")
             return 0
         print(f"代码已就绪：{st['cli']['display']}（当前无运行中的常驻进程，将由 sidecar supervisor 自动拉起或运行 `sheepdog run`）")
@@ -2407,6 +2442,9 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--dry-run", action="store_true", help="只打印将要执行的升级动作，不拉代码、不入队")
     sp.add_argument("--beta", action="store_true", help="升级至最新 Beta Tag（tag > release）")
     sp.add_argument("--stable", action="store_true", help="升级至最新 GitHub Release 稳定版（默认）")
+    sp.add_argument("--rollback", action="store_true", help="回滚至升级前的上一版本并通知常驻进程原地热重启")
+    sp.add_argument("--to", default="", help="回滚目标 commit SHA 或 tag（配合 --rollback 使用，默认取上一版本）")
+    sp.add_argument("--notes", default="", help="本次更新说明（展示在飞书升级完成通知卡片中）")
     sp.set_defaults(func=cmd_upgrade)
     sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
     obs.add_observe_arguments(sp)

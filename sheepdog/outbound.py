@@ -587,7 +587,7 @@ def owner_content(cfg: Config, text: str, at: bool = False, *, summary: str = ""
     except ValueError:
         return plain, None
     first_line = (text or "").strip("\n").partition("\n")[0]
-    if kind == ASK or first_line.startswith(("🐕 需要你定", "🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态")):
+    if kind == ASK or first_line.startswith(("🐕 需要你定", "🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态", "🐕 汇报 · 升级完成")):
         from .card_callback import attach_ask_interactions
         card = attach_ask_interactions(card, text=text, summary=summary, options_spec=options,
                                        topic_id=topic_id, key=key, title=title, interactive=bool(cfg.identity.enabled))

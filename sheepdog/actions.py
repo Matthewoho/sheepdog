@@ -55,6 +55,11 @@ def execute(dispatcher, kind: str, args: dict) -> object:
             command=args.get("command", ""),
             no_pull=bool(args.get("no_pull", False)),
             channel=str(args.get("channel") or "stable"),
+            rollback=bool(args.get("rollback", False)),
+            target_sha=str(args.get("target_sha") or ""),
+            from_sha=str(args.get("from_sha") or ""),
+            from_display=str(args.get("from_display") or ""),
+            notes=str(args.get("notes") or ""),
         )
     d.sync_roster()
     if kind == "spawn":

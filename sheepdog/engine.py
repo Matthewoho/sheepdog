@@ -1476,12 +1476,13 @@ class Collector:
                 d = RouteDecision(DROP, "tg_move", [OWNER_VERIFIED_TAG, "card_callback", *([f"item:{no}"] if no else [])])
                 self.store.upsert_message(m, d.route, d.reason, d.tags, cb.get("topic_id") or None)
                 return d
-            if cb_kind in ("version_dismiss", "version_query", "version_upgrade"):
-                d = RouteDecision(DROP, "upgrade_command" if cb_kind == "version_upgrade" else cb_kind, [OWNER_VERIFIED_TAG, "card_callback"])
+            if cb_kind in ("version_dismiss", "version_query", "version_upgrade", "version_rollback"):
+                reason = "upgrade_command" if cb_kind == "version_upgrade" else cb_kind
+                d = RouteDecision(DROP, reason, [OWNER_VERIFIED_TAG, "card_callback"])
                 self.store.upsert_message(m, d.route, d.reason, d.tags, BUS_TOPIC_ID)
                 if cb_kind == "version_query":
                     self._version_query_reply(m)
-                elif cb_kind == "version_upgrade":
+                elif cb_kind in ("version_upgrade", "version_rollback"):
                     self._upgrade_shortcut(m)
                 return d
             d = self._owner_reply(m)
@@ -1645,7 +1646,7 @@ class Collector:
                            "版本查询", BUS_TOPIC_ID, reply_to=(m.reply_to or m.message_id) if isinstance(cb, dict) else m.message_id)
 
     def _upgrade_shortcut(self, m: Message) -> None:
-        """主人在找主人聊天里发「你来升级 / 升级 beta / 重启生效」或点升级卡片按钮（7.69 / 7.75 / 7.76）：入队 upgrade 动作。"""
+        """主人在找主人聊天里发「你来升级 / 升级 beta / 重启生效 / 回滚」或点升级/回滚卡片按钮（7.69 / 7.75 / 7.76 / 7.93）：入队 upgrade 动作。"""
         from . import actions, version_watch
         if any(a["kind"] == "upgrade" for a in self.store.pending_actions()):
             log.info("主人发了升级口令 %s，队列里已有待执行的 upgrade 动作，不重复入队", m.message_id)
@@ -1655,7 +1656,13 @@ class Collector:
         no_pull = bool(cb.get("no_pull")) if isinstance(cb, dict) else False
         reply_to = (m.reply_to or m.message_id) if isinstance(cb, dict) else m.message_id
         cmd_text = plain_text(m.content or "").strip()
-        aid = actions.enqueue(self.store, "upgrade", {"reply_to": reply_to, "command": cmd_text, "channel": channel, "no_pull": no_pull})
+        payload: dict = {"reply_to": reply_to, "command": cmd_text, "channel": channel, "no_pull": no_pull}
+        if channel == "rollback" or (isinstance(cb, dict) and cb.get("rollback")):
+            payload["rollback"] = True
+            payload["no_pull"] = True
+            if isinstance(cb, dict) and cb.get("target_sha"):
+                payload["target_sha"] = str(cb["target_sha"])
+        aid = actions.enqueue(self.store, "upgrade", payload)
         log.info("主人发了升级口令 %s（%r, channel=%s, no_pull=%s），已入队动作 #%d（upgrade）", m.message_id, cmd_text, channel, no_pull, aid)
 
     def _agent_reply_text(self, content: str) -> bool:
@@ -5632,16 +5639,25 @@ class Dispatcher:
         return report
 
     def upgrade(self, *, reply_to: str = "", command: str = "", no_pull: bool = False,
-                channel: str = "stable", repo_dir: Path | None = None) -> dict:
-        """7.69 / 7.75：执行常驻进程热升级动作——委托给 version_watch.execute_upgrade。"""
+                channel: str = "stable", rollback: bool = False, target_sha: str = "",
+                from_sha: str = "", from_display: str = "", notes: str = "",
+                repo_dir: Path | None = None) -> dict:
+        """7.69 / 7.75 / 7.93：执行常驻进程热升级或一键回滚动作——委托给 version_watch.execute_upgrade。"""
         from . import version_watch
-        if channel == "stable":
+        if channel == "stable" and not rollback:
             act = next((json.loads(a["args_json"] or "{}") for a in self.store.pending_actions() if a["kind"] == "upgrade"), {})
             channel = (version_watch.parse_upgrade_request(command) if command else None) or (
-                act.get("channel") if act.get("channel") in ("stable", "beta") else "stable"
+                act.get("channel") if act.get("channel") in ("stable", "beta", "rollback") else "stable"
             )
+            rollback = bool(rollback or channel == "rollback" or act.get("rollback"))
+            target_sha = target_sha or str(act.get("target_sha") or "")
+            from_sha = from_sha or str(act.get("from_sha") or "")
+            from_display = from_display or str(act.get("from_display") or "")
+            notes = notes or str(act.get("notes") or "")
         return version_watch.execute_upgrade(
-            self, reply_to=reply_to, command=command, no_pull=no_pull, channel=channel, repo_dir=repo_dir
+            self, reply_to=reply_to, command=command, no_pull=no_pull, channel=channel,
+            rollback=rollback, target_sha=target_sha, from_sha=from_sha, from_display=from_display,
+            notes=notes, repo_dir=repo_dir,
         )
 
 

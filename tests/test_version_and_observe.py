@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.92")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 92))
+        self.assertEqual(cur_ver, "0.7.93")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 93))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -557,9 +557,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.92）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.93）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.92")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.93")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -988,6 +988,127 @@ class VersionAndObserveTest(unittest.TestCase):
             store.upsert_message(m_owner, "dispatch", "owner_reply", ["owner_verified"], "tp_release")
             res_floor_ok = outbound.resolve(cfg, store, None, "tp_release", "主人已拍板删表", message_id="om_ask_with_floor", quote="同意删除旧表")
             self.assertEqual(res_floor_ok.closed, ["om_ask_with_floor"])
+
+    def test_reg_061_upgrade_notice_changelog_and_interactive_rollback(self):
+        from sheepdog import actions, card_callback, outbound, version_watch
+        from sheepdog.config import EscalationConfig
+        from sheepdog.engine import Collector
+        from sheepdog.models import Message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            (repo / "sheepdog").mkdir(parents=True)
+            (repo / "tests").mkdir(parents=True)
+
+            def git(*args: str) -> str:
+                cmd = ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args]
+                return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+
+            git("init", "-q")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.92"\n', encoding="utf-8")
+            (repo / "tests" / "REGRESSIONS.md").write_text(
+                "# 回归\n\n## 7.92 旧版（REG-060）\n\n| 规格 | 症状 | 守它的测试 |\n| --- | --- | --- |\n| 7.92 | 旧问题 | `t1` |\n",
+                encoding="utf-8",
+            )
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: release v0.7.92")
+            sha_792 = git("rev-parse", "HEAD")
+
+            # 提交 0.7.93 并登记 REGRESSIONS.md
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.93"\n', encoding="utf-8")
+            (repo / "tests" / "REGRESSIONS.md").write_text(
+                "# 回归\n\n## 7.92 旧版（REG-060）\n\n| 规格 | 症状 | 守它的测试 |\n| --- | --- | --- |\n| 7.92 | 旧问题 | `t1` |\n\n"
+                "## 7.93 升级通知附带更新说明与一键回滚按钮（REG-061）\n\n| 规格 | 症状 | 守它的测试 |\n| --- | --- | --- |\n"
+                "| 7.93 | 升级通知缺少更新了什么和解决了什么问题，或缺少一键回滚按钮（REG-061） | `t2` |\n",
+                encoding="utf-8",
+            )
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat(version): add changelog and rollback button in v0.7.93")
+            sha_793 = git("rev-parse", "HEAD")
+
+            cfg = Config(self_open_id="ou_test_owner", state_dir=tmp_path / "state")
+            cfg.escalation = EscalationConfig(
+                chat_ids=["oc_owner_dm"],
+                header_regex=r"^🐕 需要你定 · [^\n]*\[(?P<topic>tp_[a-z0-9_.-]+)\]",
+                attribution_regex=r"\[(?P<topic>tp_[a-z0-9_.-]+)\]",
+                owner_shortcut=True,
+            )
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            rt_792 = {"version": "0.7.92", "git_sha": sha_792, "display": f"0.7.92 ({sha_792[:7]})", "pid": 43210}
+            store.set_meta("daemon_runtime", json.dumps(rt_792, ensure_ascii=False))
+
+            # 1) 执行从 0.7.92 -> 0.7.93 的热升级：自动从 REGRESSIONS.md diff 提取「更新了什么」和「解决了什么问题」，并写入回滚目标
+            sent_notices: list[str] = []
+            disp = Dispatcher(cfg, store, DryRunSink(), Roster(), SecurityConfig())
+            disp.runtime_info = rt_792
+            disp._notify_owner = lambda text, what, topic_id="", **kw: (sent_notices.append(text) or True)
+
+            res_upg = disp.upgrade(no_pull=True, channel="stable", repo_dir=repo)
+            self.assertTrue(res_upg["restart_requested"])
+            self.assertEqual(len(sent_notices), 1)
+            upg_text = sent_notices[0]
+            self.assertTrue(upg_text.startswith("🐕 汇报 · 升级完成 [tp_bus]\n"))
+            self.assertIn("更新了什么", upg_text)
+            self.assertIn("7.93 升级通知附带更新说明与一键回滚按钮", upg_text)
+            self.assertIn("解决了什么问题", upg_text)
+            self.assertIn("升级通知缺少更新了什么和解决了什么问题", upg_text)
+            self.assertIn(f"回滚至 0.7.92 ({sha_792[:7]})", upg_text)
+
+            saved_rb = json.loads(store.get_meta("version_rollback_target") or "{}")
+            self.assertEqual(saved_rb.get("version"), "0.7.92")
+            self.assertEqual(saved_rb.get("git_sha"), sha_792)
+
+            # 2) outbound.owner_content 为「🐕 汇报 · 升级完成」卡片挂载 [⏪ 回滚至 0.7.92 (<sha>)] 红色胶囊按钮
+            _, upg_card = outbound.owner_content(cfg, upg_text)
+            self.assertIsNotNone(upg_card)
+            cs = upg_card["body"]["elements"][-1]
+            self.assertEqual(cs["tag"], "column_set")
+            btns = [col["elements"][0] for col in cs["columns"]]
+            self.assertEqual(btns[0]["type"], "danger")
+            self.assertIn("⏪ 回滚至 0.7.92", btns[0]["text"]["content"])
+            self.assertEqual(btns[0]["value"]["sd_action"], "version_rollback")
+            self.assertEqual(btns[0]["value"]["target_sha"], sha_792[:7])
+
+            # 3) 主人点击 [⏪ 回滚至 0.7.92] 卡片按钮：原地刷绿卡、入队 rollback 动作，常驻进程执行后代码库回退至 0.7.92 且保护无关脏文件
+            (repo / "unrelated_notes.txt").write_text("keep me\n", encoding="utf-8")
+            store.add_bot_outbox("om_upg_done_card", "tp_bus", False, upg_text, "2026-10-31T17:45:00+08:00")
+            fake_source = mock.MagicMock()
+            col = Collector(cfg, store, fake_source, Roster(), SecurityConfig())
+            rb_ev = {
+                "type": "card.action.trigger", "event_id": "ev_rb_061", "message_id": "om_upg_done_card",
+                "chat_id": "oc_owner_dm", "operator_id": "ou_test_owner", "action_tag": "button",
+                "action_value": btns[0]["value"], "timestamp": "2026-10-31T17:46:00+08:00",
+            }
+            m_rb = card_callback.process_card_action_event(rb_ev, cfg=cfg, store=store, source=fake_source)
+            self.assertIsNotNone(m_rb)
+            col.ingest([m_rb], received_by="bot")
+            self.assertEqual(fake_source.patch_card.call_count, 1)
+            patched_rb = fake_source.patch_card.call_args.args[1]
+            self.assertEqual(patched_rb["header"]["template"], "green")
+            self.assertIn("⏪ 回滚至 0.7.92", json.dumps(patched_rb, ensure_ascii=False))
+
+            # 二次重复点击防重拦截
+            self.assertIsNone(card_callback.process_card_action_event({**rb_ev, "event_id": "ev_rb_061_dup"}, cfg=cfg, store=store, source=fake_source))
+
+            pending_rb = store.pending_actions()
+            self.assertEqual(len(pending_rb), 1)
+            rb_args = json.loads(pending_rb[0]["args_json"])
+            self.assertTrue(rb_args.get("rollback"))
+            self.assertEqual(rb_args.get("target_sha"), sha_792[:7])
+
+            sent_notices.clear()
+            disp.runtime_info = {"version": "0.7.93", "git_sha": sha_793, "display": f"0.7.93 ({sha_793[:7]})", "pid": 43210}
+            with mock.patch("sheepdog.default_repo_dir", return_value=repo):
+                actions.run_pending(disp)
+            self.assertEqual(git("rev-parse", "HEAD"), sha_792)
+            self.assertEqual(sheepdog.read_disk_version(repo), "0.7.92")
+            self.assertEqual((repo / "unrelated_notes.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertEqual(len(sent_notices), 1)
+            self.assertIn("⏪ 已从", sent_notices[0])
+            self.assertIn("回滚至 **0.7.92", sent_notices[0])
 
 
 if __name__ == "__main__":

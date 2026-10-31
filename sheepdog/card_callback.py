@@ -164,7 +164,7 @@ def attach_ask_interactions(
     spec = (options_spec or "").strip()
     if spec.lower() in _DISABLED_SPECS:
         return card
-    if (text or "").strip("\n").startswith(("🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态")):
+    if (text or "").strip("\n").startswith(("🐕 汇报 · 新版提醒", "🐕 汇报 · 版本与更新状态", "🐕 汇报 · 升级完成")):
         return attach_version_interactions(card, text)
     opts = parse_ask_options(f"{summary}\n{text}" if summary else text, spec)
     if not (bool(spec) or (interactive and bool(opts))):
@@ -330,8 +330,8 @@ def _handle_tg_move_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_i
 
 def _handle_version_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_id: str, chat_type: str, operator_id: str, create_time: str, raw: dict, tgt: dict, store, source) -> Message | None:
     act = str(val.get("sd_action") or "").strip()
-    if act in ("version_upgrade", "version_dismiss") and card_mid:
-        if store.conn.execute("SELECT 1 FROM messages WHERE reply_to = ? AND reason IN ('upgrade_command', 'version_dismiss') LIMIT 1", (card_mid,)).fetchone() is not None:
+    if act in ("version_upgrade", "version_dismiss", "version_rollback") and card_mid:
+        if store.conn.execute("SELECT 1 FROM messages WHERE reply_to = ? AND reason IN ('upgrade_command', 'version_dismiss', 'version_rollback') LIMIT 1", (card_mid,)).fetchone() is not None:
             dup_m = Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=str(val.get("label") or act), msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw))
             store.upsert_message(dup_m, "drop", "card_callback_duplicate", ["card_callback"], topic_id="tp_bus", received_by="bot")
             return None
@@ -344,6 +344,12 @@ def _handle_version_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_i
         chosen = f"{val.get('label') or '⏸ 暂不升级'}（不强制）"
         cb_meta = {"kind": "version_dismiss", "topic_id": "tp_bus", "card_message_id": card_mid, "chosen_display": chosen}
         content = chosen
+    elif act == "version_rollback":
+        target_sha = str(val.get("target_sha") or "").strip()
+        target_ver = str(val.get("target_version") or "").strip()
+        content = "回滚"
+        chosen = f"{val.get('label') or (f'⏪ 回滚至 {target_ver}' if target_ver else '⏪ 回滚至上一版')}（已提交后台执行）"
+        cb_meta = {"kind": "version_rollback", "topic_id": "tp_bus", "card_message_id": card_mid, "channel": "rollback", "rollback": True, "target_sha": target_sha, "target_version": target_ver, "chosen_display": chosen}
     else:
         channel = "beta" if val.get("channel") == "beta" else "stable"
         no_pull, target_ver = bool(val.get("no_pull", False)), str(val.get("target_version") or "")
@@ -380,7 +386,7 @@ def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | Non
                          msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw))
         store.upsert_message(drop_m, "drop", "card_callback_non_owner", ["card_callback", f"operator:{operator_id}"], received_by="bot")
         return None
-    if val.get("sd_action") in ("version_upgrade", "version_dismiss", "version_query"):
+    if val.get("sd_action") in ("version_upgrade", "version_dismiss", "version_query", "version_rollback"):
         return _handle_version_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
                                         chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,
                                         raw=raw, tgt=tgt, store=store, source=source)

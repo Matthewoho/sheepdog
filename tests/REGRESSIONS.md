@@ -414,4 +414,11 @@
 | --- | --- | --- |
 | 7.92 | 非 VIP 发起事务先触发会话 `sheepdog ask`（未触碰 `credentials/destructive/vip_conflict` 底线，`sends.floor` 为空），随后名册 `tier="vip"` 关键人在提问之后发消息明确授权拍板并由会话办结，但会话调 `sheepdog resolve --quote <VIP消息ID或原话>` 销假时被 `verify_resolve_allowed` 死卡「未找到主人发送的匹配消息」导致已办结卡片长期挂在 `open_escalations` 反复催办；或反过来让 VIP 消息越权结掉带 `sends.floor` 的底线提问；或 `observe._is_unbounded_code_search` 将显式带 `-maxdepth [0-3]` 的 `<20ms` 浅层找仓 `find` 误报为 `REG-057` 全目录盲扫（REG-060） | `test_version_and_observe.VersionAndObserveTest.test_reg_060_vip_resolve_quote_symmetry_and_shallow_find_exemption`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_060_vip_resolve_quote_symmetry_and_shallow_find_exemption`） |
 
+## 7.93 升级完成通知自动附带「更新了什么 / 解决了什么问题」摘要与一键交互式回滚按钮闭环（REG-061）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.93 | `🐕 汇报 · 升级完成 [tp_bus]` 卡片仅报一句版本号变更而未说明本次更新了什么、解决了什么问题（未支持 `--notes` 或从 `tests/REGRESSIONS.md` / `git log` 自动提炼更新与问题修复摘要），或升级完成卡片未通过 `outbound.owner_content` 注入 `⏪ 回滚至 <上一版>` 交互式胶囊按钮（`sd_action="version_rollback"`）与 `meta["version_rollback_target"]` 持久化，或主人点击回滚按钮 / 发「回滚」/ 跑 `sheepdog upgrade --rollback` 未安全将代码库回退至上一版本并触发常驻进程原地热重启（REG-061） | `test_version_and_observe.VersionAndObserveTest.test_reg_061_upgrade_notice_changelog_and_interactive_rollback`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_061_upgrade_notice_changelog_and_interactive_rollback`） |
+
+
 

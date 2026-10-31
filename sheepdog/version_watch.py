@@ -19,7 +19,8 @@ GITHUB_RELEASE_API_URL = f"https://api.github.com/repos/{PUBLIC_REPO_SLUG}/relea
 GITHUB_RELEASE_WEB_URL = f"https://github.com/{PUBLIC_REPO_SLUG}/releases/latest"
 BETA_UPGRADE_WORDS = frozenset({"升级beta", "升级 beta", "升级beta版", "升级 beta 版", "你来升级beta", "你来升级 beta", "立即升级beta", "立即升级 beta", "更新beta", "更新 beta", "升级尝鲜版", "你来升级尝鲜版", "sheepdog upgrade --beta"})
 STABLE_UPGRADE_WORDS = frozenset({"升级", "你来升级", "立即升级", "更新", "你来更新", "升级稳定版", "你来升级稳定版", "更新稳定版", "重启", "你来重启", "重启生效", "升级重启", "sheepdog upgrade"})
-UPGRADE_WORDS = STABLE_UPGRADE_WORDS | BETA_UPGRADE_WORDS
+ROLLBACK_WORDS = frozenset({"回滚", "你来回滚", "立即回滚", "回滚上一版", "退回上一版", "回退上一版", "版本回滚", "回滚版本", "sheepdog upgrade --rollback"})
+UPGRADE_WORDS = STABLE_UPGRADE_WORDS | BETA_UPGRADE_WORDS | ROLLBACK_WORDS
 VERSION_QUERY_WORDS = frozenset({"有新版本吗", "有没有新版本", "有没有新版", "有新版吗", "有没有beta", "有没有 beta", "有beta吗", "有 beta 吗", "有没有beta版", "有没有 beta 版", "有beta版吗", "有 beta 版吗", "有没有尝鲜版", "有尝鲜版吗", "查版本", "查询版本", "查一下版本", "看看版本", "当前版本", "检查更新", "查更新", "sheepdog version", "sheepdog version --check-remote"})
 _AT_TAG_RE = re.compile(r"<at\b[^>]*>.*?</at>", re.I | re.S)
 _TRAIL_PUNCT = " \t\r\n。！!~～？?，,、.·\"'”’」』】"
@@ -55,8 +56,10 @@ def _cleaned_candidates(content: str) -> list[str]:
 
 
 def parse_upgrade_request(content: str) -> str | None:
-    """识别升级口令：返回 'beta' | 'stable' | None。"""
+    """识别升级/回滚口令：返回 'rollback' | 'beta' | 'stable' | None。"""
     for c in _cleaned_candidates(content):
+        if c in ROLLBACK_WORDS or c.startswith("sheepdog upgrade --rollback"):
+            return "rollback"
         norm = c if c.startswith("sheepdog ") else re.sub(r"\s*beta\s*", "beta", c)
         if c in BETA_UPGRADE_WORDS or norm in BETA_UPGRADE_WORDS:
             return "beta"
@@ -294,8 +297,23 @@ def _ver_btn(label: str, sd_action: str, btn_type: str = "default", **extra) -> 
 
 
 def parse_version_card_actions(text: str) -> list[dict]:
-    """按新版提醒（Scenario A/B）或版本与更新状态（Scenario C）文本推导 Card 2.0 胶囊按钮列表。"""
+    """按新版提醒（Scenario A/B）、版本与更新状态（Scenario C）或升级完成（Scenario D，7.93）文本推导 Card 2.0 胶囊按钮列表。"""
     first, _, body = (text or "").strip("\n").partition("\n")
+    if first.startswith("🐕 汇报 · 升级完成"):
+        if "已从" in body and "回滚至" in body and "升级至" not in body:
+            return [_ver_btn("🔍 查看版本状态", "version_query")]
+        m_rb = re.search(r"回滚至\s*\*{0,2}([vV]?[0-9]+\.[0-9]+\.[0-9]+)?\s*(?:\(([0-9a-f]{7,40})\))?\*{0,2}", body)
+        if not (m_rb and (m_rb.group(1) or m_rb.group(2))):
+            m_rb = re.search(r"已从\s*\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+)?(?:\s*\(([0-9a-f]{7,40})(?:-dirty)?\))?\*\*\s*升级至", body)
+        rb_ver = (m_rb.group(1) or "").strip() if m_rb else ""
+        rb_sha = (m_rb.group(2) or "").strip() if m_rb else ""
+        if rb_ver or rb_sha:
+            disp = f"{rb_ver} ({rb_sha[:7]})".strip() if (rb_ver and rb_sha) else (rb_ver or rb_sha[:7])
+            return [
+                _ver_btn(f"⏪ 回滚至 {disp}", "version_rollback", "danger", target_sha=rb_sha, target_version=rb_ver or disp),
+                _ver_btn("🔍 查看版本状态", "version_query"),
+            ]
+        return [_ver_btn("🔍 查看版本状态", "version_query")]
     if first.startswith("🐕 汇报 · 新版提醒"):
         if any(k in body for k in ("GitHub 已发布最新稳定版", "远端新稳定版", "升级稳定版")):
             m = re.search(r"(?:Release|稳定版)[^vV0-9\n]*?([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）`'\"”]*)", body) or re.search(r"\*\*([vV]?[0-9]+\.[0-9]+\.[0-9]+[^\s*()（）]*)", body)
@@ -365,12 +383,163 @@ def pull_repo_for_channel(root: Path, channel: str = "stable", timeout: float = 
     return (r.returncode == 0), out, ("" if r.returncode == 0 else (out or f"returncode={r.returncode}"))
 
 
-def execute_upgrade(dispatcher, *, reply_to: str = "", command: str = "", no_pull: bool = False, channel: str = "stable", repo_dir: Path | None = None) -> dict:
-    """执行常驻进程双轨（stable / beta）热升级，诚实报告拉取失败或 dirty 跳过。"""
+def summarize_upgrade_changes(root: Path, from_sha: str = "", to_sha: str = "", explicit_notes: str = "") -> str:
+    """7.93（REG-061）：提炼本次升级『更新了什么』与『解决了什么问题』摘要，供升级完成通知展示。"""
+    notes = (explicit_notes or "").strip()
+    if notes:
+        if "更新了什么" in notes or "解决了什么问题" in notes:
+            return notes
+        parts = [p.strip() for p in re.split(r"[\n；;]+", notes) if p.strip()]
+        if len(parts) >= 2:
+            return f"- 📋 **更新了什么**：{parts[0]}\n- 🎯 **解决了什么问题**：{'；'.join(parts[1:])}"
+        return f"- 📋 **更新了什么 / 解决了什么问题**：{notes}"
+
+    if not (root / ".git").exists():
+        return ""
+    rng = f"{from_sha}..{to_sha}" if (from_sha and to_sha and from_sha != to_sha) else "HEAD~1..HEAD"
+    updated_items: list[str] = []
+    solved_items: list[str] = []
+    r_diff = _git_run(["git", "-C", str(root), "diff", "--unified=0", rng, "--", "tests/REGRESSIONS.md"], timeout=5.0)
+    if r_diff is not None and r_diff.returncode == 0 and (r_diff.stdout or "").strip():
+        for raw_ln in r_diff.stdout.splitlines():
+            if not raw_ln.startswith("+") or raw_ln.startswith("+++"):
+                continue
+            ln = raw_ln[1:].strip()
+            if mh := re.match(r"^##\s+([0-9]+\.[0-9]+\s+.+)$", ln):
+                item = mh.group(1).strip()
+                if item not in updated_items:
+                    updated_items.append(item)
+            elif mr := re.match(r"^\|\s*([0-9]+\.[0-9]+)\s*\|\s*([^|]+?)\s*\|", ln):
+                spec_no, symptom = mr.group(1).strip(), mr.group(2).strip()
+                if symptom and symptom not in ("症状", "---"):
+                    entry = f"[{spec_no}] {symptom}"
+                    if entry not in solved_items:
+                        solved_items.append(entry)
+
+    commits: list[str] = []
+    r_log = _git_run(["git", "-C", str(root), "log", "--no-merges", "-n", "5", "--format=%h %s", rng], timeout=5.0)
+    if (r_log is None or r_log.returncode != 0 or not (r_log.stdout or "").strip()) and to_sha:
+        r_log = _git_run(["git", "-C", str(root), "log", "-n", "1", "--format=%h %s", to_sha], timeout=5.0)
+    if r_log is not None and r_log.returncode == 0 and (r_log.stdout or "").strip():
+        commits = [c.strip() for c in r_log.stdout.splitlines() if c.strip()]
+
+    lines: list[str] = []
+    if updated_items:
+        lines.append(f"- 📋 **更新了什么**：{'；'.join(updated_items[:3])}")
+    elif commits:
+        lines.append(f"- 📋 **更新了什么**：{'；'.join(commits[:3])}")
+    if solved_items:
+        lines.append(f"- 🎯 **解决了什么问题**：{'；'.join(solved_items[:3])}")
+    elif commits and updated_items:
+        lines.append(f"- 🎯 **提交记录**：{'；'.join(commits[:3])}")
+    elif commits:
+        lines.append(f"- 🎯 **解决了什么问题**：同步提交 {'；'.join(commits[:3])} 中的修复与改进")
+    return "\n".join(lines)
+
+
+def rollback_repo_to_target(root: Path, target_sha: str, timeout: float = 15.0) -> tuple[bool, str, str]:
+    """7.93（REG-061）：安全将仓库回滚至目标 commit/tag（保护无关未提交文件不被误抹）。"""
+    ref = (target_sha or "").strip()
+    if not ref:
+        return False, "", "未指定回滚目标版本（target_sha 为空）"
+    if not (root / ".git").exists():
+        return False, "", "当前目录不是 Git 仓库，无法执行版本回滚"
+    rv = _git_run(["git", "-C", str(root), "rev-parse", "--verify", f"{ref}^{{commit}}"], timeout=5.0)
+    if rv is None or rv.returncode != 0 or not (rv.stdout or "").strip():
+        err = ((rv.stderr if rv else "") or "").strip() or f"无法解析目标版本 {ref}"
+        return False, "", err
+    resolved_sha = rv.stdout.strip().splitlines()[0].strip()
+
+    rd = _git_run(["git", "-C", str(root), "diff", "--name-only", resolved_sha, "HEAD"], timeout=5.0)
+    changed_files = [f.strip() for f in (rd.stdout.splitlines() if (rd and rd.returncode == 0 and rd.stdout) else ()) if f.strip()]
+
+    rs = _git_run(["git", "-C", str(root), "status", "--porcelain", "-uno"], timeout=5.0)
+    has_dirty_tracked = bool(rs and rs.returncode == 0 and (rs.stdout or "").strip())
+    if not has_dirty_tracked:
+        rr = _git_run(["git", "-C", str(root), "reset", "--hard", resolved_sha], timeout=timeout)
+        if rr is None or rr.returncode != 0:
+            err = ((rr.stderr if rr else "") or (rr.stdout if rr else "") or "git reset --hard 失败").strip()[:300]
+            return False, "", err
+        out = ((rr.stdout or "") + "\n" + (rr.stderr or "")).strip()[:300]
+        return True, out, ""
+
+    if changed_files:
+        rc_dirty = _git_run(["git", "-C", str(root), "status", "--porcelain", "-uno", "--", *changed_files], timeout=5.0)
+        if rc_dirty and rc_dirty.returncode == 0 and (rc_dirty.stdout or "").strip():
+            return False, "", "回滚涉及的目标文件存在未提交修改，已拒绝覆盖"
+    r_soft = _git_run(["git", "-C", str(root), "reset", "--soft", resolved_sha], timeout=timeout)
+    if r_soft is None or r_soft.returncode != 0:
+        err = ((r_soft.stderr if r_soft else "") or "git reset --soft 失败").strip()[:300]
+        return False, "", err
+    if changed_files:
+        _git_run(["git", "-C", str(root), "checkout", resolved_sha, "--", *changed_files], timeout=timeout)
+    _git_run(["git", "-C", str(root), "reset", "HEAD", "--", "."], timeout=timeout)
+    return True, f"HEAD selectively reset to {resolved_sha[:7]}", ""
+
+
+def _resolve_rollback_info(store, root: Path, prev_ver: str, prev_sha: str, prev_disp: str, after_sha: str) -> dict:
+    """确定并持久化升级完成卡片上可供一键回滚的上一版本目标。"""
+    if prev_sha and after_sha and prev_sha != after_sha:
+        info = {"version": prev_ver, "git_sha": prev_sha, "git_short": prev_sha[:7], "display": prev_disp, "saved_at": now_iso()}
+        if store is not None:
+            store.set_meta("version_rollback_target", json.dumps(info, ensure_ascii=False))
+        return info
+    if store is not None and isinstance(saved := _safe_json(store.get_meta("version_rollback_target")), dict):
+        s_sha = str(saved.get("git_sha") or "").strip()
+        if s_sha and s_sha != after_sha:
+            return saved
+    if (root / ".git").exists():
+        rp = _git_run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD~1^{commit}"], timeout=3.0)
+        if rp is not None and rp.returncode == 0 and (p_sha := (rp.stdout or "").strip()):
+            p_ver = ""
+            rf = _git_run(["git", "-C", str(root), "show", f"{p_sha}:sheepdog/__init__.py"], timeout=3.0)
+            if rf is not None and rf.returncode == 0 and rf.stdout:
+                m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', rf.stdout)
+                p_ver = m.group(1).strip() if m else ""
+            info = {"version": p_ver, "git_sha": p_sha, "git_short": p_sha[:7], "display": f"{p_ver} ({p_sha[:7]})".strip() if p_ver else p_sha[:7]}
+            if store is not None:
+                store.set_meta("version_rollback_target", json.dumps({**info, "saved_at": now_iso()}, ensure_ascii=False))
+            return info
+    return {}
+
+
+def execute_upgrade(
+    dispatcher, *, reply_to: str = "", command: str = "", no_pull: bool = False,
+    channel: str = "stable", rollback: bool = False, target_sha: str = "",
+    from_sha: str = "", from_display: str = "", notes: str = "", repo_dir: Path | None = None,
+) -> dict:
+    """执行常驻进程双轨（stable / beta）热升级或一键回滚（rollback），附带更新摘要与回滚按钮（7.75 / 7.93）。"""
     root = _repo_root(repo_dir)
     mem = _resolve_mem(dispatcher.store, dispatcher.runtime_info, root)
-    mem_disp, pid = mem.get("display") or mem.get("version") or "?", mem.get("pid") or os.getpid()
+    mem_disp = (from_display or mem.get("display") or mem.get("version") or "?").strip()
+    mem_ver = (mem.get("version") or "").strip()
+    pid = mem.get("pid") or os.getpid()
     disk_before = version_info(root, prefer_disk_version=True)
+    prev_sha = (from_sha or mem.get("git_sha") or disk_before.get("git_sha") or "").strip()
+    if not mem_ver:
+        mem_ver = disk_before.get("version") or ""
+
+    is_rollback = bool(rollback or channel == "rollback")
+    if is_rollback:
+        rb_target = (target_sha or "").strip()
+        if not rb_target and dispatcher.store is not None:
+            saved = _safe_json(dispatcher.store.get_meta("version_rollback_target"))
+            if isinstance(saved, dict):
+                rb_target = str(saved.get("git_sha") or "").strip()
+        if not rb_target:
+            rb_target = "HEAD~1"
+        rolled_ok, rb_out, rb_err = rollback_repo_to_target(root, rb_target, timeout=15.0)
+        disk_after = version_info(root, prefer_disk_version=True)
+        if rolled_ok:
+            dispatcher.restart_requested = True
+            body = f"⏪ 已从 **{mem_disp}** 回滚至 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程使其立即生效。"
+        else:
+            dispatcher.restart_requested = False
+            body = f"⚠️ 回滚失败（{rb_err}），当前仍为 **{disk_after['display']}**（PID {pid}）。"
+        dispatcher._notify_owner(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n{body}", "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
+        log.info("已执行 rollback 动作（%s -> %s，ok=%s，target=%s，command=%r）", mem_disp, disk_after["display"], rolled_ok, rb_target, command)
+        return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": "rollback", "rollback": True, "rolled_back": rolled_ok, "rollback_output": rb_out, "rollback_failed_reason": rb_err, "restart_requested": bool(rolled_ok)}
+
     pulled, pull_output, pull_failed_reason = False, "", ""
     if not no_pull and (root / ".git").exists():
         if disk_before["dirty"]:
@@ -380,14 +549,31 @@ def execute_upgrade(dispatcher, *, reply_to: str = "", command: str = "", no_pul
     disk_after = version_info(root, prefer_disk_version=True)
     dispatcher.restart_requested = True
     if disk_after["display"] != mem_disp:
-        body = f"✅ 已从 **{mem_disp}** 升级至 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程使其立即生效。"
+        headline = f"✅ 已从 **{mem_disp}** 升级至 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程使其立即生效。"
     elif pull_failed_reason:
-        body = f"⚠️ 未能拉取远端最新代码（{pull_failed_reason}），当前仍为 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程。"
+        headline = f"⚠️ 未能拉取远端最新代码（{pull_failed_reason}），当前仍为 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程。"
     else:
-        body = f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程刷新运行态。"
-    dispatcher._notify_owner(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n{body}", "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
+        headline = f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程刷新运行态。"
+
+    rb_info = _resolve_rollback_info(dispatcher.store, root, mem_ver, prev_sha, mem_disp, disk_after.get("git_sha") or "")
+    change_summary = summarize_upgrade_changes(
+        root,
+        from_sha=prev_sha or str(rb_info.get("git_sha") or ""),
+        to_sha=disk_after.get("git_sha") or "",
+        explicit_notes=notes,
+    )
+    extra_lines: list[str] = []
+    if change_summary:
+        extra_lines.append(change_summary)
+    if rb_info.get("git_sha"):
+        rb_ver_str = str(rb_info.get("version") or "").strip()
+        rb_short = str(rb_info["git_sha"])[:7]
+        rb_label = f"{rb_ver_str} ({rb_short})" if rb_ver_str else rb_short
+        extra_lines.append(f"⏪ 如需回退：可直接点击下方「**回滚至 {rb_label}**」按钮（或回复「**回滚**」/ 运行 `sheepdog upgrade --rollback`）。")
+    full_body = "\n".join([headline, *extra_lines])
+    dispatcher._notify_owner(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n{full_body}", "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
     log.info("已执行 upgrade 动作（channel=%s，%s -> %s，pulled=%s，command=%r），标记原地重启", channel, mem_disp, disk_after["display"], pulled, command)
-    return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": channel, "pulled": pulled, "pull_output": pull_output, "pull_failed_reason": pull_failed_reason, "restart_requested": True}
+    return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": channel, "pulled": pulled, "pull_output": pull_output, "pull_failed_reason": pull_failed_reason, "change_summary": change_summary, "rollback_target": rb_info, "restart_requested": True}
 
 
 def check_version_drift(c, disk_ver_info: dict, version_mismatch_since: str | None, ref_now: datetime) -> tuple[list[str], list[str], str | None]:
