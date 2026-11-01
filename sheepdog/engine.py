@@ -4428,17 +4428,15 @@ class Dispatcher:
             lid, tid = lb["lamb_id"], lb["parent_topic_id"]
             if lb["kind"] in ("cli", "bash_worker") and lb["pid"]:
                 if not _pid_alive(int(lb["pid"])) and lb["state"] == "running":
-                    tail_lines: list[str] = []
+                    raw_log = ""
                     if lb["log_path"]:
                         try:
                             lp = Path(lb["log_path"])
                             if lp.exists():
-                                raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
-                                tail_lines = [ln.strip() for ln in raw_lines if ln.strip()][-5:]
+                                raw_log = lp.read_text(encoding="utf-8", errors="replace")
                         except OSError:
                             pass
-                    tail_text = "\n".join(tail_lines)
-                    has_err = any(k in tail_text for k in ("Traceback", "Fatal", "Error", "ERROR"))
+                    tail_text, has_err = _summarize_cli_lamb_log(raw_log)
                     st = "failed" if has_err else "done"
                     summary = tail_text or lb["result_summary"] or "后台进程已退出"
                     complete_lamb(self.store, lid, summary=summary, state=st)
@@ -6094,12 +6092,82 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
     return lid
 
 
+def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
+    """7.101（REG-069）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，杜绝格式化多行 JSON 尾行退化为 '}\\n}\\n}\\n]\\n}'。"""
+    if not raw_text:
+        return "", False
+    non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    if not non_empty:
+        return "", False
+    recent_window = "\n".join(non_empty[-30:])
+    has_err = any(k in recent_window for k in ("Traceback", "Fatal", "Error", "ERROR"))
+    stripped = raw_text.rstrip()
+    if stripped.endswith("}"):
+        idx = stripped.rfind("\n{")
+        cand = stripped[idx + 1:] if idx != -1 else (stripped if stripped.startswith("{") else "")
+        if cand:
+            try:
+                obj = json.loads(cand)
+                if isinstance(obj, dict):
+                    if obj.get("ok") is False or obj.get("status") in ("failed", "error") or obj.get("error"):
+                        has_err = True
+                    prefix_lines = [
+                        ln.strip() for ln in stripped[:idx].splitlines()
+                        if ln.strip() and not re.match(r"^[}\],;:\s]+$", ln.strip())
+                    ][-2:] if idx != -1 else []
+                    compact_parts: list[str] = []
+                    for k, v in obj.items():
+                        if isinstance(v, (str, int, float, bool)) or v is None:
+                            compact_parts.append(f"{k}={v}")
+                        elif isinstance(v, list):
+                            compact_parts.append(f"{k}=[{len(v)} items]")
+                        elif isinstance(v, dict):
+                            compact_parts.append(f"{k}={{{len(v)} keys}}")
+                    json_summary = ", ".join(compact_parts[:8]) or json.dumps(obj, ensure_ascii=False)[:200]
+                    return ("\n".join([*prefix_lines, f"JSON({json_summary})"]) if prefix_lines else f"JSON({json_summary})"), has_err
+            except Exception:
+                pass
+    meaningful = [ln for ln in non_empty if not re.match(r"^[}\],;:\s]+$", ln)]
+    tail_lines = (meaningful or non_empty)[-5:]
+    return "\n".join(tail_lines), has_err
+
+
+def _terminate_lamb_process(lb: dict) -> bool:
+    """7.101（REG-069）：终止 CLI 羔羊的整个后台进程组（os.killpg），防止 lamb done / cancel / timeout 后子进程残留为孤儿僵尸继续执行。"""
+    import signal
+    if not lb or lb.get("kind") not in ("cli", "bash_worker") or not lb.get("pid"):
+        return False
+    try:
+        pid = int(lb["pid"])
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    killed = False
+    try:
+        pgid = os.getpgid(pid)
+        if pgid > 1 and pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGTERM)
+            killed = True
+    except (OSError, ValueError):
+        pass
+    if not killed:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed = True
+        except (OSError, ValueError):
+            pass
+    return killed
+
+
 def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "done",
                   report_msg_id: str | None = None) -> dict:
-    """7.63：羔羊完工 / 失败 / 超时收尾：更新 lambs 表、关闭母羊名下对应的 work_items (lamb:<id>)、向母羊排入 lamb_report 系统消息。"""
+    """7.63 / 7.101：羔羊完工 / 失败 / 超时收尾：若 CLI 进程组仍在运行则先行终止，更新 lambs 表、关闭母羊名下对应的 work_items (lamb:<id>)、向母羊排入 lamb_report 系统消息。"""
     lid = (lamb_id or "").strip()
     if (lb := store.get_lamb(lid)) is None:
         raise ValueError(f"羔羊 {lid} 不存在")
+    if lb.get("state") == "running" and lb.get("pid"):
+        _terminate_lamb_process(lb)
     final_state = state if state in ("done", "failed", "timeout") else "done"
     ts = now_iso()
     summary = (summary or "").strip() or (lb["result_summary"] or f"羔羊 {lid} 已结束（{final_state}）")
@@ -6136,14 +6204,11 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
 
 
 def cancel_lamb(store: Store, lamb_id: str, reason: str = "") -> dict:
-    """7.63：取消一只羔羊，若后台进程仍在运行则终止进程并更新状态。"""
-    import signal
+    """7.63 / 7.101：取消一只羔羊，若后台进程组仍在运行则整组终止并更新状态。"""
     lid = (lamb_id or "").strip()
     if (lb := store.get_lamb(lid)) is None:
         raise ValueError(f"羔羊 {lid} 不存在")
-    if lb["pid"]:
-        try: os.kill(int(lb["pid"]), signal.SIGTERM)
-        except (OSError, ValueError): pass
+    _terminate_lamb_process(lb)
     ts, summary = now_iso(), (reason or "").strip() or "已手动取消"
     store.update_lamb(lid, state="failed", finished_at=lb["finished_at"] or ts, last_act_at=ts,
                       result_summary=summary, reported_at=lb["reported_at"] or ts)

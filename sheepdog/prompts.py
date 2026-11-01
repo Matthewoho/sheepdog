@@ -119,23 +119,29 @@ _OWNER_TAGS = ("owner_verified", OWNER_INSTRUCTION_TAG)
 _OWNER_REASONS = ("owner_context", "owner_reply", "owner_instruction")
 _AGENT_PROXY_CONTENT_RE = re.compile(
     r"^\s*(?:<card[^>]*>\s*)*(?:(?:[▶▸▼▾#*+-]+\s*)*✦(?:\s|[\u4e00-\u9fffA-Za-z0-9\[【(（])"
-    r"|由[^\n]{1,24}的\s*(?:Codex|Claude|AI)?\s*助理|(?:【|\[|\()[^】\]\)\n]{0,24}(?:Codex|Claude|AI)\s*助理(?:】|\]|\))|🐕\s*(?:汇报|需要你定)\s*·)"
+    r"|由[^\n]{1,24}的\s*(?:Codex|Claude|AI|工作|智能)?\s*助理|🐕\s*(?:汇报|需要你定)\s*·)"
+    r"|(?:【|\[|\(|（)\s*[^】\]\)）\n]{0,32}?(?:(?:Codex|Claude|AI|工作|智能)\s*助理|助理\s*(?:代发|代回|代留言))[^】\]\)）\n]{0,24}?(?:】|\]|\)|）)"
+    r"|(?:^|[\n\r>]|<font[^>]*>|——|--|—)\s*[^\n<>]{1,36}?的\s*(?:Codex|Claude|AI|工作|智能)\s*助理(?:\s*(?:代发|代回|代留言|（[^）\n]*）|\([^)\n]*\)))?\s*(?:</font>|<\/card>|\s)*$"
     r"|\[🐕\s*Sheepdog\s+Reply\]|\n🐕SheepDog\s+v\d+\.", re.I)
 
 
 def is_agent_proxy_content(text: str) -> bool:
-    """7.100（REG-068）：识别同事个人账号代发的 AI 助理消息（如老胡助理 ✦ 前缀卡片、由…的Codex助理、Sheepdog 代回签名）。"""
+    """7.100 / 7.101（REG-068 / REG-069）：识别同事个人账号代发的 AI 助理消息（含句首 ✦、由…助理、全角/半角括号（…AI助理代发）、句尾 <font>Sammi · …的 AI 助理</font>、——…的工作助理等）。"""
     return bool(text and _AGENT_PROXY_CONTENT_RE.search(text))
 
 
 def vip_of(row, vips: dict | None) -> str:
-    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100）：是就返回盖章用的名字，不是返回空串。
-    不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex 助理消息）、主人本人的。"""
+    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100 / 7.101）：是就返回盖章用的名字，不是返回空串。
+    不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex / AI 助理消息）、主人本人的。"""
     if not vips or row is None:
         return ""
     tags = json.loads(row["tags_json"] or "[]")
+    content = (row["content"] if "content" in row.keys() else "") or ""
     if row["chat_type"] == SYSTEM_CHAT:
         if row["reason"] == "duty_mail":
+            unquoted = "\n".join(ln[2:] if ln.startswith("> ") else ln for ln in content.splitlines())
+            if is_agent_proxy_content(content) or is_agent_proxy_content(unquoted):
+                return ""
             for t in tags:
                 if t.startswith("vip_relay:"):
                     parts = t.split(":", 2)
@@ -145,7 +151,6 @@ def vip_of(row, vips: dict | None) -> str:
     sid = (row["sender_id"] or "").strip()
     if not sid or sid not in vips or (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
         return ""
-    content = (row["content"] if "content" in row.keys() else "") or ""
     if "agent_sender" in tags or is_agent_proxy_content(content) or any(t in tags for t in _OWNER_TAGS):
         return ""
     return vips[sid] or (row["sender_name"] or "").strip() or sid

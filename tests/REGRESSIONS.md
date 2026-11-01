@@ -462,3 +462,9 @@
 | --- | --- | --- |
 | 7.100 | VIP 同事（如老胡）的 AI 助理通过其个人飞书账号（`sender_type="user"`）发送带 `✦` 前缀（如 `<card>\n▶ ✦ ...`）或 `由…的Codex助理` 签名的消息时，因 `Engine._is_agent` 与 `prompts.vip_of` 仅按 `sender_type in ("app", "bot")` 过滤机器人，将该 AI 助理消息误判为 VIP 本人亲口指令并盖上 `👑 VIP：老胡`、附上《👑 VIP 规则》（免问直接动生产）且经 `duty.send_mail` 跨会话传播 `vip_relay` 印章，导致双方 AI 助理将技术建议当成 VIP 生产变更授权自主执行（REG-068） | `test_vip.VipBranch765Test.test_reg_068_vip_agent_proxy_sparkle_prefix_not_stamped_as_vip`（`tests/test_vip.py::VipBranch765Test::test_reg_068_vip_agent_proxy_sparkle_prefix_not_stamped_as_vip`） |
 
+## 7.101 全位置个人账号 AI 助理代发落款识别（全角括号 / 灰字尾签 / 工作助理代留言）、CLI 羔羊进程组强一致回收防孤儿僵尸与多行 JSON 尾行摘要提炼（REG-069）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.101 | 同事个人账号 AI 助理在消息末尾或全角括号落款（如 `（Sammy 的 AI 助理代发）`、`<font color='grey'>Sammi · Sammy 的 AI 助理</font>`、`——Klaus 的工作助理（按本人要求代留言）`）因不在句首而漏过 `_AGENT_PROXY_CONTENT_RE` 被误盖 `👑 VIP` 免问动生产印章；或母羊调用 `sheepdog lamb done` / `cancel` 提前终止 `start_new_session=True` 启动的 CLI 羔羊时未按进程组（`os.killpg`）清理子进程树，导致后台 Python 子进程残留为孤儿僵尸继续偷跑批准构建；或 CLI 羔羊正常退出末尾打印多行格式化 JSON 时 `_tick_lambs` 仅截取最后 5 行闭合括号导致汇报摘要退化为 `}\n}\n}\n]\n}`（REG-069） | `test_vip.VipBranch765Test.test_reg_069_vip_agent_proxy_footer_and_cli_lamb_pgid_and_json_summary`（`tests/test_vip.py::VipBranch765Test::test_reg_069_vip_agent_proxy_footer_and_cli_lamb_pgid_and_json_summary`） |
+

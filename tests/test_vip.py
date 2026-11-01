@@ -680,6 +680,87 @@ class VipBranch765Test(AskFloorTest):
         prompt_human = batch_prompt(pb, fx.TOPIC, "b_human", [r_human], [], fx.TITLE, vips={VIP: VIP_NAME})
         self.assertIn(f"👑 VIP：{VIP_NAME}", prompt_human)
 
+    def test_reg_069_vip_agent_proxy_footer_and_cli_lamb_pgid_and_json_summary(self):
+        """7.101（REG-069）：
+        1. 同事个人账号 AI 助理在句尾/全角括号/灰字落款的代发签名（如『（Sammy 的 AI 助理代发）』、『<font color='grey'>Sammi · Sammy 的 AI 助理</font>』、『——Klaus 的工作助理（按本人要求代留言）』）一律识别为 Agent 代理，严禁盖 👑 VIP 章或通过 tell 传播 vip_relay 印章；
+        2. CLI 羔羊通过 complete_lamb / cancel_lamb 提前结束时必须按进程组（os.killpg）终止整棵子进程树，杜绝 shell 子进程残留为孤儿僵尸继续跑；
+        3. CLI 羔羊输出多行格式化 JSON 时自动提炼结构化 JSON(...) 摘要，杜绝退化为 '}\\n}\\n}\\n]\\n}'。
+        """
+        import subprocess
+        import sys
+        import time
+        from sheepdog.engine import _pid_alive, _summarize_cli_lamb_log, cancel_lamb, complete_lamb, register_lamb
+        from sheepdog.prompts import is_agent_proxy_content
+
+        # 1. 全位置 AI 助理签名识别与零误伤校验
+        sammy_paren = "Matthew，今晚要发单 202611010023，请严格按顺序放行：UC -> EAS -> fe-eas -> fe-eps。\n（Sammy 的 AI 助理代发）"
+        sammy_font = "Matthew，单 202611010023：测试审批还没过，EAS、fe-eas、fe-eps 请等测试审批通过再放。\n\n<font color='grey'>Sammi · Sammy 的 AI 助理</font>"
+        sammy_card = "<card>\n@Ben 收到，我核对下这几个 PR 的测试覆盖。\nSammi · Sammy 的 AI 助理\n</card>"
+        klaus_dash = "Matthew，Klaus 想给自己的 CC 配一条干净的新 VPN 线路。\n\n——Klaus 的工作助理（按本人要求代留言）"
+        for proxy_txt in (sammy_paren, sammy_font, sammy_card, klaus_dash):
+            with self.subTest(proxy_txt=proxy_txt[:30]):
+                self.assertTrue(is_agent_proxy_content(proxy_txt))
+
+        for human_txt in (
+            "咋了 服务 429 了吗 查一下什么原因单发给我@Sammi",
+            "请帮我问一下老胡的 AI 助理那边修好没有",
+            "带 “✦”前缀的回答都是老胡的助理提供的表达，需要注意一下！",
+        ):
+            with self.subTest(human_txt=human_txt[:30]):
+                self.assertFalse(is_agent_proxy_content(human_txt))
+
+        r_sammy_proxy = fx.add(self.store, fx.message("om_reg069_sammy_proxy", sender_id=VIP, sender_name=VIP_NAME, content=sammy_paren), "p2p")
+        self.assertEqual(vip_of(r_sammy_proxy, {VIP: VIP_NAME}), "")
+        pb = Playbook(REPO / "examples" / "playbook")
+        prompt_p = batch_prompt(pb, fx.TOPIC, "b_reg069_p", [r_sammy_proxy], [], fx.TITLE, vips={VIP: VIP_NAME})
+        self.assertNotIn("👑 VIP", prompt_p)
+        self.assertIn("🤖 来自机器人 / Agent", prompt_p)
+
+        # 2. CLI 羔羊 complete_lamb / cancel_lamb 终止整个后台进程组（含 shell 派生的子进程）
+        proc = subprocess.Popen(
+            f"{sys.executable} -c 'import time; time.sleep(60)'",
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        time.sleep(0.15)
+        lid = register_lamb(self.store, fx.TOPIC, "测试进程组回收", kind="cli", lamb_id="lamb_reg069_pg", pid=proc.pid)
+        self.assertTrue(_pid_alive(proc.pid))
+        complete_lamb(self.store, lid, summary="提前拦截停止", state="done")
+        for _ in range(20):
+            if not _pid_alive(proc.pid):
+                break
+            time.sleep(0.05)
+        proc.wait(timeout=2)
+        self.assertFalse(_pid_alive(proc.pid))
+
+        # 3. 多行格式化 JSON 尾行摘要提炼（不退化为 }\n}\n}\n]\n}）
+        raw_json_log = (
+            "[user-center-service] build 1b6aafb5 initial status: SUCCESS\n"
+            "{\n"
+            '  "ok": true,\n'
+            '  "lane_id": "lane_1_202611010023",\n'
+            '  "completed_layers": 1,\n'
+            '  "layer_results": [\n'
+            "    {\n"
+            '      "layer_index": 0\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        )
+        summary_ok, has_err_ok = _summarize_cli_lamb_log(raw_json_log)
+        self.assertFalse(has_err_ok)
+        self.assertIn("JSON(ok=True, lane_id=lane_1_202611010023, completed_layers=1", summary_ok)
+        self.assertNotEqual(summary_ok.strip(), "}\n}\n}\n]\n}")
+
+        raw_err_json_log = '{\n  "ok": false,\n  "error": "transient ssl reset"\n}\n'
+        summary_err, has_err_err = _summarize_cli_lamb_log(raw_err_json_log)
+        self.assertTrue(has_err_err)
+        self.assertIn("ok=False", summary_err)
+
 
 if __name__ == "__main__":
     unittest.main()
