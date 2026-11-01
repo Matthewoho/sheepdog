@@ -456,10 +456,9 @@
 | --- | --- | --- |
 | 7.99 | `dispatches` 表缺少 `acked_at` 完结时间戳及历史回填导致无法精确统计 `T3->T4` 会话执行耗时；或缺少统一 Web 管理与可观测工作台（`sheepdog web`）集中观测 `Session Group -> Session -> Subagent/Lamb + Stop Hook` 三级实时状态、`T0 飞书发出 -> T1 扫到 -> T2 点 Get -> T3a/T3 投递 -> T4 会话回执 -> T5 回复飞书` 及会话内 `transcript.jsonl` 步进耗时瀑布流、找人决策 `Accepted vs Overridden 错题本 vs Auto-Resolved` 对账与连续采纳免问自治晋升推荐，以及 VIP 花名册与在办台账干预闭环（REG-067） | `test_admin_web_799.TestAdminWeb799.test_reg_067_end_to_end_workbench_observability_and_actions`（`tests/test_admin_web_799.py::TestAdminWeb799::test_reg_067_end_to_end_workbench_observability_and_actions`） |
 
+## 7.100 识别同事个人账号代发的 AI 助理消息（✦ 前缀 / Codex 助理），严禁误盖 👑 VIP 印章或传播免问动生产授权（REG-068）
 
-
-
-
-
-
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.100 | VIP 同事（如老胡）的 AI 助理通过其个人飞书账号（`sender_type="user"`）发送带 `✦` 前缀（如 `<card>\n▶ ✦ ...`）或 `由…的Codex助理` 签名的消息时，因 `Engine._is_agent` 与 `prompts.vip_of` 仅按 `sender_type in ("app", "bot")` 过滤机器人，将该 AI 助理消息误判为 VIP 本人亲口指令并盖上 `👑 VIP：老胡`、附上《👑 VIP 规则》（免问直接动生产）且经 `duty.send_mail` 跨会话传播 `vip_relay` 印章，导致双方 AI 助理将技术建议当成 VIP 生产变更授权自主执行（REG-068） | `test_vip.VipBranch765Test.test_reg_068_vip_agent_proxy_sparkle_prefix_not_stamped_as_vip`（`tests/test_vip.py::VipBranch765Test::test_reg_068_vip_agent_proxy_sparkle_prefix_not_stamped_as_vip`） |
 

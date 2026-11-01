@@ -27,7 +27,7 @@ from .guard import (ACTIVITY, AUDIT, COMPACTION, DUTY, LAMB_DISCOVERY, LAST_ACTI
 from .playbook import REMINDERS_DIR, Playbook
 from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABEL, QUOTE_LABEL_IM, ROSTER_HASH_STUB,
                       adopted_bootstrap, batch_prompt, bootstrap_prompt, chat_label, compaction_rules_message,
-                      onboarding_prompt, with_cli, quote_line, relay_content, render_group_peer_status,
+                      is_agent_proxy_content, onboarding_prompt, with_cli, quote_line, relay_content, render_group_peer_status,
                       retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message, priority_prompt)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession, parse_patrol_hours
@@ -518,7 +518,7 @@ class Collector:
 
     def _is_agent(self, m: Message) -> bool:
         lg = self.cfg.loop_guard
-        if lg.treat_all_bots_as_agents and m.sender_type in ("app", "bot"):
+        if lg.treat_all_bots_as_agents and (m.sender_type in ("app", "bot") or (m.sender_id != self.cfg.self_open_id and is_agent_proxy_content(m.content or ""))):
             return True
         if m.sender_id and m.sender_id in lg.agent_sender_ids:
             return True

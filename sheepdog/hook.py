@@ -69,6 +69,15 @@ BATCH_OPENINGS = (
 # 新建会话的开场是 USER_INPUT，正文在「<USER_REQUEST>\n」之后（10-16 只读核过正式会话记录的格式）
 _SYSTEM_BODY_RE = re.compile(r"^\[Message\] [^\n]*?\bcontent=", re.M)
 _USER_REQUEST = "<USER_REQUEST>\n"
+_PENDING_DECISION_RE = re.compile(
+    r"(?:^|\n)\s*(?:[-*•+]|\d+[.)、]|#{1,4})?\s*(?:\*\*|__)?(?:等(?:你|您|主人|他)定的事(?:和回法)?|需要(?:你|主人)拍板的事)"
+    r"(?:[^:\n：]*[:：]\s*([^\n]*)|(?:\*\*|__)?\s*(?=\n))(?:\n((?:\s*(?:[-*•+]|\d+[.)、]|[A-E][:：.、])\s*\S[^\n]*\n?)*))?",
+    re.I,
+)
+_NONE_DECISION_RE = re.compile(
+    r"^\s*(?:[`*_~>-]*\s*)*(?:无|没有|暂无|无需|目前无|目前没有|暂时没有|0\s*项|none\b)", re.I
+)
+_ASK_CMD_RE = re.compile(r"\bsheepdog\s+ask\b")
 
 
 def _parse(ts: str) -> datetime | None:
@@ -170,35 +179,45 @@ def opens_batch(content, batch_id: str, topic_id: str = "") -> bool:
     return False
 
 
-def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TAIL_BYTES,
-                            topic_id: str = "") -> bool | None:
-    """读会话记录末尾 tail 字节：这一批送达以后，主人有没有亲自在会话里打过字（type USER_INPUT、source USER_EXPLICIT；
-    agentapi 送进去的是 SYSTEM_MESSAGE，hook 插的是 SYSTEM_SDK 来源的 USER_INPUT，都不算）。
-
-    返回 True：打过；False：没打过；None：末尾这一段里找不到这一批送达的那一行（找不到就不拦）。
-    「送达的那一行」= 末尾这一段里第一条开启这一批的 SYSTEM_MESSAGE / USER_INPUT：正文里有这一批的开头（BATCH_OPENINGS，
-    7.47 第 4 条）。只是提到批次号的（主人插话批次写着「手上那批」、压缩后重推规则、Stop hook 的提示）不算。
-    读不了就抛错（调用方兜成不拦）。"""
+def _tail_lines(path: Path, tail: int) -> list[bytes]:
     with path.open("rb") as f:
         size = f.seek(0, os.SEEK_END)
         start = max(0, size - tail)
         f.seek(start)
-        data = f.read(size - start)
-    lines = data.split(b"\n")
-    if start > 0:
-        lines = lines[1:]  # 第一行是从中间截开的
-    needle = batch_id.encode()   # 先按字节粗筛（便宜），再解析 JSON、按批次开头认（7.47 第 4 条）
-    found = False
-    for line in lines:
+        lines = f.read(size - start).split(b"\n")
+    return lines[1:] if start > 0 else lines
+
+
+def owner_typed_after_batch(path: Path, batch_id: str, tail: int = TRANSCRIPT_TAIL_BYTES, topic_id: str = "") -> bool | None:
+    """读会话记录末尾 tail 字节：这一批送达以后，主人有没有亲自在会话里打过字（True/False/None）。"""
+    needle, found = batch_id.encode(), False
+    for line in _tail_lines(path, tail):
         if not found:
-            if needle in line and (d := _json_line(line)) is not None and d.get("type") in DELIVERY_TYPES \
-                    and opens_batch(d.get("content"), batch_id, topic_id):
+            if needle in line and (d := _json_line(line)) is not None and d.get("type") in DELIVERY_TYPES and opens_batch(d.get("content"), batch_id, topic_id):
                 found = True
-            continue
-        if b"USER_EXPLICIT" in line and (d := _json_line(line)) is not None \
-                and d.get("type") == "USER_INPUT" and d.get("source") == "USER_EXPLICIT":
+        elif b"USER_EXPLICIT" in line and (d := _json_line(line)) is not None and d.get("type") == "USER_INPUT" and d.get("source") == "USER_EXPLICIT":
             return True
     return False if found else None
+
+
+def _unsent_ask_turn(path: Path, tail: int = TRANSCRIPT_TAIL_BYTES) -> tuple[str, str] | None:
+    """REG-044：读会话记录末尾最后一段真实输入后的本轮轨迹：最后一条 PLANNER_RESPONSE 写了「等你定的事」且本轮未调 sheepdog ask 时返回 (key, snippet)。"""
+    steps = [d for line in _tail_lines(path, tail) if line and (d := _json_line(line)) is not None]
+    anchor_idx, anchor_step = 0, 0
+    for i, d in enumerate(steps):
+        tp, content = d.get("type"), str(d.get("content") or "")
+        if (tp == "USER_INPUT" and d.get("source") == "USER_EXPLICIT") or (
+            tp == "SYSTEM_MESSAGE" and "[sheepdog] 先别结束" not in content and "Stop hook blocked termination" not in content
+        ):
+            anchor_idx, anchor_step = i, d.get("step_index", i)
+    tail_steps = steps[anchor_idx:]
+    if any(_ASK_CMD_RE.search(json.dumps(d, ensure_ascii=False)) for d in tail_steps if d.get("type") != "USER_INPUT"):
+        return None
+    planners = [d for d in tail_steps if d.get("type") == "PLANNER_RESPONSE"]
+    if not planners or not (m := _PENDING_DECISION_RE.search(str(planners[-1].get("content") or ""))):
+        return None
+    body = f"{m.group(1) or ''}\n{m.group(2) or ''}".strip()
+    return (f"ask:{anchor_step}", re.sub(r"\s+", " ", body)[:80]) if body and not _NONE_DECISION_RE.match(body) else None
 
 
 def _target(conn: sqlite3.Connection, conversation_id: str):
@@ -206,167 +225,118 @@ def _target(conn: sqlite3.Connection, conversation_id: str):
     rows = conn.execute(
         "SELECT * FROM topics WHERE conversation_id=? AND state != ? AND (kind IN (?, ?) OR topic_id=?)",
         (conversation_id, sm.CLOSED, *MANAGED_KINDS, BUS_TOPIC_ID)).fetchall()
-    if len(rows) != 1:
-        return None
-    t = rows[0]
-    return t if (t["host"] or ANTIGRAVITY) == ANTIGRAVITY else None
+    return rows[0] if len(rows) == 1 and (rows[0]["host"] or ANTIGRAVITY) == ANTIGRAVITY else None
 
 
 def _find_lamb(conn: sqlite3.Connection, conversation_id: str):
     """7.63：conversationId 不在 topics 表时，查是不是登记在 lambs 表的羔羊；命中则可回溯到 parent_topic_id。"""
     try:
-        return conn.execute(
-            "SELECT * FROM lambs WHERE conversation_id=? ORDER BY (state='running') DESC, started_at DESC LIMIT 1",
-            (conversation_id,),
-        ).fetchone()
+        return conn.execute("SELECT * FROM lambs WHERE conversation_id=? ORDER BY (state='running') DESC, started_at DESC LIMIT 1", (conversation_id,)).fetchone()
     except sqlite3.OperationalError:
         return None
 
 
 def resolve_lamb_attribution(conn_or_store, conversation_id: str) -> tuple[str, str, str] | None:
     """7.63：按 conversation_id 查 lambs 表回溯母羊（parent_topic_id, lamb_id, '（由羔羊 <lamb_id> 执行）'）。"""
-    cid = (conversation_id or "").strip()
-    if not cid:
+    if not (cid := (conversation_id or "").strip()):
         return None
-    if hasattr(conn_or_store, "find_lamb_by_cid"):
-        lb = conn_or_store.find_lamb_by_cid(cid)
-    else:
-        row = _find_lamb(conn_or_store, cid)
-        lb = dict(row) if row is not None else None
-    if not lb:
-        return None
-    lid = lb["lamb_id"]
-    ptid = lb["parent_topic_id"]
-    return ptid, lid, f"（由羔羊 {lid} 执行）"
+    lb = conn_or_store.find_lamb_by_cid(cid) if hasattr(conn_or_store, "find_lamb_by_cid") else (dict(r) if (r := _find_lamb(conn_or_store, cid)) is not None else None)
+    return (lb["parent_topic_id"], lb["lamb_id"], f"（由羔羊 {lb['lamb_id']} 执行）") if lb else None
 
 
 def _occupied(card, cfg: Config, now: datetime) -> bool:
     """被主人占着：口径同羊群看板（卡片判为被主人占着，或主人 human_attach_minutes 分钟内在会话里亲自说过话）。"""
     if card is None:
         return False
-    if card["run_state"] == OCCUPIED:
-        return True
-    at = _parse(card["human_at"] or "")
-    return at is not None and now - at < timedelta(minutes=cfg.session.human_attach_minutes)
+    return card["run_state"] == OCCUPIED or ((at := _parse(card["human_at"] or "")) is not None and now - at < timedelta(minutes=cfg.session.human_attach_minutes))
+
+
+def _record_stop_block(cfg: Config, data: dict, tid: str, key: str, now: datetime, info: dict, why, label: str) -> int | None:
+    p, now_iso, exec_num = count_path(cfg, tid), now.isoformat(timespec="seconds"), data.get("executionNum")
+    st = _read_stop_state(p, key)
+    prev, last_blocked = (st.get("count") if isinstance(st.get("count"), int) and st.get("count") > 0 else 0), _parse(str(st.get("last_blocked_at") or ""))
+    if isinstance(exec_num, int) and not isinstance(exec_num, bool) and exec_num >= 1 and prev > 0 and last_blocked is not None and 0 <= (now - last_blocked).total_seconds() < STOP_RAPID_SECONDS:
+        try: _write_stop_state(p, {**st, "batch": key, "count": prev, "interrupted": True, "passed_at": now_iso})
+        except OSError: pass
+        return why("宿主断连/重登瞬时连续触发（间隔 <10s），标记 interrupted 并放行等待自动续跑")
+    if (n := prev + 1) > STOP_MAX_BLOCKS:
+        try: _write_stop_state(p, {**st, "batch": key, "count": prev, "passed_at": st.get("passed_at") or now_iso})
+        except OSError: pass
+        return why(f"这一批已经拦过 {STOP_MAX_BLOCKS} 次")
+    _write_count(p, key, n, last_blocked_at=now_iso, **{k: st[k] for k in ("auto_resumed", "auto_resumed_at") if k in st})
+    info["reason"] = f"{label}，第 {n} 次拦"
+    return n
 
 
 def stop_check(raw: str, cfg: Config | None = None, now: datetime | None = None, info: dict | None = None) -> dict | None:
-    """要拦就返回要写到 stdout 的 dict，不拦返回 None。出错一律当不拦（异常向外抛，由 stop_main 兜住）。
-    info（7.45 三之二）：传进来就把这次调用的情况写进去（conversation_id、managed、topic、batch、reason），给调用日志用。
-
-    拦的条件（全部满足，7.37 / 7.38 第 6 条）：conversationId 是牧羊犬管的 Antigravity 会话；fullyIdle 为 true；会话 running、
-    手上那批的回执文件不在、账本里那批还是 sent（没收到回执）；这一批拦过的次数 < STOP_MAX_BLOCKS；会话没被主人占着（羊群
-    看板的口径）；入参 transcriptPath 末尾找得到这一批，且送达以后主人没有亲自在会话里打过字。"""
+    """要拦就返回要写到 stdout 的 dict，不拦返回 None。出错一律当不拦（异常向外抛，由 stop_main 兜住）。"""
     info = info if info is not None else {}
-
-    def why(reason: str) -> None:
-        info["reason"] = reason
-        return None
-
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        return why("入参不是 JSON 对象")
-    cid = data.get("conversationId")
-    if isinstance(cid, str):
-        info["conversation_id"] = cid.strip()
-    if data.get("fullyIdle") is not True:
-        return why("fullyIdle 不是 true（后台任务还在跑）")
-    if not isinstance(cid, str) or not cid.strip():
-        return why("没有 conversationId")
-    cfg = cfg or load_config()   # 每次调用都是新进程、现读配置：[hooks] stop 改完下一次收工就生效
+    why = lambda reason: (info.__setitem__("reason", reason), None)[1]
+    if not isinstance(data := json.loads(raw), dict): return why("入参不是 JSON 对象")
+    if isinstance(cid := data.get("conversationId"), str): info["conversation_id"] = cid.strip()
+    if data.get("fullyIdle") is not True: return why("fullyIdle 不是 true（后台任务还在跑）")
+    if not isinstance(cid, str) or not cid.strip(): return why("没有 conversationId")
+    cfg, now = cfg or load_config(), now or datetime.now().astimezone()
     info["state_dir"] = str(cfg.state_dir)
-    if not cfg.hooks.stop:
-        return why("[hooks] stop 关着")   # 7.40 开关关掉：什么都不输出，会话照常结束
-    now = now or datetime.now().astimezone()
-    if not cfg.db_path.is_file():
-        return why("账本不在")
+    if not cfg.hooks.stop: return why("[hooks] stop 关着")
+    if not cfg.db_path.is_file(): return why("账本不在")
     conn = _connect_ro(cfg.db_path)
+    need_receipt, batch_reason, open_escs = False, "", 0
     try:
-        t = _target(conn, cid.strip())
-        info["managed"] = t is not None
+        info["managed"] = (t := _target(conn, cid.strip())) is not None
         if t is None:
-            lb = _find_lamb(conn, cid.strip())
-            if lb is not None:
+            if (lb := _find_lamb(conn, cid.strip())) is not None:
                 lid, ptid = lb["lamb_id"], lb["parent_topic_id"]
-                info["topic"] = ptid
-                info["lamb_id"] = lid
-                info["parent_topic_id"] = ptid
-                info["note"] = f"（由羔羊 {lid} 执行）"
+                info.update(topic=ptid, lamb_id=lid, parent_topic_id=ptid, note=f"（由羔羊 {lid} 执行）")
                 return why(f"羔羊 {lid}（隶属 {ptid}）（由羔羊 {lid} 执行），不由 Stop hook 拦回执")
             return why("不是牧羊犬管的 Antigravity 会话")
-        info["topic"] = t["topic_id"]
-        if t["state"] != sm.RUNNING or not t["pending_batch_id"]:
-            return why(f"会话 {t['state']}，手上没有在等回执的批次")
-        tid, batch = t["topic_id"], t["pending_batch_id"]
-        info["batch"] = batch
-        if (cfg.receipts_dir / tid / f"{batch}.json").exists():
-            clear_stop_state(cfg.state_dir, tid)
-            return why("回执已交")  # 回执交了，下一轮 sheepdog 收
-        d = conn.execute("SELECT state FROM dispatches WHERE batch_id=?", (batch,)).fetchone()
-        if d is None or d["state"] != "sent":
-            if d is not None and d["state"] in ("acked", "acked_late", "missed", "failed"):
-                clear_stop_state(cfg.state_dir, tid)
-            return why(f"批次状态 {d['state'] if d is not None else '查不到'}")
-        card = conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (tid,)).fetchone()
-        if _occupied(card, cfg, now):
-            return why("被主人占着")
+        tid, batch = t["topic_id"], t["pending_batch_id"] or ""
+        info["topic"] = tid
+        if t["state"] != sm.RUNNING or not batch:
+            batch_reason = f"会话 {t['state']}，手上没有在等回执的批次"
+        else:
+            info["batch"] = batch
+            if (cfg.receipts_dir / tid / f"{batch}.json").exists():
+                if _read_stop_state(count_path(cfg, tid), batch): clear_stop_state(cfg.state_dir, tid)
+                batch_reason = "回执已交"
+            else:
+                d = conn.execute("SELECT state FROM dispatches WHERE batch_id=?", (batch,)).fetchone()
+                if d is None or d["state"] != "sent":
+                    if d is not None and d["state"] in ("acked", "acked_late", "missed", "failed") and _read_stop_state(count_path(cfg, tid), batch):
+                        clear_stop_state(cfg.state_dir, tid)
+                    batch_reason = f"批次状态 {d['state'] if d is not None else '查不到'}"
+                else:
+                    if _occupied(conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (tid,)).fetchone(), cfg, now):
+                        return why("被主人占着")
+                    need_receipt = True
+        if tid != BUS_TOPIC_ID:
+            try:
+                r = conn.execute("SELECT COUNT(*) AS c FROM escalations WHERE (topic_id=? OR topic_id=?) AND closed_at IS NULL", (tid, tid.split("#", 1)[0])).fetchone()
+                open_escs = int(r["c"]) if r is not None else 0
+            except sqlite3.OperationalError:
+                open_escs = 0
     finally:
         conn.close()
-    # 被主人占着的另一个口径（正式配置 human_attach_minutes = 0，上面那条永远不成立）：读会话记录，这一批送达以后主人亲自
-    # 打过字就不拦；末尾找不到这一批（记录不在、太长、送达那行早被挤出末尾这一段）也不拦
     tp = data.get("transcriptPath")
-    if not isinstance(tp, str) or not tp.strip():
-        return why("没有 transcriptPath")
-    typed = owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES, tid)
-    if typed is None:
-        return why("会话记录末尾找不到这一批的开头")
-    if typed:
-        return why("这批送达以后主人亲自打过字")
-    p = count_path(cfg, tid)
-    st = _read_stop_state(p, batch)
-    prev_count = st.get("count") if isinstance(st.get("count"), int) and st.get("count") > 0 else 0
-    now_iso_str = now.isoformat(timespec="seconds")
-    last_blocked = _parse(str(st.get("last_blocked_at") or ""))
-    exec_num = data.get("executionNum")
-    is_followup_exec = isinstance(exec_num, int) and not isinstance(exec_num, bool) and exec_num >= 1
-    if (is_followup_exec and prev_count > 0 and last_blocked is not None
-            and 0 <= (now - last_blocked).total_seconds() < STOP_RAPID_SECONDS):
-        try:
-            _write_stop_state(p, {
-                **st,
-                "batch": batch,
-                "count": prev_count,
-                "interrupted": True,
-                "passed_at": now_iso_str,
-            })
-        except OSError:
-            pass
-        return why("宿主断连/重登瞬时连续触发（间隔 <10s），标记 interrupted 并放行等待自动续跑")
-    n = prev_count + 1
-    if n > STOP_MAX_BLOCKS:
-        try:
-            _write_stop_state(p, {
-                **st,
-                "batch": batch,
-                "count": prev_count,
-                "passed_at": st.get("passed_at") or now_iso_str,
-            })
-        except OSError:
-            pass
-        return why(f"这一批已经拦过 {STOP_MAX_BLOCKS} 次")
-    kept = {k: st[k] for k in ("auto_resumed", "auto_resumed_at") if k in st}
-    _write_count(p, batch, n, last_blocked_at=now_iso_str, **kept)  # 记不下次数就不拦：宁可放它停，也不能拦个没完
-    info["reason"] = f"没交回执，第 {n} 次拦"
-    cli = cfg.cli_command
-    receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
-    waiting = (f"{cli} receipt --topic {tid} --batch {batch} "
-               f"--json '{{\"status\": \"waiting_external\", \"summary\": \"等谁、等什么\"}}'")
-    pb = Playbook.from_config(cfg)
-    pb.strict = True   # 模板读不了就抛出去、由 stop_main 兜成不输出（出错一律当不拦），不拿默认话去拦
-    reason = pb.render_or(
-        STOP_TEMPLATE, DEFAULT_STOP_REASON, topic_id=tid, batch_id=batch, receipt_command=receipt,
-        waiting_command=waiting, blocked=str(n))
-    return {"decision": "continue", "reason": reason}
+    if need_receipt:
+        if not isinstance(tp, str) or not tp.strip(): return why("没有 transcriptPath")
+        if (typed := owner_typed_after_batch(Path(tp), batch, TRANSCRIPT_TAIL_BYTES, tid)) is None:
+            batch_reason = "会话记录末尾找不到这一批的开头"
+        elif typed:
+            batch_reason = "这批送达以后主人亲自打过字"
+        else:
+            if (n := _record_stop_block(cfg, data, tid, batch, now, info, why, "没交回执")) is None: return None
+            cli, pb = cfg.cli_command, Playbook.from_config(cfg)
+            pb.strict = True
+            receipt = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"handled\", \"summary\": \"一句话：做了什么\"}}'"
+            waiting = f"{cli} receipt --topic {tid} --batch {batch} --json '{{\"status\": \"waiting_external\", \"summary\": \"等谁、等什么\"}}'"
+            return {"decision": "continue", "reason": pb.render_or(STOP_TEMPLATE, DEFAULT_STOP_REASON, topic_id=tid, batch_id=batch, receipt_command=receipt, waiting_command=waiting, blocked=str(n))}
+    if tid != BUS_TOPIC_ID and open_escs == 0 and isinstance(tp, str) and tp.strip() and Path(tp).is_file():
+        if (unsent := _unsent_ask_turn(Path(tp), TRANSCRIPT_TAIL_BYTES)) is not None:
+            ask_key, ask_snippet = unsent
+            if _record_stop_block(cfg, data, tid, ask_key, now, info, why, "等你定的事未发 ask") is None: return None
+            return {"decision": "continue", "reason": f"[sheepdog] 先别结束：你在回复中列出了「等你定的事」（{ask_snippet}），但账本中尚无未决飞书待拍板卡片（open_escalations=0）。请立即调用 `{cfg.cli_command} ask --topic {tid} ...` 发送到飞书后再结束。"}
+    return why(batch_reason)
 
 
 def call_log_dir(state_dir: Path) -> Path:
@@ -414,8 +384,8 @@ def stop_main(stdin, stdout, cfg: Config | None = None, now: datetime | None = N
         log_call(state_dir, {
             "at": at.isoformat(timespec="seconds"), "conversation_id": info.get("conversation_id", ""),
             "managed": info.get("managed"), "topic": info.get("topic", ""), "batch": info.get("batch", ""),
-            "decision": "block" if out is not None else "pass", "reason": info.get("reason", ""),
-            "ms": round((time.monotonic() - started) * 1000, 1)}, at)
+            "lamb_id": info.get("lamb_id", ""), "decision": "block" if out is not None else "pass",
+            "reason": info.get("reason", ""), "ms": round((time.monotonic() - started) * 1000, 1)}, at)
     except Exception:
         pass
     return 0

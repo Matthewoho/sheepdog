@@ -117,13 +117,20 @@ _BOT_SENDER_TYPES = ("app", "bot", "system")
 # 主人自己的消息（背景、回复、指令）不盖章：按标记和 reason 认，和上面这些标注的认法一致
 _OWNER_TAGS = ("owner_verified", OWNER_INSTRUCTION_TAG)
 _OWNER_REASONS = ("owner_context", "owner_reply", "owner_instruction")
+_AGENT_PROXY_CONTENT_RE = re.compile(
+    r"^\s*(?:<card[^>]*>\s*)*(?:(?:[▶▸▼▾#*+-]+\s*)*✦(?:\s|[\u4e00-\u9fffA-Za-z0-9\[【(（])"
+    r"|由[^\n]{1,24}的\s*(?:Codex|Claude|AI)?\s*助理|(?:【|\[|\()[^】\]\)\n]{0,24}(?:Codex|Claude|AI)\s*助理(?:】|\]|\))|🐕\s*(?:汇报|需要你定)\s*·)"
+    r"|\[🐕\s*Sheepdog\s+Reply\]|\n🐕SheepDog\s+v\d+\.", re.I)
+
+
+def is_agent_proxy_content(text: str) -> bool:
+    """7.100（REG-068）：识别同事个人账号代发的 AI 助理消息（如老胡助理 ✦ 前缀卡片、由…的Codex助理、Sheepdog 代回签名）。"""
+    return bool(text and _AGENT_PROXY_CONTENT_RE.search(text))
 
 
 def vip_of(row, vips: dict | None) -> str:
-    """这条消息是不是 VIP 本人发的（7.61 / 7.95）：是就返回盖章用的名字，不是返回空串。投递盖章和 `sheepdog ask --floor` 都只用它判。
-
-    只认发送人本身（sender_id）或 sheepdog 账本验真签发的 `vip_relay:<open_id>:<om_id>` 标签（7.95），不看正文：别人转述「某某让你…」不算。
-    不算 VIP 的：普通系统消息、机器人 / Agent 发的、主人本人的（背景、回复、指令）。vips 是 open_id → 名字（Roster.vips，已排除主人自己）；空 = 名册没有 VIP。"""
+    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100）：是就返回盖章用的名字，不是返回空串。
+    不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex 助理消息）、主人本人的。"""
     if not vips or row is None:
         return ""
     tags = json.loads(row["tags_json"] or "[]")
@@ -136,11 +143,10 @@ def vip_of(row, vips: dict | None) -> str:
                         return vips[parts[1]] or parts[1]
         return ""
     sid = (row["sender_id"] or "").strip()
-    if not sid or sid not in vips:
+    if not sid or sid not in vips or (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
         return ""
-    if (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
-        return ""
-    if "agent_sender" in tags or any(t in tags for t in _OWNER_TAGS):
+    content = (row["content"] if "content" in row.keys() else "") or ""
+    if "agent_sender" in tags or is_agent_proxy_content(content) or any(t in tags for t in _OWNER_TAGS):
         return ""
     return vips[sid] or (row["sender_name"] or "").strip() or sid
 
@@ -675,7 +681,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         lines.append(OWNER_REPLY_LABEL)
     if row["reason"] == "owner_context" and not instruction:
         lines.append(OWNER_CONTEXT_LABEL)
-    if "agent_sender" in tags:
+    if "agent_sender" in tags or (is_agent_proxy_content(row["content"] or "") and not instruction and "owner_verified" not in tags and row["reason"] not in _OWNER_REASONS):
         lines.append(agent_label)
     if row["note"]:
         lines.append(row["note"])

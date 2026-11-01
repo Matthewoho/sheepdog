@@ -449,27 +449,17 @@ class AckConfig:
 
 # 会话跑了这些命令就报警（7.19 K3）：示例配置里写的也是这一份
 DEFAULT_DANGER_PATTERNS = [
-    r"builds triggers run",
-    r"builds .*approve|:approve",
-    r"add-iam-policy-binding|remove-iam-policy-binding",
-    r"run services update-traffic",
-    r"secrets versions (access|add)",
-    r"lark-cli approval tasks (approve|reject)",
-    r"gh pr merge",
-    r"gh workflow run",
-    r"kubectl (apply|delete)",
+    r"builds triggers run", r"builds .*approve|:approve",
+    r"add-iam-policy-binding|remove-iam-policy-binding", r"run services update-traffic",
+    r"secrets versions (access|add)", r"lark-cli approval tasks (approve|reject)",
+    r"gh pr merge", r"gh workflow run", r"kubectl (apply|delete)",
 ]
 
 # 命中 danger_patterns 但同时命中这些的不报（7.19 K3 误报）：查帮助、知识库记录脚本、sheepdog 自己的命令
 # （含 forward 的备注）、IM 收发、dry-run。对整条命令判断，不逐段拆
 DEFAULT_IGNORE_PATTERNS = [
-    r"(^|\s)--help(\s|$)",
-    r"(^|\s)-h(\s|$)",
-    r"context_memory\.py",
-    r"pkm\.py",
-    r"(^|[\s/])sheepdog\s",
-    r"lark-cli\s+im\s",
-    r"--dry-run",
+    r"(^|\s)--help(\s|$)", r"(^|\s)-h(\s|$)", r"context_memory\.py", r"pkm\.py",
+    r"(^|[\s/])sheepdog\s", r"lark-cli\s+im\s", r"--dry-run",
 ]
 
 
@@ -656,6 +646,7 @@ class NotifyConfig:
     file: str = ""
     owner_card: bool = True
     require_summary: bool = True
+    alert_chat_id: str = ""
 
     def validate(self) -> None:
         if not isinstance(self.file, str):
@@ -664,6 +655,11 @@ class NotifyConfig:
             raise ConfigError("[notify] owner_card 必须是 true/false（true = 发给主人的消息发成卡片）")
         if not isinstance(self.require_summary, bool):
             raise ConfigError("[notify] require_summary 必须是 true/false（true = 长消息必须带白话总结）")
+        if not isinstance(self.alert_chat_id, str):
+            raise ConfigError("[notify] alert_chat_id 必须是 oc_ 开头的飞书群号")
+        self.alert_chat_id = self.alert_chat_id.strip()
+        if self.alert_chat_id and not self.alert_chat_id.startswith("oc_"):
+            raise ConfigError("[notify] alert_chat_id 必须是 oc_ 开头的飞书群号")
 
 
 @dataclass
@@ -865,13 +861,11 @@ class Config:
 
     @property
     def owner_side_chat_ids(self) -> list[str]:
-        """「找主人」那一侧的聊天（7.51）：找主人聊天，加上配了的话题群（[topic_group] chat_id，开没开都算）。
-        这些聊天里主人说的话不当成别处的背景、不算防循环、不能当提问来源、不能用 sheepdog reply 代回；
-        入账时先于普通路由处理（话题群走自己的分支）。"""
+        """「找主人」那一侧的聊天（7.51 / 7.81）：找主人聊天，加上配了的话题群（[topic_group] chat_id）与自身告警群（[notify] alert_chat_id）。"""
         out = self.owner_chat_ids
-        tg = self.topic_group.chat_id
-        if tg and tg not in out:
-            out.append(tg)
+        for cid in (self.topic_group.chat_id, self.notify.alert_chat_id):
+            if cid and cid not in out:
+                out.append(cid)
         return out
 
     def chat_scope(self, chat_id: str) -> str:

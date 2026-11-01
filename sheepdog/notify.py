@@ -92,31 +92,36 @@ class OwnerDM:
       免得测试牧羊犬的通知进了主人和机器人的真私聊、被正式牧羊犬读到。
     配置热加载：常驻进程每轮按新配置重建 OwnerDM（cli._reload_config）。"""
 
-    def __init__(self, source, open_id: str, cfg=None):
+    def __init__(self, source, open_id: str, cfg=None, store=None):
         self.source = source
         self.open_id = open_id
         self.cfg = cfg
+        self.store = store
 
     @property
     def chat_id(self) -> str:
-        return (self.cfg.threads.owner_chat_id or "") if self.cfg is not None else ""
+        from . import alert_group as ag
+        if self.cfg is None:
+            return ""
+        return ag.resolve_alert_chat_id(self.cfg, self.store) or (self.cfg.threads.owner_chat_id or "")
 
     def send(self, text: str, idempotency_key: str = "", reply_to: str = "", in_thread: bool = False) -> None:
         """reply_to（7.52 回执带回）：回复主人的那一条（in_thread = 回到它的话题里），不新起一条。"""
+        from . import alert_group as ag
         from .outbound import owner_content, send_owner
         if self.cfg is not None:
             plain, card = owner_content(self.cfg, text)
         else:
             plain, card = text, None
-        chat = self.chat_id
+        target_chat = ag.ensure_alert_group(self.cfg, self.store, self.source) or self.chat_id
 
         def one(t: str, c: dict | None):
             kw = {"card": c} if c is not None else {}
             if reply_to:
                 return self.source.reply_to(reply_to, identity="bot", idem_key=idempotency_key, text=t,
                                             in_thread=in_thread, **kw)
-            if chat:
-                return self.source.send_to_chat(chat, t, idempotency_key, "bot", **kw)
+            if target_chat:
+                return self.source.send_to_chat(target_chat, t, idempotency_key, "bot", **kw)
             if idempotency_key:
                 return self.source.send_text(self.open_id, t, "bot", idempotency_key=idempotency_key, **kw)
             return self.source.send_text(self.open_id, t, "bot", **kw)

@@ -225,7 +225,7 @@ class WatchTest(Base):
         self.d.init()
 
     def reasons(self, reason):
-        return self.store.conn.execute("SELECT * FROM messages WHERE reason=? ORDER BY first_seen", (reason,)).fetchall()
+        return self.store.conn.execute("SELECT * FROM messages WHERE reason=? ORDER BY first_seen, rowid", (reason,)).fetchall()
 
     def test_reply_routed_to_watcher_until_confirmed(self):
         wid = add_watch(self.store, "tp_alpha", "ou_test_bob", note="等 Bob 确认排期")

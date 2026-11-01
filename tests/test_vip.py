@@ -658,6 +658,28 @@ class VipBranch765Test(AskFloorTest):
         self.assertIn("reply", bus_text)
         self.assertIn("ask", bus_text)
 
+    def test_reg_068_vip_agent_proxy_sparkle_prefix_not_stamped_as_vip(self):
+        """7.100（REG-068）：VIP 个人账号代发的 AI 助理消息（如老胡 ✦ 前缀卡片、由…的Codex助理）严禁盖 👑 VIP 章或附 vip.md，自动标 agent_sender；VIP 本人说明 ✦ 规则的正文仍正常盖 👑 VIP 章。"""
+        from sheepdog.prompts import is_agent_proxy_content
+        sparkle_card = "<card>\n▶ ✦ 接口直连 PR 里预发隔离和文件跨域的几处问题我已经直接推提交修好了，另外记得把国内域名和证书也正式绑到 Vercel 主站项目上。\n</card>"
+        codex_msg = "由Klaus的Codex助理推进上线：\n本轮联合创作人体验修复已开发并正式QA放行。"
+        human_note = "带 “✦”前缀的回答都是老胡的助理提供的表达，需要注意一下！"
+        self.assertTrue(is_agent_proxy_content(sparkle_card))
+        self.assertTrue(is_agent_proxy_content(codex_msg))
+        self.assertFalse(is_agent_proxy_content(human_note))
+
+        r_proxy = fx.add(self.store, fx.message("om_reg068_proxy", sender_id=VIP, sender_name=VIP_NAME, content=sparkle_card), "p2p")
+        r_human = fx.add(self.store, fx.message("om_reg068_human", sender_id=VIP, sender_name=VIP_NAME, content=human_note), "p2p")
+        self.assertEqual(vip_of(r_proxy, {VIP: VIP_NAME}), "")
+        self.assertEqual(vip_of(r_human, {VIP: VIP_NAME}), VIP_NAME)
+
+        pb = Playbook(REPO / "examples" / "playbook")
+        prompt_proxy = batch_prompt(pb, fx.TOPIC, "b_proxy", [r_proxy], [], fx.TITLE, vips={VIP: VIP_NAME})
+        self.assertNotIn("👑 VIP", prompt_proxy)
+        self.assertIn("🤖 来自机器人 / Agent", prompt_proxy)
+        prompt_human = batch_prompt(pb, fx.TOPIC, "b_human", [r_human], [], fx.TITLE, vips={VIP: VIP_NAME})
+        self.assertIn(f"👑 VIP：{VIP_NAME}", prompt_human)
+
 
 if __name__ == "__main__":
     unittest.main()

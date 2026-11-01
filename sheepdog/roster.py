@@ -35,8 +35,9 @@ _SESSION_KEYS = {"key", "mode", "conversation_id", "title", "duty", "authority",
                  "host", "model", "effort", "patrol_every_minutes", "patrol_hours", "patrol_prompt",
                  "max_sessions", "group"}
 _CHAT_KEYS = {"chat_id", "name", "all_messages", "thread_id"}
-# 名册里的「人」（7.61）：授权跟着人走，不跟着会话走。目前只有 vip 一档
-_PERSON_KEYS = {"open_id", "name", "tier", "authority"}
+_TOP_KEYS = {"session", "person", "group", "persona"}
+# 名册里的「人」（7.61）：授权跟着人走，不跟着会话走。目前只有 vip 一档；兼容 nickname/aliases/role 可选字段
+_PERSON_KEYS = {"open_id", "name", "tier", "authority", "nickname", "aliases", "role"}
 VIP = "vip"
 PERSON_TIERS = (VIP,)
 # authority 里要看得出主人哪天说的：至少有一个 MM-DD（YYYY-MM-DD 里也含一个）
@@ -49,7 +50,6 @@ class RosterError(ValueError):
 
 def primary_topic_id(topic_id: str) -> str:
     return topic_id.split("#", 1)[0]
-
 
 def member_index(topic_id: str) -> int:
     if "#" not in topic_id:
@@ -135,28 +135,17 @@ class RosterSession:
         return self.mode == MANAGED and not self.conversation_id
 
     @property
-    def topic_id(self) -> str:
-        return "tp_" + self.key
-
+    def topic_id(self) -> str: return "tp_" + self.key
     @property
-    def primary_key(self) -> str:
-        return self.key.split("#", 1)[0]
-
+    def primary_key(self) -> str: return self.key.split("#", 1)[0]
     @property
-    def primary_topic_id(self) -> str:
-        return f"tp_{self.primary_key}"
-
+    def primary_topic_id(self) -> str: return f"tp_{self.primary_key}"
     @property
-    def group_id(self) -> str:
-        return self.group or (self.primary_key if self.max_sessions > 1 else "")
-
+    def group_id(self) -> str: return self.group or (self.primary_key if self.max_sessions > 1 else "")
     @property
-    def kind(self) -> str:
-        return "adopted" if self.mode == MANAGED else "known"
-
+    def kind(self) -> str: return "adopted" if self.mode == MANAGED else "known"
     @property
-    def display_title(self) -> str:
-        return self.title or self.key
+    def display_title(self) -> str: return self.title or self.key
 
 
 @dataclass
@@ -167,6 +156,9 @@ class RosterPerson:
     tier: str = VIP
     name: str = ""
     authority: str = ""
+    nickname: str = ""
+    aliases: list[str] = field(default_factory=list)
+    role: str = ""
 
 
 @dataclass
@@ -202,17 +194,9 @@ class Roster:
         base = next((s for s in self.sessions if s.key == base_key), None)
         if base is None or base.mode != MANAGED or idx < 2 or idx > base.max_sessions:
             return None
-        return replace(
-            base,
-            key=key,
-            title=f"{base.display_title} #{idx}",
-            conversation_id="",
-            group=base.group_id,
-            predecessor_conversation_id="",
-            retire_predecessor=False,
-            self_polling="",
-            retire_self_polling=False,
-        )
+        return replace(base, key=key, title=f"{base.display_title} #{idx}", conversation_id="",
+                       group=base.group_id, predecessor_conversation_id="", retire_predecessor=False,
+                       self_polling="", retire_self_polling=False)
 
     def by_topic(self, topic_id: str) -> RosterSession | None:
         direct = next((s for s in self.sessions if s.topic_id == topic_id), None)
@@ -257,7 +241,14 @@ class Roster:
                     c.pop("thread_id", None)
             rows.append(d)
         # 7.61 的 [[person]]：没有时 hash 和以前一字不差（老名册升级后不算「名册更新」）；有时一起算
-        data = rows if not self.persons else {"session": rows, "person": [asdict(p) for p in self.persons]}
+        p_rows = []
+        for p in self.persons:
+            pd = asdict(p)
+            for k, default in (("nickname", ""), ("aliases", []), ("role", "")):
+                if pd.get(k) == default:
+                    pd.pop(k, None)
+            p_rows.append(pd)
+        data = rows if not self.persons else {"session": rows, "person": p_rows}
         blob = json.dumps(data, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -278,9 +269,9 @@ def _bool(d: dict, k: str, where: str) -> bool:
 
 def parse_roster(data: dict) -> Roster:
     """校验并解析名册 dict（tomllib 的输出）。"""
-    unknown_top = set(data) - {"session", "person", "group"}
+    unknown_top = set(data) - _TOP_KEYS
     if unknown_top:
-        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]]、[[group]] 和 [[person]]）")
+        raise RosterError(f"名册顶层有未知键 {sorted(unknown_top)}（只允许 [[session]]、[[group]]、[persona] 和 [[person]]）")
     raw_sessions = list(data.get("session", []))
     if not isinstance(data.get("session", []), list):
         raise RosterError("session 必须写成 [[session]] 数组")
@@ -296,10 +287,7 @@ def parse_roster(data: dict) -> Roster:
         norm.setdefault("max_sessions", 3)
         norm.setdefault("group", str(norm.get("key", "")).strip())
         if isinstance(norm.get("chats"), list):
-            norm["chats"] = [
-                {"chat_id": c} if isinstance(c, str) else c
-                for c in norm["chats"]
-            ]
+            norm["chats"] = [{"chat_id": c} if isinstance(c, str) else c for c in norm["chats"]]
         raw_sessions.append(norm)
 
     sessions: list[RosterSession] = []
@@ -348,23 +336,16 @@ def parse_roster(data: dict) -> Roster:
         if group_name and max_sessions == 1 and "max_sessions" not in raw:
             max_sessions = 3
         s = RosterSession(
-            key=key, mode=mode,
-            conversation_id=_str(raw, "conversation_id", where),
-            title=_str(raw, "title", where),
-            duty=_str(raw, "duty", where),
-            authority=_str(raw, "authority", where),
-            self_polling=_str(raw, "self_polling", where),
+            key=key, mode=mode, conversation_id=_str(raw, "conversation_id", where),
+            title=_str(raw, "title", where), duty=_str(raw, "duty", where),
+            authority=_str(raw, "authority", where), self_polling=_str(raw, "self_polling", where),
             retire_self_polling=_bool(raw, "retire_self_polling", where),
             predecessor_conversation_id=_str(raw, "predecessor_conversation_id", where),
             retire_predecessor=_bool(raw, "retire_predecessor", where),
-            host=_str(raw, "host", where) or DEFAULT_HOST,
-            model=_str(raw, "model", where),
-            effort=_str(raw, "effort", where),
-            patrol_every_minutes=patrol_every,
-            patrol_hours=patrol_hours,
-            patrol_prompt=patrol_prompt,
-            max_sessions=max_sessions,
-            group=group_name,
+            host=_str(raw, "host", where) or DEFAULT_HOST, model=_str(raw, "model", where),
+            effort=_str(raw, "effort", where), patrol_every_minutes=patrol_every,
+            patrol_hours=patrol_hours, patrol_prompt=patrol_prompt,
+            max_sessions=max_sessions, group=group_name,
         )
         if s.host not in HOSTS:
             raise RosterError(f"{where}: host 只能是 {' / '.join(HOSTS)}，收到 {s.host!r}")
@@ -436,7 +417,15 @@ def _parse_persons(raw_persons) -> list[RosterPerson]:
         tier = _str(raw, "tier", where)
         if tier not in PERSON_TIERS:
             raise RosterError(f"{where}: tier 只能是 {' / '.join(PERSON_TIERS)}，收到 {tier!r}")
-        p = RosterPerson(open_id=open_id, tier=tier, name=_str(raw, "name", where), authority=_str(raw, "authority", where))
+        raw_aliases = raw.get("aliases", [])
+        if isinstance(raw_aliases, str):
+            aliases = [x.strip() for x in raw_aliases.split(",") if x.strip()]
+        elif isinstance(raw_aliases, list) and all(isinstance(x, str) for x in raw_aliases):
+            aliases = [x.strip() for x in raw_aliases if x.strip()]
+        else:
+            raise RosterError(f"{where}: aliases 必须是字符串数组")
+        p = RosterPerson(open_id=open_id, tier=tier, name=_str(raw, "name", where), authority=_str(raw, "authority", where),
+                         nickname=_str(raw, "nickname", where), aliases=aliases, role=_str(raw, "role", where))
         if tier == VIP:
             if not p.authority:
                 raise RosterError(f"{where}: tier = vip 必须写 authority（主人原话，带日期）")
