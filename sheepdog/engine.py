@@ -1270,14 +1270,18 @@ class Collector:
         if self._expired(last, m):
             log.info("话题 %s 最近活动 %s，超过 %g 小时，不再自动归属", thread_id, last, self.cfg.threads.group_owner_hours)
             return None
-        owner = self._message_owner(root)
+        from .prompts import is_group_directed_to_others
+        root_directed_other = is_group_directed_to_others(root, self.cfg.self_open_id, self.bot_ids)
+        owner = None if root_directed_other else self._message_owner(root)
         if owner is None or owner[0] == BUS_TOPIC_ID:
             for r in self.store.thread_messages_in_ledger(thread_id, root["message_id"]):
                 if (mo := self._message_owner(r)) is not None and mo[0] != BUS_TOPIC_ID:
+                    if root_directed_other and mo[1] != "forwarded":
+                        continue
                     owner = mo; break
-                if (so := self._sent_owner(r["message_id"])) is not None and so[0] != BUS_TOPIC_ID:
+                if not root_directed_other and (so := self._sent_owner(r["message_id"])) is not None and so[0] != BUS_TOPIC_ID:
                     owner = (so[0], "sent"); break
-            if owner is None or owner[0] == BUS_TOPIC_ID:
+            if not root_directed_other and (owner is None or owner[0] == BUS_TOPIC_ID):
                 s_row = self.store.conn.execute(
                     "SELECT topic_id FROM sends WHERE target_message_id=? AND topic_id != ? ORDER BY rowid DESC LIMIT 1",
                     (root["message_id"], BUS_TOPIC_ID)).fetchone()
@@ -1320,10 +1324,14 @@ class Collector:
         return self._quote_owner(m, exclude) if m.reply_to else None
 
     def _group_reply_owner(self, m: Message, *, allow_bot: bool = False) -> dict | None:
-        """C 类：别人在群里的话题回复或对本会话发出卡片的引用回复 → 归属会话（7.45 / 7.86 REG-049）。"""
+        """C 类：别人在群里的话题回复或对本会话发出卡片的引用回复 → 归属会话（7.45 / 7.86 REG-049 / 7.103 REG-071）。"""
+        from .prompts import is_group_directed_to_others
         if not self.cfg.threads.group_owner or not self._group_chat(m) or is_agent_reply(m.content, self.cfg.owner_context):
             return None
-        if m.sender_type in BOT_SENDER_TYPES and (not allow_bot or (is_thread_reply(m) and self._sent_owner(m.reply_to or m.root_id) is None)):
+        is_bot_or_proxy = m.sender_type in BOT_SENDER_TYPES or is_agent_proxy_content(m.content or "")
+        if is_bot_or_proxy and (not allow_bot or (is_thread_reply(m) and self._sent_owner(m.reply_to or m.root_id) is None)):
+            return None
+        if is_group_directed_to_others(m, self.cfg.self_open_id, self.bot_ids) and self._sent_owner(m.reply_to) is None:
             return None
         if is_thread_reply(m):
             return self._group_thread_owner(m, m.thread_id, m.message_id)

@@ -251,6 +251,58 @@ def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -
         raise OutboundError(EXIT_INVALID, f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog reply（{target_id} 已转交给 {forwarded[target_id]}）：请交由承接该消息的专属会话处理与回复，没有发送")
 
 
+def check_group_reply_allowed(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    target: sqlite3.Row | None,
+    *,
+    even_if_owner_replied: bool = False,
+) -> None:
+    """7.103（REG-071）：多人大群代回门禁：
+    1. 非总线会话严禁对停留在 tp_bus 未 forward 转交的被动群消息（keyword/group/watched_chat/vip_sender 或仅 @ 他人）调用 reply 越权抢答；
+    2. 严禁在多人大群里直接对仅 @ 其他同事（未 @ 主人/机器人/所有人且未 forward 转交）的消息调用 reply；
+    3. 严禁在多人大群里直接 reply 同事个人账号代发的 AI 助理消息（防跨 Agent 群聊乒乓死循环；主人确需回复时可加 --even-if-owner-replied）。"""
+    if target is None:
+        return
+    from .prompts import is_agent_proxy_content, is_group_directed_to_others
+    from .store import SYSTEM_CHAT
+
+    keys = target.keys() if hasattr(target, "keys") else ()
+    chat_type = ((target["chat_type"] if "chat_type" in keys else "") or "").strip()
+    chat_id = ((target["chat_id"] if "chat_id" in keys else "") or "").strip()
+    if chat_type in ("p2p", SYSTEM_CHAT, "") or chat_id in cfg.owner_side_chat_ids:
+        return
+    t_topic = ((target["topic_id"] if "topic_id" in keys else "") or "").strip()
+    t_reason = ((target["reason"] if "reason" in keys else "") or "").strip()
+    t_tags = (target["tags_json"] if "tags_json" in keys else "") or ""
+    t_content = (target["content"] if "content" in keys else "") or ""
+    forwarded = "forwarded_from:" in t_tags
+    bot_ids = ident.bot_ids(cfg, store) if hasattr(ident, "bot_ids") else frozenset()
+    directed_other = is_group_directed_to_others(target, cfg.self_open_id, bot_ids)
+
+    if topic_id != BUS_TOPIC_ID and t_topic == BUS_TOPIC_ID and not forwarded:
+        if t_reason in ("keyword", "group", "watched_chat", "vip_sender") or directed_other:
+            raise OutboundError(
+                EXIT_INVALID,
+                f"群消息 {target['message_id']} 停留在总线 tp_bus 且未通过 sheepdog forward 转交给 {topic_id}（reason={t_reason}）："
+                "总线未转交的群消息仅作背景知会，严禁专席在群内越权代回（没有发送）",
+            )
+    if is_agent_proxy_content(t_content) and not even_if_owner_replied:
+        raise OutboundError(
+            EXIT_INVALID,
+            f"群消息 {target['message_id']} 来自同事的 AI 助理代发（个人账号代理）："
+            "严禁在多人大群里直接对其他 AI 助理调用 sheepdog reply（防 Agent 群内乒乓死循环）；"
+            "请保持群内静默，有结论用 sheepdog report 或 sheepdog ask 找主人（没有发送）",
+        )
+    if directed_other and not forwarded and not even_if_owner_replied:
+        raise OutboundError(
+            EXIT_INVALID,
+            f"群消息 {target['message_id']} 在群内明确只 @ 了其他同事（未 @ 主人或机器人，且未经 forward 交办）："
+            "非呼叫我们的群内他人对话严禁主动插话代回；若需同步进展请用 sheepdog report 汇报主人（没有发送）",
+        )
+
+
 def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] | None, vips: dict | None,
                     floor: str, batch: str = "", floor_type: str | None = None) -> list[tuple[str, str]]:
     """7.61 / 7.65：先核总线未对已转交消息越位 ask，再核 ask 关联的来源里有 VIP 本人发的消息（或显式传了 --floor / --floor-type）时，
@@ -786,6 +838,8 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     chat_id = target_id if is_chat else (target["chat_id"] if target is not None else "")
     if chat_id and ((text or "").strip() or (card_text or "").strip()):
         reject_owner_chat(cfg, topic_id, chat_id)
+    if not is_chat and target is not None:
+        check_group_reply_allowed(cfg, store, topic_id, target, even_if_owner_replied=even_if_owner_replied)
     try: shown, card = reply_body(cfg, text, card_text, summary=summary)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
     ik = reply_idem(store, topic_id, target_id, shown)

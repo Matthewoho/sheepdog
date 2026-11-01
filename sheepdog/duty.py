@@ -418,21 +418,46 @@ _BUS_ASK_ACT_RE = re.compile(r"请转交|forward|new-session|\?|？", re.I)
 _PEER_CLOSE_ACK_RE = re.compile(r"(?:感谢|多谢|谢谢|辛苦|已闭环|全链路.*办结|无需再回)", re.I)
 _PEER_SUBSTANTIVE_RE = re.compile(r"正在|已启动|已向|已在|已代回|已通知|已将|已拉起|已锁定|已同步|请|待|需要|若.*会|如果.*会|1\.|2\.|\n", re.I)
 _REDUNDANT_FORWARD_TELL_RE = re.compile(r"^\s*已(?:调用|用|通过|执行)?\s*(?:sheepdog\s+)?forward\b.*转交", re.I)
+_FYI_ONLY_TELL_RE = re.compile(
+    r"无需回复|不用回复|勿回|保持静默|严格静默|仅同步背景|背景同步|仅作背景|仅供参考|备查",
+    re.I,
+)
+_PASSIVE_BUS_GROUP_REASONS = ("keyword", "group", "watched_chat", "vip_sender")
+
+
+def _eligible_vip_mail_row(r, eff_vips: dict[str, str], self_open_id: str = "") -> str:
+    """7.103（REG-071）：判断账本消息 r 是否有资格作为 sheepdog tell 的 👑 VIP 授权来源。"""
+    from .prompts import is_group_directed_to_others, vip_of
+
+    vname = vip_of(r, eff_vips)
+    if not vname:
+        return ""
+    keys = r.keys() if hasattr(r, "keys") else ()
+    chat_type = ((r["chat_type"] if "chat_type" in keys else "") or "").strip()
+    if chat_type not in ("p2p", "system", ""):
+        if is_group_directed_to_others(r, self_open_id):
+            return ""
+        t_topic = ((r["topic_id"] if "topic_id" in keys else "") or "").strip()
+        t_reason = ((r["reason"] if "reason" in keys else "") or "").strip()
+        t_tags = (r["tags_json"] if "tags_json" in keys else "") or ""
+        if t_topic == "tp_bus" and "forwarded_from:" not in t_tags and t_reason in _PASSIVE_BUS_GROUP_REASONS:
+            return ""
+    return vname
 
 
 def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key: str = "", quote: str = "",
                              vips: dict[str, str] | None = None) -> tuple:
-    """7.95（REG-063）：核查 from_topic 在发起 tell 时是否关联了账本中已验真的 VIP 本人原消息。
+    """7.95 / 7.103（REG-063 / REG-071）：核查 from_topic 在发起 tell 时是否关联了账本中已验真的 VIP 本人原消息。
     返回 (vip_row, vip_name)；未命中返回 (None, "")。"""
     from .card import plain_text
-    from .prompts import vip_of
 
+    self_oid = (getattr(cfg, "self_open_id", "") or "") if cfg is not None else ""
     if vips is not None:
         eff_vips = dict(vips)
     elif cfg is not None and getattr(cfg, "roster_file", None):
         try:
             from .roster import load_roster
-            eff_vips = load_roster(cfg.roster_file, False).vips(exclude=getattr(cfg, "self_open_id", "") or "")
+            eff_vips = load_roster(cfg.roster_file, False).vips(exclude=self_oid)
         except Exception:
             eff_vips = {}
     else:
@@ -440,9 +465,14 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
     if not eff_vips:
         return None, ""
 
+    text_l = text.lower()
+    has_vip_claim = any(w.lower() in text_l for w in VIP_CLAIM_WORDS)
+    if not has_vip_claim and _FYI_ONLY_TELL_RE.search(text):
+        return None, ""
+
     for mid in dict.fromkeys(re.findall(r"\bom_[A-Za-z0-9_]+\b", f"{text} {quote}")):
         r = store.get_message(mid)
-        if r is not None and (vname := vip_of(r, eff_vips)):
+        if r is not None and (vname := _eligible_vip_mail_row(r, eff_vips, self_oid)):
             return r, vname
 
     cand_ids: list[str] = []
@@ -472,11 +502,10 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
         if m and not m.startswith("sd_") and m not in cand_ids:
             cand_ids.append(m)
 
-    text_l = text.lower()
     cand_rows: list[tuple] = []
     for mid in cand_ids:
         r = store.get_message(mid)
-        if r is not None and (vname := vip_of(r, eff_vips)):
+        if r is not None and (vname := _eligible_vip_mail_row(r, eff_vips, self_oid)):
             cand_rows.append((r, vname))
 
     sids = [s for s in eff_vips if s]
@@ -495,7 +524,7 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
             f"SELECT * FROM messages WHERE sender_id IN ({ph}) AND create_time >= ? ORDER BY create_time DESC LIMIT 500",
             (*sids, age_since),
         ).fetchall():
-            if r["message_id"] not in seen_mids and (vname := vip_of(r, eff_vips)):
+            if r["message_id"] not in seen_mids and (vname := _eligible_vip_mail_row(r, eff_vips, self_oid)):
                 recent_vip_rows.append((r, vname))
                 seen_mids.add(r["message_id"])
 
@@ -511,7 +540,6 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
                 return r, vname
 
     # 第二优先级：当前会话候选集（活跃批次直通；非活跃历史批次须无单号锚点且显式宣称 VIP 授权词）
-    has_vip_claim = any(w.lower() in text_l for w in VIP_CLAIM_WORDS)
     for r, vname in cand_rows:
         c_raw = r["content"] or ""
         in_active = r["message_id"] in active_set

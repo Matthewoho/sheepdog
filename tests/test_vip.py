@@ -761,6 +761,176 @@ class VipBranch765Test(AskFloorTest):
         self.assertTrue(has_err_err)
         self.assertIn("ok=False", summary_err)
 
+    def test_reg_071_group_unaddressed_vip_tell_reply_guard_and_agent_proxy_thread_silence(self):
+        """7.103（REG-071）：
+        1. 多人大群内 VIP 明确只 @ 其他同事/机器人（如 @Dashell @Ethan、@老胡 Lark cli，未 @ 主人/本机器人且未 forward）时，
+           is_group_directed_to_others 为 True，vip_of 不盖 👑 VIP 章；
+        2. 总线 tp_bus 对未 forward 的群内被动消息发背景知会 sheepdog tell 时，严禁自动盖 👑 VIP 授权章或注入 vip_relay；
+        3. 专席严禁对停留在 tp_bus 未 forward 的被动群消息、群内仅 @ 他人的消息、或群内同事个人账号 AI 助理消息调用 sheepdog reply（防越俎代庖抢答与跨 Agent 群内乒乓）；
+        4. 群内同事个人账号 AI 助理（✦ 老胡的AI助理）不触发 vip_sender / keyword 直推，也不触发群话题 thread_owner 自动唤醒；群话题内仅 @ 他人的讨论同样不触发 thread_owner 抢答。
+        """
+        from sheepdog import duty
+        from sheepdog.engine import Collector
+        from sheepdog.models import Mention
+        from sheepdog.prompts import is_group_directed_to_others
+        from sheepdog.router import DISPATCH, INBOX, RouteContext, route
+
+        grp_chat = "oc_test_plugins_grp"
+        self.lark.chat_types[grp_chat] = "group"
+        dashell_id = "ou_test_dashell"
+        ethan_id = "ou_test_ethan"
+
+        # 1) 群内 VIP 明确只 @ 其他人（未 @ 主人） vs 群内 VIP @ 主人
+        m_jessie_other = fx.message(
+            "om_reg071_jessie_other",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            content="@Dashell Zhou @Ethan Wen 已经开启了管理员审批，生产环境需要两位看一下",
+            mentions=[Mention(dashell_id, "Dashell Zhou"), Mention(ethan_id, "Ethan Wen")],
+        )
+        self.store.upsert_message(m_jessie_other, DISPATCH, "keyword", ["keyword:生产"], BUS_TOPIC_ID)
+        r_jessie_other = self.store.get_message("om_reg071_jessie_other")
+        self.assertTrue(is_group_directed_to_others(r_jessie_other, ME))
+        self.assertEqual(vip_of(r_jessie_other, {VIP: VIP_NAME}), "")
+
+        # 群内 VIP 无 @ 被动 keyword 落入 tp_bus
+        m_passive_kw = fx.message(
+            "om_reg071_passive_kw",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            content="生产环境插件配置已经更新",
+        )
+        self.store.upsert_message(m_passive_kw, DISPATCH, "keyword", ["keyword:生产"], BUS_TOPIC_ID)
+
+        # 群内 VIP 明确 @ 主人时照常盖 👑 VIP 章
+        m_jessie_me = fx.message(
+            "om_reg071_jessie_me",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            content="@主人 请帮忙审批一下",
+            mentions=[Mention(ME, "主人")],
+        )
+        self.store.upsert_message(m_jessie_me, DISPATCH, "at_me", [], BUS_TOPIC_ID)
+        self.assertFalse(is_group_directed_to_others(self.store.get_message("om_reg071_jessie_me"), ME))
+        self.assertEqual(vip_of(self.store.get_message("om_reg071_jessie_me"), {VIP: VIP_NAME}), VIP_NAME)
+
+        # 2) tp_bus 对未 forward 的群消息发背景知会 tell 给 tp_alpha 时，绝不盖 👑 VIP 章
+        bid_bus = "b_reg071_bus"
+        self.store.record_dispatch(bid_bus, BUS_TOPIC_ID, ["om_reg071_jessie_other", "om_reg071_passive_kw"])
+        self.store.mark_batch(["om_reg071_jessie_other", "om_reg071_passive_kw"], bid_bus, BUS_TOPIC_ID, "delivered")
+        self.store.update_topic(BUS_TOPIC_ID, state="running", pending_batch_id=bid_bus)
+        mail_id = duty.send_mail(
+            self.store,
+            self.cfg,
+            BUS_TOPIC_ID,
+            "tp_alpha",
+            f"【群背景同步】{VIP_NAME} 刚才在群内（om_reg071_jessie_other / om_reg071_passive_kw）回复 Dashell 与 Ethan，"
+            "注：该消息未 @Matthew，群内已保持静默；仅同步背景备查，无需回复。",
+            key="plugins-oauth",
+            vips={VIP: VIP_NAME},
+        )
+        mail_row = self.store.conn.execute(
+            "SELECT m.* FROM mailbox mb JOIN messages m ON m.message_id = mb.message_id WHERE mb.id = ?",
+            (mail_id,),
+        ).fetchone()
+        self.assertNotIn("👑 VIP", mail_row["content"])
+        self.assertNotIn("vip_relay:", mail_row["tags_json"] or "")
+        self.assertEqual(vip_of(mail_row, {VIP: VIP_NAME}), "")
+
+        # 3) outbound.reply 门禁：专席不能回未 forward 的 tp_bus 被动群消息，不能回群里仅 @ 他人的消息，也不能在群里直接回同事 AI 助理
+        for target_mid, expected_err in (
+            ("om_reg071_jessie_other", "未通过 sheepdog forward 转交"),
+            ("om_reg071_passive_kw", "未通过 sheepdog forward 转交"),
+            ("om_reg071_jessie_other", "在群内明确只 @ 了其他同事"),
+        ):
+            topic_arg = "tp_bus" if expected_err == "在群内明确只 @ 了其他同事" else "tp_alpha"
+            rc_rep, out_rep, err_rep = self.cli(
+                "reply", "--topic", topic_arg, "--to", target_mid, "--card-text", "收到，我来看下",
+            )
+            self.assertEqual(rc_rep, outbound.EXIT_INVALID, (topic_arg, target_mid, out_rep, err_rep))
+            self.assertIn(expected_err, err_rep)
+
+        m_laohu_ai = fx.message(
+            "om_reg071_laohu_ai",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name="老胡",
+            sender_type="user",
+            content="<card>\n**[✦ 老胡的AI助理]** @Dashell Zhou 测试环境已对齐，生产相关仍等老胡批准。\n</card>",
+            mentions=[Mention(dashell_id, "Dashell Zhou")],
+        )
+        self.store.upsert_message(m_laohu_ai, DISPATCH, "thread_owner", [], "tp_alpha")
+        rc_ai, out_ai, err_ai = self.cli(
+            "reply", "--topic", "tp_alpha", "--to", "om_reg071_laohu_ai", "--card-text", "好的，我们对齐一下",
+        )
+        self.assertEqual(rc_ai, outbound.EXIT_INVALID, (out_ai, err_ai))
+        self.assertIn("来自同事的 AI 助理代发", err_ai)
+        self.assertEqual(len(self.lark.sent()), 0)
+
+        # 4) 路由器与群话题归属：同事个人账号 AI 助理不触发 vip_sender / keyword 直推，也不触发 thread_owner；
+        #    群话题内仅 @ 他人的消息不触发 thread_owner，普通无 @ 回复照常归属
+        self.cfg.routing.vip_sender_ids = [VIP]
+        self.cfg.routing.keywords = ["生产"]
+        self.cfg.routing.keyword_skip_bot_senders = True
+        dec_ai = route(m_laohu_ai, RouteContext(self_open_id=ME), self.cfg.routing)
+        self.assertEqual((dec_ai.route, dec_ai.reason), (INBOX, "group"))
+
+        # 造一个正式归属给 tp_alpha 的群话题 omt_reg071_thr
+        self.store.add_group_thread("omt_reg071_thr", grp_chat, "tp_alpha", "forwarded", "om_reg071_jessie_me", "请帮忙审批")
+        col = Collector(self.cfg, self.store, self.source, self.roster)
+        m_thr_ai = fx.message(
+            "om_reg071_thr_ai",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name="老胡",
+            sender_type="user",
+            content="<card>\n**[✦ 老胡的AI助理]** 我再补充一点，生产相关仍等老胡批准。\n</card>",
+            thread_id="omt_reg071_thr",
+            thread_position="1",
+        )
+        m_thr_other = fx.message(
+            "om_reg071_thr_other",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=ethan_id,
+            sender_name="Ethan Wen",
+            sender_type="user",
+            content="@Dashell Zhou 你那边本地能连上吗",
+            thread_id="omt_reg071_thr",
+            thread_position="2",
+            mentions=[Mention(dashell_id, "Dashell Zhou")],
+        )
+        m_thr_normal = fx.message(
+            "om_reg071_thr_normal",
+            chat_id=grp_chat,
+            chat_name="Agent Plugins & Connector",
+            chat_type="group",
+            sender_id=ethan_id,
+            sender_name="Ethan Wen",
+            sender_type="user",
+            content="收到，这边已经验证通过了",
+            thread_id="omt_reg071_thr",
+            thread_position="3",
+        )
+        col.ingest([m_thr_ai, m_thr_other, m_thr_normal])
+        self.assertEqual((self.store.get_message("om_reg071_thr_ai")["route"], self.store.get_message("om_reg071_thr_ai")["topic_id"]), (INBOX, None))
+        self.assertEqual((self.store.get_message("om_reg071_thr_other")["route"], self.store.get_message("om_reg071_thr_other")["topic_id"]), (INBOX, None))
+        self.assertEqual((self.store.get_message("om_reg071_thr_normal")["route"], self.store.get_message("om_reg071_thr_normal")["reason"], self.store.get_message("om_reg071_thr_normal")["topic_id"]), (DISPATCH, "thread_owner", "tp_alpha"))
+
 
 if __name__ == "__main__":
     unittest.main()

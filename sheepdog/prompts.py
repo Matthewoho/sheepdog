@@ -130,9 +130,62 @@ def is_agent_proxy_content(text: str) -> bool:
     return bool(text and _AGENT_PROXY_CONTENT_RE.search(text))
 
 
+_DIRECT_CALL_REASONS = ("at_me", "at_bot", "at_all", "reply_to_me", "owner_instruction", "owner_reply", "owner_context")
+
+
+def is_group_directed_to_others(row_or_msg, self_open_id: str = "", bot_ids=()) -> bool:
+    """7.103（REG-071）：判断群消息是否明确只 @ 了其他同事/机器人（未 @ 主人/本机器人/@所有人，非回复主人/本机器人，且未经 forward 转交）。"""
+    if row_or_msg is None:
+        return False
+    if hasattr(row_or_msg, "chat_type") and not hasattr(row_or_msg, "keys"):
+        chat_type = (row_or_msg.chat_type or "").strip()
+        if chat_type in ("p2p", SYSTEM_CHAT, ""):
+            return False
+        mentions = row_or_msg.mentions or []
+        if not mentions:
+            return False
+        bot_set = set(bot_ids or ())
+        for m in mentions:
+            if getattr(m, "is_all", False):
+                return False
+            mid = (getattr(m, "id", "") or "").strip()
+            if (self_open_id and mid == self_open_id) or (bot_set and mid in bot_set):
+                return False
+        return True
+    keys = row_or_msg.keys() if hasattr(row_or_msg, "keys") else ()
+    chat_type = ((row_or_msg["chat_type"] if "chat_type" in keys else "") or "").strip()
+    if chat_type in ("p2p", SYSTEM_CHAT, ""):
+        return False
+    reason = ((row_or_msg["reason"] if "reason" in keys else "") or "").strip()
+    if reason in _DIRECT_CALL_REASONS:
+        return False
+    tags_raw = (row_or_msg["tags_json"] if "tags_json" in keys else "") or ""
+    if "forwarded_from:" in tags_raw:
+        return False
+    mentions_raw = (row_or_msg["mentions_json"] if "mentions_json" in keys else "") or ""
+    if not mentions_raw or mentions_raw == "[]":
+        return False
+    try:
+        mentions = json.loads(mentions_raw)
+    except ValueError:
+        return False
+    if not mentions or not isinstance(mentions, list):
+        return False
+    bot_set = set(bot_ids or ())
+    for m in mentions:
+        if not isinstance(m, dict):
+            continue
+        if m.get("is_all"):
+            return False
+        mid = (m.get("id") or "").strip()
+        if (self_open_id and mid == self_open_id) or (bot_set and mid in bot_set):
+            return False
+    return True
+
+
 def vip_of(row, vips: dict | None) -> str:
-    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100 / 7.101）：是就返回盖章用的名字，不是返回空串。
-    不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex / AI 助理消息）、主人本人的。"""
+    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100 / 7.101 / 7.103）：是就返回盖章用的名字，不是返回空串。
+    不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex / AI 助理消息）、主人本人的、群内明确只 @ 其他人且未 forward 的。"""
     if not vips or row is None:
         return ""
     tags = json.loads(row["tags_json"] or "[]")
@@ -152,6 +205,8 @@ def vip_of(row, vips: dict | None) -> str:
     if not sid or sid not in vips or (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
         return ""
     if "agent_sender" in tags or is_agent_proxy_content(content) or any(t in tags for t in _OWNER_TAGS):
+        return ""
+    if is_group_directed_to_others(row):
         return ""
     return vips[sid] or (row["sender_name"] or "").strip() or sid
 

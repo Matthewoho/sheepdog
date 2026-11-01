@@ -474,3 +474,10 @@
 | --- | --- | --- |
 | 7.102 | 母羊通过 `python3 -c` 三引号字符串（`sheepdog lamb prepare --spec`）或 `cat << 'EOF'` 编写子代理规格说明并在正文中提醒『严禁对 `~/Code` 直接裸跑 `grep -rn`！先用 `ls ~/Code`』时，因 compact `transcript.jsonl` 尾部 `<truncated N bytes>` 导致 `decode_command_line` 未解码且 `observe._is_unbounded_code_search` 未剥离文档块、未要求命令段起点边界及标志位空白边界，将守规提示文字误报为 `REG-057` 未定仓全量搜索；或会话通过 Python `subprocess.run(["find", "~/Code", "-maxdepth", "2", ...])` 数组形式执行浅层定仓查询时，因 `_SHALLOW_FIND_SEG_RE` 仅支持裸空格 `-maxdepth [0-3]` 而漏豁免误报（REG-070） | `test_version_and_observe.VersionAndObserveTest.test_reg_070_unbounded_search_ignores_prose_spec_and_array_shallow_find`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_070_unbounded_search_ignores_prose_spec_and_array_shallow_find`） |
 
+## 7.103 多人大群非呼叫消息（仅 @ 他人 / 未转交被动 keyword）禁盖 👑 VIP 章、禁专席越权代回与防跨 Agent 群聊乒乓死循环（REG-071）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.103 | 多人大群内 VIP 明确只 `@` 其他同事/机器人（如 `@Dashell Zhou @Ethan Wen`、`@老胡 Lark cli`，未 `@` 主人/本机器人且未经 `forward`）或因通用关键词被 `tp_bus` 被动截获后，`tp_bus` 仅发背景备忘 `sheepdog tell` 却被 `duty._resolve_vip_mail_source` 自动盖上 `👑 VIP` 授权章，诱导专席调用 `sheepdog reply` 越俎代庖在群内抢答并锁死 `group_threads`；或同事个人账号代发的 AI 助理（`[✦ 老胡的AI助理]`）在群内发言命中关键词 / `thread_owner` 唤醒专席并被专席直接 `reply` 引发跨 Agent 多轮群聊乒乓（REG-071） | `test_vip.VipBranch765Test.test_reg_071_group_unaddressed_vip_tell_reply_guard_and_agent_proxy_thread_silence`（`tests/test_vip.py::VipBranch765Test::test_reg_071_group_unaddressed_vip_tell_reply_guard_and_agent_proxy_thread_silence`） |
+
+

@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.102")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 102))
+        self.assertEqual(cur_ver, "0.7.103")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 103))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -107,7 +107,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertIn(cur_ver, buf.getvalue())
 
             # 4. 常驻进程 _check_version_update：本机磁盘升版提醒 + 远端 tag 提醒 + 幂等防重
-            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.103"\n', encoding="utf-8")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.104"\n', encoding="utf-8")
             fake_dispatcher = mock.MagicMock()
             now_dt = datetime(2026, 10, 21, 20, 0, 0, tzinfo=observe.TZ)
             real_run = subprocess.run
@@ -122,7 +122,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt
                 )
                 self.assertEqual(len(sent1), 1)
-                self.assertIn("0.7.103", sent1[0])
+                self.assertIn("0.7.104", sent1[0])
                 self.assertIn(cur_ver, sent1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
@@ -133,8 +133,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertEqual(sent2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
-            # 远端出现更高版本 v0.7.104 时单次提醒
-            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.104\n"
+            # 远端出现更高版本 v0.7.105 时单次提醒
+            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.105\n"
 
             def has_remote_tag(cmd, *a, **kw):
                 if isinstance(cmd, list) and "ls-remote" in cmd:
@@ -144,7 +144,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             with mock.patch("subprocess.run", side_effect=has_remote_tag):
                 sent_remote1 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=35))
                 self.assertEqual(len(sent_remote1), 1)
-                self.assertIn("v0.7.104", sent_remote1[0])
+                self.assertIn("v0.7.105", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
                 sent_remote2 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=70))
@@ -559,7 +559,7 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
 
         # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.100）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.102")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.103")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 

@@ -27,6 +27,7 @@ from . import session as sm
 from .card import plain_text
 from .config import RoutingConfig
 from .models import Message
+from .prompts import is_agent_proxy_content
 from .roster import member_index, primary_topic_id
 
 DROP = "drop"
@@ -120,12 +121,14 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     if cfg.ignore_muted_chats and msg.chat_id in ctx.muted_chat_ids and msg.chat_id not in cfg.watch_chat_ids:
         return RouteDecision(DROP, "muted_chat")
 
+    is_bot_or_proxy = msg.is_bot_sender or is_agent_proxy_content(msg.content)
+
     # 8. 关键人
-    if msg.sender_id in cfg.vip_sender_ids:
+    if msg.sender_id in cfg.vip_sender_ids and not is_bot_or_proxy:
         return RouteDecision(DISPATCH, "vip_sender")
 
-    # 9. 关键词：群里机器人的消息常带「告警」「审批」之类字样，默认不参与，避免误报
-    if kw and not (cfg.keyword_skip_bot_senders and msg.is_bot_sender):
+    # 9. 关键词：群里机器人的消息（含同事个人账号代发的 AI 助理消息）常带「告警」「审批」「生产」之类字样，默认不参与，避免误报
+    if kw and not (cfg.keyword_skip_bot_senders and is_bot_or_proxy):
         return RouteDecision(DISPATCH, "keyword", [f"keyword:{kw}"])
 
     # 10. 强制关注
