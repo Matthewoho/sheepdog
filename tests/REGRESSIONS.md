@@ -468,3 +468,9 @@
 | --- | --- | --- |
 | 7.101 | 同事个人账号 AI 助理在消息末尾或全角括号落款（如 `（Sammy 的 AI 助理代发）`、`<font color='grey'>Sammi · Sammy 的 AI 助理</font>`、`——Klaus 的工作助理（按本人要求代留言）`）因不在句首而漏过 `_AGENT_PROXY_CONTENT_RE` 被误盖 `👑 VIP` 免问动生产印章；或母羊调用 `sheepdog lamb done` / `cancel` 提前终止 `start_new_session=True` 启动的 CLI 羔羊时未按进程组（`os.killpg`）清理子进程树，导致后台 Python 子进程残留为孤儿僵尸继续偷跑批准构建；或 CLI 羔羊正常退出末尾打印多行格式化 JSON 时 `_tick_lambs` 仅截取最后 5 行闭合括号导致汇报摘要退化为 `}\n}\n}\n]\n}`（REG-069） | `test_vip.VipBranch765Test.test_reg_069_vip_agent_proxy_footer_and_cli_lamb_pgid_and_json_summary`（`tests/test_vip.py::VipBranch765Test::test_reg_069_vip_agent_proxy_footer_and_cli_lamb_pgid_and_json_summary`） |
 
+## 7.102 全目录代码盲扫探针（REG-057）剥离文档规格说明文本、支持截断 JSON 命令解码与 Python 列表浅层 find 对称豁免（REG-070）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.102 | 母羊通过 `python3 -c` 三引号字符串（`sheepdog lamb prepare --spec`）或 `cat << 'EOF'` 编写子代理规格说明并在正文中提醒『严禁对 `~/Code` 直接裸跑 `grep -rn`！先用 `ls ~/Code`』时，因 compact `transcript.jsonl` 尾部 `<truncated N bytes>` 导致 `decode_command_line` 未解码且 `observe._is_unbounded_code_search` 未剥离文档块、未要求命令段起点边界及标志位空白边界，将守规提示文字误报为 `REG-057` 未定仓全量搜索；或会话通过 Python `subprocess.run(["find", "~/Code", "-maxdepth", "2", ...])` 数组形式执行浅层定仓查询时，因 `_SHALLOW_FIND_SEG_RE` 仅支持裸空格 `-maxdepth [0-3]` 而漏豁免误报（REG-070） | `test_version_and_observe.VersionAndObserveTest.test_reg_070_unbounded_search_ignores_prose_spec_and_array_shallow_find`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg_070_unbounded_search_ignores_prose_spec_and_array_shallow_find`） |
+

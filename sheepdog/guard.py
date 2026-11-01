@@ -189,15 +189,30 @@ def normalize(text: str) -> str:
     return _SPACES.sub(" ", _CONTINUATION.sub(" ", text or "")).strip()
 
 
+_TRUNC_CMD_SUFFIX_RE = re.compile(r"\n?<truncated \d+ bytes>$")
+
+
 def decode_command_line(raw) -> str:
-    """Antigravity 的 CommandLine 是 JSON 编码过的字符串（外面多一层引号），先解一次；解不开就按原样。"""
+    """Antigravity 的 CommandLine 是 JSON 编码过的字符串（外面多一层引号），先解一次；
+    若 compact transcript.jsonl 因长度截断尾部附带 `<truncated N bytes>`，剥离截断尾缀后尝试补齐引号解码。
+    """
     if not isinstance(raw, str):
         return ""
     try:
         v = json.loads(raw)
+        if isinstance(v, str):
+            return v
     except json.JSONDecodeError:
-        return raw
-    return v if isinstance(v, str) else raw
+        if raw.startswith('"'):
+            trimmed = _TRUNC_CMD_SUFFIX_RE.sub("", raw)
+            for suffix in ('"', '\\""', "'\""):
+                try:
+                    v = json.loads(trimmed + suffix)
+                    if isinstance(v, str):
+                        return v
+                except json.JSONDecodeError:
+                    pass
+    return raw
 
 
 def _argv_text(cmd) -> str:

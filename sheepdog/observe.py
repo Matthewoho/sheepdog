@@ -44,11 +44,18 @@ _BUS_FORBIDDEN_CMD_RE = re.compile(
     r"\b(?:gcloud|terraform|kubectl|context_memory\.py(?!\s+runtime-context\b)|pkm\.py|linear_task_memory\.py)\b"
     r"|\blark-cli\s+(?:docs|drive|wiki|bitable|sheets)\b"
 )
-_CODE_ROOT_PAT = r"(?:/Users/[^/\s\"';|&]+|~|\$HOME|\$\{HOME\})/Code(?:/+(?:\*|\.)?)?(?=$|[\s\"';|&])"
-_UNBOUNDED_CODE_SEARCH_RE = re.compile(
-    rf"\b(?:grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive)\b|(?:rg|ripgrep|find)\b)[^;\n|&]*?{_CODE_ROOT_PAT}"
-    rf"|\bgrep\b[^;\n|&]*?{_CODE_ROOT_PAT}[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive)\b"
-    rf"|\bcd\s+{_CODE_ROOT_PAT}\s*(?:&&|;)\s*(?:rg|ripgrep|find|grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive))\b"
+_CODE_ROOT_PAT = r"(?<!\bls\s)(?:/Users/[^/\s\"';|&]+|~|\$HOME|\$\{HOME\})/Code(?:/+(?:\*|\.)?)?(?=$|[\s\"'\\,;|&\])])"
+_CODE_ROOT_RE = re.compile(_CODE_ROOT_PAT)
+_TRIPLE_QUOTE_DOC_RE = re.compile(r'(?:\\?"\\?"\\?"[\s\S]*?(?:\\?"\\?"\\?"|$)|\'\'\'[\s\S]*?(?:\'\'\'|$))')
+_CAT_HEREDOC_DOC_RE = re.compile(r"\bcat\b[^;|&\n]*<<-?\s*\\?['\"]?([A-Za-z0-9_]+)\\?['\"]?[\s\S]*?(?:\b\1\b|$)")
+_MD_PROSE_LINE_RE = re.compile(r"(?m)^\s*(?:#{1,6}|\d+\.|[-*+]\s+\*\*|>)\s+.*$")
+_SEARCH_SEG_SPLIT_RE = re.compile(r"(?:&&|\|\||[;\n|&()]|\b(?:then|do|else|elif)\b)+")
+_SEARCH_CMD_VERB_RE = re.compile(
+    r"""(?:^|(?<=["'\[]))\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:sudo|env|time|nice|nohup|xargs|command|builtin)\s+)*(?P<verb>grep|rg|ripgrep|find)\b(?P<rest>[^！。？；`]*)$"""
+)
+_GREP_REC_FLAG_RE = re.compile(r"(?:[\s\"'\\,]+)(?:-[A-Za-z]*[rR]\w*|--recursive)(?=[\s\"'\\,]|$)")
+_CD_CODE_ROOT_RE = re.compile(
+    rf"(?:^|(?<=[\"'\[])|[;\n|&])\s*cd\s+{_CODE_ROOT_PAT}\s*(?:&&|;)\s*(?:rg|ripgrep|find|grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive))(?=[\s\"'\\,]|$)"
 )
 _QUOTED_STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _SHEEPDOG_SUBCMDS = frozenset({
@@ -164,16 +171,46 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
     return False
 
 
-_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?\s-maxdepth\s+[0-3]\b)")
+_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?(?:[\s\"'\\,]+)-maxdepth(?:[\s\"'\\,]+)[0-3]\b)")
+
+
+def _strip_doc_prose_blocks(s: str) -> str:
+    s = _CAT_HEREDOC_DOC_RE.sub("", s)
+    s = _TRIPLE_QUOTE_DOC_RE.sub('""', s)
+    s = _MD_PROSE_LINE_RE.sub("", s)
+    s = _SHALLOW_FIND_SEG_RE.sub("shallow_find", s)
+    return _QUOTED_STR_RE.sub(
+        lambda m: m.group(0)
+        if not any(ch in m.group(0) for ch in ("|", ";", "&"))
+        or any(k in m.group(0) for k in ("Code", "grep", "find", "rg ", "-maxdepth", "-r"))
+        else '"_P_"',
+        s,
+    )
 
 
 def _is_unbounded_code_search(cmd_str: str) -> bool:
-    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057；豁免显式带 -maxdepth [0-3] 的浅层定仓 find）。"""
-    if not cmd_str:
+    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057 / REG-070）：
+    1. 豁免显式带 -maxdepth [0-3] 的浅层定仓 find（含 Shell 空格与 Python subprocess 列表写法）；
+    2. 剥离 Python 三引号规格文档、cat <<EOF 文本写入与 Markdown 列表说明行，并要求搜索命令动词位于命令段起点，消除守规提示文字误报。
+    """
+    if not cmd_str or "Code" not in cmd_str:
         return False
-    san_raw = _SHALLOW_FIND_SEG_RE.sub("shallow_find", cmd_str)
-    norm = _SHALLOW_FIND_SEG_RE.sub("shallow_find", normalize(decode_command_line(cmd_str)))
-    return bool(_UNBOUNDED_CODE_SEARCH_RE.search(san_raw) or _UNBOUNDED_CODE_SEARCH_RE.search(norm))
+    decoded = _strip_doc_prose_blocks(decode_command_line(cmd_str))
+    for cand in (decoded, normalize(decoded)):
+        san = _SHALLOW_FIND_SEG_RE.sub("shallow_find", cand)
+        if _CD_CODE_ROOT_RE.search(san):
+            return True
+        for seg in _SEARCH_SEG_SPLIT_RE.split(san):
+            if "Code" not in seg:
+                continue
+            for m in _SEARCH_CMD_VERB_RE.finditer(seg):
+                verb, rest = m.group("verb"), m.group("rest")
+                if not _CODE_ROOT_RE.search(rest):
+                    continue
+                if verb == "grep" and not _GREP_REC_FLAG_RE.search(rest):
+                    continue
+                return True
+    return False
 
 
 def _is_kb_interrupt_tb(lines: list[str], idx: int) -> bool:
@@ -726,10 +763,11 @@ def run_observe(
                             if t_tid == bus_topic_id and t_name in _BUS_FORBIDDEN_TOOLS:
                                 bad_calls.append(t_name)
                             elif t_name == "run_command":
-                                cmd_str = normalize(decode_command_line(t_args.get("CommandLine") or t_args.get("command") or ""))
+                                raw_cmd = decode_command_line(t_args.get("CommandLine") or t_args.get("command") or "")
+                                cmd_str = normalize(raw_cmd)
                                 if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
                                     bad_calls.append(f"run_command({cmd_str[:60]})")
-                                if _is_unbounded_code_search(cmd_str):
+                                if _is_unbounded_code_search(raw_cmd):
                                     warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {cmd_str[:80]}")
                     if bad_calls:
                         warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")

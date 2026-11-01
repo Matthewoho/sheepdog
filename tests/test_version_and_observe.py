@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.101")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 101))
+        self.assertEqual(cur_ver, "0.7.102")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 102))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -107,7 +107,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertIn(cur_ver, buf.getvalue())
 
             # 4. 常驻进程 _check_version_update：本机磁盘升版提醒 + 远端 tag 提醒 + 幂等防重
-            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.102"\n', encoding="utf-8")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.103"\n', encoding="utf-8")
             fake_dispatcher = mock.MagicMock()
             now_dt = datetime(2026, 10, 21, 20, 0, 0, tzinfo=observe.TZ)
             real_run = subprocess.run
@@ -122,7 +122,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt
                 )
                 self.assertEqual(len(sent1), 1)
-                self.assertIn("0.7.102", sent1[0])
+                self.assertIn("0.7.103", sent1[0])
                 self.assertIn(cur_ver, sent1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
@@ -133,8 +133,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertEqual(sent2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
-            # 远端出现更高版本 v0.7.103 时单次提醒
-            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.103\n"
+            # 远端出现更高版本 v0.7.104 时单次提醒
+            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.104\n"
 
             def has_remote_tag(cmd, *a, **kw):
                 if isinstance(cmd, list) and "ls-remote" in cmd:
@@ -144,7 +144,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             with mock.patch("subprocess.run", side_effect=has_remote_tag):
                 sent_remote1 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=35))
                 self.assertEqual(len(sent_remote1), 1)
-                self.assertIn("v0.7.103", sent_remote1[0])
+                self.assertIn("v0.7.104", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
                 sent_remote2 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=70))
@@ -559,7 +559,7 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
 
         # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.100）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.101")
+        self.assertEqual(expected_sig, "🐕SheepDog v0.7.102")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -861,6 +861,48 @@ class VersionAndObserveTest(unittest.TestCase):
         self.assertTrue(observe._is_unbounded_code_search(f'find {u_code} -maxdepth 2 -name "*fe-admin*" && rg "bar" {u_code}'))
         self.assertFalse(observe._is_unbounded_code_search(f'rg "foo" {u_code}/sheepdog/sheepdog'))
         self.assertFalse(observe._is_unbounded_code_search(f"ls {u_code}"))
+
+    def test_reg_070_unbounded_search_ignores_prose_spec_and_array_shallow_find(self):
+        from sheepdog.guard import decode_command_line, normalize
+
+        u_code = "/Use" + "rs/test_user/Code"
+        # 1) 真实案发场景 A（tp_dashell-zhou step 70）：在 python3 -c 中编写三引号 lamb 规格文档（含 compact transcript 尾部 <truncated N bytes> 及反例命令行）引用 REG-057 规则，绝不误报
+        truncated_json_cmd = (
+            '"python3 -c \'\\nimport subprocess, json\\n\\n# 准备 lamb 规格说明\\n'
+            'spec = \\"\\"\\"# 任务：TapNow Connector 排查\\n\\n## 严格规则与门禁（7.89 / REG-057）\\n'
+            f"1. 代码检索必先定仓：严禁对 ~/Code 或 {u_code} 直接裸跑 grep -rn！先用 ls ~/Code 或 git -C <repo> ls-files 定位具体仓库。\\n"
+            'grep -rn \\"bad_example\\" ~/Code\\n'
+            '2. 物理出处严格归属。\\n<truncated 597 bytes>'
+        )
+        decoded_trunc = decode_command_line(truncated_json_cmd)
+        self.assertTrue(decoded_trunc.startswith("python3 -c '"))
+        self.assertIn("\nspec = \"\"\"", decoded_trunc)
+        self.assertFalse(observe._is_unbounded_code_search(truncated_json_cmd))
+        self.assertFalse(observe._is_unbounded_code_search(decoded_trunc))
+        self.assertFalse(observe._is_unbounded_code_search(normalize(decoded_trunc)))
+
+        # 2) 真实案发场景 B（tp_laohu step 9423）：通过 cat << 'EOF' > /tmp/spec.md 写入 Markdown 守规提示（含独立反例行），绝不误报
+        heredoc_cmd = (
+            "set -e\ncat << 'EOF' > /tmp/lamb_spec.md\n"
+            "## Hard Rules\n"
+            f"- **Never run `find /Use" + "rs/test_user` or `grep -r ~/Code`** (`REG-057` — use `ls ~/Code` first).\n"
+            "rg \"bad_example\" ~/Code\n"
+            "EOF\n"
+        )
+        self.assertFalse(observe._is_unbounded_code_search(heredoc_cmd))
+        self.assertFalse(observe._is_unbounded_code_search(normalize(heredoc_cmd)))
+
+        # 3) 真实案发场景 C（tp_klaus-he step 181 & tp_release step 4528）：Python subprocess 列表形式传 -maxdepth [0-3] 浅层定仓 find，对称豁免
+        py_find_1 = f'p_find = subprocess.run(["find", "{u_code}", "-maxdepth", "2", "-name", "*fe-admin*"], capture_output=True)'
+        py_find_2 = f"find_cmd = ['find', '{u_code}', '-name', 'tapnow-agent', '-maxdepth', '2']"
+        self.assertFalse(observe._is_unbounded_code_search(py_find_1))
+        self.assertFalse(observe._is_unbounded_code_search(py_find_2))
+
+        # 4) 正向检出：真正的未定仓全目录递归搜索（含 Python 列表无 -maxdepth 或 -maxdepth 4、以及 python3 -c 中拼 shell grep -rn 命令）必须 100% 检出
+        self.assertTrue(observe._is_unbounded_code_search(f'subprocess.run(["find", "{u_code}", "-maxdepth", "4", "-name", "*.py"])'))
+        self.assertTrue(observe._is_unbounded_code_search(f'subprocess.run(["find", "{u_code}", "-name", "*.py"])'))
+        self.assertTrue(observe._is_unbounded_code_search(f'python3 -c \'import subprocess; cmd = "grep -rn \\"secret\\" {u_code}/"; subprocess.run(cmd, shell=True)\''))
+        self.assertTrue(observe._is_unbounded_code_search(f'rg -i "订阅缓存|subscription.*cache" {u_code}/'))
 
         self.assertFalse(observe._is_bus_forbidden_command('python3 .agents/skills/personal-knowledge-assistant/scripts/context_memory.py runtime-context --query "腾讯云"'))
         self.assertTrue(observe._is_bus_forbidden_command("python3 .agents/skills/personal-knowledge-assistant/scripts/context_memory.py capture ..."))
