@@ -191,10 +191,14 @@ class CliHostSink:
     def _launch(self, run) -> None:
         inp, out, err = self._paths(run["batch_id"])
         argv = self._argv(run, inp)
+        repo_dir = Path(__file__).resolve().parent.parent.parent
+        env = os.environ.copy()
+        existing_pp = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{repo_dir}{os.pathsep}{existing_pp}" if existing_pp else str(repo_dir)
         try:
             with out.open("wb") as fo, err.open("wb") as fe, self._stdin(inp) as fi:
                 p = subprocess.Popen(argv, cwd=str(self.hcfg.workdir_path), stdin=fi, stdout=fo, stderr=fe,
-                                     start_new_session=True)
+                                     start_new_session=True, env=env)
         except OSError as e:
             self.store.update_run(run["batch_id"], state="failed", ended_at=now_iso(), error_kind="other",
                                   error=f"起不来：{e}")

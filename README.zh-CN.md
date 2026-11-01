@@ -1,10 +1,91 @@
 # sheepdog 牧羊犬 🐕🐑
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-1212%20passed-success.svg)](tests/)
+[![Dependencies](https://img.shields.io/badge/dependencies-0%20(standard%20library)-brightgreen.svg)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/CI-passing-success.svg)](https://github.com/Matthewoho/sheepdog/actions)
+
 [English](README.md) | **简体中文** | [日本語](README.ja.md)
 
 牧羊犬是跑在主人自己电脑上的工作助理。它每分钟从飞书（Lark）拉一次新消息，交给负责的 AI 会话去办，管着这些会话的状态；要主人拍板的事，由会话经机器人在飞书上问主人。
 
 名字的意思：主人是牧羊人，AI 会话是羊群，牧羊犬看群。
+
+## 快速上手（1秒纯本地试玩 Demo）
+
+无需配置飞书或 Antigravity，开箱即用体验完整调度流程：
+
+```bash
+git clone https://github.com/Matthewoho/sheepdog.git
+cd sheepdog
+python3 scripts/demo_duty_board.py
+```
+
+该脚本会在 `/tmp` 临时沙箱中构建隔离的配置与账本，使用合成数据跑一轮完整投递，并实时展示 **羊群看板 (`sheepdog board`)**、总线智能防撞车路由、以及异常会话自动诊断与主人告警机制。
+
+## 架构拓扑
+
+```mermaid
+flowchart TD
+    subgraph Ingest["1. 信号摄入 (Ingest)"]
+        WS["飞书长连接 (WebSocket 原生流)"]
+        POLL["飞书轮询 (CLI Pull)"]
+        HOOK["机器人事件 (Webhook / Event)"]
+    end
+
+    subgraph Engine["2. 核心引擎 (Dispatcher & 状态机)"]
+        COL["采集器 (Collector)"]
+        SEC["安全护栏与危险审计"]
+        DISP["消息分派与路由中心"]
+        SM["会话状态机 (State Machine)"]
+    end
+
+    subgraph Storage["3. 本机账本 (Ledger)"]
+        SQLITE[("SQLite 账本 (单机事实真源)")]
+    end
+
+    subgraph Sinks["4. 宿主适配器 (Sinks)"]
+        AG["Antigravity (agentapi)"]
+        CDX["Codex (app-server runner)"]
+        CLD["Claude (cli -p)"]
+    end
+
+    subgraph Mesh["5. 母羊-羔羊分形协同 (Mother-Lamb Mesh)"]
+        BUS["总线会话 (tp_bus)"]
+        MOTHER["母羊会话 (如 tp_release / tp_auth)"]
+        LAMB["羔羊实施子代理 (后台任务闭环)"]
+    end
+
+    subgraph Observe["6. 控制与观测 (Observe)"]
+        BOARD["终端羊群看板 (sheepdog board)"]
+        WEB["管理后台 Web UI (实时仪表盘)"]
+        NOTIFY["飞书交互卡片与私聊告警"]
+    end
+
+    WS --> COL
+    POLL --> COL
+    HOOK --> COL
+    COL --> SQLITE
+    COL --> SEC
+    SEC --> DISP
+    DISP --> SM
+    SM --> SQLITE
+
+    DISP --> AG
+    DISP --> CDX
+    DISP --> CLD
+
+    AG --> Mesh
+    CDX --> Mesh
+    CLD --> Mesh
+    MOTHER -->|"派发后台任务单"| LAMB
+    LAMB -->|"汇报执行结果与证据"| MOTHER
+
+    SQLITE --> BOARD
+    SQLITE --> WEB
+    SM --> NOTIFY
+```
 
 ## 羊群看板
 

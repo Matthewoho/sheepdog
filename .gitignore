@@ -9,6 +9,11 @@ receipts/
 logs/
 .env
 .env.*
+*-receipt*.json
+docs/collab/
+.agents/
+AGENTS.md
+CLAUDE.md
 
 # Python
 __pycache__/

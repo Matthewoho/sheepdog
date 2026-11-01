@@ -1,10 +1,91 @@
 # sheepdog 🐕🐑
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-1212%20passed-success.svg)](tests/)
+[![Dependencies](https://img.shields.io/badge/dependencies-0%20(standard%20library)-brightgreen.svg)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/CI-passing-success.svg)](https://github.com/Matthewoho/sheepdog/actions)
+
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 sheepdog is a work assistant that runs on the owner's own machine. Every minute it pulls new messages from Lark (Feishu), hands each one to the AI session responsible for it, and tracks the state of those sessions. When something needs the owner's decision, the session asks the owner in Lark through a bot.
 
 The name: the owner is the shepherd, the AI sessions are the flock, and sheepdog keeps the flock together.
+
+## Quickstart (1-Second Local Demo)
+
+Try sheepdog locally in 1 second — no Lark/Feishu account or Antigravity setup required:
+
+```bash
+git clone https://github.com/Matthewoho/sheepdog.git
+cd sheepdog
+python3 scripts/demo_duty_board.py
+```
+
+This spins up an isolated sandbox in `/tmp`, populates synthetic events and sessions, runs a full dispatch round with `dryrun` sinks, and displays the real-time **Flock Board (`sheepdog board`)**, bus routing with collision detection, and stalled session intervention.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Ingest["1. Ingest (Ingress Signals)"]
+        WS["Feishu WebSocket (Long Connection)"]
+        POLL["Feishu Polling (CLI Pull)"]
+        HOOK["Webhook / Bot Events"]
+    end
+
+    subgraph Engine["2. Core Engine (Dispatcher & State Machine)"]
+        COL["Collector"]
+        SEC["Security & Danger Guard"]
+        DISP["Dispatcher & Router"]
+        SM["Session State Machine"]
+    end
+
+    subgraph Storage["3. Ledger & Storage"]
+        SQLITE[("SQLite Ledger (Local Single Source of Truth)")]
+    end
+
+    subgraph Sinks["4. Sinks (Execution Hosts)"]
+        AG["Antigravity Host (agentapi)"]
+        CDX["Codex Host (app-server runner)"]
+        CLD["Claude Host (cli -p)"]
+    end
+
+    subgraph Mesh["5. Mother-Lamb Fractal Mesh"]
+        BUS["Bus Session (tp_bus)"]
+        MOTHER["Mother Agent (e.g. tp_release / tp_auth)"]
+        LAMB["Lamb Subagent (Background Task Execution)"]
+    end
+
+    subgraph Observe["6. Control & Observe"]
+        BOARD["Terminal Duty Board (sheepdog board)"]
+        WEB["Admin Web UI (Realtime Dashboard)"]
+        NOTIFY["Lark Interactive Cards & DM Alerts"]
+    end
+
+    WS --> COL
+    POLL --> COL
+    HOOK --> COL
+    COL --> SQLITE
+    COL --> SEC
+    SEC --> DISP
+    DISP --> SM
+    SM --> SQLITE
+
+    DISP --> AG
+    DISP --> CDX
+    DISP --> CLD
+
+    AG --> Mesh
+    CDX --> Mesh
+    CLD --> Mesh
+    MOTHER -->|"Spawn background task"| LAMB
+    LAMB -->|"Report settlement & evidence"| MOTHER
+
+    SQLITE --> BOARD
+    SQLITE --> WEB
+    SM --> NOTIFY
+```
 
 ## Flock board
 
