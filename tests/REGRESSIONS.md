@@ -498,7 +498,9 @@
 | --- | --- | --- |
 | 7.106 | 子代理（`subagent` 羔羊）按提示词要求在回传 `SYSTEM_MESSAGE` 开头附上 `[lamb:lamb_xxxxxxxx]` 标签并使用 `# ...报告` / `## 一句话总览` / `1. **核心直接因果链**：` 等结构化 Markdown 汇报时，因 `guard.subagent_returns_in` 直接调用按首行截断的 `one_sentence`，导致数据库、在岗表与 Web 控制台里的 `result_summary` 退化为无意义的 `"[lamb:lamb_xxxxxxxx]"` 或章节空标题；或 CLI 羔羊完成核心变更与回读后顺手执行 `rg`/`grep` 检索文档，因 `_summarize_cli_lamb_log` 无差别取最后 5 行导致 `result_summary` 被 `/path/to/archive.jsonl:318:...` 检索行淹没（REG-074） | `test_security.GateTest.test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise`（`tests/test_security.py::GateTest::test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise`） |
 
+## 7.107 后台交互命令挂起（`fullyIdle: false`）在途停机自愈解锁、历史全目录盲扫（REG-057）规则指纹自愈重置与 CLI 羔羊成功 JSON 摘要提纯（REG-075）
 
-
-
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.107 | 会话在途执行未加 `--quiet` 的交互命令（如 `gcloud sql instances patch`）转入后台任务（`GENERIC RUNNING`）等待 stdin，导致回合结束时宿主向 Stop hook 传 `fullyIdle: false` 未写入 `hooks/stop/<tid>.json` 的 `passed_at`，进而使常驻进程 `_check_stopped_in_flight` 在首轮及 `auto_resumed` 后的次轮均无法感知 `PLANNER_RESPONSE DONE` 静默停机，锁死会话长达 30 分钟；或会话在批次中途经历上下文压缩后触发一次 `REG-057` 未定仓搜索，批次早已结束闲置但 `observe --self-heal` 未重置 `rules_hash` 也未记自愈水位，导致连续 65 分钟重复告警；或 CLI 羔羊日志末尾输出成功 JSON（如 `status="SUCCESS"`）但因 fallback 前含 Python `RuntimeError` Traceback 行且 JSON 字段按字母序截断前 8 个键，导致 `result_summary` 残留报错前缀并丢掉 `status=SUCCESS`（REG-075） | `test_security.GateTest.test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary`（`tests/test_security.py::GateTest::test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary`） |
 

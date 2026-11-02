@@ -760,7 +760,13 @@ def run_observe(
                         continue
                     t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir))
                     in_flight = {id(x) for x in _extract_post_dispatch_steps(t_steps, (tr["pending_batch_id"] or "").strip(), tr["dispatched_at"])} if (tr["state"] or "") == "running" and (tr["pending_batch_id"] or "").strip() else set()
+                    healed_at_dt = None
+                    if "meta" in tabs:
+                        r_heal = c.execute("SELECT value FROM meta WHERE key = ?", (f"reg057_healed_at:{t_tid}",)).fetchone()
+                        if r_heal and r_heal["value"]:
+                            healed_at_dt = parse_iso(str(r_heal["value"]))
                     bad_calls: list[str] = []
+                    unbounded_cmds: list[str] = []
                     for s in t_steps:
                         if s.get("type") != "PLANNER_RESPONSE":
                             continue
@@ -780,7 +786,30 @@ def run_observe(
                                 if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
                                     bad_calls.append(f"run_command({cmd_str[:60]})")
                                 if _is_unbounded_code_search(raw_cmd):
-                                    warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {cmd_str[:80]}")
+                                    if id(s) not in in_flight and healed_at_dt is not None and s_dt is not None and s_dt <= healed_at_dt:
+                                        continue
+                                    unbounded_cmds.append(cmd_str[:80])
+                    if unbounded_cmds:
+                        if self_heal and not in_flight:
+                            try:
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (t_tid,))
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"reg057_healed_at:{t_tid}", iso(ref_now)),
+                                        )
+                                    wc.commit()
+                                self_healed.append(f"{t_tid}:reg057_rules_reset")
+                                info.append(
+                                    f"已对 {t_tid} 的历史全目录盲扫（{unbounded_cmds[-1]}）执行规则指纹自愈重置（rules_hash=NULL，下一批重发 REG-057 护栏）"
+                                )
+                            except sqlite3.Error:
+                                for uc in unbounded_cmds:
+                                    warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {uc}")
+                        else:
+                            for uc in unbounded_cmds:
+                                warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {uc}")
                     if bad_calls:
                         warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
 

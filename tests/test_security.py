@@ -446,6 +446,178 @@ class GateTest(Base):
         self.assertNotIn("Ben Zhang.md:76:", summary_txt)
         self.assertNotIn("lark_events.jsonl:318:", summary_txt)
 
+    def test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary(self):
+        """7.107（REG-075）：
+        1. 会话执行后台交互命令（如 gcloud sql instances patch 未加 --quiet）导致 GENERIC RUNNING 挂起、Stop hook 因 fullyIdle=false 未写 passed_at 时，
+           Dispatcher._check_stopped_in_flight 在首轮（batch >= 180s & PLANNER_RESPONSE DONE 静默 >= 90s）自动唤醒续跑并提示清理挂起任务，
+           若二次停机（PLANNER_RESPONSE DONE 静默 >= 60s）则无需外部 observe --self-heal 即可直接按超时解锁；
+        2. observe.run_observe(..., self_heal=True) 对已结束批次的历史全目录盲扫（REG-057）自动重置 rules_hash=NULL 并记录 reg057_healed_at:<tid>，
+           避免批次已闲置后长达 65 分钟重复刷屏告警，且下一批自动重发含浅层子路径定仓规范的完整规则；
+        3. _summarize_cli_lamb_log 与 _scan_lambs 对末尾带成功 JSON（如 status="SUCCESS"）但中间含 fallback 前 Python Traceback 的 CLI 羔羊日志，
+           剥离中间报错行并将 status/id/ok 等关键字段置顶展示。"""
+        from datetime import timedelta
+        from sheepdog import observe
+        from sheepdog.engine import _summarize_cli_lamb_log
+
+        # 1. Round 1 (无 hooks/stop 文件，但 transcript 存在 GENERIC RUNNING + 末尾 PLANNER_RESPONSE DONE 静默 >= 90s) -> 自动续跑唤醒
+        #    Round 2 (已 auto_resumed，末尾 PLANNER_RESPONSE DONE 再次静默 >= 60s 且仍无 passed_at) -> 自动超时解锁
+        ref_now = datetime(2026, 11, 2, 18, 30, 0, tzinfo=observe.TZ)
+        sent_dt = ref_now - timedelta(seconds=210)
+        b_id = "b20261102182630-alpha"
+        self.store.update_topic(
+            "tp_alpha", state="running", pending_batch_id=b_id, dispatched_at=sent_dt.isoformat(timespec="seconds")
+        )
+        self.store.record_dispatch(b_id, "tp_alpha", ["om_test_bg_1"])
+        tp_alpha = write_transcript(
+            Path(self.tmp.name) / "alpha_bg_hang.jsonl",
+            [
+                {
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": sent_dt.isoformat(timespec="seconds"),
+                    "content": f"[sheepdog] 新信号批次 `{b_id}`（topic `tp_alpha`，共 1 条）",
+                },
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": (sent_dt + timedelta(seconds=10)).isoformat(timespec="seconds"),
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "gcloud sql instances patch test"}}],
+                },
+                {
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "created_at": (sent_dt + timedelta(seconds=15)).isoformat(timespec="seconds"),
+                    "content": "Tool is running as a background task with task id: cid/task-685",
+                },
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": (ref_now - timedelta(seconds=95)).isoformat(timespec="seconds"),
+                    "content": "等待后台命令完成",
+                    "tool_calls": [],
+                },
+            ],
+        )
+        with mock.patch.object(self.d, "_record_file", side_effect=lambda t: tp_alpha if t["topic_id"] == "tp_alpha" else None):
+            handled_r1 = self.d._check_stopped_in_flight(
+                self.store.get_topic("tp_alpha"), b_id, sent_dt, ref_now, True
+            )
+            self.assertTrue(handled_r1)
+            self.assertIn("--quiet", self.sink.sent[-1][1])
+            self.assertEqual(self.store.get_topic("tp_alpha")["state"], "running")
+
+            # Round 2: 唤醒后会话再次跑出無 passed_at 的 PLANNER_RESPONSE DONE 并静默 65s -> 直接解锁为 active
+            r2_done_dt = ref_now + timedelta(seconds=20)
+            tp_alpha_r2 = write_transcript(
+                Path(self.tmp.name) / "alpha_bg_hang.jsonl",
+                [
+                    {
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "created_at": sent_dt.isoformat(timespec="seconds"),
+                        "content": f"[sheepdog] 新信号批次 `{b_id}`（topic `tp_alpha`，共 1 条）",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": r2_done_dt.isoformat(timespec="seconds"),
+                        "content": "再次停机未交回执",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            handled_r2 = self.d._check_stopped_in_flight(
+                self.store.get_topic("tp_alpha"), b_id, ref_now, r2_done_dt + timedelta(seconds=65), True
+            )
+            self.assertTrue(handled_r2)
+            t_after = self.store.get_topic("tp_alpha")
+            self.assertEqual(t_after["state"], "active")
+            self.assertIsNone(t_after["pending_batch_id"])
+
+        # 2. observe Probe 3b: 对已结束批次的历史 REG-057 全目录盲扫执行 self_heal -> 重置 rules_hash=NULL 且后续不再重复报警
+        brain_dir = Path(self.tmp.name) / "brain_reg075"
+        alpha_cid = self.store.get_topic("tp_alpha")["conversation_id"]
+        t_obs_path = brain_dir / alpha_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        t_obs_path.parent.mkdir(parents=True, exist_ok=True)
+        u_code = "/Users/" + "matthew/Code"
+        t_obs_path.write_text(
+            json.dumps(
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": (ref_now - timedelta(minutes=10)).isoformat(timespec="seconds"),
+                    "tool_calls": [
+                        {"name": "run_command", "args": {"CommandLine": f'find {u_code} -path "*/infra/china/README.md"'}}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.store.update_topic("tp_alpha", rules_hash="old_hash_123")
+        obs_no_heal = observe.run_observe(
+            self.cfg, now_dt=ref_now, since_minutes=65.0, antigravity_brain_dir=brain_dir,
+            check_processes=False, check_log=False, self_heal=False,
+        )
+        self.assertTrue(any("全目录盲扫代码风险（REG-057）" in w for w in obs_no_heal["warns"]))
+        obs_healed = observe.run_observe(
+            self.cfg, now_dt=ref_now, since_minutes=65.0, antigravity_brain_dir=brain_dir,
+            check_processes=False, check_log=False, self_heal=True,
+        )
+        self.assertFalse(any("全目录盲扫代码风险（REG-057）" in w for w in obs_healed["warns"]))
+        self.assertIn("tp_alpha:reg057_rules_reset", obs_healed["self_healed"])
+        self.assertIsNone(self.store.get_topic("tp_alpha")["rules_hash"])
+        obs_after = observe.run_observe(
+            self.cfg, now_dt=ref_now + timedelta(minutes=5), since_minutes=65.0, antigravity_brain_dir=brain_dir,
+            check_processes=False, check_log=False, self_heal=False,
+        )
+        self.assertFalse(any("全目录盲扫代码风险（REG-057）" in w for w in obs_after["warns"]))
+
+        # 3. _summarize_cli_lamb_log 与 _scan_lambs 自愈：末尾 Cloud Build JSON status=SUCCESS 时剥离中间 Traceback 并置顶 status/id
+        gke_fallback_log = (
+            "[model-manager-async-service] poll 12: build 274cc606-8966-477e-806a-b302e6b24c13 status=WORKING\n"
+            "[model-manager-async-service] poll 13: build 274cc606-8966-477e-806a-b302e6b24c13 status=SUCCESS\n"
+            "Traceback (most recent call last):\n"
+            '  File "/path/release_pilot.py", line 1193, in <module>\n'
+            "    main()\n"
+            "  File \"/path/release_pilot.py\", line 1187, in main\n"
+            "    res = execute_dag_lane(lane)\n"
+            "          ^^^^^^^^^^^^^^^^^^^^^^\n"
+            '  File "/path/release_pilot.py", line 1088, in execute_dag_lane\n'
+            '    raise RuntimeError("Layer 0 execution failed: Cannot find service [model-manager-async-service]")\n'
+            "RuntimeError: Layer 0 execution failed: Cannot find service [model-manager-async-service]\n"
+            "{\n"
+            '  "approval": {"state": "APPROVED"},\n'
+            '  "artifacts": {"images": ["asia-northeast1-docker.pkg.dev/pkg/img:v1"]},\n'
+            '  "buildTriggerId": "trig-1",\n'
+            '  "createTime": "2026-11-02T10:15:39Z",\n'
+            '  "finishTime": "2026-11-02T10:20:32Z",\n'
+            '  "id": "274cc606-8966-477e-806a-b302e6b24c13",\n'
+            '  "images": ["asia-northeast1-docker.pkg.dev/pkg/img:v1"],\n'
+            '  "logUrl": "https://console.cloud.google.com/cloud-build/builds/274cc606",\n'
+            '  "name": "projects/123/locations/asia-northeast1/builds/274cc606",\n'
+            '  "status": "SUCCESS"\n'
+            "}\n"
+        )
+        sum_gke, err_gke = _summarize_cli_lamb_log(gke_fallback_log)
+        self.assertFalse(err_gke)
+        self.assertNotIn("RuntimeError:", sum_gke)
+        self.assertNotIn("raise RuntimeError", sum_gke)
+        self.assertIn("JSON(status=SUCCESS, id=274cc606-8966-477e-806a-b302e6b24c13", sum_gke)
+
+        lamb_log_file = Path(self.tmp.name) / "lamb_cceae3dc.log"
+        lamb_log_file.write_text(gke_fallback_log, encoding="utf-8")
+        self.store.create_lamb(
+            "lamb_cceae3dc", "tp_alpha", kind="cli", task_title="发布 model-manager-async-service",
+            state="done", log_path=str(lamb_log_file),
+            result_summary='raise RuntimeError("Layer 0")\nRuntimeError: Layer 0\nJSON(approval={2 keys}, id=274cc606)',
+        )
+        self.d._scan_lambs()
+        healed_lamb = self.store.get_lamb("lamb_cceae3dc")
+        self.assertNotIn("RuntimeError:", healed_lamb["result_summary"])
+        self.assertIn("JSON(status=SUCCESS, id=274cc606-8966-477e-806a-b302e6b24c13", healed_lamb["result_summary"])
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -553,6 +725,7 @@ class SecurityCliTest(GateTest):
     test_hold_forward_requires_verified_quote = None
     test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter = None
     test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise = None
+    test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary = None
 
 
 if __name__ == "__main__":

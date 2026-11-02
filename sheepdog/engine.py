@@ -2746,9 +2746,75 @@ class Dispatcher:
             return None
         return at
 
+    def _transcript_planner_idle_at(
+        self, t, batch: str, sent: datetime | None, *, require_bg_task: bool = True
+    ) -> tuple[datetime | None, bool]:
+        """7.107（REG-075）：检查会话记录末尾是否在当前批次送出后停在已完成且无工具调用的 PLANNER_RESPONSE DONE。
+        返回 (stopped_at, has_bg_task)。当 require_bg_task=True（首轮因后台命令挂起导致 fullyIdle=false 未写 passed_at）时，
+        要求批次送出后存在 RUNNING 的 GENERIC 后台任务步骤；当 require_bg_task=False（已 auto_resumed 后再次停机）时直接返回末尾时间。"""
+        path = self._record_file(t)
+        if path is None or not path.is_file():
+            return None, False
+        try:
+            with path.open("rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                start = max(0, size - 256 * 1024)
+                f.seek(start)
+                data = f.read(size - start)
+        except OSError:
+            return None, False
+        lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        if start > 0 and lines:
+            lines = lines[1:]
+        steps: list[dict] = []
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+                if isinstance(obj, dict):
+                    steps.append(obj)
+            except ValueError:
+                continue
+        if not steps:
+            return None, False
+        last = steps[-1]
+        if (
+            last.get("type") != "PLANNER_RESPONSE"
+            or str(last.get("status") or "").upper() != "DONE"
+            or bool(last.get("tool_calls"))
+        ):
+            return None, False
+        at = _parse(str(last.get("created_at") or "")) or self._record_mtime(t)
+        if at is None or (sent is not None and at < sent):
+            return None, False
+        batch_idx = None
+        if batch:
+            needle = f"`{batch}`"
+            for i in range(len(steps) - 1, -1, -1):
+                s = steps[i]
+                if s.get("type") in ("SYSTEM_MESSAGE", "USER_INPUT") and needle in str(s.get("content") or ""):
+                    batch_idx = i
+                    break
+        post_steps = steps[batch_idx + 1:] if batch_idx is not None else [
+            s for s in steps
+            if sent is None or ((st_dt := _parse(str(s.get("created_at") or ""))) is not None and st_dt >= sent)
+        ]
+        if not post_steps:
+            return None, False
+        has_bg = any(
+            s.get("type") == "GENERIC"
+            and (
+                str(s.get("status") or "").upper() == "RUNNING"
+                or "Tool is running as a background task" in str(s.get("content") or "")
+            )
+            for s in post_steps
+        )
+        if require_bg_task and not has_bg:
+            return None, False
+        return at, has_bg
+
     def _check_stopped_in_flight(self, t, batch: str, sent: datetime | None, now: datetime, adopted: bool) -> bool:
-        """7.64：会话在途因宿主退出/重登或 Stop hook 放行停机、且无活跃羔羊时：
-        静止满 60 秒自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
+        """7.64 / 7.107（REG-075）：会话在途因宿主退出/重登、Stop hook 放行停机或后台交互命令挂起（fullyIdle=false）停机、且无活跃羔羊时：
+        静止满阈值自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
         if self.topic_host(t) != ANTIGRAVITY:
             return False
         if self.store.get_active_lambs(t["topic_id"]):
@@ -2757,18 +2823,28 @@ class Dispatcher:
         tid = t["topic_id"]
         sp = hook.count_path(self.cfg, tid)
         st = hook._read_stop_state(sp, batch)
-        if not st:
-            return False
-        stopped_at = None
-        if st.get("passed_at") or st.get("interrupted") is True:
-            stopped_at = _parse(str(st.get("passed_at") or st.get("last_blocked_at") or ""))
-        if stopped_at is None:
-            stopped_at = self._transcript_error_at(t, batch, sent)
-        if stopped_at is None or (now - stopped_at).total_seconds() < 60:
-            return False
         meta_key = f"auto_resumed:{batch}"
         already_resumed = bool(st.get("auto_resumed") or self.store.get_meta(meta_key))
         resumed_at = _parse(str(st.get("auto_resumed_at") or self.store.get_meta(meta_key) or ""))
+        stopped_at = None
+        min_idle = 60
+        has_bg_hang = False
+        if st.get("passed_at") or st.get("interrupted") is True:
+            stopped_at = _parse(str(st.get("passed_at") or st.get("last_blocked_at") or ""))
+        if stopped_at is None and st:
+            stopped_at = self._transcript_error_at(t, batch, sent)
+        if stopped_at is None:
+            if already_resumed:
+                stopped_at, has_bg_hang = self._transcript_planner_idle_at(
+                    t, batch, resumed_at or sent, require_bg_task=False
+                )
+            elif sent is not None and (now - sent).total_seconds() >= 180:
+                stopped_at, has_bg_hang = self._transcript_planner_idle_at(
+                    t, batch, sent, require_bg_task=True
+                )
+                min_idle = 90
+        if stopped_at is None or (now - stopped_at).total_seconds() < min_idle:
+            return False
         if already_resumed:
             if resumed_at is not None and stopped_at < resumed_at:
                 return False
@@ -2780,7 +2856,8 @@ class Dispatcher:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
             log.info("topic %s 批次 %s 自动续跑后再次停机满 60 秒未交回执，立即按超时解锁", tid, batch)
             return True
-        prompt = f"[sheepdog] 检测到刚才宿主重登/中断，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
+        bg_hint = "（检测到后台命令可能因等待交互输入挂起，请先用 manage_task kill 挂起任务并补加 --quiet）" if has_bg_hang else ""
+        prompt = f"[sheepdog] 检测到刚才宿主重登/中断{bg_hint}，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
         try:
             self._send(t, prompt, batch)
         except SinkError as e:
@@ -4464,7 +4541,13 @@ class Dispatcher:
             for lb in topic_lambs:
                 if lb["state"] == "done" and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
                     cur_sum = str(lb["result_summary"] or "").strip()
-                    if _GREP_MATCH_LINE_RE.search(cur_sum):
+                    if (
+                        _GREP_MATCH_LINE_RE.search(cur_sum)
+                        or (
+                            "JSON(" in cur_sum
+                            and any(p in cur_sum for p in ("Traceback", "RuntimeError:", "raise RuntimeError", "~~~~", "execute_dag_lane"))
+                        )
+                    ):
                         try:
                             lp = Path(lb["log_path"])
                             if lp.exists():
@@ -6161,7 +6244,8 @@ _GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", 
 
 
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
-    """7.101（REG-069）/ 7.106（REG-074）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，并过滤尾部 grep/rg 路径匹配行噪音（含带空格路径）。"""
+    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
+    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音及已恢复 JSON 前的中间 Traceback 行。"""
     if not raw_text:
         return "", False
     non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -6177,14 +6261,34 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             try:
                 obj = json.loads(cand)
                 if isinstance(obj, dict):
-                    if obj.get("ok") is False or obj.get("status") in ("failed", "error") or obj.get("error"):
+                    st_val = str(obj.get("status") or "").strip()
+                    if obj.get("ok") is False or st_val.lower() in ("failed", "error", "failure", "timeout", "cancelled") or obj.get("error"):
                         has_err = True
-                    prefix_lines = [
+                    elif obj.get("ok") is True or st_val.upper() in ("SUCCESS", "OK", "DONE", "HANDLED"):
+                        has_err = False
+                    raw_prefix = [
                         ln.strip() for ln in stripped[:idx].splitlines()
                         if ln.strip() and not re.match(r"^[}\],;:\s]+$", ln.strip())
-                    ][-2:] if idx != -1 else []
+                    ] if idx != -1 else []
+                    if not has_err:
+                        tb_idx = next((i for i, ln in enumerate(raw_prefix) if ln.startswith("Traceback")), None)
+                        if tb_idx is not None:
+                            raw_prefix = raw_prefix[:tb_idx]
+                        raw_prefix = [
+                            ln for ln in raw_prefix
+                            if not ln.startswith(("Traceback", 'File "', "raise "))
+                            and not re.match(r"^[~^]{2,}$", ln)
+                            and not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):", ln)
+                        ]
+                    prefix_lines = raw_prefix[-2:]
+                    priority_keys = (
+                        "ok", "status", "id", "build_id", "lane_id", "service", "target_runtime",
+                        "latestReadyRevisionName", "revisionName", "completed_layers", "url", "error",
+                    )
+                    ordered_keys = [k for k in priority_keys if k in obj] + [k for k in obj if k not in priority_keys]
                     compact_parts: list[str] = []
-                    for k, v in obj.items():
+                    for k in ordered_keys:
+                        v = obj[k]
                         if isinstance(v, (str, int, float, bool)) or v is None:
                             compact_parts.append(f"{k}={v}")
                         elif isinstance(v, list):
