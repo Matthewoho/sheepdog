@@ -849,24 +849,32 @@ def run_observe(
                 except (OSError, ValueError, KeyError) as e:
                     warn.append(f"读不了名册里的 VIP：{e}")
             if vips and "escalation_sources" in tabs and "escalations" in tabs and "sends" in tabs:
-                qs = ",".join("?" * len(vips))
+                from .prompts import vip_of
                 sends_cols = {r[1] for r in c.execute("PRAGMA table_info(sends)")}
                 floor_sql = "COALESCE(s.floor,'')" if "floor" in sends_cols else "''"
-                nofloor = c.execute(
+                nofloor_rows = c.execute(
                     f"""
-                    SELECT DISTINCT e.message_id, e.topic_id, e.asked_at, m.sender_id
+                    SELECT e.message_id AS ask_mid, e.topic_id AS ask_topic, e.asked_at, m.*
                     FROM escalations e
                     JOIN escalation_sources es ON es.ask_message_id = e.message_id
                     JOIN messages m ON m.message_id = es.about_message_id
                     LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'
-                    WHERE e.asked_at >= ? AND m.sender_id IN ({qs}) AND {floor_sql} = ''
+                    WHERE e.asked_at >= ? AND {floor_sql} = ''
                     """,
-                    (since, *vips),
+                    (since,),
                 ).fetchall()
-                for r in nofloor:
+                seen_nofloor: set[tuple[str, str]] = set()
+                for r in nofloor_rows:
+                    vname = vip_of(r, vips)
+                    if not vname:
+                        continue
+                    nf_key = (r["ask_mid"], vname)
+                    if nf_key in seen_nofloor:
+                        continue
+                    seen_nofloor.add(nf_key)
                     warn.append(
-                        f"VIP（{vips.get(r['sender_id'])}）的请求又去找你批了，没写碰到哪条底线："
-                        f"{r['topic_id']} {r['asked_at'][11:16]}（7.61 回归？）"
+                        f"VIP（{vname}）的请求又去找你批了，没写碰到哪条底线："
+                        f"{r['ask_topic']} {r['asked_at'][11:16]}（7.61 回归？）"
                     )
 
             # 7.63: 代回卡片与 CLI 羔羊不变量

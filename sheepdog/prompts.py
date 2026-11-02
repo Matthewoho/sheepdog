@@ -184,14 +184,17 @@ def is_group_directed_to_others(row_or_msg, self_open_id: str = "", bot_ids=()) 
 
 
 def vip_of(row, vips: dict | None) -> str:
-    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100 / 7.101 / 7.103）：是就返回盖章用的名字，不是返回空串。
+    """这条消息是不是 VIP 本人发的（7.61 / 7.95 / 7.100 / 7.101 / 7.103 / 7.104）：是就返回盖章用的名字，不是返回空串。
     不算 VIP 的：系统消息、机器人 / Agent 发的（含个人账号代发的 ✦ / Codex / AI 助理消息）、主人本人的、群内明确只 @ 其他人且未 forward 的。"""
     if not vips or row is None:
         return ""
-    tags = json.loads(row["tags_json"] or "[]")
-    content = (row["content"] if "content" in row.keys() else "") or ""
-    if row["chat_type"] == SYSTEM_CHAT:
-        if row["reason"] == "duty_mail":
+    keys = row.keys() if hasattr(row, "keys") else ()
+    tags = json.loads((row["tags_json"] if "tags_json" in keys else "") or "[]")
+    content = (row["content"] if "content" in keys else "") or ""
+    chat_type = (row["chat_type"] if "chat_type" in keys else "") or ""
+    reason = (row["reason"] if "reason" in keys else "") or ""
+    if chat_type == SYSTEM_CHAT:
+        if reason == "duty_mail":
             unquoted = "\n".join(ln[2:] if ln.startswith("> ") else ln for ln in content.splitlines())
             if is_agent_proxy_content(content) or is_agent_proxy_content(unquoted):
                 return ""
@@ -201,14 +204,16 @@ def vip_of(row, vips: dict | None) -> str:
                     if len(parts) >= 2 and parts[1] in vips:
                         return vips[parts[1]] or parts[1]
         return ""
-    sid = (row["sender_id"] or "").strip()
-    if not sid or sid not in vips or (row["sender_type"] or "") in _BOT_SENDER_TYPES or row["reason"] in _OWNER_REASONS:
+    sid = ((row["sender_id"] if "sender_id" in keys else "") or "").strip()
+    sender_type = (row["sender_type"] if "sender_type" in keys else "") or ""
+    if not sid or sid not in vips or sender_type in _BOT_SENDER_TYPES or reason in _OWNER_REASONS:
         return ""
     if "agent_sender" in tags or is_agent_proxy_content(content) or any(t in tags for t in _OWNER_TAGS):
         return ""
     if is_group_directed_to_others(row):
         return ""
-    return vips[sid] or (row["sender_name"] or "").strip() or sid
+    sender_name = ((row["sender_name"] if "sender_name" in keys else "") or "").strip()
+    return vips[sid] or sender_name or sid
 
 
 def vip_rules(pb: Playbook, names: list[str], session_title: str, topic_id: str) -> str:

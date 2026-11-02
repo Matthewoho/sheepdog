@@ -417,7 +417,10 @@ _POLITE_ACK_RE = re.compile(r"^\s*(?:【[^】]*】\s*)?(?:已?收到|知悉|已�
 _BUS_ASK_ACT_RE = re.compile(r"请转交|forward|new-session|\?|？", re.I)
 _PEER_CLOSE_ACK_RE = re.compile(r"(?:感谢|多谢|谢谢|辛苦|已闭环|全链路.*办结|无需再回)", re.I)
 _PEER_SUBSTANTIVE_RE = re.compile(r"正在|已启动|已向|已在|已代回|已通知|已将|已拉起|已锁定|已同步|请|待|需要|若.*会|如果.*会|1\.|2\.|\n", re.I)
-_REDUNDANT_FORWARD_TELL_RE = re.compile(r"^\s*已(?:调用|用|通过|执行)?\s*(?:sheepdog\s+)?forward\b.*转交", re.I)
+_REDUNDANT_FORWARD_TELL_RE = re.compile(
+    r"(?:\bforward\b|已(?:调用|用|通过|执行|将)?[^\n，。；]{0,25}转交)",
+    re.I,
+)
 _FYI_ONLY_TELL_RE = re.compile(
     r"无需回复|不用回复|勿回|保持静默|严格静默|仅同步背景|背景同步|仅作背景|仅供参考|备查",
     re.I,

@@ -185,7 +185,7 @@ def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", supers
                 sids = [sid for sid in [me, *(list(eff_vips) if not has_floor else [])] if sid]
                 ph = ",".join("?" * len(sids))
                 where_sender = f"(sender_id IN ({ph}) OR tags_json LIKE '%owner_verified%')" if sids else "tags_json LIKE '%owner_verified%'"
-                rows = store.conn.execute(f"SELECT message_id, create_time, content, sender_id, sender_name, sender_type, chat_type, reason, tags_json, reply_to, note FROM messages WHERE {where_sender} ORDER BY create_time DESC LIMIT 120", (*sids,)).fetchall()
+                rows = store.conn.execute(f"SELECT message_id, create_time, content, sender_id, sender_name, sender_type, chat_type, reason, tags_json, mentions_json, reply_to, note FROM messages WHERE {where_sender} ORDER BY create_time DESC LIMIT 120", (*sids,)).fetchall()
                 ok = any(_auth_ok(r) and (q == r["message_id"] or q in (r["content"] or "") or q in plain_text(r["content"] or "")) for r in rows)
             if not ok: raise _outbound_err(f"resolve --quote 验真失败：账本中未找到主人{'' if has_floor else '或已授权 VIP '}在 {e['asked_at']} 之后发送（或同钥匙前序批复且有后置佐证）的匹配消息（{q}）")
         if sup_id and ((sup := store.get_escalation(sup_id) or store.send_by_message(sup_id)) is None or sup["message_id"] == e["message_id"]):

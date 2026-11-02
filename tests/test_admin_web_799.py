@@ -5,6 +5,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -46,6 +47,11 @@ class TestAdminWeb799(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_reg_067_end_to_end_workbench_observability_and_actions(self) -> None:
+        t0 = (datetime.now().astimezone() - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+
+        def ts(offset_sec: int) -> str:
+            return (t0 + timedelta(seconds=offset_sec)).isoformat(timespec="seconds")
+
         st = Store(self.db_path)
         try:
             # 1. 创建三级会话结构：Session Group (laohu) -> Session (tp_laohu) -> Subagent (lamb_sub1)
@@ -69,13 +75,13 @@ class TestAdminWeb799(unittest.TestCase):
             p_stop = count_path(self.cfg, "tp_laohu")
             p_stop.parent.mkdir(parents=True, exist_ok=True)
             p_stop.write_text(
-                json.dumps({"batch": "b_spec_1", "count": 2, "last_blocked_at": "2026-11-01T06:10:00+08:00"}),
+                json.dumps({"batch": "b_spec_1", "count": 2, "last_blocked_at": ts(600)}),
                 encoding="utf-8",
             )
             log_call(
                 self.state_dir,
                 {
-                    "at": "2026-11-01T06:10:00+08:00",
+                    "at": ts(600),
                     "conversation_id": "cid-laohu-1",
                     "managed": True,
                     "topic": "tp_laohu",
@@ -98,13 +104,13 @@ class TestAdminWeb799(unittest.TestCase):
                 sender_type="user",
                 content="请帮忙看一下灰度配置",
                 msg_type="text",
-                create_time="2026-11-01T06:00:00+08:00",
+                create_time=ts(0),
             )
             st.upsert_message(msg, "dispatch", "at_me", ["forwarded_from:b_bus_1"], "tp_laohu")
             with st.tx() as c:
                 c.execute(
                     "UPDATE messages SET first_seen=?, dispatch_state='acked', batch_id='b_spec_1' WHERE message_id='om_test_msg_1'",
-                    ("2026-11-01T06:00:02+08:00",),
+                    (ts(2),),
                 )
                 c.execute(
                     "INSERT INTO acks(message_id,chat_id,chat_type,sender_id,reason,identity,reaction_id,added_at,removed_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -116,34 +122,34 @@ class TestAdminWeb799(unittest.TestCase):
                         "at_me",
                         "user",
                         "r_1",
-                        "2026-11-01T06:00:03+08:00",
-                        "2026-11-01T06:01:10+08:00",
+                        ts(3),
+                        ts(70),
                     ),
                 )
                 # 先插入未带 acked_at 的历史批次，测试 backfill_dispatch_acked_at 从 duty_history 回填
                 c.execute(
                     "INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state,receipt,acked_at) VALUES(?,?,?,?,?,?,NULL)",
-                    ("b_bus_1", "tp_bus", '["om_test_msg_1"]', "2026-11-01T06:00:04+08:00", "acked", "[handled] 已转交 tp_laohu"),
+                    ("b_bus_1", "tp_bus", '["om_test_msg_1"]', ts(4), "acked", "[handled] 已转交 tp_laohu"),
                 )
                 c.execute(
                     "INSERT INTO duty_history(topic_id,kind,text,at) VALUES(?,?,?,?)",
-                    ("tp_bus", "receipt", "b_bus_1 handled：已转交 tp_laohu", "2026-11-01T06:00:08+08:00"),
+                    ("tp_bus", "receipt", "b_bus_1 handled：已转交 tp_laohu", ts(8)),
                 )
                 c.execute(
                     "INSERT INTO dispatches(batch_id,topic_id,message_ids,sent_at,state) VALUES(?,?,?,?,?)",
-                    ("b_spec_1", "tp_laohu", '["om_test_msg_1"]', "2026-11-01T06:00:10+08:00", "sent"),
+                    ("b_spec_1", "tp_laohu", '["om_test_msg_1"]', ts(10), "sent"),
                 )
                 c.execute(
                     "INSERT INTO sends(idem_key,kind,topic_id,message_id,target_message_id,text,sent_at) VALUES(?,?,?,?,?,?,?)",
-                    ("idem_1", "reply", "tp_laohu", "om_reply_1", "om_test_msg_1", "灰度配置已核查正常", "2026-11-01T06:01:05+08:00"),
+                    ("idem_1", "reply", "tp_laohu", "om_reply_1", "om_test_msg_1", "灰度配置已核查正常", ts(65)),
                 )
 
             # finish_dispatch 必须写入 acked_at
-            st.finish_dispatch("b_spec_1", "acked", receipt="[handled] 核查完成", acked_at="2026-11-01T06:01:08+08:00")
+            st.finish_dispatch("b_spec_1", "acked", receipt="[handled] 核查完成", acked_at=ts(68))
             backfilled = st.backfill_dispatch_acked_at()
             self.assertEqual(backfilled, 1)
             d_bus = st.get_dispatch("b_bus_1")
-            self.assertEqual(d_bus["acked_at"], "2026-11-01T06:00:08+08:00")
+            self.assertEqual(d_bus["acked_at"], ts(8))
 
             # 3. 构造三层决策数据：3 条连续采纳（触发自治晋升推荐）+ 1 条人类改判（进错题本）
             for i in range(1, 4):
@@ -160,7 +166,7 @@ class TestAdminWeb799(unittest.TestCase):
                         sender_type="user",
                         content="[卡片回调] A：同意发布",
                         msg_type="text",
-                        create_time=f"2026-11-01T05:1{i}:30+08:00",
+                        create_time=ts(-3000 + i * 60 + 30),
                     ),
                     "dispatch",
                     "owner_reply",
@@ -175,10 +181,10 @@ class TestAdminWeb799(unittest.TestCase):
                             "tp_release",
                             "oc_dm",
                             f"需要你定：常规发布单 #{i}\nA: 同意发布 (Recommended)\nB: 暂缓\n建议选 A",
-                            f"2026-11-01T05:1{i}:00+08:00",
-                            f"2026-11-01T05:1{i}:30+08:00",
+                            ts(-3000 + i * 60),
+                            ts(-3000 + i * 60 + 30),
                             ans_id,
-                            f"2026-11-01T05:1{i}:30+08:00",
+                            ts(-3000 + i * 60 + 30),
                             "answered",
                         ),
                     )
@@ -194,7 +200,7 @@ class TestAdminWeb799(unittest.TestCase):
                     sender_type="user",
                     content="[卡片回调] 其他：已经过时间了 忽略吧",
                     msg_type="text",
-                    create_time="2026-11-01T06:22:59+08:00",
+                    create_time=ts(1379),
                 ),
                 "dispatch",
                 "owner_reply",
@@ -209,10 +215,10 @@ class TestAdminWeb799(unittest.TestCase):
                         "tp_kaifeng",
                         "oc_dm",
                         "需要你定：万圣节大促零点清理生产订阅缓存请示\nA: 批准执行\nB: 取消\n建议选 A",
-                        "2026-11-01T00:02:34+08:00",
-                        "2026-11-01T06:22:59+08:00",
+                        ts(-21446),
+                        ts(1379),
                         "om_ans_ovr_1",
-                        "2026-11-01T06:22:59+08:00",
+                        ts(1379),
                         "answered",
                     ),
                 )
@@ -269,7 +275,7 @@ class TestAdminWeb799(unittest.TestCase):
                             {
                                 "step_index": 10,
                                 "type": "SYSTEM_MESSAGE",
-                                "created_at": "2026-11-01T06:00:08+08:00",
+                                "created_at": ts(8),
                                 "content": "[sheepdog] 新信号批次 b-laohu-002 (topic tp_laohu)\n请核查 PR #384",
                             },
                             ensure_ascii=False,
@@ -278,7 +284,7 @@ class TestAdminWeb799(unittest.TestCase):
                             {
                                 "step_index": 11,
                                 "type": "PLANNER_RESPONSE",
-                                "created_at": "2026-11-01T06:00:12+08:00",
+                                "created_at": ts(12),
                                 "content": "",
                                 "tool_calls": [
                                     {"name": "invoke_subagent", "arguments": {"Role": "PR Code Reviewer"}}
@@ -290,7 +296,7 @@ class TestAdminWeb799(unittest.TestCase):
                             {
                                 "step_index": 12,
                                 "type": "PLANNER_RESPONSE",
-                                "created_at": "2026-11-01T06:00:58+08:00",
+                                "created_at": ts(58),
                                 "content": "",
                                 "tool_calls": [
                                     {
@@ -305,7 +311,7 @@ class TestAdminWeb799(unittest.TestCase):
                             {
                                 "step_index": 13,
                                 "type": "PLANNER_RESPONSE",
-                                "created_at": "2026-11-01T06:01:02+08:00",
+                                "created_at": ts(62),
                                 "content": "已完成核查并交回执。",
                                 "tool_calls": [],
                             },

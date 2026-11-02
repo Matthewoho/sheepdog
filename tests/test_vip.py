@@ -931,6 +931,135 @@ class VipBranch765Test(AskFloorTest):
         self.assertEqual((self.store.get_message("om_reg071_thr_other")["route"], self.store.get_message("om_reg071_thr_other")["topic_id"]), (INBOX, None))
         self.assertEqual((self.store.get_message("om_reg071_thr_normal")["route"], self.store.get_message("om_reg071_thr_normal")["reason"], self.store.get_message("om_reg071_thr_normal")["topic_id"]), (DISPATCH, "thread_owner", "tp_alpha"))
 
+    def test_reg_072_observe_vip_floor_ssot_and_redundant_forward_tell_guard(self):
+        """7.104（REG-072）：
+        1. observe.py 的 7.61/7.65 VIP 底线体检必须与 prompts.vip_of 同源（SSoT）：
+           - 同事个人账号 AI 助理代发（如 <font color='grey'>Sammi · Sammy 的 AI 助理</font> / agent_sender）或群内仅 @ 他人的消息，
+             不具有 👑 VIP 免问资格，会话对其调用 sheepdog ask（不带 --floor）时 observe 绝不误报 7.61 回归警告；
+           - 真正的 VIP 本人消息或 vip_relay 消息若无 --floor 被记入 escalations，observe 立即报红告警；
+        2. 会话已调用 sheepdog forward 将原消息 om_... 转交给目标会话后，若再紧跟发送包含该 om_... 且在首尾任意位置声明
+           '已将原消息 forward 给你 / 转交给你' 的冗余 sheepdog tell，duty.send_mail 必须当场拦截，防止目标会话被二次排队唤醒。
+        """
+        from datetime import datetime
+        from sheepdog import duty, observe
+        from sheepdog.models import Mention
+        from sheepdog.router import DISPATCH
+
+        now_dt = datetime(2026, 11, 2, 10, 15, 0, tzinfo=observe.TZ)
+        asked_iso = "2026-11-02T10:11:10+08:00"
+
+        # 1a. 同事个人账号 AI 助理消息（Sammi · Sammy 的 AI 助理）触发正常 ask（无 floor）-> observe 零误报
+        m_sammi_proxy = fx.message(
+            "om_reg072_sammi_proxy",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            sender_type="user",
+            content="Matthew，发版单 202611020002 需要发到生产环境。\n\n<font color='grey'>Sammi · Sammy 的 AI 助理</font>",
+        )
+        self.store.upsert_message(
+            m_sammi_proxy, DISPATCH, "p2p_default", ["agent_sender", f"forwarded_from:{BUS_TOPIC_ID}"], "tp_alpha"
+        )
+        self.store.add_escalation(
+            "om_reg072_ask_from_proxy",
+            "tp_alpha",
+            "oc_owner_dm",
+            "Sammy 的 AI 助理发来发版单 202611020002，请示是否放行？",
+            asked_iso,
+        )
+        self.store.add_escalation_sources(
+            "om_reg072_ask_from_proxy", "tp_alpha", [("om_reg072_sammi_proxy", "oc_p2p")], "about"
+        )
+        self.store.add_send("idem_reg072_proxy", "ask", "tp_alpha", "om_reg072_ask_from_proxy", "请示是否放行")
+
+        # 1b. 群内仅 @ 他人的 VIP 消息触发 ask（无 floor）-> observe 零误报
+        m_grp_other = fx.message(
+            "om_reg072_grp_other",
+            chat_id="oc_reg072_grp",
+            chat_name="研发群",
+            chat_type="group",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            content="@Dashell Zhou 请确认一下配置",
+            mentions=[Mention("ou_dashell", "Dashell Zhou")],
+        )
+        self.store.upsert_message(m_grp_other, DISPATCH, "keyword", [], "tp_beta")
+        self.store.add_escalation(
+            "om_reg072_ask_from_grp_other",
+            "tp_beta",
+            "oc_owner_dm",
+            "群内讨论请示",
+            asked_iso,
+        )
+        self.store.add_escalation_sources(
+            "om_reg072_ask_from_grp_other", "tp_beta", [("om_reg072_grp_other", "oc_reg072_grp")], "about"
+        )
+        self.store.add_send("idem_reg072_grp", "ask", "tp_beta", "om_reg072_ask_from_grp_other", "群内讨论请示")
+
+        roster_p = Path(self.tmp.name) / "roster.toml"
+        rep_clean = observe.run_observe(
+            self.cfg,
+            roster_path=roster_p,
+            state_path=Path(self.tmp.name) / "cursor_clean.json",
+            since_minutes=60,
+            now_dt=now_dt,
+            check_processes=False,
+            check_log=False,
+        )
+        vip_warns_clean = [w for w in rep_clean["warns"] if "7.61" in w or "又去找你批了" in w]
+        self.assertEqual(vip_warns_clean, [], f"Expected zero false-positive 7.61 warn, got: {vip_warns_clean}")
+
+        # 1c. 真正的 VIP 本人消息若绕过门禁无 floor 写入 escalations -> observe 必须报出 7.61 告警
+        m_real_vip = fx.message(
+            "om_reg072_real_vip",
+            sender_id=VIP,
+            sender_name=VIP_NAME,
+            sender_type="user",
+            content="请帮我把 tapnow-bff 切回上一版",
+        )
+        self.store.upsert_message(m_real_vip, DISPATCH, "p2p_default", [], "tp_beta")
+        self.store.add_escalation(
+            "om_reg072_ask_real_vip",
+            "tp_beta",
+            "oc_owner_dm",
+            "请求切回上一版",
+            asked_iso,
+        )
+        self.store.add_escalation_sources(
+            "om_reg072_ask_real_vip", "tp_beta", [("om_reg072_real_vip", "oc_p2p")], "about"
+        )
+        self.store.add_send("idem_reg072_real", "ask", "tp_beta", "om_reg072_ask_real_vip", "请求切回上一版")
+
+        rep_real = observe.run_observe(
+            self.cfg,
+            roster_path=roster_p,
+            state_path=Path(self.tmp.name) / "cursor_real.json",
+            since_minutes=60,
+            now_dt=now_dt,
+            check_processes=False,
+            check_log=False,
+        )
+        vip_warns_real = [w for w in rep_real["warns"] if "7.61" in w or "又去找你批了" in w]
+        self.assertEqual(len(vip_warns_real), 1, f"Expected 1 real VIP floor warn, got: {vip_warns_real}")
+        self.assertIn(VIP_NAME, vip_warns_real[0])
+
+        # 2. 已 forward 原消息后再发尾句包含 '已将原消息 forward 给你 / 转交' 的冗余 tell -> 必须被 duty.send_mail 拒绝
+        for redundant_body in (
+            "【发版单 202611020002 转交（来自原消息 om_reg072_sammi_proxy）】\n1. 审批单号：202611020002\n已将原消息 forward 给你，请接单推进！",
+            "原消息 om_reg072_sammi_proxy 详情如下，已调用转交给你处理。",
+        ):
+            with self.subTest(redundant_body=redundant_body[:25]):
+                with self.assertRaises(ValueError) as ctx:
+                    duty.send_mail(
+                        self.store,
+                        self.cfg,
+                        BUS_TOPIC_ID,
+                        "tp_alpha",
+                        redundant_body,
+                        key="rel-202611020002",
+                        vips={VIP: VIP_NAME},
+                    )
+                self.assertIn("已通过 forward 转交给", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -480,4 +480,11 @@
 | --- | --- | --- |
 | 7.103 | 多人大群内 VIP 明确只 `@` 其他同事/机器人（如 `@Dashell Zhou @Ethan Wen`、`@老胡 Lark cli`，未 `@` 主人/本机器人且未经 `forward`）或因通用关键词被 `tp_bus` 被动截获后，`tp_bus` 仅发背景备忘 `sheepdog tell` 却被 `duty._resolve_vip_mail_source` 自动盖上 `👑 VIP` 授权章，诱导专席调用 `sheepdog reply` 越俎代庖在群内抢答并锁死 `group_threads`；或同事个人账号代发的 AI 助理（`[✦ 老胡的AI助理]`）在群内发言命中关键词 / `thread_owner` 唤醒专席并被专席直接 `reply` 引发跨 Agent 多轮群聊乒乓（REG-071） | `test_vip.VipBranch765Test.test_reg_071_group_unaddressed_vip_tell_reply_guard_and_agent_proxy_thread_silence`（`tests/test_vip.py::VipBranch765Test::test_reg_071_group_unaddressed_vip_tell_reply_guard_and_agent_proxy_thread_silence`） |
 
+## 7.104 巡检 observe 7.61 VIP 底线告警与 prompts.vip_of 单一事实源对齐（消除同事 AI 助理消息正常请示误报）及 forward 后尾句冗余 tell 拦截（REG-072）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.104 | 同事个人账号代发的 AI 助理消息（如 `<font color='grey'>Sammi · Sammy 的 AI 助理</font>`，`tags_json: ["agent_sender"]`）不具备 `👑 VIP` 免问直接动生产资格，专席按规调用 `sheepdog ask` 向主人请示生产发布授权后，因 `observe.py` 的 7.61 检查绕过 `prompts.vip_of` 直接用裸 SQL `m.sender_id IN (...)` 匹配，将合规请示误报为『VIP（Sammy）的请求又去找你批了，没写碰到哪条底线（7.61 回归？）』骚扰主人；或联系人专席调用 `sheepdog forward` 将原消息 `om_...` 转交发版专席后，又发送标题为『【发版单 ... 转交（来自原消息 om_...）】』、尾句写『已将原消息 forward 给你，请接单推进！』的冗余 `sheepdog tell`，因 `_REDUNDANT_FORWARD_TELL_RE` 仅锚定句首而漏拦截，导致目标专席被二次排队唤醒（REG-072） | `test_vip.VipBranch765Test.test_reg_072_observe_vip_floor_ssot_and_redundant_forward_tell_guard`（`tests/test_vip.py::VipBranch765Test::test_reg_072_observe_vip_floor_ssot_and_redundant_forward_tell_guard`） |
+
+
 
