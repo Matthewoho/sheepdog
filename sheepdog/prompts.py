@@ -122,7 +122,12 @@ _AGENT_PROXY_CONTENT_RE = re.compile(
     r"|由[^\n]{1,24}的\s*(?:Codex|Claude|AI|工作|智能)?\s*助理|🐕\s*(?:汇报|需要你定)\s*·)"
     r"|(?:【|\[|\(|（)\s*[^】\]\)）\n]{0,32}?(?:(?:Codex|Claude|AI|工作|智能)\s*助理|助理\s*(?:代发|代回|代留言))[^】\]\)）\n]{0,24}?(?:】|\]|\)|）)"
     r"|(?:^|[\n\r>]|<font[^>]*>|——|--|—)\s*[^\n<>]{1,36}?的\s*(?:Codex|Claude|AI|工作|智能)\s*助理(?:\s*(?:代发|代回|代留言|（[^）\n]*）|\([^)\n]*\)))?\s*(?:</font>|<\/card>|\s)*$"
+    r"|(?:🐕\s*)?\bfrom\s+[^\n<>]{1,32}?(?:'s|’s)\s+(?:ai\s+|work\s+)?(?:agent|assistant|bot)\b"
     r"|\[🐕\s*Sheepdog\s+Reply\]|\n🐕SheepDog\s+v\d+\.", re.I)
+
+GROUP_DIRECTED_OTHER_LABEL = (
+    "🔇 [群内仅 @ 他人 · 仅作背景同步，勿代查他方代码/日志、勿插话代回]"
+)
 
 
 def is_agent_proxy_content(text: str) -> bool:
@@ -737,6 +742,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
     mentions = _mention_line(row["mentions_json"])
     if mentions:
         lines.append(mentions)
+        if is_group_directed_to_others(row) and not any(t.startswith("watch:") for t in tags):
+            lines.append(GROUP_DIRECTED_OTHER_LABEL)
     if quote:
         lines.append(quote)
     if vip:

@@ -2351,6 +2351,27 @@ def _lamb_prepare(cfg, store: Store, args) -> int:
     return 0
 
 
+_TRAILING_REDIRECT_RE = re.compile(
+    r"^(?P<body>.+?)\s*(?P<op>>>|>)\s*(?P<target>(?:\"[^\"]+\"|'[^']+'|[^\s>&|;]+))(?:\s*2>&1)?\s*$",
+    re.S,
+)
+
+
+def _normalize_lamb_spawn_cmd(cmd_str: str) -> str:
+    """7.109（REG-077）：当调用方在 `sheepdog lamb spawn --cmd` 末尾写 `> /tmp/xx.log 2>&1` 时，
+    自动改写为 `tee` 双写管道（保留 pipefail），既满足调用方读 `/tmp/xx.log` 的预期，又保证 `lamb_<id>.log` 不被截空。"""
+    s = (cmd_str or "").strip()
+    m = _TRAILING_REDIRECT_RE.match(s)
+    if not m:
+        return s
+    body = m.group("body").strip()
+    target = m.group("target").strip()
+    if not body or target in ("/dev/null", "&1", "&2"):
+        return s
+    tee_flag = "-a " if m.group("op") == ">>" else ""
+    return f"set -o pipefail; {{ {body}; }} 2>&1 | tee {tee_flag}{target}"
+
+
 def cmd_lamb(args) -> int:
     """sheepdog lamb（7.63 / 7.72）：母羊准备/登记/派生/收尾/列出/取消羔羊（Subagent 或后台 CLI 子进程）。"""
     cfg, store, sub_cmd = _load_cfg(), Store(_load_cfg().db_path), args.lamb_cmd
@@ -2368,10 +2389,11 @@ def cmd_lamb(args) -> int:
         print(f"已登记羔羊 {lid}（母羊 {tid}，[{args.kind}] {args.title}{cid_text}）")
         return 0
     if sub_cmd == "spawn":
-        tid, cmd_str = _topic_arg(args.topic), (args.command or "").strip()
-        if store.get_topic(tid) is None or not cmd_str:
+        tid, raw_cmd_str = _topic_arg(args.topic), (args.command or "").strip()
+        if store.get_topic(tid) is None or not raw_cmd_str:
             print(f"lamb spawn 被拒绝: {'母羊会话 ' + tid + ' 不存在' if store.get_topic(tid) is None else '--cmd 不能为空'}", file=sys.stderr)
             return 2
+        cmd_str = _normalize_lamb_spawn_cmd(raw_cmd_str)
         raw_lid = (args.lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
         lid = raw_lid if raw_lid.startswith("lamb_") else f"lamb_{raw_lid}"
         cfg.lambs_dir.mkdir(parents=True, exist_ok=True)
@@ -2379,7 +2401,7 @@ def cmd_lamb(args) -> int:
         env = {**os.environ, "SHEEPDOG_LAMB_ID": lid}
         try:
             with log_path.open("ab") as lf:
-                proc = subprocess.Popen(cmd_str, shell=True, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                proc = subprocess.Popen(["/bin/bash", "-lc", cmd_str], stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
             try:
                 proc.wait(timeout=0.1)
             except subprocess.TimeoutExpired:

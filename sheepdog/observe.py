@@ -171,7 +171,7 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
     return False
 
 
-_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?(?:[\s\"'\\,]+)-maxdepth(?:[\s\"'\\,]+)[0-3]\b)")
+_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?(?:[\s\"'\\,]+)-maxdepth(?:[\s\"'\\,]+)[0-4]\b)")
 
 
 def _strip_doc_prose_blocks(s: str) -> str:
@@ -786,11 +786,11 @@ def run_observe(
                                 if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
                                     bad_calls.append(f"run_command({cmd_str[:60]})")
                                 if _is_unbounded_code_search(raw_cmd):
-                                    if id(s) not in in_flight and healed_at_dt is not None and s_dt is not None and s_dt <= healed_at_dt:
+                                    if healed_at_dt is not None and s_dt is not None and s_dt <= healed_at_dt:
                                         continue
                                     unbounded_cmds.append(cmd_str[:80])
                     if unbounded_cmds:
-                        if self_heal and not in_flight:
+                        if self_heal:
                             try:
                                 with sqlite3.connect(db, timeout=5.0) as wc:
                                     wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (t_tid,))

@@ -119,6 +119,9 @@ def parse_security(data: dict) -> SecurityConfig:
             raise SecurityError(f"{where}: patterns 必须是非空字符串列表")
         compiled = []
         for p in pats:
+            if name == "privacy_exfiltration" and p.strip() == "私信":
+                # 7.109（REG-077）：裸「私信」会误伤群内正常协作进展（如「补充 SQL 已私信 Nicky」），收敛为索取/外泄私信记录语境
+                p = r"私信(记录|内容|历史|截图|原文)|((查|看|读|导出|发我|给我|翻|搜|调取).{0,10}私信)|((和|跟|与).{1,12}的私信)"
             try:
                 compiled.append(re.compile(p))
             except re.error as e:

@@ -4541,6 +4541,15 @@ class Dispatcher:
             for lb in topic_lambs:
                 if lb["state"] in ("done", "failed") and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
                     cur_sum = str(lb["result_summary"] or "").strip()
+                    if cur_sum in ("", "后台进程已退出") and lb["state"] == "done":
+                        fallback_done = f"已完成：{lb['task_title']}" if (lb["task_title"] or "").strip() else "后台进程已完成"
+                        try:
+                            lp = Path(lb["log_path"])
+                            new_sum = _summarize_cli_lamb_log(lp.read_text(encoding="utf-8", errors="replace"))[0] if lp.exists() else ""
+                        except OSError:
+                            new_sum = ""
+                        self.store.update_lamb(lb["lamb_id"], result_summary=new_sum or fallback_done)
+                        continue
                     if (
                         _GREP_MATCH_LINE_RE.search(cur_sum)
                         or (
@@ -4588,7 +4597,9 @@ class Dispatcher:
                             pass
                     tail_text, has_err = _summarize_cli_lamb_log(raw_log)
                     st = "failed" if has_err else "done"
-                    summary = tail_text or lb["result_summary"] or "后台进程已退出"
+                    fallback_done = f"已完成：{lb['task_title']}" if (lb["task_title"] or "").strip() else "后台进程已完成"
+                    prev_sum = lb["result_summary"] if (lb["result_summary"] and lb["result_summary"] != "后台进程已退出") else ""
+                    summary = tail_text or prev_sum or fallback_done
                     complete_lamb(self.store, lid, summary=summary, state=st)
                     log.info("CLI 羔羊 %s（母羊 %s，pid=%s）进程已退出，自动按 %s 收尾", lid, tid, lb["pid"], st)
                     continue

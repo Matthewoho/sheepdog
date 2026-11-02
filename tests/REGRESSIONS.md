@@ -510,3 +510,10 @@
 | --- | --- | --- |
 | 7.108 | 主人在卡片回调点 `[其他]` 填入测试凭据（`wsurl:... key:... secret:...`）或回复『你直接配吧』『听他的』本来是采纳放行，却因 `classify_escalation` 在 `ans_clean` 前拼了 `"[其他] "` 且 `_ACCEPT_WORDS_RE` 带 `^` 与中文 `\b` 导致 100% 误判为 `overridden`；或专席未先向 `tp_3x-ui-ops` 核实空余席位就发 `ask` 申请 CC 专线/家宽节点、未标明『明确是测试/生产环境』就发 `ask` 索要 LiveKit/子成员账号逼主人反问；或 `:8788` 识别出连续 $\ge 3$ 次采纳（0 改判）的免问自治候选与新产生的人类改判只做静态展示、未接入 `observe --self-heal` 自动晋升与重置 `rules_hash`；或 `T0->T5` 步进追踪把 `T5 · 回复卡片送达 Lark` 的增量耗时算成 `diff_ms(t0, t5)`（端到端累计 `+1.5m`）且 `parse_transcript_steps` 把 `PLANNER_RESPONSE -> GENERIC` 之间的模型推理耗时全算在 `read_file` / `sheepdog reply` 工具头上；或 CLI 羔羊末尾输出 `=== VERIFICATION PASSED ===` 但因前置幂等检查含 `STDERR: ERROR: ... NOT_FOUND` 误判为 `failed`（REG-076） | `test_security.GateTest.test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard`（`tests/test_security.py::GateTest::test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard`） |
 
+## 7.109 同事英文 Agent 落款（`🐕 from X's agent`）与群内仅 `@` 他人静默横幅、`privacy_exfiltration` 裸「私信」误伤修复、`find -maxdepth 4` 豁免与 `lamb spawn` 重定向双写自愈（REG-077）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.109 | 同事个人账号代发的英文落款卡片（如 `🐕 from Ben's agent`）漏标 `agent_sender`，且群消息明确只 `@` 其他同事（如 `@Kai Feng`）作为 `group` 背景投递进专席时缺少醒目静默横幅，诱导专席耗费 20 分钟代查他方代码；或安全规则 `privacy_exfiltration` 含裸词 `私信` 将群内正常协作进展『补充 SQL 已私信 Nicky』误判为 `hold` 拦截；或 `find ~/Code -maxdepth 4 -name "taskexec.go"` 浅层秒级查文件名被误判为 `REG-057` 全目录盲扫且在途会话不触发 `rules_hash` 自愈；或 `sheepdog lamb spawn --cmd "... > /tmp/xx.log 2>&1"` 将子进程输出全部重定向走导致 `lamb_<id>.log` 为 0 字节、收尾摘要退化为无意义的『后台进程已退出』（REG-077） | `test_security.GateTest.test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee`（`tests/test_security.py::GateTest::test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee`） |
+
+
