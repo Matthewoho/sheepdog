@@ -599,6 +599,58 @@ def recent_subagent_cids_since(host: str, path: Path | None, since_iso: str, par
     return list(found.items())
 
 
+_LAMB_TAG_RE = re.compile(r"\[lamb:[A-Za-z0-9_.-]+\]", re.I)
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+_MD_LIST_PREFIX_RE = re.compile(r"^(?:>\s*)*(?:[-*+]\s+|\d+[.)、]\s+)+")
+_SUBAGENT_GREETING_RE = re.compile(r"^母羊您好[，,：:\s]*")
+_SUBAGENT_LEADIN_SUFFIX_RE = re.compile(
+    r"[，,；;]?\s*(?:结论与证据如下|核心结论与证据如下|结论如下|汇总大盘如下|汇总如下|详情如下|具体如下)[：:]?\s*$"
+)
+
+
+def _summarize_subagent_return(raw_text: str, limit: int = 120) -> str:
+    """7.106（REG-074）：从子代理回传 Markdown 中提取实质结论摘要，剥离 [lamb:...] 路由标签、Markdown 标题与导语寒暄。"""
+    cleaned_raw = _LAMB_TAG_RE.sub("", raw_text or "").strip()
+    if not cleaned_raw:
+        return ""
+    headings: list[str] = []
+    body_lines: list[str] = []
+    in_code_block = False
+    for raw_ln in cleaned_raw.splitlines():
+        s = raw_ln.strip()
+        if s.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block or not s:
+            continue
+        if re.match(r"^[-*_]{3,}$", s) or (s.startswith("|") and s.endswith("|")):
+            continue
+        if (m_h := _MD_HEADING_RE.match(s)) is not None:
+            h_txt = m_h.group(1).replace("**", "").replace("__", "").strip()
+            if h_txt:
+                headings.append(h_txt)
+            continue
+        b = _MD_LIST_PREFIX_RE.sub("", s).replace("**", "").replace("__", "").strip()
+        b = _SUBAGENT_GREETING_RE.sub("", b).strip()
+        b = _SUBAGENT_LEADIN_SUFFIX_RE.sub("", b).strip()
+        if b:
+            body_lines.append(b)
+    if body_lines:
+        chosen = body_lines[0]
+        idx = 1
+        while idx < len(body_lines) and (
+            (len(chosen) <= 28 and chosen.endswith((":", "：")))
+            or (chosen.endswith((":", "：")) and len(chosen) < limit - 20)
+        ):
+            nxt = body_lines[idx]
+            chosen = f"{chosen}{nxt}" if chosen.endswith((" ", "：")) else f"{chosen} {nxt}"
+            idx += 1
+        return one_sentence(chosen, limit)
+    if headings:
+        return one_sentence(headings[0], limit)
+    return ""
+
+
 def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:
     """从 Antigravity SYSTEM_MESSAGE '[Message] ... sender=<cid> ... content=...' 行提取子代理回传通知。"""
     if d.get("type") != "SYSTEM_MESSAGE":
@@ -612,7 +664,7 @@ def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:
     return [
         SubagentReturn(
             conversation_id=m.group(2).strip(),
-            summary=one_sentence(m.group(3).strip(), 120) or "subagent returned",
+            summary=_summarize_subagent_return(m.group(3), 120) or "subagent returned",
             at=line_at or m.group(1).strip(),
         )
         for m in matches

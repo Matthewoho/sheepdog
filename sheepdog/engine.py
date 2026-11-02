@@ -4328,8 +4328,8 @@ class Dispatcher:
     def _bind_subagent_cids(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
         for cid in subagent_created_cids_in(host, d):
             existing_by_cid = self.store.find_lamb_by_cid(cid)
-            if existing_by_cid is not None and existing_by_cid["state"] == "running":
-                if existing_by_cid["parent_topic_id"] == tid:
+            if existing_by_cid is not None:
+                if existing_by_cid["state"] == "running" and existing_by_cid["parent_topic_id"] == tid:
                     dup_empty = next((lb for lb in self.store.get_active_lambs(tid)
                                       if lb["lamb_id"] != existing_by_cid["lamb_id"]
                                       and lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None)
@@ -4367,10 +4367,18 @@ class Dispatcher:
     def _handle_lamb_line(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
         new_lids_in_line: set[str] = set()
         for inv in subagent_invocations_in(host, d, off):
-            if inv.conversation_id and (ex := self.store.find_lamb_by_cid(inv.conversation_id)) is not None and ex["state"] == "running":
+            raw_id = (inv.lamb_id or "").strip()
+            if raw_id.startswith("lamb_") and (ex_id := self.store.get_lamb(raw_id)) is not None:
+                if ex_id["state"] == "running":
+                    new_lids_in_line.add(raw_id)
+                    if inv.conversation_id and not ex_id["conversation_id"]:
+                        self.store.update_lamb(raw_id, conversation_id=inv.conversation_id, last_act_at=inv.at or now_iso())
+                continue
+            if inv.conversation_id and (ex := self.store.find_lamb_by_cid(inv.conversation_id)) is not None:
+                if ex["state"] == "running":
+                    new_lids_in_line.add(ex["lamb_id"])
                 continue
             active = [lb for lb in self.store.get_active_lambs(tid) if lb["lamb_id"] not in new_lids_in_line]
-            raw_id = (inv.lamb_id or "").strip()
             matched = (next((lb for lb in active if raw_id and lb["lamb_id"] == raw_id), None)
                        or next((lb for lb in active if lb["task_title"] == inv.task_title and (not (lb["conversation_id"] or "").strip() or lb["conversation_id"] == inv.conversation_id)), None)
                        or next((lb for lb in active if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None))
@@ -4394,8 +4402,17 @@ class Dispatcher:
                     if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip():
                         complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错", state="failed", report_msg_id="subagent_spawn_error")
         for ret in subagent_returns_in(host, d):
-            cands = ([lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id]
-                     or [lb for lb in self.store.list_lambs(tid, include_finished=True) if lb["state"] == "timeout" and (lb["conversation_id"] or "").strip() == ret.conversation_id])
+            cands = (
+                [lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id]
+                or [
+                    lb for lb in self.store.list_lambs(tid, include_finished=True)
+                    if (lb["conversation_id"] or "").strip() == ret.conversation_id
+                    and (
+                        lb["state"] == "timeout"
+                        or (lb["state"] == "done" and str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# ")))
+                    )
+                ]
+            )
             for matched in cands:
                 lid = matched["lamb_id"]
                 complete_lamb(self.store, lid, summary=ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成", state="done", report_msg_id="native_system_message")
@@ -4411,7 +4428,7 @@ class Dispatcher:
                 log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lb["lamb_id"], cid)
 
     def _scan_lambs(self) -> list[str]:
-        """7.63：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案。"""
+        """7.63 / 7.106：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案，并自愈存量占位/grep 摘要。"""
         from . import guard as _g
         if b"pre-tool hook" not in _g._NEEDLES[LAMB_DISCOVERY]:
             _g._NEEDLES[LAMB_DISCOVERY] = (*_g._NEEDLES[LAMB_DISCOVERY], b"pre-tool hook", b"Encountered error", b'"ERROR"')
@@ -4423,6 +4440,39 @@ class Dispatcher:
             tid, host = t["topic_id"], self.topic_host(t)
             self._follow(t, LAMB_DISCOVERY, lambda off, d, tid=tid, host=host: self._handle_lamb_line(tid, host, off, d, discovered),
                          backfill=LAST_ACTIVITY_TAIL)
+            topic_lambs = self.store.list_lambs(tid, include_finished=True)
+            need_sub_heal = [
+                lb for lb in topic_lambs
+                if lb["state"] == "done"
+                and lb["kind"] in ("subagent", "native_subagent")
+                and (lb["conversation_id"] or "").strip()
+                and str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
+            ]
+            if need_sub_heal and (tp_file := self._record_file(t)) is not None and tp_file.exists():
+                scan_jsonl(
+                    tp_file, 0, LAMB_DISCOVERY,
+                    lambda off, d, tid=tid, host=host: self._handle_lamb_line(tid, host, off, d, discovered)
+                    if d.get("type") == "SYSTEM_MESSAGE" else None,
+                )
+                for lb in need_sub_heal:
+                    after_lb = self.store.get_lamb(lb["lamb_id"])
+                    if after_lb and str(after_lb["result_summary"] or "").strip().startswith(("[lamb:", "# ")):
+                        fallback_sum = str(after_lb["result_summary"] or "").strip().lstrip("#").strip()
+                        if fallback_sum.startswith("[lamb:"):
+                            fallback_sum = after_lb["task_title"] or f"羔羊 {lb['lamb_id']} 已完成"
+                        self.store.update_lamb(lb["lamb_id"], result_summary=fallback_sum)
+            for lb in topic_lambs:
+                if lb["state"] == "done" and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
+                    cur_sum = str(lb["result_summary"] or "").strip()
+                    if _GREP_MATCH_LINE_RE.search(cur_sum):
+                        try:
+                            lp = Path(lb["log_path"])
+                            if lp.exists():
+                                new_sum, _ = _summarize_cli_lamb_log(lp.read_text(encoding="utf-8", errors="replace"))
+                                if new_sum and new_sum != cur_sum:
+                                    self.store.update_lamb(lb["lamb_id"], result_summary=new_sum)
+                        except OSError:
+                            pass
         return discovered
 
     discover_lambs_from_transcript = _scan_lambs
@@ -6107,8 +6157,11 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
     return lid
 
 
+_GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", re.M)
+
+
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
-    """7.101（REG-069）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，杜绝格式化多行 JSON 尾行退化为 '}\\n}\\n}\\n]\\n}'。"""
+    """7.101（REG-069）/ 7.106（REG-074）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，并过滤尾部 grep/rg 路径匹配行噪音（含带空格路径）。"""
     if not raw_text:
         return "", False
     non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -6143,6 +6196,13 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             except Exception:
                 pass
     meaningful = [ln for ln in non_empty if not re.match(r"^[}\],;:\s]+$", ln)]
+    if not has_err:
+        non_grep = [
+            ln for ln in meaningful
+            if not _GREP_MATCH_LINE_RE.match(ln)
+        ]
+        if non_grep:
+            meaningful = non_grep
     tail_lines = (meaningful or non_empty)[-5:]
     return "\n".join(tail_lines), has_err
 

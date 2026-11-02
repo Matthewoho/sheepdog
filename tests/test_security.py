@@ -351,6 +351,101 @@ class GateTest(Base):
         )
         self.assertTrue(any("ERROR/Traceback" in w for w in res_warn["warns"]), res_warn["warns"])
 
+    def test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise(self):
+        """7.106（REG-074）：subagent_returns_in 自动剥离 [lamb:...] 路由标签、Markdown 标题与导语寒暄并自愈存量占位摘要；_summarize_cli_lamb_log 过滤尾部 grep 行噪音。"""
+        from sheepdog.guard import subagent_returns_in
+        from sheepdog.engine import _summarize_cli_lamb_log
+
+        # 1. 子代理回传以 [lamb:lamb_88b5b1a8] + Markdown 标题开头时，提取真正的一句话结论
+        cid1 = "86cb80c4-43fb-44f3-9048-f4115f2571fd"
+        sys_msg_1 = {
+            "type": "SYSTEM_MESSAGE",
+            "created_at": "2026-11-02T08:44:17Z",
+            "content": (
+                "<SYSTEM_MESSAGE>\n"
+                f"[Message] timestamp=2026-11-02T08:44:17Z sender={cid1} priority=MESSAGE_PRIORITY_HIGH content=[lamb:lamb_88b5b1a8]\n\n"
+                "# 生产环境东京业务服务端访问国内网络链路与带宽现状调研报告\n\n"
+                "## 一句话总览\n"
+                "**目前东京业务服务端访问国内没有单点物理带宽瓶颈，整体处于“大容量低利用率”状态：**\n"
+                "1. **链路双轨分流**：核心模型服务访问国内公网模型走骨干公网直出。\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }
+        rets1 = subagent_returns_in("antigravity", sys_msg_1)
+        self.assertEqual(len(rets1), 1)
+        self.assertNotIn("[lamb:", rets1[0].summary)
+        self.assertFalse(rets1[0].summary.startswith("#"))
+        self.assertIn("目前东京业务服务端访问国内没有单点物理带宽瓶颈", rets1[0].summary)
+
+        # 2. 子代理回传以 # 标题 + [lamb:...] + 短编号小节头（1. **核心直接因果链**：）开头时，自动拼接实质内容
+        cid2 = "c3cf7d96-6d04-40bd-addb-3361f5c08527"
+        sys_msg_2 = {
+            "type": "SYSTEM_MESSAGE",
+            "created_at": "2026-11-02T07:31:47Z",
+            "content": (
+                "<SYSTEM_MESSAGE>\n"
+                f"[Message] timestamp=2026-11-02T07:31:47Z sender={cid2} priority=MESSAGE_PRIORITY_HIGH content=# 任务 5f9b3a44 排查报告\n\n"
+                "[lamb:lamb_36aae5ec]\n\n"
+                "## 一、排查结论总览（Executive Summary）\n\n"
+                "1. **核心直接因果链**：\n"
+                "   - 任务在传入外部供应商时的 4 张参考图均为内部动态路由，gRPC 超时导致 400。\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }
+        rets2 = subagent_returns_in("antigravity", sys_msg_2)
+        self.assertEqual(len(rets2), 1)
+        self.assertIn("核心直接因果链：任务在传入外部供应商时的 4 张参考图均为内部动态路由", rets2[0].summary)
+
+        # 3. _handle_lamb_line 与 _scan_lambs 对存量已 done 但 result_summary 仍为 '[lamb:...]' 的子代理自动回填且重扫不产生克隆羊
+        self.store.create_lamb(
+            "lamb_88b5b1a8", "tp_alpha", kind="subagent", task_title="调研东京带宽",
+            conversation_id=cid1, state="done", result_summary="[lamb:lamb_88b5b1a8]",
+        )
+        inv_line = {
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-02T08:35:00Z",
+            "tool_calls": [{"name": "invoke_subagent", "args": {"Role": "调研东京带宽", "Prompt": "[lamb:lamb_88b5b1a8] 调研"}}],
+        }
+        gen_line = {
+            "type": "GENERIC",
+            "created_at": "2026-11-02T08:35:01Z",
+            "content": f'Created the following subagent:\n{{"conversationId": "{cid1}"}}',
+        }
+        self.d._handle_lamb_line("tp_alpha", "antigravity", 1, inv_line, [])
+        self.d._handle_lamb_line("tp_alpha", "antigravity", 2, gen_line, [])
+        self.d._handle_lamb_line("tp_alpha", "antigravity", 10, sys_msg_1, [])
+        all_alpha_lambs = self.store.list_lambs("tp_alpha", include_finished=True)
+        self.assertEqual(len(all_alpha_lambs), 1)
+        repaired = self.store.get_lamb("lamb_88b5b1a8")
+        self.assertIn("目前东京业务服务端访问国内没有单点物理带宽瓶颈", repaired["result_summary"])
+
+        # 验证游标已在文件末尾（offset == size）时调用 _scan_lambs() 仍可通过 scan_jsonl 自愈存量占位摘要
+        tp_alpha_file = write_transcript(Path(self.tmp.name) / "alpha_lamb.jsonl", [inv_line, gen_line, sys_msg_1])
+        self.store.update_lamb("lamb_88b5b1a8", result_summary="[lamb:lamb_88b5b1a8]")
+        alpha_cid = self.store.get_topic("tp_alpha")["conversation_id"]
+        self.store.set_cursor("tp_alpha", "lamb_discovery", alpha_cid, str(tp_alpha_file), tp_alpha_file.stat().st_size)
+        with mock.patch.object(self.d, "_record_file", side_effect=lambda t: tp_alpha_file if t["topic_id"] == "tp_alpha" else None):
+            self.d._scan_lambs()
+        repaired_by_scan = self.store.get_lamb("lamb_88b5b1a8")
+        self.assertIn("目前东京业务服务端访问国内没有单点物理带宽瓶颈", repaired_by_scan["result_summary"])
+
+        # 4. _summarize_cli_lamb_log 过滤尾部 rg/grep 归档检索行（含带空格路径），保留前面的实质执行与回读结论
+        cli_log = (
+            "=== 4. Apply RoleBinding qa-runtime-ben-admin in namespace qa-runtime ===\n"
+            "rolebinding.rbac.authorization.k8s.io/qa-runtime-ben-admin created\n"
+            "After -> can-i patch statefulsets -n qa-runtime: yes\n"
+            "After -> can-i patch statefulsets -n default (isolation check): no\n"
+            "=== 6. Lookup P2P chat_id in vault ===\n"
+            "/tmp/sheepdog_test_vault/50_People/Ben Zhang.md:76:- 无 active checkbox\n"
+            "/tmp/sheepdog_test_vault/90_Archive/communication_sources/2026-05-30/normalized/lark_events.jsonl:318:{\"text\": \"ok\"}\n"
+            "/tmp/sheepdog_test_vault/90_Archive/communication_sources/2026-05-30/normalized/lark_events.jsonl:337:{\"text\": \"test\"}\n"
+        )
+        summary_txt, has_err = _summarize_cli_lamb_log(cli_log)
+        self.assertFalse(has_err)
+        self.assertIn("After -> can-i patch statefulsets -n qa-runtime: yes", summary_txt)
+        self.assertNotIn("Ben Zhang.md:76:", summary_txt)
+        self.assertNotIn("lark_events.jsonl:318:", summary_txt)
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -457,6 +552,7 @@ class SecurityCliTest(GateTest):
     test_edit_re_evaluates = None
     test_hold_forward_requires_verified_quote = None
     test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter = None
+    test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise = None
 
 
 if __name__ == "__main__":

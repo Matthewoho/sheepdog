@@ -492,6 +492,13 @@
 | --- | --- | --- |
 | 7.105 | 主人在飞书私聊或群内 `@` 机器人下达指令（如 `om_test_owner_im`：『帮我看一下哪一个vps的ip段好一点』）后，总线调用 `sheepdog forward --quote "<主人在飞书上的原话>"` 转交或放行 `hold` 消息时，因 `cmd_forward` 仍停留在仅查总线 GUI `USER_INPUT` 的 `bus_quote_verifier`（且 `owner_quote_verifier` 漏认了群内 `@` 机器人的 `owner_instruction` 标签），被误拒报『这句话在总线里找不到主人的原文，请原样引用』；或本机短时 DNS/网络抖动触发 `SourceError: ... network/transport:` 后下一轮已自动从水位线恢复且最新 `dispatch` 正常，`sheepdog observe` 仍在滚动窗口内持续报 `ERROR/Traceback` 假告警（REG-073） | `test_security.GateTest.test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter`（`tests/test_security.py::GateTest::test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter`） |
 
+## 7.106 Subagent 羔羊回传 Markdown 摘要提纯（剥离 `[lamb:...]` 标签与标题导语并自愈存量占位摘要）及 CLI 羔羊日志尾部 grep 噪音过滤（REG-074）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.106 | 子代理（`subagent` 羔羊）按提示词要求在回传 `SYSTEM_MESSAGE` 开头附上 `[lamb:lamb_xxxxxxxx]` 标签并使用 `# ...报告` / `## 一句话总览` / `1. **核心直接因果链**：` 等结构化 Markdown 汇报时，因 `guard.subagent_returns_in` 直接调用按首行截断的 `one_sentence`，导致数据库、在岗表与 Web 控制台里的 `result_summary` 退化为无意义的 `"[lamb:lamb_xxxxxxxx]"` 或章节空标题；或 CLI 羔羊完成核心变更与回读后顺手执行 `rg`/`grep` 检索文档，因 `_summarize_cli_lamb_log` 无差别取最后 5 行导致 `result_summary` 被 `/path/to/archive.jsonl:318:...` 检索行淹没（REG-074） | `test_security.GateTest.test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise`（`tests/test_security.py::GateTest::test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise`） |
+
+
 
 
 
