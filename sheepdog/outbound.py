@@ -327,6 +327,54 @@ def check_vip_floor(cfg: Config, store: Store, topic_id: str, about: list[str] |
     return hits
 
 
+_CC_PROXY_ASK_RE = re.compile(
+    r"(?:申请|开通|分配|询问是否有多余).{0,18}(?:CC|Claude\s*Code|家宽节点|住宅\s*IP|防风控专线|专属网络|专线代理)",
+    re.I,
+)
+_CC_SEAT_EVIDENCE_RE = re.compile(
+    r"(?:3x-ui|tp_3x-ui-ops|lsg\d|空余席位|当前.{0,6}人数|使用人数|席位余量|已满)",
+    re.I,
+)
+_ENV_REQUIRED_TITLE_RE = re.compile(
+    r"(?:请提供|需要|申请).{0,16}(?:LiveKit.{0,8}凭据|子成员账号)",
+    re.I,
+)
+_EXPLICIT_ENV_DECL_RE = re.compile(
+    r"(?:明确是|100%是|仅用于|目标环境|所属环境)[：:\s]*(?:纯)?(?:测试|生产|Stage|预发|tap-testing-env|taplabs-453508|tpn-prod-506507)",
+    re.I,
+)
+
+
+def check_ask_pre_flight_guard(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    title: str,
+    body: str,
+    *,
+    floor: str = "",
+    floor_type: str | None = None,
+) -> None:
+    """7.108（REG-076）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
+    2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』，严禁逼主人反问『他是测试还是生产呀 / 哪个环境的子成员账号』。"""
+    if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
+        return
+    full_text = f"{title}\n{body}"
+    if _CC_PROXY_ASK_RE.search(full_text) and not _CC_SEAT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "申请开通 CC 专线 / 家宽节点 / 住宅 IP 前，必须先通过 `sheepdog tell --to tp_3x-ui-ops` 核实当前各线路使用人数与空余席位余量，"
+            "并在正文中写明各线路当前人数与空余席位实据后再发起 ask（REG-076 防打扰门禁，没有发送）",
+        )
+    if _ENV_REQUIRED_TITLE_RE.search(title) and not _EXPLICIT_ENV_DECL_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示 LiveKit 凭据或子成员账号时，必须在标题或正文中显式声明『明确是测试环境（tap-testing-env）』或『明确是生产环境（taplabs-453508）』"
+            "（或『目标环境：Stage/测试/生产』），严禁让主人反问『他是测试还是生产呀 / 哪个环境的子成员账号』（REG-076 防打扰门禁，没有发送）",
+        )
+
+
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str, key: str = "",
                   batch: str = "", about: list[str] | None = None, track: bool = False, floor: str = "",
                   vips: dict | None = None, summary: str = "", floor_type: str | None = None, options: str = "", ball: str = "", fyi: bool = False) -> SendResult:
@@ -348,7 +396,9 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         key = decision_hub.base_topic_id(topic_id).removeprefix("tp_") or topic_id
     nk = duty.norm_key(key) if key else ""
     raw_floor, floor = (floor if kind == ASK else ""), (_one_line(floor) if kind == ASK else "")
-    if kind == ASK: check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
+    if kind == ASK:
+        check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
+        check_ask_pre_flight_guard(cfg, store, topic_id, title, body, floor=raw_floor, floor_type=floor_type)
     else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, body, key=key, ball=ball, fyi=fyi)
     try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))

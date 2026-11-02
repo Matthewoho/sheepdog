@@ -179,12 +179,13 @@ class Playbook:
 
 
 def source_and_search_guard(topic_id: str, *, bus: bool = False) -> str:
-    """事实出处严格归属与定向代码检索硬护栏（7.89 / REG-057）：业务会话注入，总线不注入。"""
+    """事实出处严格归属、定向代码检索与找人拍板防打扰硬护栏（7.89 / 7.108，REG-057 / REG-076）：业务会话注入，总线不注入。"""
     if bus:
         return ""
     return "\n".join([
         "### 事实出处严格归属与定向代码检索（7.89 硬门禁 / REG-057）",
         "- **事实出处与物理介质严格归属（严禁跨源嫁接与张冠李戴）**：回答「为什么这么写/当时怎么考量/当前配置是什么」时，必须严格区分并注明物理出处（**提问者原话或截图里的文字/注释** vs **本地 `MatthewNote` 笔记记录** vs **本地代码仓 `<repo>/<文件>:<行号>` 静态配置** vs **线上/测试 DB 或 `gcloud` 实时回读**）。严禁把提问者截图里的注释/假设嫁接成己方历史报告结论反向复述；严禁把只读了本地静态代码说成「查了测试/生产数据库（DB）」；命令超时或输出未读完时，严禁下「没有/不存在」的否定结论。",
         "- **代码检索必先定仓（严禁 `~/Code` 全目录或大仓顶层裸跑 `grep -rn` 超时放弃）**：查代码或 Terraform 配置必须先用 `ls ~/Code` 或 `git -C <repo> ls-files` 定位具体仓库与子目录（如 `~/Code/<repo>/internal`），再进目标仓库子目录执行定向检索（`rg` 或 `git -C <repo> log -S`）；若提问者仅给出相对子路径（如 `infra/china/README.md`）而未说明仓库名，先用 `ls -d ~/Code/*/<子路径>` 或 `find ~/Code -maxdepth 3 -path \"*/<子路径>\"` 毫秒级定位所属仓库；**严禁对 `~/Code`（或 `$HOME/Code`）父目录直接递归 `grep -r` / `rg` 或跑无 `-maxdepth 3` 的 `find`**；测试环境执行 `gcloud sql instances patch` 等写命令必带 `--quiet` 防后台交互挂起；若检索超时或调用链未闭环，必须派生羔羊（`lamb`）查透再回复，严禁半截放弃凭猜测作答。",
+        "- **找人拍板（`sheepdog ask`）防打扰五铁律（7.108 / REG-076，源自人类改判错题本自进化）**：① **必写清环境与完整调用链**：发起 `sheepdog ask` 前必须明确写出目标环境（测试 `tap-testing-env` / Stage / 预发 / 生产 `taplabs-453508`）与完整端到端调用链/前置功能与压测证据，严禁让主人反问「他是测试还是生产 / 哪个环境的子成员账号 / 讲一下完整调用链」；② **必先找兄弟专席或内部 Owner**：申请 CC 专线/家宽/住宅 IP 必先 `sheepdog tell --topic " + topic_id + " --to tp_3x-ui-ops \"...\"` 核实各线路人数与空余席位实据；DB 账号密码与 SQL 找 Nicky 老师；Vercel/前端工程权限找老胡；Agent 预览控制器/冷启动找 Ziyi；ChatGPT/Codex/外部渠道额度找 Sammy；发版密钥打码 Diff 找发版发起人核对；File Hub 代码找 Kaichi；③ **测试/Stage 常规变更免问自治**：`tap-testing-env` 与 Stage 环境常规 DNS（EdgeOne TXT/CNAME）、容器扩缩容或已连续 ≥3 次获主人 100% 采纳的非底线常规方案，直接安全执行并事后 `sheepdog report`；④ **生产 Cloud Run 扩缩容只改 Service-level**：止血或临时调 `minScale/maxScale` 一律改 Service-level（不建新 Revision，便于随时调回），严禁动 Revision-level；⑤ **催办/上报前必重读群内最新消息**：确认同事（如 Ziyi/老胡）是否已处理或请求已过期。",
     ])
 

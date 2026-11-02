@@ -4539,7 +4539,7 @@ class Dispatcher:
                             fallback_sum = after_lb["task_title"] or f"羔羊 {lb['lamb_id']} 已完成"
                         self.store.update_lamb(lb["lamb_id"], result_summary=fallback_sum)
             for lb in topic_lambs:
-                if lb["state"] == "done" and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
+                if lb["state"] in ("done", "failed") and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
                     cur_sum = str(lb["result_summary"] or "").strip()
                     if (
                         _GREP_MATCH_LINE_RE.search(cur_sum)
@@ -4547,13 +4547,22 @@ class Dispatcher:
                             "JSON(" in cur_sum
                             and any(p in cur_sum for p in ("Traceback", "RuntimeError:", "raise RuntimeError", "~~~~", "execute_dag_lane"))
                         )
+                        or (
+                            lb["state"] == "failed"
+                            and any(ok_m in cur_sum for ok_m in ("=== VERIFICATION PASSED ===", "=== ALL PASSED ==="))
+                        )
                     ):
                         try:
                             lp = Path(lb["log_path"])
                             if lp.exists():
-                                new_sum, _ = _summarize_cli_lamb_log(lp.read_text(encoding="utf-8", errors="replace"))
+                                new_sum, has_err = _summarize_cli_lamb_log(lp.read_text(encoding="utf-8", errors="replace"))
+                                upd_kw: dict = {}
                                 if new_sum and new_sum != cur_sum:
-                                    self.store.update_lamb(lb["lamb_id"], result_summary=new_sum)
+                                    upd_kw["result_summary"] = new_sum
+                                if lb["state"] == "failed" and not has_err:
+                                    upd_kw["state"] = "done"
+                                if upd_kw:
+                                    self.store.update_lamb(lb["lamb_id"], **upd_kw)
                         except OSError:
                             pass
         return discovered
@@ -6253,6 +6262,15 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
         return "", False
     recent_window = "\n".join(non_empty[-30:])
     has_err = any(k in recent_window for k in ("Traceback", "Fatal", "Error", "ERROR"))
+    tail_10 = non_empty[-10:]
+    pass_idx = next(
+        (i for i in range(len(tail_10) - 1, -1, -1) if any(ok_m in tail_10[i] for ok_m in ("=== VERIFICATION PASSED ===", "=== ALL PASSED ===", "VERIFICATION PASSED"))),
+        None,
+    )
+    if pass_idx is not None and not any(
+        k in "\n".join(tail_10[pass_idx + 1:]) for k in ("Traceback", "Fatal", "FAILED", "ERROR:")
+    ):
+        has_err = False
     stripped = raw_text.rstrip()
     if stripped.endswith("}"):
         idx = stripped.rfind("\n{")
@@ -6304,6 +6322,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
         non_grep = [
             ln for ln in meaningful
             if not _GREP_MATCH_LINE_RE.match(ln)
+            and not ln.startswith(("STDERR: ERROR:", "ERROR: (gcloud."))
         ]
         if non_grep:
             meaningful = non_grep

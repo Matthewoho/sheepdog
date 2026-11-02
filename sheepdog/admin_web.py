@@ -49,14 +49,55 @@ _RECOMMEND_RE = re.compile(
     re.I,
 )
 _CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:]\s*(.*)", re.S)
+_CHOICE_PREFIX_RE = re.compile(r"^\[(?:[A-E]|其他)\]\s*", re.I)
 _ACCEPT_WORDS_RE = re.compile(
-    r"^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到)\b",
+    r"(?:^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
+    r"|直接配|直接弄|帮我弄|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理|18点(?:执行|再动)"
+    r"|\bwsurl\s*[:=]|\bkey\s*[:=].*\bsecret\s*[:=])",
     re.I,
 )
 _OVERRIDE_WORDS_RE = re.compile(
-    r"(?:忽略|不用|取消|算了|不对|不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|不用我同意|已经过时间)",
+    r"(?:忽略|不用|取消|算了|不对|不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|不用我同意|已经过时间"
+    r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个环境|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
     re.I,
 )
+
+
+def diagnose_override_reason(
+    text: str,
+    ans_body: str,
+    chosen_code: str = "",
+    recommended: str = "",
+) -> tuple[str, str]:
+    """7.108（REG-076）：将人类改判/反问归因为 5 类可执行自进化根因。"""
+    s = (ans_body or "").strip()
+    if re.search(
+        r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看)",
+        s,
+        re.I,
+    ):
+        return ("peer_or_owner_delegate", "未先找专席或Owner")
+    if re.search(
+        r"(?:测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理)",
+        s,
+        re.I,
+    ):
+        return ("context_incomplete", "缺环境/调用链反问")
+    if re.search(
+        r"(?:service[\s-]*level|sevicel-level|不要动\s*revision|上层抽象思考|先限制)",
+        s,
+        re.I,
+    ):
+        return ("arch_or_config_posture", "技术姿势纠偏")
+    if re.search(
+        r"(?:已经处理了|过时间了|太久了|他有权限了|我已经回了|还要吗)",
+        s,
+        re.I,
+    ):
+        return ("stale_or_already_handled", "陈旧/已处理未重查")
+    if chosen_code in ("A", "B", "C", "D", "E") and recommended and chosen_code != recommended:
+        return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
+    return ("option_or_schedule_redirect", "人类改判 / 调整窗口")
 
 
 def clean_ui_text(val: Any, max_len: int = 0) -> str:
@@ -155,13 +196,27 @@ def _read_stop_state_file(cfg: Config, topic_id: str) -> dict:
         return {}
 
 
+_GENERIC_CREATED_RE = re.compile(r"Created At:\s*(\S+)")
+_GENERIC_COMPLETED_RE = re.compile(r"Completed At:\s*(\S+)")
+
+
+def _fmt_ms_short(ms: int | None) -> str:
+    if ms is None:
+        return "-"
+    if ms < 1000:
+        return f"{max(0, int(ms))}ms"
+    if ms < 60_000:
+        return f"{ms / 1000.0:.1f}s"
+    return f"{ms / 60_000.0:.1f}m"
+
+
 def parse_transcript_steps(
     cid: str | None,
     batch_id: str = "",
     max_steps: int = 40,
     tail_bytes: int = 384 * 1024,
 ) -> list[dict]:
-    """从 Antigravity 会话 transcript.jsonl 提取会话内各事件步骤与耗时（思考、工具调用、派生羔羊、回执/回复命令）。"""
+    """从 Antigravity 会话 transcript.jsonl 提取会话内各事件步骤与耗时（将模型推理耗时与工具/CLI实测执行耗时物理拆开）。"""
     if not cid or not cid.strip():
         return []
     tp = transcript_path(cid.strip())
@@ -214,6 +269,7 @@ def parse_transcript_steps(
         parsed = parsed[-max_steps:]
 
     steps: list[dict] = []
+    last_tool_completed_at = ""
     for idx, item in enumerate(parsed):
         stype = str(item.get("type") or "STEP")
         created_at = str(item.get("created_at") or "")
@@ -222,13 +278,21 @@ def parse_transcript_steps(
         tool_calls = item.get("tool_calls") if isinstance(item.get("tool_calls"), list) else []
         content = str(item.get("content") or "")
 
+        if stype == "GENERIC":
+            m_comp = _GENERIC_COMPLETED_RE.search(content)
+            if m_comp:
+                last_tool_completed_at = m_comp.group(1)
+            elif created_at:
+                last_tool_completed_at = created_at
+            continue
+
         kind = "step"
         label = stype
         detail = ""
         if stype == "SYSTEM_MESSAGE":
             if "[sheepdog] 新信号批次" in content:
                 kind = "batch_inject"
-                m = re.search(r"新信号批次\s+(\S+)", content)
+                m = re.search(r"新信号批次\s+`?([^`\s（(]+)", content)
                 label = f"注入批次 {m.group(1) if m else ''}".strip()
             elif "Stop hook" in content or "先别结束" in content:
                 kind = "hook_block"
@@ -237,12 +301,14 @@ def parse_transcript_steps(
                 kind = "system"
                 label = "系统信号注入"
             detail = clean_ui_text(content.splitlines()[0] if content else "", 100)
+            last_tool_completed_at = created_at
         elif stype == "USER_INPUT":
             kind = "user_input"
             label = "人工输入 / 唤醒"
             detail = clean_ui_text(content[:100], 100)
+            last_tool_completed_at = created_at
         elif stype == "PLANNER_RESPONSE":
-            tools = []
+            tools: list[str] = []
             for tc in tool_calls:
                 if not isinstance(tc, dict):
                     continue
@@ -257,26 +323,39 @@ def parse_transcript_steps(
                     args = {}
                 if "run_command" in tname:
                     cmd = str(args.get("CommandLine") or args.get("toolSummary") or "")
+                    matched_sd = False
                     if "sheepdog reply" in cmd:
                         kind = "sd_reply"
                         tools.append("sheepdog reply (代回飞书)")
-                    elif "sheepdog ask" in cmd:
-                        kind = "sd_ask"
+                        matched_sd = True
+                    if "sheepdog ask" in cmd:
+                        if kind == "step":
+                            kind = "sd_ask"
                         tools.append("sheepdog ask (发起拍板)")
-                    elif "sheepdog report" in cmd:
-                        kind = "sd_report"
+                        matched_sd = True
+                    if "sheepdog report" in cmd:
+                        if kind == "step":
+                            kind = "sd_report"
                         tools.append("sheepdog report (汇报进展)")
-                    elif "sheepdog receipt" in cmd:
-                        kind = "sd_receipt"
+                        matched_sd = True
+                    if "sheepdog receipt" in cmd:
+                        if kind == "step":
+                            kind = "sd_receipt"
                         tools.append("sheepdog receipt (提交回执)")
-                    elif "sheepdog forward" in cmd:
-                        kind = "sd_forward"
+                        matched_sd = True
+                    if "sheepdog forward" in cmd:
+                        if kind == "step":
+                            kind = "sd_forward"
                         tools.append("sheepdog forward (总线转交)")
-                    elif "sheepdog lamb" in cmd:
-                        kind = "sd_lamb"
+                        matched_sd = True
+                    if "sheepdog lamb" in cmd:
+                        if kind == "step":
+                            kind = "sd_lamb"
                         tools.append("sheepdog lamb (羔羊派单)")
-                    else:
-                        kind = "tool_cmd"
+                        matched_sd = True
+                    if not matched_sd:
+                        if kind == "step":
+                            kind = "tool_cmd"
                         tools.append(f"cmd: {clean_ui_text(args.get('toolSummary') or cmd, 48)}")
                 elif "invoke_subagent" in tname:
                     kind = "subagent"
@@ -287,11 +366,58 @@ def parse_transcript_steps(
                     tools.append(clean_ui_text(tname.replace("default_api:", ""), 32))
             if tools:
                 label = " · ".join(tools[:2])
-                detail = clean_ui_text(content or ("调用 " + ", ".join(tools)), 110)
+                raw_call_detail = clean_ui_text(content or ("调用 " + ", ".join(tools)), 90)
+                # 7.108 (REG-076)：Antigravity PLANNER_RESPONSE.created_at 为模型开始思考时间，
+                # 紧随其后的 GENERIC 步骤内含 Created At / Completed At 才是工具真实执行起止时间。
+                tool_start_iso = ""
+                tool_end_iso = ""
+                for nxt in parsed[idx + 1 : idx + 3]:
+                    if str(nxt.get("type") or "") != "GENERIC":
+                        break
+                    g_txt = str(nxt.get("content") or "")
+                    m_cr = _GENERIC_CREATED_RE.search(g_txt)
+                    m_cp = _GENERIC_COMPLETED_RE.search(g_txt)
+                    if m_cr and not tool_start_iso:
+                        tool_start_iso = m_cr.group(1)
+                    if m_cp:
+                        tool_end_iso = m_cp.group(1)
+                if tool_start_iso:
+                    think_ms = max(0, diff_ms(created_at, tool_start_iso) or 0)
+                    exec_ms = max(0, diff_ms(tool_start_iso, tool_end_iso or tool_start_iso) or 0)
+                else:
+                    think_ms = 0
+                    exec_ms = max(0, dur_ms or 0)
+
+                if think_ms >= 500:
+                    short_tool = tools[0].split(" (")[0]
+                    steps.append(
+                        {
+                            "step_index": item.get("step_index", idx),
+                            "kind": "thinking",
+                            "label": clean_ui_text(f"模型推理（准备 {short_tool}）", 64),
+                            "detail": clean_ui_text(
+                                str(item.get("thinking") or content or f"识图/分析上下文并生成 {', '.join(tools)} 参数"),
+                                110,
+                            ),
+                            "at": created_at,
+                            "duration_ms": think_ms,
+                        }
+                    )
+                dur_ms = exec_ms
+                created_at = tool_start_iso or created_at
+                detail = (
+                    f"工具实测 {_fmt_ms_short(exec_ms)}（前置推理 {_fmt_ms_short(think_ms)} 已单列）· {raw_call_detail}"
+                    if think_ms >= 500
+                    else raw_call_detail
+                )
             else:
                 kind = "thinking"
                 label = "模型推理与总结"
                 detail = clean_ui_text(content or str(item.get("thinking") or ""), 110)
+                if (not dur_ms or dur_ms <= 0) and last_tool_completed_at:
+                    inferred = diff_ms(last_tool_completed_at, created_at)
+                    if inferred is not None and 0 < inferred <= 120_000:
+                        dur_ms = inferred
         else:
             continue
 
@@ -350,34 +476,43 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
         category = "清理与生命周期确认"
 
     ans_clean = clean_ui_text(answer_content, 160)
+    ans_body = ans_clean
     chosen_code = ""
     cb_match = _CALLBACK_CHOICE_RE.search(answer_content or "")
     if cb_match:
         chosen_code = cb_match.group(1).upper()
-        ans_clean = f"[{chosen_code}] {clean_ui_text(cb_match.group(2), 140)}"
+        ans_body = clean_ui_text(cb_match.group(2), 140)
+        ans_clean = f"[{chosen_code}] {ans_body}"
+    else:
+        ans_body = _CHOICE_PREFIX_RE.sub("", ans_clean).strip()
 
+    override_code = ""
+    override_reason = ""
     if not closed_at and not answered_at:
         alignment = "pending"
         alignment_label = "待人类拍板"
     elif answered_at or close_reason == "answered":
         if chosen_code == "其他":
-            if _OVERRIDE_WORDS_RE.search(ans_clean) or not _ACCEPT_WORDS_RE.search(ans_clean):
+            if _OVERRIDE_WORDS_RE.search(ans_body) or not _ACCEPT_WORDS_RE.search(ans_body):
                 alignment = "overridden"
-                alignment_label = "人类改判 / 补充约束"
+                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                alignment_label = override_reason
             else:
                 alignment = "accepted"
-                alignment_label = "采纳建议"
+                alignment_label = "采纳建议 (带参/直接放行)"
         elif chosen_code in ("A", "B", "C", "D", "E"):
             if recommended and chosen_code != recommended:
                 alignment = "overridden"
+                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
                 alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
             else:
                 alignment = "accepted"
                 alignment_label = f"采纳建议 ({chosen_code})"
         else:
-            if _OVERRIDE_WORDS_RE.search(ans_clean):
+            if _OVERRIDE_WORDS_RE.search(ans_body):
                 alignment = "overridden"
-                alignment_label = "人类推翻 / 改判"
+                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                alignment_label = override_reason or "人类推翻 / 改判"
             else:
                 alignment = "accepted"
                 alignment_label = "采纳建议"
@@ -403,6 +538,8 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
         "answer_text": ans_clean,
         "alignment": alignment,
         "alignment_label": alignment_label,
+        "override_code": override_code,
+        "override_reason": override_reason,
         "asked_at": row["asked_at"],
         "answered_at": answered_at,
         "closed_at": closed_at,
@@ -968,9 +1105,18 @@ class WorkbenchService:
         reply_rows = [s for s in sends if s["kind"] == "reply" and s["target_message_id"] == message_id] or list(sends)
         t5 = reply_rows[0]["sent_at"] if reply_rows else None
 
+        reply_step_ms = next(
+            (int(st.get("duration_ms") or 0) for st in session_steps if st.get("kind") == "sd_reply" and int(st.get("duration_ms") or 0) > 0),
+            None,
+        )
+        e2e_ms = diff_ms(t0, t5)
+        t5_step_ms = reply_step_ms if (t5 and reply_step_ms is not None) else (max(0, diff_ms(t4 or t3, t5) or 0) if t5 else None)
+        t0_minute_only = bool(t0 and (str(t0).endswith(":00+08:00") or str(t0).endswith(":00Z")))
+        t1_note = " · 飞书搜索T0仅精确到分" if t0_minute_only and (diff_ms(t0, t1) or 0) >= 15000 else ""
+
         stages = [
             {"code": "T0", "name": "Lark 消息发出", "at": t0, "delta_ms": 0, "detail": f"发送人：{clean_ui_text(m['sender_name'] or m['sender_id'], 32)}"},
-            {"code": "T1", "name": "Sheepdog 扫到入账", "at": t1, "delta_ms": diff_ms(t0, t1), "detail": f"路由：{m['route']} · 原因：{m['reason'] or '-'}"},
+            {"code": "T1", "name": "Sheepdog 扫到入账", "at": t1, "delta_ms": diff_ms(t0, t1), "detail": f"路由：{m['route']} · 原因：{m['reason'] or '-'}{t1_note}"},
             {"code": "T2", "name": "点 Get 确认表情", "at": t2, "delta_ms": diff_ms(t1, t2), "detail": f"身份：{ack['identity'] if ack else '-'} · 撤下：{ack['removed_at'] if ack and ack['removed_at'] else '未撤'}"},
         ]
         if t3_bus:
@@ -1001,13 +1147,15 @@ class WorkbenchService:
                 "detail": clean_ui_text(disp["receipt"] if disp and disp["receipt"] else "未交回执或仍在执行", 120),
             }
         )
+        t5_prefix = f"端到端累计 {_fmt_ms_short(e2e_ms)} · " if e2e_ms is not None else ""
         stages.append(
             {
                 "code": "T5",
                 "name": "回复卡片送达 Lark",
                 "at": t5,
-                "delta_ms": diff_ms(t0, t5),
-                "detail": clean_ui_text(reply_rows[0]["text"] if reply_rows else "无需代回或由主人直接回复", 120),
+                "delta_ms": t5_step_ms,
+                "e2e_ms": e2e_ms,
+                "detail": t5_prefix + clean_ui_text(reply_rows[0]["text"] if reply_rows else "无需代回或由主人直接回复", 120),
             }
         )
 
@@ -1095,19 +1243,50 @@ class WorkbenchService:
             human_decided = counts["accepted"] + counts["overridden"]
             acceptance_rate = round(counts["accepted"] * 100.0 / human_decided, 1) if human_decided > 0 else 100.0
 
+            promoted_map: dict[str, dict] = {}
+            try:
+                p_row = conn.execute("SELECT value FROM meta WHERE key='autonomy_promoted_rules'").fetchone()
+                if p_row and p_row["value"]:
+                    raw_p = json.loads(p_row["value"])
+                    if isinstance(raw_p, dict):
+                        promoted_map = raw_p
+            except Exception:
+                pass
+
             # 自动提炼「免问自治规则晋升候选」：某会话在同一类别下连续 >=3 次被人类采纳且 0 次推翻
             autonomy_candidates = []
             for (tid, cat), st in sorted(by_cat_topic.items(), key=lambda kv: -kv[1]["accepted"]):
                 if st["accepted"] >= 3 and st["overridden"] == 0 and "底线" not in cat:
+                    p_info = promoted_map.get(f"{tid}:{cat}") or {}
+                    is_promoted = bool(p_info)
                     autonomy_candidates.append(
                         {
                             "topic_id": tid,
                             "category": cat,
                             "accepted_streak": st["accepted"],
                             "examples": st["examples"],
-                            "suggestion": f"会话 {tid} 的「{cat}」已连续 {st['accepted']} 次获人类 100% 采纳（0 改判），建议降级为事后 report 免问自治。",
+                            "promoted": is_promoted,
+                            "promoted_at": p_info.get("promoted_at", ""),
+                            "suggestion": (
+                                f"已自动晋升生效：会话 {tid} 的「{cat}」连采 {st['accepted']} 次（0 改判），已注入事后 report 免问自治规则。"
+                                if is_promoted
+                                else f"会话 {tid} 的「{cat}」已连续 {st['accepted']} 次获人类 100% 采纳（0 改判），建议降级为事后 report 免问自治。"
+                            ),
                         }
                     )
+
+            override_groups: dict[str, dict] = {}
+            for it in ledger:
+                if it["alignment"] == "overridden":
+                    ocode = it.get("override_code") or "option_or_schedule_redirect"
+                    oreason = it.get("override_reason") or "人类改判"
+                    og = override_groups.setdefault(
+                        ocode,
+                        {"code": ocode, "label": oreason, "count": 0, "topics": []},
+                    )
+                    og["count"] += 1
+                    if it["topic_id"] not in og["topics"] and len(og["topics"]) < 5:
+                        og["topics"].append(it["topic_id"])
 
             # Layer 2: 系统路由与 tp_bus 分诊决策统计
             route_reasons = conn.execute(
@@ -1163,9 +1342,11 @@ class WorkbenchService:
                 "p90_latency_ms": quantile(latencies, 0.90),
                 "hook_block_count": len(hook_blocks),
                 "autonomy_candidate_count": len(autonomy_candidates),
+                "autonomy_promoted_count": sum(1 for c in autonomy_candidates if c.get("promoted")),
             },
             "categories": sorted(by_category.values(), key=lambda x: -x["total"]),
             "autonomy_candidates": autonomy_candidates[:8],
+            "override_breakdown": sorted(override_groups.values(), key=lambda x: -x["count"]),
             "ledger": ledger[:80],
             "overridden_book": [x for x in ledger if x["alignment"] == "overridden"][:25],
             "routing_breakdown": [

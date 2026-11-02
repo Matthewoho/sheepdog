@@ -618,6 +618,231 @@ class GateTest(Base):
         self.assertNotIn("RuntimeError:", healed_lamb["result_summary"])
         self.assertIn("JSON(status=SUCCESS, id=274cc606-8966-477e-806a-b302e6b24c13", healed_lamb["result_summary"])
 
+    def test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard(self):
+        """7.108 (REG-076)：
+        1. classify_escalation 剥离 [其他] 前缀后准确识别带参同意/直接放行（如提供 wsurl/key/secret 或『你直接配吧』『听他的』）为 accepted，
+           并将真实改判按 5 类根因（peer_or_owner_delegate / context_incomplete / arch_or_config_posture / stale_or_already_handled / option_or_schedule_redirect）归类；
+        2. outbound.check_ask_pre_flight_guard 在发 ask 前拦截未查 tp_3x-ui-ops 席位的 CC/家宽节点申请，以及未声明『明确是测试/生产环境』的 LiveKit/子成员账号申请；
+        3. observe.run_observe(..., self_heal=True) 自动对新产生的人类改判重置对应会话 rules_hash=NULL，并对连续 >=3 次采纳且 0 改判的非底线候选自动晋升写入 meta['autonomy_promoted_rules']。"""
+        from datetime import datetime, timedelta
+        from sheepdog import observe
+        from sheepdog.admin_web import classify_escalation
+        from sheepdog.outbound import ASK, OutboundError, send_to_owner
+
+        ref_now = datetime.now().astimezone().replace(microsecond=0)
+        base_row = {
+            "message_id": "om_esc_1",
+            "topic_id": "tp_alpha",
+            "text": "🐕 需要你定 · 明确是测试环境，请提供测试LiveKit凭据 [tp_alpha]\n选项：\nA. 提供凭据写入 tap-testing-env\nB. 本地执行\n建议：选 A",
+            "asked_at": (ref_now - timedelta(minutes=20)).isoformat(timespec="seconds"),
+            "answered_at": (ref_now - timedelta(minutes=15)).isoformat(timespec="seconds"),
+            "closed_at": (ref_now - timedelta(minutes=15)).isoformat(timespec="seconds"),
+            "close_reason": "answered",
+            "resolved_by": "",
+            "resolve_note": "",
+            "nudge_count": 0,
+        }
+        # 1a. [其他] 带参放行 / 直接配吧 -> accepted
+        c_cred = classify_escalation(
+            base_row,
+            answer_content="[卡片回调] 其他：这个是测试的，生产的另给。wsurl:wss://tapnow-test.livekit.cloud key:API123 secret:SEC456",
+        )
+        self.assertEqual(c_cred["alignment"], "accepted")
+
+        c_direct = classify_escalation(
+            base_row,
+            answer_content="[卡片回调] 其他：你直接配吧",
+        )
+        self.assertEqual(c_direct["alignment"], "accepted")
+
+        # 1b. [其他] 真实人类改判 -> overridden + 5 类根因诊断
+        c_peer = classify_escalation(
+            base_row,
+            answer_content="[卡片回调] 其他：让3x-ui 的session帮忙看看还有没有专线的空余席位",
+        )
+        self.assertEqual(c_peer["alignment"], "overridden")
+        self.assertEqual(c_peer["override_code"], "peer_or_owner_delegate")
+
+        c_ctx = classify_escalation(
+            base_row,
+            answer_content="[卡片回调] 其他：他是测试还是生产呀",
+        )
+        self.assertEqual(c_ctx["alignment"], "overridden")
+        self.assertEqual(c_ctx["override_code"], "context_incomplete")
+
+        # 2. outbound.check_ask_pre_flight_guard 拦截未查 3x-ui 席位的 CC 专线申请与环境不明的 LiveKit 凭据申请
+        with self.assertRaises(OutboundError) as ctx_cc:
+            send_to_owner(
+                self.cfg, self.store, None, ASK, "tp_alpha",
+                "Damien 申请 Claude Code 防风控专线",
+                "选项：\nA. 分配节点\nB. 暂缓",
+                summary="Damien 申请开通防风控专线，请拍板。",
+            )
+        self.assertIn("tp_3x-ui-ops", str(ctx_cc.exception))
+
+        # 带上 3x-ui 空余席位实据后放行
+        res_cc_ok = send_to_owner(
+            self.cfg, self.store, None, ASK, "tp_alpha",
+            "Damien 申请 Claude Code 防风控专线",
+            "已向 tp_3x-ui-ops 核实：lsg1 当前人数 4/8，空余席位 4 个。\n选项：\nA. 分配 lsg1 节点\nB. 暂缓",
+            summary="已核实 tp_3x-ui-ops 空余席位 4 个，请拍板是否分配。",
+        )
+        self.assertTrue(res_cc_ok.message_id)
+
+        with self.assertRaises(OutboundError) as ctx_env:
+            send_to_owner(
+                self.cfg, self.store, None, ASK, "tp_alpha",
+                "请提供LiveKit项目凭据以配置BFF",
+                "选项：\nA. 提供凭据\nB. 暂缓",
+                summary="请提供 LiveKit 凭据配置 BFF。",
+            )
+        self.assertIn("明确是测试环境", str(ctx_env.exception))
+
+        # 3. observe Probe 8 (REG-076)：自动晋升连续 3 次采纳候选 + 对新改判重置 rules_hash=NULL
+        for idx in range(3):
+            mid = f"om_auto_acc_{idx}"
+            ans_mid = f"om_auto_ans_{idx}"
+            asked_ts = (ref_now - timedelta(minutes=30 - idx)).isoformat(timespec="seconds")
+            ans_ts = (ref_now - timedelta(minutes=25 - idx)).isoformat(timespec="seconds")
+            self.store.upsert_message(
+                msg(message_id=ans_mid, sender_id="ou_test_owner", content="[卡片回调] A：同意按建议执行", create_time=ans_ts),
+                "dispatch", "owner_reply", [], "tp_alpha",
+            )
+            with self.store.tx() as cur:
+                cur.execute(
+                    """INSERT OR REPLACE INTO escalations(message_id, topic_id, text, asked_at, answered_at, closed_at, close_reason, answer_message_id)
+                       VALUES(?, 'tp_alpha', '需要你定 · 常规方案确认\n选项：\nA. 执行\n建议：选 A', ?, ?, ?, 'answered', ?)""",
+                    (mid, asked_ts, ans_ts, ans_ts, ans_mid),
+                )
+        # 插入一条 tp_bus 的新改判
+        self.store.update_topic("tp_alpha", rules_hash="hash_alpha_old")
+        self.store.update_topic("tp_bus", rules_hash="hash_bus_old")
+        ovr_ans_mid = "om_ovr_ans_1"
+        ovr_ts = (ref_now - timedelta(minutes=5)).isoformat(timespec="seconds")
+        self.store.upsert_message(
+            msg(message_id=ovr_ans_mid, sender_id="ou_test_owner", content="[卡片回调] 其他：他是测试还是生产呀", create_time=ovr_ts),
+            "dispatch", "owner_reply", [], "tp_bus",
+        )
+        with self.store.tx() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO escalations(message_id, topic_id, text, asked_at, answered_at, closed_at, close_reason, answer_message_id)
+                   VALUES('om_ovr_esc_1', 'tp_bus', '需要你定 · 生产发布配置确认\n选项：\nA. 执行\n建议：选 A', ?, ?, ?, 'answered', ?)""",
+                (ovr_ts, ovr_ts, ovr_ts, ovr_ans_mid),
+            )
+        obs_res = observe.run_observe(
+            self.cfg, now_dt=ref_now, since_minutes=60.0,
+            check_processes=False, check_log=False, self_heal=True,
+        )
+        self.assertTrue(any("决策自进化：" in i for i in obs_res["infos"]))
+        self.assertIn("tp_alpha:autonomy_promoted:常规方案拍板", obs_res["self_healed"])
+        self.assertIn("tp_bus:override_rules_reset:context_incomplete", obs_res["self_healed"])
+        self.assertIsNone(self.store.get_topic("tp_alpha")["rules_hash"])
+        self.assertIsNone(self.store.get_topic("tp_bus")["rules_hash"])
+        prm_json = json.loads(self.store.get_meta("autonomy_promoted_rules") or "{}")
+        self.assertIn("tp_alpha:常规方案拍板", prm_json)
+
+        # 4. parse_transcript_steps 拆解模型推理 vs 工具实测执行耗时，且 get_event_trace T5.delta_ms 取单步代回耗时而非端到端累计
+        from sheepdog.admin_web import WorkbenchService, parse_transcript_steps
+        from sheepdog.engine import _summarize_cli_lamb_log
+
+        fake_cid = "00000000-0000-4000-8000-000000000776"
+        tp_dir = Path(self.tmp.name) / "brain" / fake_cid / ".system_generated" / "logs"
+        tp_dir.mkdir(parents=True, exist_ok=True)
+        tp_jsonl = tp_dir / "transcript.jsonl"
+        tp_lines = [
+            {
+                "step_index": 1,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-02T12:06:04Z",
+                "content": "批次 `b20261102200603-nicky` 消息",
+            },
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-02T12:06:04Z",
+                "thinking": "先读取截图文件",
+                "content": "",
+                "tool_calls": [{"id": "tc1", "name": "read_file", "arguments": '{"Path": "/tmp/img.png"}'}],
+            },
+            {
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-02T12:06:14Z",
+                "content": "Tool Call: read_file\nResult:\nCreated At: 2026-11-02T20:06:13+08:00\nCompleted At: 2026-11-02T20:06:14+08:00\nOutput: ok",
+            },
+            {
+                "step_index": 4,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-02T12:06:15Z",
+                "thinking": "看懂图片后回复 Nicky 并交回执",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "name": "run_command",
+                        "arguments": '{"CommandLine": "sheepdog reply --topic tp_alpha --message-id om_nicky_1 --text ok && sheepdog receipt --topic tp_alpha --batch b20261102200603-nicky --json \'{}\'"}',
+                    }
+                ],
+            },
+            {
+                "step_index": 5,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-02T12:06:31Z",
+                "content": "Tool Call: run_command\nResult:\nCreated At: 2026-11-02T20:06:28+08:00\nCompleted At: 2026-11-02T20:06:31+08:00\nExit Code: 0",
+            },
+        ]
+        tp_jsonl.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in tp_lines) + "\n", encoding="utf-8")
+        with mock.patch("sheepdog.admin_web.transcript_path", return_value=tp_jsonl):
+            steps = parse_transcript_steps(fake_cid, batch_id="b20261102200603-nicky")
+            self.assertEqual([s["kind"] for s in steps], ["system", "thinking", "tool_call", "thinking", "sd_reply"])
+            self.assertEqual(steps[1]["duration_ms"], 9000)   # 20:06:04 -> 20:06:13 模型推理 9.0s
+            self.assertEqual(steps[2]["duration_ms"], 1000)   # 20:06:13 -> 20:06:14 read_file 1.0s
+            self.assertEqual(steps[3]["duration_ms"], 13000)  # 20:06:15 -> 20:06:28 模型推理 13.0s
+            self.assertEqual(steps[4]["duration_ms"], 3000)   # 20:06:28 -> 20:06:31 sheepdog reply+receipt 3.0s
+
+            self.store.update_topic("tp_alpha", conversation_id=fake_cid)
+            m_nicky = msg(
+                message_id="om_nicky_1", chat_id="oc_test_alpha_p2p", sender_id="ou_nicky",
+                sender_name="Nicky Ye", content="[图片]", create_time="2026-11-02T20:05:00+08:00",
+            )
+            self.store.upsert_message(m_nicky, "dispatch", "p2p", [], "tp_alpha")
+            self.store.record_dispatch("b20261102200603-nicky", "tp_alpha", ["om_nicky_1"])
+            with self.store.tx() as cur:
+                cur.execute(
+                    "UPDATE messages SET first_seen='2026-11-02T20:05:58+08:00', batch_id='b20261102200603-nicky', dispatch_state='acked' WHERE message_id='om_nicky_1'"
+                )
+                cur.execute(
+                    """UPDATE dispatches SET state='acked', sent_at='2026-11-02T20:06:04+08:00', acked_at='2026-11-02T20:06:31+08:00', receipt='{"status":"handled"}'
+                       WHERE batch_id='b20261102200603-nicky'"""
+                )
+                cur.execute(
+                    """INSERT OR REPLACE INTO sends(idem_key, message_id, topic_id, kind, target_message_id, text, sent_at)
+                       VALUES('idem_nicky_1', 'om_reply_nicky_1', 'tp_alpha', 'reply', 'om_nicky_1', '收到！专属网络目前连接正常吗？', '2026-11-02T20:06:31+08:00')"""
+                )
+            provider = WorkbenchService(self.cfg)
+            trace = provider.get_event_trace("om_nicky_1")
+            st_by_code = {s["code"]: s for s in trace["stages"]}
+            self.assertIn("飞书搜索T0仅精确到分", st_by_code["T1"]["detail"])
+            self.assertEqual(st_by_code["T5"]["delta_ms"], 3000)
+            self.assertEqual(st_by_code["T5"]["e2e_ms"], 91000)
+            self.assertIn("端到端累计 1.5m", st_by_code["T5"]["detail"])
+
+        # 5. _summarize_cli_lamb_log 识别末尾 === VERIFICATION PASSED === 为成功并剔除前置幂等 NOT_FOUND 报错
+        ver_log = (
+            "STDERR: ERROR: (gcloud.secrets.describe) NOT_FOUND: Secret [projects/tap-testing-env/secrets/foo] not found.\n"
+            "Created secret [foo].\n"
+            "=== VERIFICATION PASSED ===\n"
+        )
+        ver_sum, ver_err = _summarize_cli_lamb_log(ver_log)
+        self.assertFalse(ver_err)
+        self.assertNotIn("STDERR: ERROR:", ver_sum)
+        self.assertIn("=== VERIFICATION PASSED ===", ver_sum)
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -726,6 +951,7 @@ class SecurityCliTest(GateTest):
     test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter = None
     test_reg_074_subagent_return_markdown_summary_and_cli_lamb_grep_noise = None
     test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary = None
+    test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard = None
 
 
 if __name__ == "__main__":

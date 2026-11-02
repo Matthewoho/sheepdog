@@ -2354,7 +2354,7 @@
             <div class="decision-cluster-cell">
               <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
                 <span class="cluster-title">${escapeHtml(c.topic_id)} · ${escapeHtml(c.category)}</span>
-                <span class="pill-tag info">连采 ${c.accepted_streak} 次</span>
+                <span class="pill-tag ${c.promoted ? "ok" : "info"}">${c.promoted ? "已晋升自治 · " : ""}连采 ${c.accepted_streak} 次</span>
               </div>
               <div class="cluster-desc">${escapeHtml(c.suggestion)}</div>
             </div>
@@ -2392,7 +2392,7 @@
               ${items.map((it) => {
                 const catMap = {
                   accepted: { cls: "", label: "采纳建议" },
-                  overridden: { cls: "warn", label: "人类改判" },
+                  overridden: { cls: "warn", label: it.override_reason || "人类改判" },
                   pending: { cls: "info", label: "待人类拍板" },
                   auto_resolved: { cls: "", label: "旁路自愈结案" }
                 };
@@ -2722,7 +2722,7 @@
                 <div class="timeline-node-sub">${escapeHtml(st.detail)}</div>
               </div>
             `).join("")}
-            ${sessionSteps.slice(0, 6).map((s) => `
+            ${sessionSteps.slice(0, 10).map((s) => `
               <div class="timeline-node">
                 <div class="timeline-node-head">
                   <span>会话内 · ${escapeHtml(s.label)}</span>

@@ -963,6 +963,130 @@ def run_observe(
                         )
                     except PermissionError:
                         pass
+
+            # 7.108 (REG-076): 人类拍板采纳率、改判错题本自愈重注、免问自治候选自动晋升与 T0->T5 阶段耗时分位探针
+            if "escalations" in tabs and "messages" in tabs:
+                try:
+                    from .admin_web import classify_escalation, diff_ms, quantile
+                    sends_has_floor = "sends" in tabs and "floor" in {r[1] for r in c.execute("PRAGMA table_info(sends)")}
+                    floor_sub = "(SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1)" if sends_has_floor else "''"
+                    esc_cols = {r[1] for r in c.execute("PRAGMA table_info(escalations)")}
+                    pm_join = "LEFT JOIN messages pm ON pm.message_id = e.possibly_handled_message_id" if "possibly_handled_message_id" in esc_cols else ""
+                    pm_sel = "pm.content AS possible_content," if pm_join else "'' AS possible_content,"
+                    esc_rows = c.execute(
+                        f"""SELECT e.*, am.content AS answer_content, {pm_sel} {floor_sub} AS ask_floor
+                            FROM escalations e
+                            LEFT JOIN messages am ON am.message_id = e.answer_message_id
+                            {pm_join}
+                            ORDER BY e.asked_at DESC LIMIT 200"""
+                    ).fetchall()
+                    acc_cnt, ovr_cnt = 0, 0
+                    by_ct: dict[tuple[str, str], dict] = {}
+                    new_ovr: list[dict] = []
+                    for er in esc_rows:
+                        ans_txt = str(er["answer_content"] or er["possible_content"] or "")
+                        it = classify_escalation(er, answer_content=ans_txt, ask_floor=str(er["ask_floor"] or ""))
+                        al = it["alignment"]
+                        if al == "accepted":
+                            acc_cnt += 1
+                        elif al == "overridden":
+                            ovr_cnt += 1
+                            ev_ts = str(it.get("answered_at") or it.get("closed_at") or it.get("asked_at") or "")
+                            if ev_ts >= since:
+                                new_ovr.append(it)
+                        st_ct = by_ct.setdefault((it["topic_id"], it["category"]), {"accepted": 0, "overridden": 0})
+                        if al in ("accepted", "overridden"):
+                            st_ct[al] += 1
+                    dec_total = acc_cnt + ovr_cnt
+                    acc_rate = round(acc_cnt * 100.0 / dec_total, 1) if dec_total > 0 else 100.0
+                    auto_cands = [
+                        (tid, cat, st_ct["accepted"])
+                        for (tid, cat), st_ct in sorted(by_ct.items(), key=lambda kv: -kv[1]["accepted"])
+                        if st_ct["accepted"] >= 3 and st_ct["overridden"] == 0 and "底线" not in cat
+                    ]
+                    if dec_total > 0:
+                        info.append(
+                            f"决策自进化：近 {dec_total} 次拍板采纳率 {acc_rate:.1f}%（采纳 {acc_cnt} · 改判 {ovr_cnt} · 自治候选 {len(auto_cands)}）"
+                        )
+                    if self_heal and "meta" in tabs and "topics" in tabs and (new_ovr or auto_cands):
+                        healed_ovr_ids: list[str] = []
+                        promoted_rules: dict[str, dict] = {}
+                        r_ovr = c.execute("SELECT value FROM meta WHERE key='healed_override_escalation_ids'").fetchone()
+                        if r_ovr and r_ovr[0]:
+                            try:
+                                healed_ovr_ids = list(json.loads(r_ovr[0]))
+                            except Exception:
+                                pass
+                        r_prm = c.execute("SELECT value FROM meta WHERE key='autonomy_promoted_rules'").fetchone()
+                        if r_prm and r_prm[0]:
+                            try:
+                                promoted_rules = dict(json.loads(r_prm[0]))
+                            except Exception:
+                                pass
+                        topics_to_reset: set[str] = set()
+                        meta_dirty = False
+                        for it in new_ovr:
+                            mid, tid = it["message_id"], it["topic_id"]
+                            if mid and tid and mid not in healed_ovr_ids:
+                                healed_ovr_ids.append(mid)
+                                topics_to_reset.add(tid)
+                                meta_dirty = True
+                                self_healed.append(f"{tid}:override_rules_reset:{it.get('override_code') or 'overridden'}")
+                        for tid, cat, streak in auto_cands:
+                            pkey = f"{tid}:{cat}"
+                            if pkey not in promoted_rules:
+                                promoted_rules[pkey] = {
+                                    "topic_id": tid,
+                                    "category": cat,
+                                    "accepted_streak": streak,
+                                    "promoted_at": iso(ref_now),
+                                }
+                                topics_to_reset.add(tid)
+                                meta_dirty = True
+                                self_healed.append(f"{tid}:autonomy_promoted:{cat}")
+                            elif promoted_rules[pkey].get("accepted_streak") != streak:
+                                promoted_rules[pkey]["accepted_streak"] = streak
+                                meta_dirty = True
+                        if meta_dirty:
+                            with sqlite3.connect(db, timeout=5.0) as wc:
+                                for tid in topics_to_reset:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (tid,))
+                                wc.execute(
+                                    "INSERT INTO meta(key, value) VALUES('healed_override_escalation_ids', ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    (json.dumps(healed_ovr_ids[-300:], ensure_ascii=False),),
+                                )
+                                wc.execute(
+                                    "INSERT INTO meta(key, value) VALUES('autonomy_promoted_rules', ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    (json.dumps(promoted_rules, ensure_ascii=False),),
+                                )
+                                wc.commit()
+                    if "acks" in tabs and "dispatches" in tabs:
+                        disp_cols = {r[1] for r in c.execute("PRAGMA table_info(dispatches)")}
+                        if "acked_at" in disp_cols:
+                            lat_rows = c.execute(
+                                """SELECT m.first_seen, a.added_at, d.sent_at, d.acked_at
+                                   FROM messages m
+                                   LEFT JOIN acks a ON a.message_id = m.message_id
+                                   LEFT JOIN dispatches d ON d.batch_id = m.batch_id
+                                   WHERE m.chat_type != 'sheepdog' AND m.first_seen >= ?
+                                   ORDER BY m.first_seen DESC LIMIT 300""",
+                                (since,),
+                            ).fetchall()
+                            t12_arr, t34_arr = [], []
+                            for lr in lat_rows:
+                                if (v12 := diff_ms(lr["first_seen"], lr["added_at"])) is not None and v12 <= 300_000:
+                                    t12_arr.append(v12)
+                                if (v34 := diff_ms(lr["sent_at"], lr["acked_at"])) is not None and 0 < v34 <= 3_600_000:
+                                    t34_arr.append(v34)
+                            if t12_arr or t34_arr:
+                                info.append(
+                                    f"耗时分位：T1->T2 点Get P95={quantile(t12_arr, 0.95)}ms，"
+                                    f"T3->T4 会话执行 P50={quantile(t34_arr, 0.50)/1000.0:.1f}s / P95={quantile(t34_arr, 0.95)/1000.0:.1f}s"
+                                )
+                except Exception:
+                    pass
         finally:
             c.close()
 

@@ -504,3 +504,9 @@
 | --- | --- | --- |
 | 7.107 | 会话在途执行未加 `--quiet` 的交互命令（如 `gcloud sql instances patch`）转入后台任务（`GENERIC RUNNING`）等待 stdin，导致回合结束时宿主向 Stop hook 传 `fullyIdle: false` 未写入 `hooks/stop/<tid>.json` 的 `passed_at`，进而使常驻进程 `_check_stopped_in_flight` 在首轮及 `auto_resumed` 后的次轮均无法感知 `PLANNER_RESPONSE DONE` 静默停机，锁死会话长达 30 分钟；或会话在批次中途经历上下文压缩后触发一次 `REG-057` 未定仓搜索，批次早已结束闲置但 `observe --self-heal` 未重置 `rules_hash` 也未记自愈水位，导致连续 65 分钟重复告警；或 CLI 羔羊日志末尾输出成功 JSON（如 `status="SUCCESS"`）但因 fallback 前含 Python `RuntimeError` Traceback 行且 JSON 字段按字母序截断前 8 个键，导致 `result_summary` 残留报错前缀并丢掉 `status=SUCCESS`（REG-075） | `test_security.GateTest.test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary`（`tests/test_security.py::GateTest::test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary`） |
 
+## 7.108 人类拍板与自治演进闭环自优化（`[其他]` 带参同意精准识别、5 类改判错题根因归因、免问自治自动晋升、`sheepdog ask` 防打扰前置门禁与 `T0->T5` 全链路耗时拆解归因）（REG-076）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.108 | 主人在卡片回调点 `[其他]` 填入测试凭据（`wsurl:... key:... secret:...`）或回复『你直接配吧』『听他的』本来是采纳放行，却因 `classify_escalation` 在 `ans_clean` 前拼了 `"[其他] "` 且 `_ACCEPT_WORDS_RE` 带 `^` 与中文 `\b` 导致 100% 误判为 `overridden`；或专席未先向 `tp_3x-ui-ops` 核实空余席位就发 `ask` 申请 CC 专线/家宽节点、未标明『明确是测试/生产环境』就发 `ask` 索要 LiveKit/子成员账号逼主人反问；或 `:8788` 识别出连续 $\ge 3$ 次采纳（0 改判）的免问自治候选与新产生的人类改判只做静态展示、未接入 `observe --self-heal` 自动晋升与重置 `rules_hash`；或 `T0->T5` 步进追踪把 `T5 · 回复卡片送达 Lark` 的增量耗时算成 `diff_ms(t0, t5)`（端到端累计 `+1.5m`）且 `parse_transcript_steps` 把 `PLANNER_RESPONSE -> GENERIC` 之间的模型推理耗时全算在 `read_file` / `sheepdog reply` 工具头上；或 CLI 羔羊末尾输出 `=== VERIFICATION PASSED ===` 但因前置幂等检查含 `STDERR: ERROR: ... NOT_FOUND` 误判为 `failed`（REG-076） | `test_security.GateTest.test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard`（`tests/test_security.py::GateTest::test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard`） |
+
