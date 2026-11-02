@@ -493,10 +493,12 @@ def run_observe(
             warn.append(f"读不到日志 {log_file}：{e}")
         if lines:
             last_dispatch = next((l for l in reversed(lines) if " INFO dispatch:" in l), "")
+            dispatch_fresh = False
             if last_dispatch:
                 try:
                     t = datetime.strptime(last_dispatch[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
                     m = (ref_now - t).total_seconds() / 60.0
+                    dispatch_fresh = m <= 5
                     (warn if m > 5 else info).append(f"最近一轮在 {m:.0f} 分钟前（{last_dispatch[11:19]}）")
                 except ValueError:
                     pass
@@ -509,9 +511,19 @@ def run_observe(
                     cur = l[:19]
                 if cur >= since_log:
                     recent.append(l)
-            errs = [l for i, l in enumerate(recent) if " ERROR " in l or " CRITICAL " in l or ("Traceback" in l and not _is_kb_interrupt_tb(recent, i))]
+            raw_errs = [l for i, l in enumerate(recent) if " ERROR " in l or " CRITICAL " in l or ("Traceback" in l and not _is_kb_interrupt_tb(recent, i))]
+            errs, recovered_net_errs = [], []
+            for l in raw_errs:
+                if (dispatch_fresh and last_dispatch and l[:19] < last_dispatch[:19]
+                        and "ERROR 本轮失败（下一轮从水位线续跑）: SourceError:" in l
+                        and any(k in l for k in ("network/transport:", "timed out", "timeout", "EOF", "connection reset"))):
+                    recovered_net_errs.append(l)
+                else:
+                    errs.append(l)
             if errs:
                 warn.append(f"日志里有 {len(errs)} 行 ERROR/Traceback，最近一行：{errs[-1][:200]}")
+            if recovered_net_errs:
+                info.append(f"期间有 {len(recovered_net_errs)} 次瞬时网络抖动已自动从水位线恢复")
             media_fail = [l for l in recent if "图片" in l and ("失败" in l or "超限" in l)]
             if media_fail:
                 warn.append(f"图片下载失败 {len(media_fail)} 次，最近：{media_fail[-1][:200]}")

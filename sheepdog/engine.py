@@ -5731,8 +5731,8 @@ def bus_quote_verifier(store: Store, max_age_hours: float):
 
 
 def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
-    """主人原话核对（new-session --quote，7.18）：先按 forward 的办法查总线 transcript 里主人亲口说的；
-    再查账本里主人本人账号在飞书上的回复（发送人由 IM 账号核实，带 owner_verified 标记）。回看时长同 forward。
+    """主人原话核对（new-session / forward / tell --quote，7.18 / 7.105）：先按 forward 的办法查总线 transcript 里主人亲口说的；
+    再查账本里主人本人账号在飞书上的回复与指令（发送人由 IM 账号核实，带 owner_verified 或 owner_instruction 标记，且排除 AI 助理代发）。回看时长同 forward。
 
     返回 verify(quote) -> 标注：核对通过时是「✅ 主人原话（已核对…）」，不通过是空串。
     """
@@ -5747,10 +5747,15 @@ def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
         if not self_open_id:
             return ""
         cutoff = _now() - timedelta(hours=max_age_hours)
-        rows = store.conn.execute("SELECT content, create_time, tags_json FROM messages WHERE sender_id=?",
+        rows = store.conn.execute("SELECT content, create_time, tags_json, reason FROM messages WHERE sender_id=?",
                                   (self_open_id,)).fetchall()
         for r in rows:
-            if OWNER_VERIFIED_TAG not in json.loads(r["tags_json"] or "[]"):
+            tags = json.loads(r["tags_json"] or "[]")
+            if "agent_sender" in tags or is_agent_proxy_content(r["content"] or ""):
+                continue
+            if (OWNER_VERIFIED_TAG not in tags
+                    and OWNER_INSTRUCTION_TAG not in tags
+                    and (r["reason"] or "") not in (OWNER_REPLY, OWNER_INSTRUCTION)):
                 continue
             ts = _parse(r["create_time"] or "")
             if ts is None or ts.tzinfo is None or ts < cutoff:
@@ -5857,7 +5862,8 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
     held = [i for i, r in rows.items() if r["security_action"] == HOLD]
     if held and not quote:
         raise ValueError(f"消息 {held} 被安全规则拦截，只能凭已核对的主人原话转交：加 --quote \"<主人原话>\"")
-    if quote and not (verify_quote and verify_quote(quote)):
+    quote_label = verify_quote(quote) if (quote and verify_quote) else ""
+    if quote and not quote_label:
         raise ValueError(QUOTE_NOT_FOUND)
     src_batches: set[tuple[str, str]] = set()
     for i, row in rows.items():
@@ -5903,7 +5909,8 @@ def forward_messages(store: Store, topic_id: str, message_ids: list[str], note: 
         log.info("转交时写明回答提问 %s（%s），已关", answers, topic_id)
     if quote or note:
         extra = (f"（随附转交的消息：{', '.join(ids)}）" if ids else "") + (f"（已经送到过你这里、这次不重发：{', '.join(done)}）" if done else "")
-        store.add_system_message(topic_id, "bus_relay", relay_content(quote, note) + ("\n" + extra if extra else ""))
+        lbl = quote_label if isinstance(quote_label, str) and quote_label else QUOTE_LABEL
+        store.add_system_message(topic_id, "bus_relay", relay_content(quote, note, quote_label=lbl) + ("\n" + extra if extra else ""))
     log.info("转交 %d 条消息%s -> %s%s", len(ids), "（含转达）" if quote or note else "", topic_id, f"；{len(done)} 条已送到过、不重发" if done else "")
     touch_wakeup(store)
     return ForwardResult(ids, skipped)

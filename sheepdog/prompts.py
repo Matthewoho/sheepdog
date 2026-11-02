@@ -635,11 +635,12 @@ def owner_quote_section(label: str, quote: str) -> str:
     return "\n".join(["### 主人同意开这个会话", f"{label}：", *("> " + ln for ln in quote.splitlines() or [""])])
 
 
-def relay_content(quote: str, note: str) -> str:
+def relay_content(quote: str, note: str, quote_label: str = QUOTE_LABEL) -> str:
     """总线转达：主人原话和总线备注分开标注，避免总线的转述被当成主人的话。"""
     parts = []
     if quote:
-        parts += [f"{QUOTE_LABEL}：", *("> " + ln for ln in quote.splitlines() or [""])]
+        lbl = quote_label if isinstance(quote_label, str) and quote_label else QUOTE_LABEL
+        parts += [f"{lbl}：", *("> " + ln for ln in quote.splitlines() or [""])]
     if note:
         parts += [f"{NOTE_LABEL}：{note}"]
     return "\n".join(parts)

@@ -13,8 +13,9 @@ from pathlib import Path
 from unittest import mock
 
 from sheepdog import cli
-from sheepdog.engine import (BUS_TOPIC_ID, SECURITY_HOLD_TAG, SECURITY_RELEASE_TAG, Collector, add_watch,
-                             bus_quote_verifier, forward_messages)
+from sheepdog.engine import (BUS_TOPIC_ID, OWNER_INSTRUCTION, OWNER_VERIFIED_TAG, SECURITY_HOLD_TAG,
+                             SECURITY_RELEASE_TAG, Collector, add_watch, bus_quote_verifier, forward_messages,
+                             owner_quote_verifier)
 from sheepdog.playbook import Playbook
 from sheepdog.prompts import adopted_bootstrap, batch_prompt, bootstrap_prompt, onboarding_prompt
 from sheepdog.roster import parse_roster
@@ -250,6 +251,106 @@ class GateTest(Base):
         self.assertIn("FX-BANNER action=hold", text)  # 放行后警示仍在
         self.assertIn("✅ 主人原话（已核对：主人在总线里亲口说过）：\n> 按周五 交付", text)
 
+    def test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter(self):
+        from sheepdog import observe
+        now_str = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+        # 1. 主人在飞书私聊发送指令（带图片与 owner_verified + owner_instruction）
+        m_priv = msg(
+            message_id="om_test_7105_priv",
+            chat_type="p2p",
+            chat_id="oc_test_owner_dm",
+            sender_id=ME,
+            sender_name="Matthew Hong",
+            sender_tenant_key=OWN,
+            content="帮我看一下哪一个vps的ip段好一点\n![Image](img_v3_test_vps)",
+            create_time=now_str,
+        )
+        self.store.upsert_message(m_priv, "dispatch", OWNER_INSTRUCTION, [OWNER_VERIFIED_TAG, OWNER_INSTRUCTION, "owner_at:private"])
+        # 2. 主人在群内 @ 机器人发送指令（仅带 owner_instruction 标签）
+        m_grp = msg(
+            message_id="om_test_7105_grp",
+            chat_type="group",
+            chat_id="oc_test_grp",
+            sender_id=ME,
+            sender_name="Matthew Hong",
+            sender_tenant_key=OWN,
+            content="@Sheepdog 帮我核一下东京出口带宽",
+            create_time=now_str,
+        )
+        self.store.upsert_message(m_grp, "dispatch", OWNER_INSTRUCTION, [OWNER_INSTRUCTION, "owner_at:bus"])
+        # 3. 主人账号下的 AI 助理代发消息不能冒充主人原话
+        m_proxy = msg(
+            message_id="om_test_7105_proxy",
+            chat_type="group",
+            chat_id="oc_test_grp",
+            sender_id=ME,
+            sender_name="Matthew Hong",
+            sender_tenant_key=OWN,
+            content="[✦ Matthew 的 AI 助理] 自动代回同意放行",
+            create_time=now_str,
+        )
+        self.store.upsert_message(m_proxy, "dispatch", OWNER_INSTRUCTION, [OWNER_VERIFIED_TAG, "agent_sender"])
+
+        verify = owner_quote_verifier(self.store, self.sec.quote_max_age_hours, ME)
+        self.assertEqual(verify("帮我看一下哪一个vps的ip段好一点"), "✅ 主人原话（已核对：主人本人账号在飞书上的回复）")
+        self.assertEqual(verify("帮我核一下东京出口带宽"), "✅ 主人原话（已核对：主人本人账号在飞书上的回复）")
+        self.assertEqual(verify("自动代回同意放行"), "")
+
+        # 通过 CLI cmd_forward 带 --quote 转交飞书主人原话应成功并标注 QUOTE_LABEL_IM
+        cfg_file = Path(self.tmp.name) / "config.toml"
+        cfg_file.write_text(f'self_open_id = "{ME}"\nsecurity_path = "{SEC_FILE}"\n', encoding="utf-8")
+        out = io.StringIO()
+        env = {"SHEEPDOG_CONFIG": str(cfg_file), "SHEEPDOG_STATE_DIR": self.tmp.name}
+        with mock.patch.dict(os.environ, env), redirect_stdout(out):
+            rc = cli.main([
+                "forward", "--topic", "tp_alpha",
+                "--message-ids", "om_test_7105_priv",
+                "--quote", "帮我看一下哪一个vps的ip段好一点",
+                "--note", "评估 9929 vs BGP",
+            ])
+        self.assertEqual(rc, 0)
+        self.d.dispatch_once()
+        delivered_text = self.alpha_msgs()[-1]
+        self.assertIn("✅ 主人原话（已核对：主人本人账号在飞书上的回复）：\n> 帮我看一下哪一个vps的ip段好一点", delivered_text)
+        self.assertIn("总线备注（不是主人原话）：评估 9929 vs BGP", delivered_text)
+
+        # 4. observe 对已从水位线恢复的瞬时 SourceError 网络抖动归入 infos，未恢复或非网络错误仍归入 warns
+        ref_now = datetime(2026, 11, 2, 16, 44, 9, tzinfo=timezone(timedelta(hours=8)))
+        log_recovered = Path(self.tmp.name) / "sidecar_recovered.log"
+        log_recovered.write_text(
+            "2026-11-02 15:51:37 ERROR 本轮失败（下一轮从水位线续跑）: SourceError: lark-cli 调用失败 ['im', '+messages-search']: network/transport: API call failed: dial tcp: lookup open.larksuite.com: no such host\n"
+            "2026-11-02 16:43:56 INFO dispatch: {'pending': 0, 'sent': 0}\n",
+            encoding="utf-8",
+        )
+        res_ok = observe.run_observe(
+            db_path=Path(self.tmp.name) / "nonexistent.sqlite3",
+            state_path=Path(self.tmp.name) / "cursor_rec.json",
+            log_path=log_recovered,
+            now_dt=ref_now,
+            since_minutes=65.0,
+            check_processes=False,
+            check_log=True,
+        )
+        self.assertFalse(any("ERROR/Traceback" in w for w in res_ok["warns"]), res_ok["warns"])
+        self.assertTrue(any("瞬时网络抖动已自动从水位线恢复" in i for i in res_ok["infos"]), res_ok["infos"])
+
+        log_unrecovered = Path(self.tmp.name) / "sidecar_unrecovered.log"
+        log_unrecovered.write_text(
+            "2026-11-02 16:40:00 INFO dispatch: {'pending': 0, 'sent': 0}\n"
+            "2026-11-02 16:43:56 ERROR 本轮失败（下一轮从水位线续跑）: SourceError: lark-cli 调用失败 ['im', '+messages-search']: network/transport: API call failed\n",
+            encoding="utf-8",
+        )
+        res_warn = observe.run_observe(
+            db_path=Path(self.tmp.name) / "nonexistent.sqlite3",
+            state_path=Path(self.tmp.name) / "cursor_unrec.json",
+            log_path=log_unrecovered,
+            now_dt=ref_now,
+            since_minutes=65.0,
+            check_processes=False,
+            check_log=True,
+        )
+        self.assertTrue(any("ERROR/Traceback" in w for w in res_warn["warns"]), res_warn["warns"])
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -355,6 +456,7 @@ class SecurityCliTest(GateTest):
     test_self_and_drop_not_evaluated = None
     test_edit_re_evaluates = None
     test_hold_forward_requires_verified_quote = None
+    test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter = None
 
 
 if __name__ == "__main__":

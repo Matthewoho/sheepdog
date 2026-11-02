@@ -486,5 +486,12 @@
 | --- | --- | --- |
 | 7.104 | 同事个人账号代发的 AI 助理消息（如 `<font color='grey'>Sammi · Sammy 的 AI 助理</font>`，`tags_json: ["agent_sender"]`）不具备 `👑 VIP` 免问直接动生产资格，专席按规调用 `sheepdog ask` 向主人请示生产发布授权后，因 `observe.py` 的 7.61 检查绕过 `prompts.vip_of` 直接用裸 SQL `m.sender_id IN (...)` 匹配，将合规请示误报为『VIP（Sammy）的请求又去找你批了，没写碰到哪条底线（7.61 回归？）』骚扰主人；或联系人专席调用 `sheepdog forward` 将原消息 `om_...` 转交发版专席后，又发送标题为『【发版单 ... 转交（来自原消息 om_...）】』、尾句写『已将原消息 forward 给你，请接单推进！』的冗余 `sheepdog tell`，因 `_REDUNDANT_FORWARD_TELL_RE` 仅锚定句首而漏拦截，导致目标专席被二次排队唤醒（REG-072） | `test_vip.VipBranch765Test.test_reg_072_observe_vip_floor_ssot_and_redundant_forward_tell_guard`（`tests/test_vip.py::VipBranch765Test::test_reg_072_observe_vip_floor_ssot_and_redundant_forward_tell_guard`） |
 
+## 7.105 主人原话核对（--quote）跨 forward / tell / new-session 统一收口至 owner_quote_verifier（支持飞书主人私聊与群内 @ 指令并拦截 AI 助理代发）及已恢复瞬时网络抖动巡检降噪（REG-073）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.105 | 主人在飞书私聊或群内 `@` 机器人下达指令（如 `om_test_owner_im`：『帮我看一下哪一个vps的ip段好一点』）后，总线调用 `sheepdog forward --quote "<主人在飞书上的原话>"` 转交或放行 `hold` 消息时，因 `cmd_forward` 仍停留在仅查总线 GUI `USER_INPUT` 的 `bus_quote_verifier`（且 `owner_quote_verifier` 漏认了群内 `@` 机器人的 `owner_instruction` 标签），被误拒报『这句话在总线里找不到主人的原文，请原样引用』；或本机短时 DNS/网络抖动触发 `SourceError: ... network/transport:` 后下一轮已自动从水位线恢复且最新 `dispatch` 正常，`sheepdog observe` 仍在滚动窗口内持续报 `ERROR/Traceback` 假告警（REG-073） | `test_security.GateTest.test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter`（`tests/test_security.py::GateTest::test_reg_073_forward_owner_im_quote_and_observe_recovered_net_jitter`） |
+
+
 
 

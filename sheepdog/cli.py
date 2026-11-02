@@ -1345,7 +1345,7 @@ def cmd_receipt(args) -> int:
 def cmd_forward(args) -> int:
     cfg = _load_cfg()
     security, store = _security(cfg), Store(cfg.db_path)
-    verify = bus_quote_verifier(store, security.quote_max_age_hours)
+    verify = owner_quote_verifier(store, security.quote_max_age_hours, cfg.self_open_id)
     try:
         ids = forward_messages(store, args.topic, (args.message_ids or "").split(","), args.note, args.quote, verify,
                                cfg.self_open_id, cfg.escalation.open_hours, cfg.duty.patterns, cfg.cli_command,
