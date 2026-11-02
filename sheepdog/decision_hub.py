@@ -46,6 +46,14 @@ _OWNER_WORK_DUMP_RE = re.compile(
     re.I,
 )
 _AT_ME_ACTION_RE = re.compile(r"(走查|提测|来测试|测试一下|验证|确认一下|请确认|看看|看下|请回复|反馈一下|审批|放行|核对|review|preview)", re.I)
+_OWNER_ACK_ONLY_RE = re.compile(
+    r"^\s*(?:ok|okay|好(?:的|吧|嘞|呀)?|收到|知道了?|明白了?|行(?:吧|的)?|可以|嗯+|不用(?:管|了)?|算了|没事(?:了)?|谢谢|辛苦(?:了)?)[!！。.~～\s]*$",
+    re.I,
+)
+_LOCAL_PANEL_ONLY_REPLY_RE = re.compile(
+    r"(?:直接|仅|只)?在(?:当前|本地)?(?:会话|窗口|面板)(?:中|内|里)?(?:完整|直接)?(?:答复|回复|回答|说明)",
+    re.I,
+)
 
 def _outbound_err(msg: str):
     from .outbound import EXIT_INVALID, OutboundError
@@ -62,7 +70,7 @@ def purge_self_ack_owner_reactions(cfg, store, *, dry_run: bool = False) -> dict
     return {"purged_count": len(mids), "message_ids": mids}
 
 def verify_bus_at_me_no_silent_drop(cfg, store, topic_id: str, batch_id: str = "", receipt: dict | None = None) -> str | None:
-    """REG-046：总线 @Matthew (at_me) 行动/走查诉求防静默吞没门禁（仅 tell 旁人事项或交 noop 不算路由主人待办）。"""
+    """REG-046 / REG-079：总线 @Matthew (at_me) 行动诉求与飞书主人指令（owner_instruction / owner_reply）防静默吞没与防本地面板自嗨门禁。"""
     tid = ("tp_" + topic_id.strip() if (topic_id or "").strip() and not (topic_id or "").strip().startswith("tp_") else (topic_id or "").strip())
     if store is None or base_topic_id(tid) != "tp_bus": return None
     if isinstance(receipt, dict) and receipt.get("status") not in (None, "", "handled", "done"): return None
@@ -73,15 +81,30 @@ def verify_bus_at_me_no_silent_drop(cfg, store, topic_id: str, batch_id: str = "
         for mid in json.loads(d["message_ids"] or "[]"):
             if mid and mid not in rows_by_id and (r := store.get_message(mid)) is not None: rows_by_id[mid] = r
     at_me_rows = [r for r in rows_by_id.values() if r["reason"] == "at_me" and not (r["message_id"] or "").startswith("sd_") and _AT_ME_ACTION_RE.search(r["content"] or "")]
-    if not at_me_rows: return None
+    owner_rows = [
+        r for r in rows_by_id.values()
+        if r["reason"] in ("owner_instruction", "owner_reply")
+        and not (r["message_id"] or "").startswith("sd_")
+        and not _OWNER_ACK_ONLY_RE.match((r["content"] or "").strip())
+    ]
+    target_rows = owner_rows or at_me_rows
+    if not target_rows: return None
     if store.forwarded_message_targets(list(rows_by_id)) or any((r["topic_id"] or "") not in ("", "tp_bus") or ("forwarded_to" in r.keys() and (r["forwarded_to"] or "")) for r in rows_by_id.values()):
         return None
     r_acts = (receipt.get("actions") or []) if isinstance(receipt, dict) else []
-    if any((str(a.get("type") or a.get("kind") or "").strip().lower() if isinstance(a, dict) else (str(a).strip().split()[0].lower() if str(a).strip() else "")) in ("forward", "new-session", "new_session", "spawn", "ask", "report", "reply") for a in r_acts):
+    if any((str(a.get("type") or a.get("kind") or "").strip().lower() if isinstance(a, dict) else (str(a).strip().split()[0].lower() if str(a).strip() else "")) in ("forward", "new-session", "new_session", "spawn", "ask", "report", "reply", "resolve", "upgrade", "rollback") for a in r_acts):
         return None
-    since_ts = (d["sent_at"] if d is not None and d["sent_at"] else "") or min((r["create_time"] or "" for r in at_me_rows if r["create_time"]), default="")
+    since_ts = (d["sent_at"] if d is not None and d["sent_at"] else "") or min((r["create_time"] or "" for r in target_rows if r["create_time"]), default="")
     if store.conn.execute("SELECT 1 FROM sends WHERE topic_id='tp_bus' AND kind IN ('ask','report','reply') AND (? = '' OR sent_at >= ?) LIMIT 1", (since_ts, since_ts)).fetchone(): return None
-    if store.conn.execute("SELECT 1 FROM actions WHERE kind IN ('new-session','new_session','spawn') AND (? = '' OR requested_at >= ?) LIMIT 1", (since_ts, since_ts)).fetchone(): return None
+    if store.conn.execute("SELECT 1 FROM actions WHERE kind IN ('new-session','new_session','spawn','upgrade','rollback') AND (? = '' OR requested_at >= ?) LIMIT 1", (since_ts, since_ts)).fetchone(): return None
+    if store.conn.execute("SELECT 1 FROM escalations WHERE (? = '' OR closed_at >= ?) LIMIT 1", (since_ts, since_ts)).fetchone(): return None
+    if owner_rows:
+        return (
+            f"拒绝交账（REG-079 总线主人飞书指令防吞没/防面板自嗨门禁）：批次 {eff_bid} 含主人在飞书发来的指令或追问（{owner_rows[0]['message_id']}），"
+            "但 tp_bus 既未调用 sheepdog forward 转交负责专席（询问某人/某项目进展必须优先 forward 给对应专席，严禁自己偷查旧文件或在本地 IDE 面板打字交差）、"
+            "未调用 sheepdog new-session 新开专席、也未调用 sheepdog report/ask 在飞书回复主人（只写在本地面板里主人在飞书上完全看不到！）。"
+            f"请立即用 sheepdog forward --topic <专席> --message-ids {owner_rows[0]['message_id']} --quote \"<主人原话>\" 转交专席，或调用 sheepdog report/ask 在飞书卡片回复主人后再交回执！"
+        )
     from .engine import has_reply_suffix, is_agent_reply
     me, oc, sfx = getattr(cfg, "self_open_id", "") or "", getattr(cfg, "owner_context", None), getattr(getattr(cfg, "session", None), "reply_suffix", "")
     if me and any(any(not (oc and is_agent_reply(c[0] or "", oc)) and not (sfx and has_reply_suffix(c[0] or "", sfx)) for c in store.conn.execute("SELECT content FROM messages WHERE chat_id=? AND sender_id=? AND create_time >= ? AND message_id != ? AND message_id NOT LIKE 'sd_%' AND COALESCE(reason,'') != 'agent_reply_in_owner_chat'", (r["chat_id"], me, r["create_time"] or "", r["message_id"])).fetchall()) for r in at_me_rows):
@@ -89,13 +112,19 @@ def verify_bus_at_me_no_silent_drop(cfg, store, topic_id: str, batch_id: str = "
     return f"拒绝交账（REG-046 总线 @Matthew 点名诉求防吞没门禁）：批次 {eff_bid} 含显式 @Matthew 的行动/走查诉求（{at_me_rows[0]['message_id']}），但 tp_bus 既未 forward 转交专席、未 new-session 新开专席、也未向主人发 ask/report（仅 tell 旁人事项或交 noop 不算路由主人待办）。请立即用 sheepdog forward 转交或 sheepdog new-session 新开专席承接后再交回执！"
 
 def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *, key: str = "", ball: str = "", fyi: bool = False) -> str:
-    """7.81 / 7.110（REG-078）报告球权契约：拦截 --ball owner、正文末尾交互选项块/祈使回执口令，以及把动手操作或拍板倒推给主人的祈使句。"""
+    """7.81 / 7.110 / 7.111（REG-078 / REG-079）报告球权契约：拦截 --ball owner、总线 --ball doing 越权挂活、正文末尾交互选项块/祈使回执口令，以及把动手操作或拍板倒推给主人的祈使句。"""
     b = (ball or "").strip().lower()
     if b in ("owner", "waiting_owner", "等主人"): raise _outbound_err("report 严禁使用 --ball owner（球在主人脚下必须调用 sheepdog ask 发起待拍板卡片，严禁把待拍板伪装成 report）")
     if b and b not in VALID_REPORT_BALLS: raise _outbound_err("report --ball 仅支持 done | doing | other")
-    if not fyi:
+    if not fyi and (b or hub_active(cfg, store)):
         tid = ("tp_" + topic_id.strip() if (topic_id or "").strip() and not (topic_id or "").strip().startswith("tp_") else (topic_id or "").strip())
         base = base_topic_id(tid)
+        if b == "doing" and base == "tp_bus":
+            raise _outbound_err(
+                "report 拒绝（REG-079 总线纯分流红线）：总线（tp_bus）只做纯分流路由，严禁使用 --ball doing 把进行中的业务事项锁死在 tp_bus 名下！"
+                "若主人在飞书询问某人/某项目进展或派发业务事项，必须调用 sheepdog forward --topic <负责专席> --message-ids <om_id> --quote \"<主人原话>\" 转交对应专席由其直接向主人汇报；"
+                "若确为总线自身一次性盘点答复请用 --ball done 或不传 --ball。"
+            )
         has_open_esc = bool(
             store is not None
             and tid
@@ -116,7 +145,6 @@ def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *,
                 "若主人已点选项 A 授权由专席执行，请先彻查同项目关联 Cloud Run 服务环境变量/挂载卷（gcloud run services describe ...）与代码仓自行闭环；"
                 "若确遇物理权限边界需主人决策或操作，必须调用 sheepdog ask 发起带选项卡片（纯历史引述请加 --fyi）"
             )
-    if not fyi and (b or hub_active(cfg, store)):
         cleaned = _MORE_LINE_RE.sub("", _FENCED_RE.sub("", text or ""))
         non_empty = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
         opt_keys = {m.group(1) for ln in non_empty[-8:] if (m := _OPTION_LINE_RE.match(ln))}
@@ -125,14 +153,24 @@ def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *,
     return b
 
 def verify_receipt_no_dead_ball(cfg, store, topic_id: str, batch_id: str, receipt: dict) -> str | None:
-    """REG-044 / REG-078：消灭『死球真空』——纯账本状态守恒校验（无 ask 禁交 needs_decision，无 ask 禁留 waiting_owner / waiting_on=主人或倒推操作给主人）。"""
+    """REG-044 / REG-078 / REG-079：消灭『死球真空』与『本地面板自嗨』——纯账本状态守恒校验。"""
     tid = ("tp_" + topic_id.strip() if (topic_id or "").strip() and not (topic_id or "").strip().startswith("tp_") else (topic_id or "").strip())
     base = base_topic_id(tid)
     if not isinstance(receipt, dict) or not tid or base == "tp_bus" or store is None: return None
     status = str(receipt.get("status") or "").strip()
     open_escs = store.conn.execute("SELECT message_id FROM escalations WHERE (topic_id=? OR topic_id=?) AND closed_at IS NULL", (tid, base)).fetchall()
+    rcp_summary = str(receipt.get("summary") or "")
+    if status in ("handled", "waiting", "waiting_external", "done") and _LOCAL_PANEL_ONLY_REPLY_RE.search(rcp_summary):
+        eff_bid = (batch_id or "").strip()
+        d_row = store.conn.execute("SELECT message_ids, sent_at FROM dispatches WHERE batch_id=?", (eff_bid,)).fetchone() if eff_bid else None
+        since_ts = (d_row["sent_at"] if d_row is not None and d_row["sent_at"] else "") or ""
+        has_send = bool(store.conn.execute("SELECT 1 FROM sends WHERE (topic_id=? OR topic_id=?) AND kind IN ('ask','report','reply') AND (? = '' OR sent_at >= ?) LIMIT 1", (tid, base, since_ts, since_ts)).fetchone())
+        if not has_send:
+            return (
+                f"receipt 没收（REG-079 防面板自嗨门禁）：回执 summary 宣称『{rcp_summary[:60]}』（仅在本地会话面板答复），"
+                "但本批次未向飞书发送任何 sheepdog report / ask / reply 卡片！主人在飞书上完全看不到本地 IDE 面板文字，请先调用 sheepdog report 或 ask 在飞书回复主人后再交回执。"
+            )
     if status in ("handled", "waiting", "waiting_external", "done") and not open_escs:
-        rcp_summary = str(receipt.get("summary") or "")
         if m_dump := _OWNER_WORK_DUMP_RE.search(rcp_summary):
             return (
                 f"receipt 没收: 检测到『隐形死球』（当前飞书无未决 sheepdog ask，但回执 summary 包含让主人动手/拍板的倒推语句『{m_dump.group(0).strip()}』，REG-078 防死球门禁）！"

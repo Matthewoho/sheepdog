@@ -522,5 +522,12 @@
 | --- | --- | --- |
 | 7.110 | 专席（如工作区在 `~/Code/sheepdog` 的 `tp_ziyi-zhang`）想把自进化复盘直发给工作区在 `~/Work/MatthewNote` 的 `sheepdog` 主脑会话（`c6677355`）时，调内置 `send_message` 被 Antigravity 宿主跨工程校验拦死（`cross-project messaging is not allowed`），且 `roster.toml` 未登记 `tp_sheepdog` / `tell` 拒绝 `known` 会话；或主人在首次 `ask` 已点击 `[卡片回调] A：由专席在生产 Secret Manager 挂载或注入环境...` 授权专席办理后，专席未先深挖关联服务环境变量，先就同一 `--key` 发第二次重复 `ask` 询问『A. 授权由专席云端创建 vs B. 由 Matthew 本人手动创建』，随后又在 `open_escalations=0` 的情况下通过 `sheepdog report --ball doing`（『GCP无此Key在Vercel请Matthew操作 / 请您直接从Vercel取值在GCP创建版本23』）与 `receipt` 把动手活倒推给主人，造成会话静默空转 23 分钟（REG-078） | `test_security.GateTest.test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard`（`tests/test_security.py::GateTest::test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard`） |
 
+## 7.111 总线收到主人飞书指令/追问防面板自嗨漏回门禁、拦截任何会话未发飞书卡片却在回执声称「直接在会话中答复」与禁止 `tp_bus` 调用 `report --ball doing` 抢占业务话题（REG-079）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.111 | 主人在飞书私聊或群内向总线（`tp_bus`）发消息询问进展或下达指令（`reason in {"owner_instruction", "owner_reply"}`，如 `om_test_owner_ask_kai`：『kai说的那个cinemap-stage.tapnow.tv那个事情 怎么样了 卡在哪』）时，`tp_bus` 既未 `sheepdog forward` 转交负责专席（`tp_kaifeng`），也未发任何飞书卡片（`ask`/`report`/`reply`），而是私自读取 SQLite 历史 `lambs` 后只在本机 Antigravity IDE 聊天面板里打字输出并交 `handled` 回执（『直接在会话中完整答复』），叠加 `owner_relay_after_minutes=5` 延迟导致主人在飞书上苦等 2 分钟毫无反应被迫追问『hello？』；随后 `tp_bus` 又慌忙调用 `sheepdog report --topic tp_bus --key cinemap-stage-compliance --ball doing`，既报了过时的二道贩子结论又把 `owner_threads` 业务话题锁死在 `tp_bus` 名下（REG-079） | `test_security.GateTest.test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing`（`tests/test_security.py::GateTest::test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing`） |
+
+
 
 

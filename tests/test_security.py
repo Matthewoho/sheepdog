@@ -1087,6 +1087,133 @@ class GateTest(Base):
         rendered = _fmt_msg(opt_a_row)
         self.assertIn(OPTION_A_EXECUTION_DIRECTIVE, rendered)
 
+    def test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing(self):
+        """REG-079 (7.111):
+        1. 总线收到主人在飞书上的指令或追问（reason in {'owner_instruction', 'owner_reply'}，如『kai说的那个cinemap-stage.tapnow.tv那个事情 怎么样了 卡在哪』）时，
+           若未执行 forward / new-session / spawn，也未发飞书卡片（ask / report / reply）或结案（resolve），
+           verify_bus_at_me_no_silent_drop 必须拒绝交回执；纯已知悉短语（如『好』『收到』）则豁免放行；
+        2. 任何会话若在本批未调用 ask / report / reply 发飞书卡片，却在回执 summary 中声称『直接在会话中完整答复 / 在面板中答复』，
+           verify_receipt_no_dead_ball 必须拒绝该回执（防面板自嗨门禁）；
+        3. 总线（tp_bus）严禁调用 sheepdog report --topic tp_bus --ball doing 将业务话题锁死在总线名下（除非 --fyi）。
+        """
+        from sheepdog.decision_hub import (
+            enforce_report_contract,
+            verify_bus_at_me_no_silent_drop,
+            verify_receipt_no_dead_ball,
+        )
+        from sheepdog.outbound import OutboundError
+
+        now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        # 1. 模拟主人在飞书私聊询问总线：kai说的那个cinemap-stage.tapnow.tv那个事情 怎么样了 卡在哪
+        self.store.upsert_message(
+            msg(
+                message_id="om_test_owner_ask_kai",
+                chat_type="p2p",
+                chat_id="oc_test_owner_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="kai说的那个cinemap-stage.tapnow.tv那个事情 怎么样了 卡在哪",
+                create_time=now_iso,
+            ),
+            "dispatch",
+            "owner_instruction",
+            ["owner_verified"],
+        )
+        self.store.mark_batch(["om_test_owner_ask_kai"], "b_test_bus_kai", "tp_bus", "delivered")
+        self.store.record_dispatch("b_test_bus_kai", "tp_bus", ["om_test_owner_ask_kai"], state="sent")
+
+        # 总线未 forward、未发飞书卡片，仅在面板自嗨交 handled 回执 -> 被 verify_bus_at_me_no_silent_drop 拦截
+        err_bus_drop = verify_bus_at_me_no_silent_drop(
+            self.cfg,
+            self.store,
+            "tp_bus",
+            "b_test_bus_kai",
+            {
+                "status": "handled",
+                "summary": "Matthew 私聊询问 cinemap-stage.tapnow.tv 进展与卡点，总线提取专席实测底账直接在会话中完整答复",
+            },
+        )
+        self.assertIsNotNone(err_bus_drop)
+        self.assertIn("REG-079 总线主人飞书指令防吞没/防面板自嗨门禁", err_bus_drop)
+        self.assertIn("om_test_owner_ask_kai", err_bus_drop)
+
+        # 同时，任何会话未发飞书卡片却在回执里写『直接在会话中完整答复』-> 被 verify_receipt_no_dead_ball 拦截
+        err_panel_only = verify_receipt_no_dead_ball(
+            self.cfg,
+            self.store,
+            "tp_alpha",
+            "b_test_panel_only",
+            {
+                "status": "handled",
+                "summary": "总线提取专席实测底账直接在会话中完整答复",
+            },
+        )
+        self.assertIsNotNone(err_panel_only)
+        self.assertIn("REG-079 防面板自嗨门禁", err_panel_only)
+
+        # 当总线执行了 forward 转交给 tp_alpha 后 -> verify_bus_at_me_no_silent_drop 放行
+        self.store.forward_message("om_test_owner_ask_kai", "tp_alpha", ["forwarded", "forwarded_from:tp_bus"])
+        err_bus_after_fwd = verify_bus_at_me_no_silent_drop(
+            self.cfg,
+            self.store,
+            "tp_bus",
+            "b_test_bus_kai",
+            {
+                "status": "handled",
+                "summary": "已将 Matthew 关于 cinemap-stage 的询问 forward 转交 tp_alpha",
+            },
+        )
+        self.assertIsNone(err_bus_after_fwd)
+
+        # 主人仅发纯知悉短语（如『好的』）时，总线无需 forward/report 也可放行
+        self.store.upsert_message(
+            msg(
+                message_id="om_test_owner_ack_short",
+                chat_type="p2p",
+                chat_id="oc_test_owner_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="好的",
+                create_time=now_iso,
+            ),
+            "dispatch",
+            "owner_reply",
+            ["owner_verified"],
+        )
+        self.store.mark_batch(["om_test_owner_ack_short"], "b_test_bus_ack", "tp_bus", "delivered")
+        self.store.record_dispatch("b_test_bus_ack", "tp_bus", ["om_test_owner_ack_short"], state="sent")
+        self.assertIsNone(
+            verify_bus_at_me_no_silent_drop(
+                self.cfg,
+                self.store,
+                "tp_bus",
+                "b_test_bus_ack",
+                {"status": "noop", "reason": "主人回复好的已知悉"},
+            )
+        )
+
+        # 3. 总线严禁调用 report --topic tp_bus --ball doing 抢占业务话题
+        with self.assertRaisesRegex(OutboundError, "REG-079 总线纯分流红线"):
+            enforce_report_contract(
+                self.cfg,
+                self.store,
+                "tp_bus",
+                "cinemap-stage.tapnow.tv 进展与当前卡点",
+                "目前卡在 EdgeOne 切换与合规校验",
+                fyi=False,
+                ball="doing",
+            )
+        # 总线使用 --ball done 或 --fyi 纯信息答复允许通过
+        enforce_report_contract(
+            self.cfg,
+            self.store,
+            "tp_bus",
+            "待办盘点结果",
+            "当前无未结事项",
+            fyi=False,
+            ball="done",
+        )
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1198,6 +1325,7 @@ class SecurityCliTest(GateTest):
     test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard = None
     test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee = None
     test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard = None
+    test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing = None
 
 
 if __name__ == "__main__":

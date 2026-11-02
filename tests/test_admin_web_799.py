@@ -327,7 +327,8 @@ class TestAdminWeb799(unittest.TestCase):
             stage_codes = [s["code"] for s in trace["stages"]]
             self.assertEqual(stage_codes, ["T0", "T1", "T2", "T3a", "T3", "T4", "T5"])
             t5_stage = next(s for s in trace["stages"] if s["code"] == "T5")
-            self.assertEqual(t5_stage["delta_ms"], 65_000)
+            self.assertEqual(t5_stage["delta_ms"], 0)
+            self.assertEqual(t5_stage["e2e_ms"], 65_000)
             step_kinds = [st["kind"] for st in trace["session_steps"]]
             self.assertEqual(step_kinds, ["batch_inject", "subagent", "sd_receipt", "thinking"])
             self.assertEqual(trace["session_steps"][1]["duration_ms"], 46_000)
