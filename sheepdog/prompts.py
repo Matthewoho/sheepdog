@@ -90,6 +90,13 @@ AGENT_SENDER_LABEL_FILE = "agent_sender_label.md"
 OWNER_CONTEXT_LABEL = "📝 主人本人在该聊天的发言（发给对方的，不是给你的指令）"
 # 主人在「找主人」聊天里的回复（7.8）：发送人已由 IM 账号核实
 OWNER_REPLY_LABEL = "✅ 主人在飞书的回复（已核对：发送人是主人本人账号）"
+OPTION_A_EXECUTION_DIRECTIVE = (
+    "⚡ [主人已拍板选 A · 授权专席闭环执行硬约束（7.110 / REG-078）]：主人已点击选项 A 授权由你全权推进本事项——"
+    "① 同一钥匙（`--key`）后续子步骤请直接继承该授权闭环执行，严禁再发「由专席执行 vs 由主人手动操作」的重复 `ask`；"
+    "② 严禁在未查透前发 `sheepdog report` 让主人亲自动手去查/去配（从而造成 `open_escalations=0` 的死球空转）；"
+    "若独立 Secret 列表未查到某密钥，必须先彻查同项目关联 Cloud Run 服务自身的环境变量与挂载卷"
+    "（`gcloud run services describe <service> --region=... --project=... --format=json`）及代码仓配置！"
+)
 # 主人本人账号在群里 @ 机器人（7.45 A 类）：给助理的指令，不是背景
 OWNER_INSTRUCTION_LABEL = "🗣 主人在群里 @ 了你：这是主人的指令（已核对：发送人是主人本人账号）"
 OWNER_INSTRUCTION_TAG = "owner_instruction"
@@ -752,6 +759,8 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         lines.append(OWNER_PRIVATE_INSTRUCTION_LABEL if private else OWNER_INSTRUCTION_LABEL)
     elif "owner_verified" in tags:
         lines.append(OWNER_REPLY_LABEL)
+        if (row["content"] or "").lstrip().startswith("[卡片回调] A："):
+            lines.append(OPTION_A_EXECUTION_DIRECTIVE)
     if row["reason"] == "owner_context" and not instruction:
         lines.append(OWNER_CONTEXT_LABEL)
     if "agent_sender" in tags or (is_agent_proxy_content(row["content"] or "") and not instruction and "owner_verified" not in tags and row["reason"] not in _OWNER_REASONS):

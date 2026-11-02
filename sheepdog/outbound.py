@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib, logging, os, re, sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from . import duty, identity as ident, pending as pend, session as sm
 from .ack import clear_handled_owner_reactions
@@ -343,6 +343,15 @@ _EXPLICIT_ENV_DECL_RE = re.compile(
     r"(?:明确是|100%是|仅用于|目标环境|所属环境)[：:\s]*(?:纯)?(?:测试|生产|Stage|预发|tap-testing-env|taplabs-453508|tpn-prod-506507)",
     re.I,
 )
+_REASK_MANUAL_OPTION_RE = re.compile(
+    r"(?:请定是由专席.{0,24}还是(?:您|主人|Matthew)(?:本人)?(?:手动|亲自)|"
+    r"[B-E][.、:：]\s*由\s*(?:Matthew|主人|您)(?:本人)?(?:手动|亲自)(?:在|去|登录|创建|配置|操作))",
+    re.I,
+)
+_REASK_BLOCKER_EXEMPT_RE = re.compile(
+    r"(?:余额不足|权限不足|报错|失败|冲突|403|PermissionDenied|无法访问|需二次拍板)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -352,12 +361,14 @@ def check_ask_pre_flight_guard(
     title: str,
     body: str,
     *,
+    key: str = "",
     floor: str = "",
     floor_type: str | None = None,
 ) -> None:
-    """7.108（REG-076）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110（REG-076 / REG-078）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
-    2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』，严禁逼主人反问『他是测试还是生产呀 / 哪个环境的子成员账号』。"""
+    2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
+    3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask。"""
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
     full_text = f"{title}\n{body}"
@@ -373,6 +384,29 @@ def check_ask_pre_flight_guard(
             "请示 LiveKit 凭据或子成员账号时，必须在标题或正文中显式声明『明确是测试环境（tap-testing-env）』或『明确是生产环境（taplabs-453508）』"
             "（或『目标环境：Stage/测试/生产』），严禁让主人反问『他是测试还是生产呀 / 哪个环境的子成员账号』（REG-076 防打扰门禁，没有发送）",
         )
+    nk = duty.norm_key(key) if key else ""
+    if nk and _REASK_MANUAL_OPTION_RE.search(full_text) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):
+        since_iso = (datetime.now().astimezone() - timedelta(minutes=120)).isoformat(timespec="seconds")
+        prior = store.conn.execute(
+            """SELECT e.message_id, e.answered_at, m.content AS ans_content
+               FROM escalations e
+               JOIN sends s ON s.message_id = e.message_id
+               LEFT JOIN messages m ON m.message_id = e.answer_message_id
+               WHERE e.topic_id = ? AND (s.norm_key = ? OR s.key = ?)
+                 AND e.answered_at IS NOT NULL AND e.answered_at >= ?
+               ORDER BY e.answered_at DESC LIMIT 1""",
+            (topic_id, nk, key, since_iso),
+        ).fetchone()
+        if prior is not None:
+            ans_c = (prior["ans_content"] or "").strip()
+            if ans_c.startswith("[卡片回调] A：") and any(w in ans_c for w in ("由专席", "授权", "同意", "执行", "挂载", "注入", "创建", "配置")):
+                raise OutboundError(
+                    EXIT_INVALID,
+                    f"同一钥匙 (--key {key}) 主人刚于 {prior['answered_at']} 点击选项 A 批准由专席执行（「{ans_c}」）："
+                    "同一事项后续子步骤请直接继承该授权闭环执行（查同项目关联 Cloud Run 服务 env/挂载卷与 Secret），"
+                    "严禁再次发起『由专席执行 vs 由主人手动操作』的重复 ask 打扰主人！"
+                    "（若确遇新物理权限报错或方案分叉，请在正文中写明报错详情或『需二次拍板：...』；REG-078 防打扰门禁，没有发送）",
+                )
 
 
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str, key: str = "",
@@ -396,10 +430,11 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         key = decision_hub.base_topic_id(topic_id).removeprefix("tp_") or topic_id
     nk = duty.norm_key(key) if key else ""
     raw_floor, floor = (floor if kind == ASK else ""), (_one_line(floor) if kind == ASK else "")
+    combined_for_check = f"{summary.strip()}\n---more---\n{body}" if (summary or "").strip() else body
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
-        check_ask_pre_flight_guard(cfg, store, topic_id, title, body, floor=raw_floor, floor_type=floor_type)
-    else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, body, key=key, ball=ball, fyi=fyi)
+        check_ask_pre_flight_guard(cfg, store, topic_id, title, combined_for_check, key=key, floor=raw_floor, floor_type=floor_type)
+    else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
     try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
     text, eff_batch = compose(cfg, kind, topic_id, title, resolved_body), (batch or current_batch(store, topic_id))

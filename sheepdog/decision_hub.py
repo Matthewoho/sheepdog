@@ -33,6 +33,18 @@ _FENCED_RE, _MORE_LINE_RE = re.compile(r"```.*?```", re.S), re.compile(r"^[ \t]*
 _OPTION_LINE_RE = re.compile(r"^\s*(?:[-*•+]|\d+[.)、])?\s*(?:\*\*|__)?(?:选项\s*|方案\s*)?[\(\[（【]?([A-E])[\)\]）】]?\s*[:：.、=·\-—]\s*\S+")
 _REPLY_PROMPT_RE = re.compile(r"(?:^\s*(?:[-*•>]\s*)?|[，。；：:\s])(?:请\s*(?:[^，。\n]{0,14})?(?:回(?:复)?|发(?:送)?)|回(?:复)?口令\s*[:：])\s*[「『“\"'`]\s*(?:同意|确认|批准|放行|选\s*[A-E])")
 _OWNER_WAIT_RE = re.compile(r"^\s*(?:主人|matthew(?:\s+hong)?)(?:\s|$|[（(/:：,，-])", re.I)
+_OWNER_HANDS_ON_DUMP_RE = re.compile(
+    r"(?:(?:请|需要|烦请|麻烦|劳烦|提醒|让)\s*(?:您|你|主人|Matthew))\s*"
+    r"(?:尽快|直接|亲自|手动|自行|帮忙|(?:去|在|到|从)\s*[^，。；\n]{1,24}\s*)*"
+    r"(?:取值|填入|创建|添加|配置|操作|加\s*(?:版本|key|密钥))",
+    re.I,
+)
+_OWNER_WORK_DUMP_RE = re.compile(
+    r"(?:(?:请|需要|烦请|麻烦|劳烦|提醒|等(?:待)?|让)\s*(?:您|你|主人|Matthew))\s*"
+    r"(?:尽快|直接|亲自|手动|自行|帮忙|(?:去|在|到|从)\s*[^，。；\n]{1,24}\s*)*"
+    r"(?:取值|填入|创建|添加|配置|操作|执行|拍板|介入|加\s*(?:版本|key|密钥))",
+    re.I,
+)
 _AT_ME_ACTION_RE = re.compile(r"(走查|提测|来测试|测试一下|验证|确认一下|请确认|看看|看下|请回复|反馈一下|审批|放行|核对|review|preview)", re.I)
 
 def _outbound_err(msg: str):
@@ -77,10 +89,33 @@ def verify_bus_at_me_no_silent_drop(cfg, store, topic_id: str, batch_id: str = "
     return f"拒绝交账（REG-046 总线 @Matthew 点名诉求防吞没门禁）：批次 {eff_bid} 含显式 @Matthew 的行动/走查诉求（{at_me_rows[0]['message_id']}），但 tp_bus 既未 forward 转交专席、未 new-session 新开专席、也未向主人发 ask/report（仅 tell 旁人事项或交 noop 不算路由主人待办）。请立即用 sheepdog forward 转交或 sheepdog new-session 新开专席承接后再交回执！"
 
 def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *, key: str = "", ball: str = "", fyi: bool = False) -> str:
-    """7.81 报告球权契约：拦截 --ball owner 及正文末尾伪装成 report 的交互选项块/祈使回执口令（零普通词黑名单）。"""
+    """7.81 / 7.110（REG-078）报告球权契约：拦截 --ball owner、正文末尾交互选项块/祈使回执口令，以及把动手操作或拍板倒推给主人的祈使句。"""
     b = (ball or "").strip().lower()
     if b in ("owner", "waiting_owner", "等主人"): raise _outbound_err("report 严禁使用 --ball owner（球在主人脚下必须调用 sheepdog ask 发起待拍板卡片，严禁把待拍板伪装成 report）")
     if b and b not in VALID_REPORT_BALLS: raise _outbound_err("report --ball 仅支持 done | doing | other")
+    if not fyi:
+        tid = ("tp_" + topic_id.strip() if (topic_id or "").strip() and not (topic_id or "").strip().startswith("tp_") else (topic_id or "").strip())
+        base = base_topic_id(tid)
+        has_open_esc = bool(
+            store is not None
+            and tid
+            and store.conn.execute(
+                "SELECT 1 FROM escalations WHERE (topic_id=? OR topic_id=?) AND closed_at IS NULL LIMIT 1",
+                (tid, base),
+            ).fetchone()
+        )
+        full_clean = "\n".join(
+            ln for ln in _MORE_LINE_RE.sub("", _FENCED_RE.sub("", f"{title or ''}\n{text or ''}")).splitlines()
+            if not ln.lstrip().startswith(">")
+        )
+        dump_rx = _OWNER_HANDS_ON_DUMP_RE if has_open_esc else _OWNER_WORK_DUMP_RE
+        if m_dump := dump_rx.search(full_clean):
+            raise _outbound_err(
+                f"report 严禁把动手操作或拍板倒推给主人（检测到『{m_dump.group(0).strip()}』，REG-078 防死球门禁）："
+                "普通 report 不会创建待拍板卡片（open_escalations=0），把操作推给主人会造成状态机显示 doing 而实际停机等主人的死球空转！"
+                "若主人已点选项 A 授权由专席执行，请先彻查同项目关联 Cloud Run 服务环境变量/挂载卷（gcloud run services describe ...）与代码仓自行闭环；"
+                "若确遇物理权限边界需主人决策或操作，必须调用 sheepdog ask 发起带选项卡片（纯历史引述请加 --fyi）"
+            )
     if not fyi and (b or hub_active(cfg, store)):
         cleaned = _MORE_LINE_RE.sub("", _FENCED_RE.sub("", text or ""))
         non_empty = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
@@ -90,20 +125,27 @@ def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *,
     return b
 
 def verify_receipt_no_dead_ball(cfg, store, topic_id: str, batch_id: str, receipt: dict) -> str | None:
-    """REG-044：消灭『死球真空』——纯账本状态守恒校验（无 ask 禁交 needs_decision，无 ask 禁留 waiting_owner / waiting_on=主人）。"""
+    """REG-044 / REG-078：消灭『死球真空』——纯账本状态守恒校验（无 ask 禁交 needs_decision，无 ask 禁留 waiting_owner / waiting_on=主人或倒推操作给主人）。"""
     tid = ("tp_" + topic_id.strip() if (topic_id or "").strip() and not (topic_id or "").strip().startswith("tp_") else (topic_id or "").strip())
     base = base_topic_id(tid)
     if not isinstance(receipt, dict) or not tid or base == "tp_bus" or store is None: return None
-    if not (canonical_group_mode(cfg, store) or hub_active(cfg, store) or getattr(store, "enforce_receipt_ball_gate", False)): return None
     status = str(receipt.get("status") or "").strip()
     open_escs = store.conn.execute("SELECT message_id FROM escalations WHERE (topic_id=? OR topic_id=?) AND closed_at IS NULL", (tid, base)).fetchall()
+    if status in ("handled", "waiting", "waiting_external", "done") and not open_escs:
+        rcp_summary = str(receipt.get("summary") or "")
+        if m_dump := _OWNER_WORK_DUMP_RE.search(rcp_summary):
+            return (
+                f"receipt 没收: 检测到『隐形死球』（当前飞书无未决 sheepdog ask，但回执 summary 包含让主人动手/拍板的倒推语句『{m_dump.group(0).strip()}』，REG-078 防死球门禁）！"
+                "主人已授权或无未决 ask 时，严禁把动手操作倒推给主人后交账停机；请先彻查同项目关联 Cloud Run 服务 env/挂载卷自行闭环，或先调用 sheepdog ask 发起飞书决策卡后再交回执。"
+            )
+    if not (canonical_group_mode(cfg, store) or hub_active(cfg, store) or getattr(store, "enforce_receipt_ball_gate", False)): return None
     if status == "needs_decision" and not open_escs:
         return 'receipt 没收: status="needs_decision" 但当前会话在飞书没有任何未决的 sheepdog ask 待拍板卡片（open_escalations=0）！必须先调用 sheepdog ask 把决策卡发到飞书，再交回执。'
-    if status in ("handled", "waiting") and not open_escs:
+    if status in ("handled", "waiting", "waiting_external", "done") and not open_escs:
         r_works = [w for w in (receipt.get("work") or []) if isinstance(w, dict)]
         cleared = {duty.norm_key(str(w.get("key") or "")) for w in r_works if w.get("key") and str(w.get("state") or "doing").strip().lower() in ("done", "handed_off", "waiting_other", "doing") and not _OWNER_WAIT_RE.search(str(w.get("waiting_on") or ""))}
         work_dead = any(str(w.get("state") or "").strip().lower() == "waiting_owner" or _OWNER_WAIT_RE.search(str(w.get("waiting_on") or "")) for w in r_works)
-        if not work_dead:
+        if not work_dead and status in ("handled", "waiting"):
             db_works = {w["id"]: w for t in dict.fromkeys([tid, base]) for w in store.open_work(t)}.values()
             work_dead = any(w["norm_key"] not in cleared and (w["state"] == "waiting_owner" or _OWNER_WAIT_RE.search(w["waiting_on"] or "")) for w in db_works)
         if work_dead:

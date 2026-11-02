@@ -917,6 +917,176 @@ class GateTest(Base):
         healed_lb = self.store.get_lamb("lamb_test_empty")
         self.assertEqual(healed_lb["result_summary"], "已完成：Step 3 Admin Verification")
 
+    def test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard(self):
+        """REG-078 (7.110):
+        1. 跨工作区专席直投主脑通道：tp_sheepdog 为 known 模式且有 conversation_id 时，
+           send_mail 允许 --to tp_sheepdog（但普通 known topic 如 tp_ops 仍被拒），
+           dispatch_once 通过 _deliver_brain_mail 直接把来信投递进 conv_test_sheepdog 并标 acked；
+        2. 拦截 report/receipt 把动手操作倒推给主人的隐形死球门禁：
+           enforce_report_contract 拒绝在 --title/--summary/--text 中把动手操作推给主人的 report，
+           verify_receipt_no_dead_ball 拒绝 open_escalations=0 但 summary 把动手操作推给主人的回执；
+        3. 同 --key 主人已批选项 A 后的防重复 ask 门禁与 OPTION_A_EXECUTION_DIRECTIVE 唤醒横幅：
+           120 分钟内同 --key 已有 '[卡片回调] A：...' 批复时，再次发询问『由专席执行还是主人手动操作』的 ask 被拒，
+           除非显式声明新阻碍（报错/权限不足/需二次拍板）；且投递 '[卡片回调] A：...' 时自动注入强约束执行横幅。
+        """
+        from sheepdog.decision_hub import enforce_report_contract, verify_receipt_no_dead_ball
+        from sheepdog.duty import DutyError, send_mail
+        from sheepdog.outbound import OutboundError, check_ask_pre_flight_guard
+        from sheepdog.prompts import OPTION_A_EXECUTION_DIRECTIVE, _fmt_msg
+        from sheepdog.roster import RosterSession
+
+        # 1. 在名册与账本注册 tp_sheepdog (known, conv_test_sheepdog) 并验证跨工作区 tell 直投主脑
+        self.roster.sessions.append(
+            RosterSession(
+                key="sheepdog",
+                mode="known",
+                title="🐕 Sheepdog 自治主脑",
+                duty="负责 sheepdog 守护进程自进化",
+                conversation_id="conv_test_sheepdog",
+            )
+        )
+        self.d.sync_roster()
+        target_ok = cli._duty_target_ok(self.store)
+        # 普通 known topic (tp_ops) 仍被拒绝
+        with self.assertRaisesRegex(DutyError, "不是在投递的会话"):
+            send_mail(self.store, self.cfg, "tp_alpha", "tp_ops", "测试普通 known 不应允许", is_target=target_ok)
+
+        # tp_sheepdog 允许留言并由 _deliver_brain_mail 直接投递到 conv_test_sheepdog 且不锁 pending_batch_id
+        mid = send_mail(
+            self.store,
+            self.cfg,
+            "tp_alpha",
+            "tp_sheepdog",
+            "22:34–22:57 空转 23 分钟自进化建议：刚才内置 send_message 报 cross-project messaging is not allowed，改走 tell 直投主脑。",
+            key="cinemap-sso-key",
+            is_target=target_ok,
+        )
+        self.assertGreater(mid, 0)
+        self.assertEqual(self.store.count_pending_signals("tp_sheepdog"), 1)
+        self.d.dispatch_once()
+        delivered_to_brain = self.sink.to("conv_test_sheepdog")
+        self.assertEqual(len(delivered_to_brain), 1)
+        self.assertIn("[sheepdog] 📬 跨工作区专席来信", delivered_to_brain[0])
+        self.assertIn("22:34–22:57 空转 23 分钟自进化建议", delivered_to_brain[0])
+        self.assertEqual(self.store.count_pending_signals("tp_sheepdog"), 0)
+        self.assertIsNone(self.store.get_topic("tp_sheepdog")["pending_batch_id"])
+
+        # 2. enforce_report_contract & verify_receipt_no_dead_ball 拦截把动手活倒推给主人的隐形死球
+        for dump_text in (
+            "GCP无此Key在Vercel请Matthew操作\n---more---\n请您直接从Vercel取值在GCP创建版本23",
+            "提醒 Matthew 尽快去 GCP Secret Manager 添加版本 23",
+            "请你在 AWS 控制台手动创建密钥并回告",
+        ):
+            with self.assertRaisesRegex(OutboundError, "REG-078 防死球门禁"):
+                enforce_report_contract(
+                    self.cfg, self.store, "tp_alpha", "张子仪发版进度", dump_text, fyi=False, ball="doing"
+                )
+        # 正常已完成汇报与 --fyi 通过
+        enforce_report_contract(
+            self.cfg, self.store, "tp_alpha", "张子仪发版完成", "已完成 Secret 版本 23 注入并切流 100%", fyi=False, ball="done"
+        )
+        enforce_report_contract(
+            self.cfg, self.store, "tp_alpha", "知会", "请您直接从Vercel取值在GCP创建版本23（历史转述）", fyi=True, ball="done"
+        )
+
+        for dump_summary in (
+            "已发进度汇报卡说明 GCP 搜不到 cinemap 相关密钥且该 Key 在 Vercel，请 Matthew 从 Vercel 取值填入版本 23",
+            "回飞书提醒 Matthew 尽快加版本 23，等待版本 23 就绪后立即切流",
+        ):
+            err_rcpt = verify_receipt_no_dead_ball(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "b_test_dump",
+                {"status": "handled", "summary": dump_summary},
+            )
+            self.assertIsNotNone(err_rcpt)
+            self.assertIn("REG-078 防死球门禁", err_rcpt)
+
+        # 3. 同 --key 主人已批选项 A 后的防重复 ask 门禁 + OPTION_A_EXECUTION_DIRECTIVE 横幅
+        now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        self.store.add_send(
+            "ik_test_ask_first",
+            "ask",
+            "tp_alpha",
+            "om_test_ask_first",
+            "请求配置 TAP_CINEMAP_SSO_SHARED_KEY",
+            key="cinemap-sso-key",
+            norm_key="CINEMAP-SSO-KEY",
+            title="TAP_CINEMAP_SSO_SHARED_KEY 缺失",
+        )
+        self.store.upsert_message(
+            msg(
+                message_id="sd_card_cb_test_opt_a",
+                chat_type="p2p",
+                chat_id="oc_test_alpha_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="[卡片回调] A：由专席在生产 Secret Manager 挂载或注入环境（凭据不落明文到个人），供发版直接引用",
+            ),
+            "dispatch",
+            "owner_reply",
+            ["owner_verified"],
+        )
+        self.store.conn.execute(
+            """INSERT INTO escalations
+               (message_id, chat_id, topic_id, text, asked_at, answered_at, answer_message_id, close_reason, closed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'answered', ?)""",
+            (
+                "om_test_ask_first",
+                "oc_test_alpha_p2p",
+                "tp_alpha",
+                "请求配置 TAP_CINEMAP_SSO_SHARED_KEY",
+                now_iso,
+                now_iso,
+                "sd_card_cb_test_opt_a",
+                now_iso,
+            ),
+        )
+        self.store.conn.commit()
+        with self.assertRaisesRegex(OutboundError, "REG-078 防打扰门禁"):
+            check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "TAP_CINEMAP_SSO_SHARED_KEY 生产 Secret 版本 23 待注入",
+                "请定是由专席云上创建还是您手动操作\n---more---\n"
+                "A. 授权由运维/发版专席在云端读取 BFF 密钥并创建版本 23\n"
+                "B. 由 Matthew 本人手动在 GCP Secret Manager 创建版本 23",
+                key="cinemap-sso-key",
+            )
+        # 带有真实新阻碍（如权限不足/报错）的二次请示放行
+        check_ask_pre_flight_guard(
+            self.cfg,
+            self.store,
+            "tp_alpha",
+            "创建版本 23 报 PERMISSION_DENIED 权限不足",
+            "执行 gcloud secrets versions add 报错 PERMISSION_DENIED，需要您手动操作或授权 IAM。",
+            key="cinemap-sso-key",
+        )
+        # 投递 '[卡片回调] A：...' 消息时自动注入 OPTION_A_EXECUTION_DIRECTIVE
+        opt_a_row = {
+            "message_id": "sd_card_cb_test_opt_a",
+            "chat_type": "p2p",
+            "chat_name": "",
+            "chat_id": "oc_test_alpha_p2p",
+            "sender_id": ME,
+            "sender_name": "Matthew",
+            "sender_type": "user",
+            "create_time": "2026-11-02T22:22:28+08:00",
+            "msg_type": "text",
+            "content": "[卡片回调] A：由专席在生产 Secret Manager 挂载或注入环境（凭据不落明文到个人），供发版直接引用",
+            "mentions_json": "[]",
+            "reply_to": "om_test_ask_first",
+            "reason": "owner_reply",
+            "tags_json": '["owner_verified"]',
+            "is_read": 0,
+            "note": "",
+            "link": "",
+        }
+        rendered = _fmt_msg(opt_a_row)
+        self.assertIn(OPTION_A_EXECUTION_DIRECTIVE, rendered)
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1027,6 +1197,7 @@ class SecurityCliTest(GateTest):
     test_reg_075_bg_hang_auto_resume_unlock_reg057_heal_and_cli_lamb_json_summary = None
     test_reg_076_decision_autonomy_self_evolution_and_ask_preflight_guard = None
     test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee = None
+    test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard = None
 
 
 if __name__ == "__main__":

@@ -556,6 +556,17 @@ def _resolve_vip_mail_source(store: Store, cfg, from_topic: str, text: str, key:
     return None, ""
 
 
+SHEEPDOG_BRAIN_TOPIC_ID = "tp_sheepdog"
+
+
+def is_brain_mail_target(store: Store, tid: str) -> bool:
+    """7.110（REG-078）：tp_sheepdog 作为 known 自治主脑会话时，允许跨工作区专席通过 sheepdog tell --to tp_sheepdog 直投来信。"""
+    if _tid(tid) != SHEEPDOG_BRAIN_TOPIC_ID:
+        return False
+    t = store.get_topic(SHEEPDOG_BRAIN_TOPIC_ID)
+    return bool(t is not None and t["state"] != "closed" and (t["conversation_id"] or "").strip())
+
+
 def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key: str = "", quote: str = "",
               verify_quote=None, playbook=None, is_target: Callable[[str], bool] | None = None,
               vips: dict[str, str] | None = None) -> int:
@@ -575,7 +586,7 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
         raise DutyError("纯礼貌收到/结单致谢无需回传 tell 唤醒对方会话，请在回执 summary 中说明即可")
     ok = is_target or (lambda tid: store.get_topic(tid) is not None)
     for tid, who in ((from_topic, "--topic"), (to_topic, "--to")):
-        if not ok(tid):
+        if not ok(tid) and not (who == "--to" and is_brain_mail_target(store, tid)):
             raise DutyError(f"{who} {tid} 不是在投递的会话（总线、名册 managed、总线新开的）")
     if _REDUNDANT_FORWARD_TELL_RE.search(text):
         f_mids = re.findall(r"\bom_[A-Za-z0-9_]+\b", text)

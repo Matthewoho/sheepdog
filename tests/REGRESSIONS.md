@@ -516,4 +516,11 @@
 | --- | --- | --- |
 | 7.109 | 同事个人账号代发的英文落款卡片（如 `🐕 from Ben's agent`）漏标 `agent_sender`，且群消息明确只 `@` 其他同事（如 `@Kai Feng`）作为 `group` 背景投递进专席时缺少醒目静默横幅，诱导专席耗费 20 分钟代查他方代码；或安全规则 `privacy_exfiltration` 含裸词 `私信` 将群内正常协作进展『补充 SQL 已私信 Nicky』误判为 `hold` 拦截；或 `find ~/Code -maxdepth 4 -name "taskexec.go"` 浅层秒级查文件名被误判为 `REG-057` 全目录盲扫且在途会话不触发 `rules_hash` 自愈；或 `sheepdog lamb spawn --cmd "... > /tmp/xx.log 2>&1"` 将子进程输出全部重定向走导致 `lamb_<id>.log` 为 0 字节、收尾摘要退化为无意义的『后台进程已退出』（REG-077） | `test_security.GateTest.test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee`（`tests/test_security.py::GateTest::test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee`） |
 
+## 7.110 跨工作区专席直投主脑通道（`tell --to tp_sheepdog`）、拦截 `report`/`receipt` 把动手操作倒推给主人的隐形死球门禁与同钥匙已批选项 A 防重复 `ask` 护栏（REG-078）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.110 | 专席（如工作区在 `~/Code/sheepdog` 的 `tp_ziyi-zhang`）想把自进化复盘直发给工作区在 `~/Work/MatthewNote` 的 `sheepdog` 主脑会话（`c6677355`）时，调内置 `send_message` 被 Antigravity 宿主跨工程校验拦死（`cross-project messaging is not allowed`），且 `roster.toml` 未登记 `tp_sheepdog` / `tell` 拒绝 `known` 会话；或主人在首次 `ask` 已点击 `[卡片回调] A：由专席在生产 Secret Manager 挂载或注入环境...` 授权专席办理后，专席未先深挖关联服务环境变量，先就同一 `--key` 发第二次重复 `ask` 询问『A. 授权由专席云端创建 vs B. 由 Matthew 本人手动创建』，随后又在 `open_escalations=0` 的情况下通过 `sheepdog report --ball doing`（『GCP无此Key在Vercel请Matthew操作 / 请您直接从Vercel取值在GCP创建版本23』）与 `receipt` 把动手活倒推给主人，造成会话静默空转 23 分钟（REG-078） | `test_security.GateTest.test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard`（`tests/test_security.py::GateTest::test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard`） |
+
+
 

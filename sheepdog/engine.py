@@ -5353,6 +5353,10 @@ class Dispatcher:
             self._enqueue_patrols()
         except Exception as e:
             log.warning("定时巡检排入出错: %s", e)
+        try:  # 7.110（REG-078）：向 tp_sheepdog（known 自治主脑会话）直投跨工作区专席来信
+            self._deliver_brain_mail()
+        except Exception as e:
+            log.warning("直投主脑来信出错: %s", e)
 
         rows, groups = self._pending_groups(tids)
 
@@ -5433,6 +5437,32 @@ class Dispatcher:
         return [BUS_TOPIC_ID] + [t["topic_id"] for t in self.store.list_topics()
                                  if t["kind"] in MANAGED_KINDS and t["state"] != sm.CLOSED]
 
+    def _deliver_brain_mail(self) -> list[str]:
+        """7.110（REG-078）：向 tp_sheepdog（known 自治主脑会话）直投跨工作区专席来信，不占 pending_batch_id、不触发 Stop hook。"""
+        t = self.store.get_topic(duty.SHEEPDOG_BRAIN_TOPIC_ID)
+        if t is None or t["state"] == sm.CLOSED or t["kind"] in MANAGED_KINDS:
+            return []
+        cid = (t["conversation_id"] or "").strip()
+        if not cid:
+            return []
+        rows = self.store.conn.execute(
+            "SELECT * FROM messages WHERE route='dispatch' AND dispatch_state='pending' AND topic_id=? AND reason=? ORDER BY create_time ASC, rowid ASC",
+            (duty.SHEEPDOG_BRAIN_TOPIC_ID, duty.MAIL_REASON),
+        ).fetchall()
+        if not rows:
+            return []
+        mids = [r["message_id"] for r in rows]
+        bid = f"m{ _now().strftime('%Y%m%d%H%M%S') }-sheepdog"
+        header = (
+            f"[sheepdog] 📬 跨工作区专席来信（收件 `{duty.SHEEPDOG_BRAIN_TOPIC_ID}`，共 {len(rows)} 条；"
+            "直接注入主脑窗口，无需交 sheepdog receipt 回执）"
+        )
+        body = "\n\n".join([header, *[(r["content"] or "") for r in rows]])
+        self._send(t, body, bid)
+        self.store.mark_batch(mids, bid, duty.SHEEPDOG_BRAIN_TOPIC_ID, "acked")
+        log.info("已直投 %d 条跨工作区来信至主脑 %s (%s)", len(mids), duty.SHEEPDOG_BRAIN_TOPIC_ID, cid)
+        return mids
+
     def _pending_groups(self, tids: list[str]) -> tuple[list, dict[str, list]]:
         """待推消息按会话分组：归属的会话不能投了退回总线；被安全规则 hold 又没放行的只能给总线。"""
         rows = self.store.pending_dispatch()
@@ -5459,6 +5489,10 @@ class Dispatcher:
             for tid in tids:
                 if (t_r := self.store.get_topic(tid)) is not None and t_r["state"] == sm.RUNNING:
                     self._check_receipt(t_r)
+        try:
+            self._deliver_brain_mail()
+        except Exception as e:
+            log.warning("直投主脑来信出错: %s", e)
         sending = {d["topic_id"] for d in self.store.dispatches_in_state("sending")}
         rows, groups = self._pending_groups(tids)
         result: dict = {"pending": len(rows), "sent": 0, "topics": {}}
