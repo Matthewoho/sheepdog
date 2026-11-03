@@ -1497,6 +1497,160 @@ class GateTest(Base):
             self.cfg, self.store, "tp_auth", fw_title, fw_body_prod, key="jumpbox-fw"
         )
 
+    def test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen(self):
+        """7.115 (REG-083):
+        1. sheepdog ask 写明『建议选 A』或开启聚合台/总结折叠模式但正文与 --options 均无 A/B 选项时，拒绝发送防空头无按钮卡片；
+           单行『选项：A. 同意...；B. 拒绝...』能被 parse_ask_options 正确解析；
+        2. 测试环境（tap-testing-env）授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）发起 ask 时，被防打扰门禁拦截引导直接执行+回读+report；
+        3. sheepdog report 含『等你决策卡拍板后即可推进 / 等待你在上一条决策卡点选 A 授权』时，即使有未决 ask 也拒绝发送，引导用 sheepdog ask 原地更新卡片；
+        4. admin_web.classify_escalation / diagnose_override_reason 准确识别主人批评『你是不是用错了 你要用ask / 你没有给我提供选项啊』为 overridden (context_incomplete)；
+        5. observe.py 阶段 1 (Ingest Ack SLA) 以 first_seen 为起算基准，消除 create_time -> first_seen 跨 90s 造成的假阳性告警。"""
+        from sheepdog import admin_web, decision_hub, observe, outbound
+        from sheepdog.card_callback import parse_ask_options
+
+        self.store.create_topic("tp_edm-testing-whitelist", "[managed] EDM", "adopted", "职责", "active")
+
+        # 1a. ask 写了『建议选 A：...』但无 A/B 选项列表 -> REG-083 拦截
+        no_opt_title = "tapnow-edm生产环境搭建授权"
+        no_opt_body = (
+            "收到，马上改用 ask 提请生产搭建授权：Elaine 申请在 taplabs-453508 搭建生产环境，前置卡点已扫清。"
+            "建议选 A：入口接入新 ELB-2 避开证书过期，按清单推进生产配置。\n"
+            "---more---\n"
+            "### 详细背景与证据核验\n"
+            "- 大陆访问实测正常；发信额度充裕。"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-083 防缺选项门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_edm-testing-whitelist", no_opt_title, no_opt_body, key="edm-prod-setup"
+            )
+
+        # 1b. 单行『选项：A. 同意...；B. 拒绝...』能被 parse_ask_options 提取出 A/B 两个选项并放行生产请示
+        inline_opt_body = (
+            "事情：Elaine 申请在生产环境（taplabs-453508）搭建 tapnow-edm。\n"
+            "选项：A. 同意接入新 ELB-2 搭建生产；B. 暂缓生产搭建。\n"
+            "建议：选 A。"
+        )
+        parsed_opts = parse_ask_options(inline_opt_body)
+        self.assertEqual([o.key for o in parsed_opts], ["A", "B"])
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_edm-testing-whitelist", no_opt_title, inline_opt_body, key="edm-prod-setup"
+        )
+
+        # 2a. 测试环境（tap-testing-env）授予 roles/iam.serviceAccountTokenCreator 请示 ask -> REG-083 拦截
+        iam_title = "Elaine申请测试服务账号Token签发权限"
+        iam_body_test = (
+            "事情：Elaine申请开通测试服务账号TokenCreator权限用于演练写入分组。\n"
+            "选项：A. 同意授予测试SA权限；B. 拒绝或专席代调。\n"
+            "建议：选 A。仅限测试环境服务账号，演练必需且风险可控。\n"
+            "---more---\n"
+            "- 目标环境：tap-testing-env（测试环境，非生产）\n"
+            "- 目标主体：user:elaine.shi@tamaredge.ai\n"
+            "- 目标资源：tap-edm-backend@tap-testing-env.iam.gserviceaccount.com\n"
+            "- 目标角色：roles/iam.serviceAccountTokenCreator"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-083 防打扰门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_edm-testing-whitelist", iam_title, iam_body_test, key="edm-test-sa-token-creator"
+            )
+
+        # 2b. 若涉及生产环境（taplabs-453508）IAM 授权 -> 允许正常 ask
+        iam_body_prod = iam_body_test.replace("tap-testing-env", "taplabs-453508").replace("测试环境，非生产", "生产环境")
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_edm-testing-whitelist", "Elaine申请生产服务账号权限", iam_body_prod, key="edm-prod-sa"
+        )
+
+        # 3. 即使会话存在未决 ask，发 report 催主人『等你决策卡拍板后即可推进 / 等待你在上一条决策卡点选 A 授权』 -> REG-083 拦截
+        self.store.conn.execute(
+            "INSERT INTO escalations(message_id, chat_id, topic_id, text, asked_at) VALUES (?,?,?,?,?)",
+            ("om_test_open_esc_83", "oc_test_esc", "tp_edm-testing-whitelist", "🐕 需要你定", "2026-11-03T15:32:31+08:00"),
+        )
+        self.store.conn.commit()
+        rep_text_bad = (
+            "前置卡点已扫清，等你决策卡拍板后即可推进。\n"
+            "---more---\n"
+            "- 当前状态：等待你在上一条决策卡点选 A 授权后，专席即可按新 ELB-2 推进生产搭建。"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-083 防错用 report 门禁"):
+            decision_hub.enforce_report_contract(
+                self.cfg,
+                self.store,
+                "tp_edm-testing-whitelist",
+                "tapnow-edm生产前置卡点已扫清",
+                rep_text_bad,
+                key="edm-prod-setup",
+                ball="doing",
+            )
+
+        # 4. classify_escalation / diagnose_override_reason 识别『你是不是用错了 你要用ask』与『你没有给我提供选项啊』
+        for ans_txt in ("@Mattheuu 你是不是用错了 你要用ask", "你没有给我提供选项啊"):
+            code, label = admin_web.diagnose_override_reason(no_opt_body, ans_txt, "", "A")
+            self.assertEqual(code, "context_incomplete")
+            self.assertEqual(label, "缺环境/调用链反问")
+            row_mock = {
+                "message_id": "om_test_esc_meta_83",
+                "topic_id": "tp_edm-testing-whitelist",
+                "text": f"🐕 需要你定 · {no_opt_title}\n{no_opt_body}",
+                "asked_at": "2026-11-03T15:32:31+08:00",
+                "answered_at": "2026-11-03T15:41:03+08:00",
+                "closed_at": "2026-11-03T15:41:03+08:00",
+                "close_reason": "answered",
+                "resolved_by": "",
+                "resolve_note": "",
+                "nudge_count": 0,
+            }
+            classified = admin_web.classify_escalation(row_mock, answer_content=ans_txt)
+            self.assertEqual(classified["alignment"], "overridden")
+            self.assertEqual(classified["override_code"], "context_incomplete")
+
+        # 5. observe 阶段 1 (Ingest Ack SLA)：create_time 在 95s 前，但 first_seen 在 1s 前 -> 不误报 90s 超时
+        ref_now = observe.datetime(2026, 11, 3, 16, 44, 35, tzinfo=observe.TZ)
+        self.store.conn.execute(
+            "INSERT INTO messages(message_id, chat_id, chat_type, sender_id, sender_type, create_time, content, "
+            "route, reason, tags_json, topic_id, dispatch_state, first_seen, last_seen, security_action, deleted) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+            (
+                "om_test_ack_fs_ok",
+                "oc_test_p2p",
+                "p2p",
+                "ou_test_sammy",
+                "user",
+                "2026-11-03T16:43:00+08:00",
+                "ping",
+                "dispatch",
+                "p2p",
+                "[]",
+                "tp_alpha",
+                "pending",
+                "2026-11-03T16:44:34+08:00",
+                "2026-11-03T16:44:34+08:00",
+                "none",
+            ),
+        )
+        self.store.conn.commit()
+        rep_ok = observe.run_observe(
+            db_path=self.cfg.db_path,
+            state_path=Path(self.tmp.name) / "obs_state.json",
+            now_dt=ref_now,
+            check_processes=False,
+            check_log=False,
+        )
+        self.assertFalse(any("Ingest Ack SLA" in w for w in rep_ok["warns"]), rep_ok["warns"])
+
+        # 若 first_seen 也已超过 95s 且未点 Get -> 正常触发 Ingest Ack SLA 告警
+        self.store.conn.execute(
+            "UPDATE messages SET first_seen=? WHERE message_id=?",
+            ("2026-11-03T16:43:00+08:00", "om_test_ack_fs_ok"),
+        )
+        self.store.conn.commit()
+        rep_warn = observe.run_observe(
+            db_path=self.cfg.db_path,
+            state_path=Path(self.tmp.name) / "obs_state2.json",
+            now_dt=ref_now,
+            check_processes=False,
+            check_log=False,
+        )
+        self.assertTrue(any("Ingest Ack SLA" in w for w in rep_warn["warns"]), rep_warn["warns"])
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1612,6 +1766,7 @@ class SecurityCliTest(GateTest):
     test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery = None
     test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis = None
     test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards = None
+    test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen = None
 
 
 if __name__ == "__main__":

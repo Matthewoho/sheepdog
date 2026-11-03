@@ -382,7 +382,22 @@ _TEST_JUMPBOX_FIREWALL_ASK_RE = re.compile(
     re.I,
 )
 _DESTRUCTIVE_OR_PROD_FIREWALL_RE = re.compile(
-    r"(?:删除|移除|生产|taplabs-453508|tpn-prod-506507|0\.0\.0\.0/0)",
+    r"(?:删除|移除|(?<!非)(?<!不涉及)生产|taplabs-453508|tpn-prod-506507|0\.0\.0\.0/0)",
+    re.I,
+)
+_ASK_CLAIMS_RECOMMENDED_OPTION_RE = re.compile(
+    r"(?:(?:建议|推荐|倾向|默认)\s*[:：]?\s*(?:点)?选\s*[A-E]|请\s*(?:点)?选\s*[A-E])(?![A-Za-z0-9])",
+    re.I,
+)
+_TEST_ENV_IAM_GRANT_ASK_RE = re.compile(
+    r"(?:tap-testing-env|测试环境|测试服务账号)[\s\S]{0,260}"
+    r"(?:roles/iam\.serviceAccountTokenCreator|serviceAccountTokenCreator|Token\s*签发权限|TokenCreator|"
+    r"roles/run\.(?:developer|viewer|invoker)|roles/secretmanager\.(?:secretAccessor|viewer|secretVersionAdder)|"
+    r"add-iam-policy-binding)",
+    re.I,
+)
+_PROD_OR_DESTRUCTIVE_IAM_RE = re.compile(
+    r"(?:(?<!非)(?<!不涉及)生产|taplabs-453508|tpn-prod-506507|remove-iam-policy-binding|delete|删除|移除|roles/owner|roles/editor|roles/resourcemanager\.projectIamAdmin)",
     re.I,
 )
 
@@ -397,18 +412,45 @@ def check_ask_pre_flight_guard(
     key: str = "",
     floor: str = "",
     floor_type: str | None = None,
+    options: str = "",
 ) -> None:
-    """7.108 / 7.110 / 7.113 / 7.114（REG-076 / REG-078 / REG-081 / REG-082）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110 / 7.113 / 7.114 / 7.115（REG-076 / REG-078 / REG-081 / REG-082 / REG-083）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    0. 发起待拍板 ask 卡片（含写明『建议选 A』或启用聚合台/白话总结折叠模式）时，必须提供至少 2 个可解析的 A/B 互斥选项，严禁发无选项按钮的空头决策卡；
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
     2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
     3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask；
     4. 请示执行 gh pr merge 或直接合入 PR 打 Tag 发布生产前，必须显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/N 未过）；
     5. 请示确认 CORS / Origin 域名白名单或『是否有其他前端域名调用』前，必须先扫描云上真实流量日志 + 本地记录并与技术负责人（如 tp_laohu）核对；
     6. 请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先与该单技术负责人（如 tp_laohu）核对；
-    7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示，引导直接办理并联动 tp_3x-ui-ops 补齐 VPS IP 后用 report 报备。"""
+    7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示；
+    8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）属于预授权测试环境操作，拦截向主人 ask 请示。"""
+    from . import decision_hub
+    from .card_callback import _DISABLED_SPECS, _MORE_LINE_RE, parse_ask_options
+
+    full_text = f"{title}\n{body}"
+    opt_spec = (options or "").strip()
+    if opt_spec.lower() not in _DISABLED_SPECS:
+        needs_explicit_opts = bool(
+            _ASK_CLAIMS_RECOMMENDED_OPTION_RE.search(full_text)
+            or (decision_hub.hub_active(cfg, store) and (cfg.notify.require_summary or _MORE_LINE_RE.search(full_text)))
+        )
+        if needs_explicit_opts and len(parse_ask_options(full_text, opt_spec)) < 2:
+            raise OutboundError(
+                EXIT_INVALID,
+                "sheepdog ask 缺少可点击的 A/B 决策选项（主人批评：『你没有给我提供选项啊』，REG-083 防缺选项门禁）："
+                "发起待拍板决策卡时，必须在正文中显式列出至少 2 个互斥选项（如 `A. 同意...\\nB. 暂缓...` 或 `选项：A. ...；B. ...`），"
+                "或传 `--options \"A:方案一|B:方案二\"`，严禁只写『建议选 A：...』却不提供 A/B 选项列表导致飞书卡片无按钮！（没有发送）",
+            )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
-    full_text = f"{title}\n{body}"
+    if _TEST_ENV_IAM_GRANT_ASK_RE.search(full_text) and not _PROD_OR_DESTRUCTIVE_IAM_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator、Cloud Run、Secret Manager 权限）"
+            "属于预授权测试环境操作（『测试环境可以直接动。做完马上回读，如实报结果』）："
+            "请直接带 `--account=matthewohmygosh@gmail.com --project=tap-testing-env` 执行 IAM 绑定并 `get-iam-policy` 独立回读核验，"
+            "完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（REG-083 防打扰门禁，没有发送）",
+        )
     if _CC_PROXY_ASK_RE.search(full_text) and not _CC_SEAT_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
@@ -499,7 +541,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     combined_for_check = f"{summary.strip()}\n---more---\n{body}" if (summary or "").strip() else body
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
-        check_ask_pre_flight_guard(cfg, store, topic_id, title, combined_for_check, key=key, floor=raw_floor, floor_type=floor_type)
+        check_ask_pre_flight_guard(cfg, store, topic_id, title, combined_for_check, key=key, floor=raw_floor, floor_type=floor_type, options=options)
     else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
     try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))

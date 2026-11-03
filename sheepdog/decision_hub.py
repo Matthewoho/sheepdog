@@ -45,6 +45,11 @@ _OWNER_WORK_DUMP_RE = re.compile(
     r"(?:取值|填入|创建|添加|配置|操作|执行|拍板|介入|加\s*(?:版本|key|密钥))",
     re.I,
 )
+_REPORT_WAIT_DECISION_CARD_RE = re.compile(
+    r"(?:等(?:待)?\s*(?:你|您|主人|Matthew)\s*(?:在[^，。；\n]{0,16})?(?:决策卡|上一条|ask)[^，。；\n]{0,12}(?:点选|拍板|授权|决定|定夺)"
+    r"|等(?:待)?\s*(?:你|您|主人|Matthew)\s*(?:决策卡)?拍板后即可推进)",
+    re.I,
+)
 _AT_ME_ACTION_RE = re.compile(r"(走查|提测|来测试|测试一下|验证|确认一下|请确认|看看|看下|请回复|反馈一下|审批|放行|核对|review|preview)", re.I)
 _OWNER_ACK_ONLY_RE = re.compile(
     r"^\s*(?:ok|okay|好(?:的|吧|嘞|呀)?|收到|知道了?|明白了?|行(?:吧|的)?|可以|嗯+|不用(?:管|了)?|算了|没事(?:了)?|谢谢|辛苦(?:了)?)[!！。.~～\s]*$",
@@ -137,6 +142,12 @@ def enforce_report_contract(cfg, store, topic_id: str, title: str, text: str, *,
             ln for ln in _MORE_LINE_RE.sub("", _FENCED_RE.sub("", f"{title or ''}\n{text or ''}")).splitlines()
             if not ln.lstrip().startswith(">")
         )
+        if m_wait_card := _REPORT_WAIT_DECISION_CARD_RE.search(full_clean):
+            raise _outbound_err(
+                f"report 严禁催促或等待主人在决策卡拍板（检测到『{m_wait_card.group(0).strip()}』，主人批评：『你是不是用错了 你要用ask』，REG-083 防错用 report 门禁）："
+                "当事项仍有待主人拍板或需补充最新前置核验结论时，必须调用 `sheepdog ask --key <同一钥匙>`（系统会自动原地更新未决 ask 卡片并保留 A/B 选项按钮），"
+                "严禁发无按钮的 `sheepdog report` 让主人拍板！（纯历史引述请加 --fyi）"
+            )
         dump_rx = _OWNER_HANDS_ON_DUMP_RE if has_open_esc else _OWNER_WORK_DUMP_RE
         if m_dump := dump_rx.search(full_clean):
             raise _outbound_err(

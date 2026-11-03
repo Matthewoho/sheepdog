@@ -61,6 +61,7 @@ _ACCEPT_WORDS_RE = re.compile(
 )
 _OVERRIDE_WORDS_RE = re.compile(
     r"(?:忽略|不用|取消|算了|不对|不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|不用我同意|已经过时间"
+    r"|用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢"
     r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个环境|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
     re.I,
 )
@@ -72,7 +73,7 @@ def diagnose_override_reason(
     chosen_code: str = "",
     recommended: str = "",
 ) -> tuple[str, str]:
-    """7.108 / 7.113（REG-076 / REG-081）：将人类改判/反问归因为 5 类可执行自进化根因。"""
+    """7.108 / 7.113 / 7.115（REG-076 / REG-081 / REG-083）：将人类改判/反问归因为 5 类可执行自进化根因。"""
     s = (ans_body or "").strip()
     if re.search(
         r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看)",
@@ -81,7 +82,8 @@ def diagnose_override_reason(
     ):
         return ("peer_or_owner_delegate", "未先找专席或Owner")
     if re.search(
-        r"(?:测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理)",
+        r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢|"
+        r"测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理)",
         s,
         re.I,
     ):
@@ -452,6 +454,11 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
         code, desc = m.group(1).upper(), clean_ui_text(m.group(2), 90)
         if not any(o["code"] == code for o in options):
             options.append({"code": code, "label": desc})
+    if not options:
+        from .card_callback import parse_ask_options
+        for opt in parse_ask_options(text):
+            if not any(o["code"] == opt.key for o in options):
+                options.append({"code": opt.key, "label": clean_ui_text(opt.label, 90)})
 
     rec_match = _RECOMMEND_RE.search(text)
     recommended = ""

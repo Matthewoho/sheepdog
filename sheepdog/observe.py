@@ -576,9 +576,11 @@ def run_observe(
                 ack_window_start = iso(ref_now - timedelta(minutes=30))
                 if iso(ref_now) >= GOLIVE:
                     ack_window_start = max(GOLIVE, ack_window_start)
+                msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+                fs_col = "m.first_seen" if "first_seen" in msg_cols else "'' AS first_seen"
                 ack_candidates = c.execute(
-                    """
-                    SELECT m.message_id, m.topic_id, m.chat_type, m.reason, m.tags_json, m.create_time, m.update_time
+                    f"""
+                    SELECT m.message_id, m.topic_id, m.chat_type, m.reason, m.tags_json, m.create_time, m.update_time, {fs_col}
                     FROM messages m
                     LEFT JOIN acks a ON a.message_id = m.message_id
                     WHERE m.create_time >= ?
@@ -595,7 +597,7 @@ def run_observe(
                 for r in ack_candidates:
                     if not _should_expect_ack(r, ack_reasons):
                         continue
-                    age_s = age_seconds(r["create_time"], ref_now)
+                    age_s = age_seconds(r["first_seen"] or r["create_time"], ref_now)
                     if age_s is not None and age_s >= 90:
                         bad_acks.append((r, age_s))
                 if bad_acks:

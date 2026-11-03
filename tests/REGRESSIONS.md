@@ -546,6 +546,13 @@
 | --- | --- | --- |
 | 7.114 | 专席在发起 `sheepdog ask` 前未用尽本机日志与跨专席协同手段，把核实活推给主人：① `tp_sammy-shi` 在推进 `file-hub-gateway` CORS 白名单收敛时未先扫云端访问日志（Referer/Origin）并向 `tp_laohu` 核实，就直接发 `ask`（`om_test_cors_domain_ask`）问主人『生产是否还有其他业务前端域名直接跨域调用』；② `tp_ben` 在收到测试环境验收节点催办时未先向负责专席 `tp_laohu` 核实，就直接发 `ask`（`om_test_qa_bypass_ask`）问主人『是否无需 QA 介入直接点通过』；③ `tp_auth` 收到同事申请把新家宽出口 IP 加入 `tap-testing-env` 跳板机防火墙 `office-allow-all` 时，违背『测试环境可以直接动』常驻规则发 `ask`（`om_test_jumpbox_fw_ask`）找主人要授权，且未同步向 `tp_3x-ui-ops` 核对齐整批 14 台 VPS 出口 IP（REG-082） | `test_security.GateTest.test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards`（`tests/test_security.py::GateTest::test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards`） |
 
+## 7.115 `sheepdog ask` 强制 A/B 选项门禁、测试环境服务账号 IAM 预授权免问门禁、`report` 禁催决策卡拍板门禁与 `observe` Ingest Ack SLA `first_seen` 基准修复（REG-083）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.115 | 专席（如 `tp_edm-testing-whitelist`）连续触发三类交互与自治缺陷：① 发起 4 张 `sheepdog ask` 决策卡时在总结里写『建议选 A：...』但正文与 `--options` 均未提供 A/B 选项列表，导致飞书渲染出无任何按钮的空头决策卡，迫使主人批评『`你没有给我提供选项啊`』，且单行『`选项：A. ...；B. ...`』未被 `parse_ask_options` 识别；② 在已有未决 `ask` 时错用 `sheepdog report` 发『`前置卡点已扫清，等你决策卡拍板后即可推进 / 等待你在上一条决策卡点选 A 授权`』，迫使主人批评『`@Mattheuu 你是不是用错了 你要用ask`』，而 `classify_escalation` 把这两类批评误判为 `accepted`；③ 为内部同事在测试环境（`tap-testing-env`）开通非破坏性服务账号权限（`roles/iam.serviceAccountTokenCreator`）连发 3 次 `ask` 打扰主人；④ `observe.py` 阶段 1（Ingest Ack SLA）按消息 `create_time` 而非入账时间 `first_seen` 计 90s 超时，导致拉取耗时 ~94s 的消息刚入账 1s 即误报超时（REG-083） | `test_security.GateTest.test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen`（`tests/test_security.py::GateTest::test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen`） |
+
+
 
 
 
