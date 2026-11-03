@@ -1837,7 +1837,9 @@ class Collector:
         if decision_hub.is_hub_message(self.store, m):
             if decision_hub.handle_hub_text_reply(self, m):
                 r = self.store.get_message(m.message_id)
-                return RouteDecision(DISPATCH, OWNER_REPLY, json.loads(r["tags_json"] or "[]") if r else tags)
+                reason = (r["reason"] if r is not None and r["reason"] else OWNER_REPLY)
+                r_tags = json.loads(r["tags_json"] or "[]") if r is not None else tags
+                return RouteDecision(DISPATCH, reason, r_tags)
             d = RouteDecision(DROP, "decision_hub_hint", tags)
             self.store.upsert_message(m, d.route, d.reason, tags)
             self._tg_note(m, "请直接点击上方待拍板卡片按钮，或引用具体那张待拍板卡片回复")
@@ -4563,6 +4565,8 @@ class Dispatcher:
                         continue
                     if (
                         _GREP_MATCH_LINE_RE.search(cur_sum)
+                        or _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(cur_sum)
+                        or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
                             and any(p in cur_sum for p in ("Traceback", "RuntimeError:", "raise RuntimeError", "~~~~", "execute_dag_lane"))
@@ -6307,6 +6311,15 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
 
 _GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", re.M)
 _INTERMEDIATE_POLL_LINE_RE = re.compile(r"\bpoll\s+\d+\s*:.*\bstatus=(?:WORKING|QUEUED|PENDING)\b", re.I)
+_GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
+    r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|Done\.|Proxy locally with:\s*gcloud\b)",
+    re.I | re.M,
+)
+_JSON_PROP_FRAGMENT_LINE_RE = re.compile(
+    r'^"[^"]+"\s*:\s*(?:\{|\[|[-0-9.]+|true|false|null|"[^"]*")\s*,?\s*$',
+    re.I,
+)
+_JSON_OBJECT_KEY_LINE_RE = re.compile(r'^"([^"]+)"\s*:\s*\{\s*$')
 _EDITED_PREFIX = "（已编辑）旧："
 _RECALLED_PREFIX = "（已撤回）原文："
 
@@ -6330,8 +6343,8 @@ def _unwrap_edited_content(text: str) -> tuple[str, str]:
 
 
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
-    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
-    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行及中间轮询 status=WORKING 行。"""
+    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
+    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片。"""
     if not raw_text:
         return "", False
     non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -6375,6 +6388,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                             and not re.match(r"^[~^]{2,}$", ln)
                             and not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):", ln)
                             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
+                            and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
                         ]
                     prefix_lines = raw_prefix[-1:] if not has_err else raw_prefix[-2:]
                     priority_keys = (
@@ -6402,10 +6416,25 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             if not _GREP_MATCH_LINE_RE.match(ln)
             and not ln.startswith(("STDERR: ERROR:", "ERROR: (gcloud."))
             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
+            and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
         ]
         if non_grep:
             meaningful = non_grep
     tail_lines = (meaningful or non_empty)[-5:]
+    if tail_lines and all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
+        obj_keys = [m.group(1) for ln in meaningful if (m := _JSON_OBJECT_KEY_LINE_RE.match(ln))]
+        kv_pairs = []
+        for ln in tail_lines:
+            if not _JSON_OBJECT_KEY_LINE_RE.match(ln) and ":" in ln:
+                k_raw, v_raw = ln.split(":", 1)
+                k_clean = k_raw.strip().strip('"')
+                v_clean = v_raw.strip().rstrip(",").strip()
+                kv_pairs.append(f"{k_clean}={v_clean}")
+        if obj_keys:
+            tail_kv = (", " + ", ".join(kv_pairs[-2:])) if kv_pairs else ""
+            return f"JSON_TAIL(sections={len(obj_keys)}, last={obj_keys[-1]}{tail_kv})", has_err
+        if kv_pairs:
+            return f"JSON_TAIL({', '.join(kv_pairs[-4:])})", has_err
     return "\n".join(tail_lines), has_err
 
 

@@ -564,6 +564,13 @@
 | --- | --- | --- |
 | 7.117 | 实战巡检暴露四类系统性缺陷：① 已投递消息在飞书被编辑一次后，`messages.content` 被覆写为『`（已编辑）旧：A\n新：B`』，导致后续每次轮询重扫时 `old["content"] != m.content`（`B`）恒成立，将同一条编辑消息递归套娃成 5 层『`（已编辑）旧：（已编辑）旧：...`』并连续 6 个批次（`b20261103183354`～`b20261103183741`）反复重投轰炸目标会话，且已撤回消息二次轮询时被 `[Invalid text JSON]` 覆写冲掉原文；② `_summarize_cli_lamb_log` 在 CLI 羔羊成功结束时把倒数第 2 行『`[service] poll N-1: build ... status=WORKING`』拼在最前，导致 140 字截断视图下已完工羔羊全部显示为 `status=WORKING`；③ 内部同学切换办公专线申请数据库白名单（Cloud SQL / ADB）时，专席未先找 `tp_3x-ui-ops` 拉齐 14 台全套 VPS 出口 IP 清单请 Nicky 老师一次性加白，而是按单人单 IP 散装发 `ask`；④ 老胡（`laohu`）AI 助理代发需求时，专席未先在原会话找老胡本人确认后直办，而是发 `ask` 让主人拍板『同意在老胡本人确认后执行』（REG-085） | `test_security.GateTest.test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards`（`tests/test_security.py::GateTest::test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards`） |
 
+## 7.118 拍板总台无引用追问/截图智能关联与防丢单、常规发版排期防象征性发问门禁、在途已批复/『这个不动』防并发重发 `ask`、数据库内部账号归口 Nicky 门禁与 CLI 羔羊截断 JSON 碎片清洗（REG-086）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.118 | 实战巡检与跨会话留言暴露五类系统性摩擦：① 主人在『`🐕 拍板总台`』点按钮 A 拍板后 34s 内直接发不带子卡引用的截图追问『`这玩意有啥决策点吗 还需要问我 是哪里不合理吗 还是说你只是象征性问问`』，因 `len(opens) != 1` 被 `handle_hub_text_reply` 拒收并由 `_topic_group_message` 标为 `DROP (decision_hub_hint)` 弹出说教提示，迫使主人去原话题重发，且 `classify_escalation` 未结合点选后追问将该单归入 `overridden`；② `tp_api-resale` 在 PR 仍在等待 Sammy Review、无任何冲突时发起『同意排期明天 18:00 窗口 vs 调整排期时间或有其他要求』的象征性 `ask`；③ `tp_ziyi-zhang` 在途批次运行期间主人已点『其他：这个不动...』结案旧卡，11s 后会话在途再调同 `--key` 的 `sheepdog ask` 刷出第 2 张重复卡；④ `tp_bus` 与专席将数据库内部 User / 只读账号（`elaine_readonly`）创建与发放发 `ask` 找主人，且 `tp_edm-testing-whitelist` 因正文含『登记生产模板（测试与生产共用）』绕过测试环境 IAM 免问门禁；⑤ `_summarize_cli_lamb_log` 对截断的日志末尾输出裸 JSON 属性碎片与 `gcloud` 进度/proxy 提示噪音（REG-086） | `test_security.GateTest.test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail`（`tests/test_security.py::GateTest::test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail`） |
+
+
 
 
 

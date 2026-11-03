@@ -691,17 +691,101 @@ def is_hub_message(store, m) -> bool:
     return bool(reply_to and (esc := store.get_escalation(reply_to)) is not None and "hub_message_id" in esc.keys() and esc["hub_message_id"] == reply_to)
 
 def handle_hub_text_reply(collector, m) -> bool:
+    """7.81 / 7.118 (REG-036 / REG-086): 处理主人在『🐕 拍板总台』话题内的文字/图片回复：
+    1. 若显式引用某张待拍板子卡或当前仅 1 项未决提问，直接作答该提问并双端变绿；
+    2. 若未引用具体子卡但正文提及某提问/会话，或距最近一次拍板 <= 300s（如点完按钮后追加截图/追问『这玩意有啥决策点吗』），
+       自动作为 owner_instruction 投递给对应会话（带 escalation_followup:<mid> 标签）；
+    3. 其余在拍板总台内的主人发言兜底投递给中枢 tp_bus（decision_hub_general），严禁 DROP 丢弃或弹窗说教主人。"""
     store, cfg, source = collector.store, collector.cfg, getattr(collector, "source", None)
-    if not is_hub_message(store, m): return False
+    if not is_hub_message(store, m):
+        return False
     reply_to = getattr(m, "reply_to", "") or ""
     esc = store.get_escalation(reply_to) if reply_to else None
-    if esc is None and len(opens := _open_escalation_rows(store)) == 1: esc = opens[0]
-    if esc is None: return False
-    canon_mid = str(esc["message_id"])
-    store.answer_escalation(canon_mid, m.message_id)
-    chosen = " ".join(plain_text(getattr(m, "content", "") or "").split())[:60] or "主人文字批复"
-    sync_escalation_dual_cards(cfg, store, source, canon_mid, chosen_display=chosen, topic_id=esc["topic_id"], answered_at=m.create_time or now_iso(), orig_text=esc["text"] or "")
-    store.upsert_message(m, "dispatch", "owner_reply", ["owner_verified", f"escalation:{canon_mid}"], topic_id=esc["topic_id"])
+    opens = _open_escalation_rows(store)
+    if esc is None and len(opens) == 1:
+        esc = opens[0]
+    raw_content = getattr(m, "content", "") or ""
+    if esc is None and opens:
+        for cand in opens:
+            cmid = str(cand["message_id"] or "")
+            ctid = str(cand["topic_id"] or "")
+            if (cmid and cmid in raw_content) or (ctid and ctid in raw_content):
+                esc = cand
+                break
+    if esc is not None:
+        canon_mid = str(esc["message_id"])
+        if esc["answered_at"] or esc["closed_at"]:
+            store.upsert_message(
+                m,
+                "dispatch",
+                "owner_instruction",
+                ["owner_verified", f"escalation_followup:{canon_mid}"],
+                topic_id=esc["topic_id"],
+            )
+            return True
+        store.answer_escalation(canon_mid, m.message_id)
+        chosen = " ".join(plain_text(raw_content).split())[:60] or "主人文字批复"
+        sync_escalation_dual_cards(
+            cfg,
+            store,
+            source,
+            canon_mid,
+            chosen_display=chosen,
+            topic_id=esc["topic_id"],
+            answered_at=m.create_time or now_iso(),
+            orig_text=esc["text"] or "",
+        )
+        store.upsert_message(
+            m,
+            "dispatch",
+            "owner_reply",
+            ["owner_verified", f"escalation:{canon_mid}"],
+            topic_id=esc["topic_id"],
+        )
+        return True
+
+    recent_rows = store.conn.execute(
+        "SELECT * FROM escalations WHERE answered_at IS NOT NULL ORDER BY answered_at DESC, rowid DESC LIMIT 5"
+    ).fetchall()
+    for r_esc in recent_rows:
+        rmid = str(r_esc["message_id"] or "")
+        rtid = str(r_esc["topic_id"] or "")
+        if (rmid and rmid in raw_content) or (rtid and rtid in raw_content):
+            store.upsert_message(
+                m,
+                "dispatch",
+                "owner_instruction",
+                ["owner_verified", f"escalation_followup:{rmid}"],
+                topic_id=rtid,
+            )
+            return True
+    if recent_rows:
+        r_latest = recent_rows[0]
+        try:
+            ref_ts = getattr(m, "first_seen", "") or m.create_time or now_iso()
+            m_dt = datetime.fromisoformat(ref_ts)
+            ans_dt = datetime.fromisoformat(str(r_latest["answered_at"]))
+            delta_sec = (m_dt - ans_dt).total_seconds()
+            if -60 <= delta_sec <= 300:
+                rmid = str(r_latest["message_id"] or "")
+                store.upsert_message(
+                    m,
+                    "dispatch",
+                    "owner_instruction",
+                    ["owner_verified", f"escalation_followup:{rmid}"],
+                    topic_id=str(r_latest["topic_id"]),
+                )
+                return True
+        except Exception:
+            pass
+
+    store.upsert_message(
+        m,
+        "dispatch",
+        "owner_instruction",
+        ["owner_verified", "decision_hub_general"],
+        topic_id="tp_bus",
+    )
     return True
 
 def defer_quiet_hours(dt: datetime) -> datetime:

@@ -1974,6 +1974,225 @@ class GateTest(Base):
         self.assertIn("REG-085", str(ctx_lh.exception))
         self.assertIn("laohu 的需求 只要经过他本人确认 你就给他弄", str(ctx_lh.exception))
 
+    def test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail(self):
+        """REG-086（7.118）：
+        1. 主人在『🐕 拍板总台』点完按钮拍板后 300s 内直接发不带引用的文字/截图追问（如『这玩意有啥决策点吗 还需要问我』），
+           handle_hub_text_reply 自动关联刚拍板的提问作为 owner_instruction 投递对应会话（带 escalation_followup:<mid>），
+           绝不 DROP 为 decision_hub_hint 或发说教卡片；且 classify_escalation 自动将该单纠偏归类为 overridden（context_incomplete）；
+        2. 常规发版排期窗口报备（PR 仍在等待同行 Review 合入、无冲突、选项 B 仅为『调整排期时间或有其他要求』）拦截象征性 ask；
+        3. 同一 (topic_id, key) 主人已批复但会话在途未消费（或批复『这个不动 / 忽略吧』）时，拦截并发重发第 2 张重复 ask；
+        4. 数据库内部 User 账号 / 只读账密（含尚未入 DBA 台账的新库）拦截绕过 DBA 向主人 ask（含在 tp_bus 总线发起），
+           且测试环境 IAM 门禁不因正文附带『登记生产模板（测试与生产共用）』误判放行；
+        5. _summarize_cli_lamb_log 过滤 gcloud 部署进度/proxy 提示行，并将截断的纯 JSON 属性碎片提炼为单行 JSON_TAIL(...)。"""
+        from sheepdog import admin_web, decision_hub, engine, outbound
+        from sheepdog.config import TopicGroupConfig
+
+        # (1) 拍板总台点按钮后 34s 内主人不带引用发截图追问：路由到对应会话而非 DROP (decision_hub_hint)
+        self.cfg.topic_group = TopicGroupConfig(chat_id="oc_test_tg_hub", enabled=True)
+        self.cfg.topic_group.decision_hub = True
+        self.store.set_meta(
+            decision_hub.META_DECISION_HUB,
+            json.dumps({"root_message_id": "om_test_hub_root", "thread_id": "omt_test_hub_thr"}, ensure_ascii=False),
+        )
+        ans_ts = "2026-11-03T20:13:19+08:00"
+        follow_ts = "2026-11-03T20:13:53+08:00"
+        self.store.add_send(
+            "ik_test_resale_ask",
+            "ask",
+            "tp_alpha",
+            "om_test_resale_ask",
+            "🐕 需要你定 · Kai提请排期明日18点发版文本模型官方对齐 [tp_alpha]\n建议选 A：同意排期明天 18:00 窗口\n---more---\n选项：\nA. 同意排期明天 18:00 窗口\nB. 调整排期时间或有其他要求",
+            key="api-resale",
+            norm_key="api-resale",
+            title="Kai提请排期明日18点发版文本模型官方对齐",
+        )
+        self.store.add_escalation(
+            "om_test_resale_ask",
+            "tp_alpha",
+            "oc_test_tg_hub",
+            "🐕 需要你定 · Kai提请排期明日18点发版文本模型官方对齐 [tp_alpha]\n建议选 A：同意排期明天 18:00 窗口\n---more---\n选项：\nA. 同意排期明天 18:00 窗口\nB. 调整排期时间或有其他要求",
+            "2026-11-03T20:10:02+08:00",
+        )
+        cb_msg = msg(
+            message_id="om_test_cb_resale_a",
+            chat_type="group",
+            chat_id="oc_test_tg_hub",
+            sender_id=ME,
+            sender_name="Matthew",
+            content="[卡片回调] A：同意排期明天 18:00 发版窗口",
+            create_time=ans_ts,
+        )
+        self.store.upsert_message(cb_msg, "dispatch", "owner_reply", ["owner_verified"], topic_id="tp_alpha")
+        self.store.conn.execute(
+            "UPDATE escalations SET answered_at=?, closed_at=?, close_reason='answered', answer_message_id=? WHERE message_id=?",
+            (ans_ts, ans_ts, "om_test_cb_resale_a", "om_test_resale_ask"),
+        )
+        self.store.conn.commit()
+
+        # 同时存在另外 2 张别的会话未决 ask，模拟 len(opens) != 1
+        self.store.add_escalation("om_test_other_open_1", "tp_bus", "oc_test_tg_hub", "提问1", "2026-11-03T20:00:00+08:00")
+        self.store.add_escalation("om_test_other_open_2", "tp_bus", "oc_test_tg_hub", "提问2", "2026-11-03T20:01:00+08:00")
+
+        critique_msg = msg(
+            message_id="om_test_hub_critique",
+            chat_type="group",
+            chat_id="oc_test_tg_hub",
+            sender_id=ME,
+            sender_name="Matthew",
+            content="![Image](img_v3_test)\n这玩意有啥决策点吗 还需要问我 是哪里不合理吗 还是说你只是象征性问问",
+            create_time=follow_ts,
+            reply_to="om_test_hub_root",
+            root_id="om_test_hub_root",
+            thread_id="omt_test_hub_thr",
+        )
+        self.poll([critique_msg])
+        routed_critique = self.store.get_message("om_test_hub_critique")
+        self.assertEqual(routed_critique["route"], "dispatch")
+        self.assertEqual(routed_critique["reason"], "owner_instruction")
+        self.assertEqual(routed_critique["topic_id"], "tp_alpha")
+        self.assertIn("escalation_followup:om_test_resale_ask", routed_critique["tags_json"])
+
+        # classify_escalation 结合追问批评自动将该单改判为 overridden (context_incomplete)
+        esc_row = self.store.get_escalation("om_test_resale_ask")
+        classified = admin_web.classify_escalation(
+            esc_row,
+            answer_content="[卡片回调] A：同意排期明天 18:00 发版窗口",
+            followup_critique=routed_critique["content"],
+        )
+        self.assertEqual(classified["alignment"], "overridden")
+        self.assertEqual(classified["override_code"], "context_incomplete")
+        self.assertIn("追问纠偏", classified["alignment_label"])
+
+        # (2) 象征性常规发版排期 ask 拦截门禁（Guard 12）
+        with self.assertRaises(outbound.OutboundError) as ctx_sched:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "Kai提请排期明日18点发版文本模型官方对齐",
+                "Kai 在群内汇报：后端重构 PR 与配置重构 PR 已提交给 Sammy Review，提请排期明天 18:00 发版窗口上线。\n"
+                "建议选 A：同意排期明天 18:00 窗口，待 Sammy Review 合入后由专席按双仓顺序跟进上线。\n"
+                "选项：\n"
+                "A. 同意排期明天 18:00 发版窗口，待 Sammy 完成 Code Review 合入后由专席跟进执行\n"
+                "B. 调整排期时间或对超时/发布步骤有其他要求",
+            )
+        self.assertIn("REG-086", str(ctx_sched.exception))
+        self.assertIn("这玩意有啥决策点吗", str(ctx_sched.exception))
+
+        # (3) 在途并发重发 / 主人刚批复『这个不动』防重发门禁（Guard 3 升级）
+        now_str = datetime.now().astimezone().isoformat(timespec="seconds")
+        veto_msg = msg(
+            message_id="om_test_cb_ziyi_veto",
+            chat_type="group",
+            chat_id="oc_test_tg_hub",
+            sender_id=ME,
+            sender_name="Matthew",
+            content="[卡片回调] 其他：这个不动 我们会在国际站弄 他们还没开白名单使用",
+            create_time=now_str,
+        )
+        self.store.upsert_message(veto_msg, "dispatch", "owner_reply", ["owner_verified"], topic_id="tp_alpha")
+        self.store.add_send(
+            "ik_test_ziyi_1",
+            "ask",
+            "tp_alpha",
+            "om_test_ziyi_ask_1",
+            "给Ziyi开国内广州AGS测试镜像库与API凭据",
+            key="ziyi-ags-custom-sandbox",
+            norm_key="ziyi-ags-custom-sandbox",
+            title="给Ziyi开国内广州AGS测试镜像库与API凭据",
+        )
+        self.store.add_escalation("om_test_ziyi_ask_1", "tp_alpha", "oc_test_tg_hub", "给Ziyi开国内广州AGS", now_str)
+        self.store.conn.execute(
+            "UPDATE escalations SET answered_at=?, closed_at=?, close_reason='answered', answer_message_id=? WHERE message_id=?",
+            (now_str, now_str, "om_test_cb_ziyi_veto", "om_test_ziyi_ask_1"),
+        )
+        self.store.conn.commit()
+        with self.assertRaises(outbound.OutboundError) as ctx_veto:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "给Ziyi开国内广州AGS测试镜像库与API凭据",
+                "已核查本机 ~/.tccli/tencent-cn.credential 主账号凭据可用。\n选项：\nA. 同意代建\nB. 暂不建\n建议：选 A",
+                key="ziyi-ags-custom-sandbox",
+            )
+        self.assertIn("REG-086", str(ctx_veto.exception))
+        self.assertIn("这个不动", str(ctx_veto.exception))
+
+        # (4) 数据库内部 User 账号 / 只读账密归口 Nicky 老师（含 tp_bus 总线与专席）+ 测试环境 IAM 不被『登记生产模板』绕过
+        for caller_tp in ("tp_bus", "tp_alpha"):
+            with self.assertRaises(outbound.OutboundError) as ctx_db_user:
+                outbound.check_ask_pre_flight_guard(
+                    self.cfg,
+                    self.store,
+                    caller_tp,
+                    "Elaine生产EDM只读账号创建方式确认",
+                    "Nicky 老师反馈 tapnow_edm 尚未纳入 DBA 台账无现成只读账密。建议选 A：由专席用 migrator 凭据创建只读账号 elaine_readonly。\n"
+                    "选项：\nA. 专席用 migrator 凭据创建只读账号\nB. 仍交由 Nicky 老师纳入 DBA 台账后发放",
+                )
+            self.assertIn("REG-086", str(ctx_db_user.exception))
+            self.assertIn("Nicky", str(ctx_db_user.exception))
+
+        with self.assertRaises(outbound.OutboundError) as ctx_ses_iam:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "Elaine申请测试环境腾讯SES两个Secret读取权限",
+                "Elaine 申请 tap-testing-env 项目下 tencent-ses-secret-id 两个 Secret 的读取权限（roles/secretmanager.secretAccessor），"
+                "用于调腾讯云 API 登记生产模板（测试与生产共用腾讯云 SES 账号）。\n"
+                "选项：\nA. 同意仅在 tap-testing-env 授予 secretAccessor\nB. 暂不授予\n建议：选 A",
+            )
+        self.assertIn("REG-083", str(ctx_ses_iam.exception))
+
+        with self.assertRaises(outbound.OutboundError) as ctx_login_pwd:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "Kai申请重设中国站Stage临时密码",
+                "Kai登录中国站stage提示密码不正确，Kai Feng请求查询自建Supabase并重设临时密码私发给Kai。\n"
+                "选项：\nA. 授权专席在 stage 机器自建 Supabase 核实账号并重设临时密码\nB. 不由专席重置\n建议：选 A",
+            )
+        self.assertIn("REG-086", str(ctx_login_pwd.exception))
+        self.assertIn("啥意思", str(ctx_login_pwd.exception))
+
+        # (5) CLI 羔羊日志截断 JSON 碎片与 gcloud 进度行清洗
+        truncated_json_log = (
+            '      "avg_pct": 1.62,\n'
+            '      "max_pct": 1.63\n'
+            '    },\n'
+            '    "tapnow-infra-1-499806/tap-staging-redis-tokyo-6": {\n'
+            '      "avg_pct": 1.64,\n'
+            '      "max_pct": 1.65\n'
+            '    },\n'
+            '    "tapnow-infra-1-499806/tap-staging-redis-tokyo-7": {\n'
+            '      "avg_pct": 0.65,\n'
+            '      "max_pct": 0.65\n'
+            '    }\n'
+            '  }\n'
+            '}\n'
+        )
+        j_sum, j_err = engine._summarize_cli_lamb_log(truncated_json_log)
+        self.assertFalse(j_err)
+        self.assertIn("JSON_TAIL(sections=2, last=tapnow-infra-1-499806/tap-staging-redis-tokyo-7", j_sum)
+
+        gcloud_deploy_log = (
+            "Deploying...\n"
+            "Setting IAM Policy.....done\n"
+            "Creating Revision.....done\n"
+            "Routing traffic.....done\n"
+            "Done.\n"
+            "Service [tap-studio-backend-test] revision [tap-studio-backend-test-00018-t6f] has been deployed and is serving 100 percent of traffic.\n"
+            "=== Studio Backend Test Deploy Done ===\n"
+            "Proxy locally with: gcloud run services proxy tap-studio-backend-test --project=tap-testing-env --region=asia-northeast1\n"
+        )
+        g_sum, g_err = engine._summarize_cli_lamb_log(gcloud_deploy_log)
+        self.assertFalse(g_err)
+        self.assertNotIn("Routing traffic", g_sum)
+        self.assertNotIn("Proxy locally with", g_sum)
+        self.assertIn("=== Studio Backend Test Deploy Done ===", g_sum)
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -2092,6 +2311,7 @@ class SecurityCliTest(GateTest):
     test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen = None
     test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done = None
     test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards = None
+    test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail = None
 
 
 if __name__ == "__main__":

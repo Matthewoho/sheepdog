@@ -62,7 +62,12 @@ _ACCEPT_WORDS_RE = re.compile(
 _OVERRIDE_WORDS_RE = re.compile(
     r"(?:忽略|不用|取消|算了|不对|不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|不用我同意|已经过时间"
     r"|用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢"
+    r"|有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我"
     r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个环境|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
+    re.I,
+)
+_SYMBOLIC_CRITIQUE_RE = re.compile(
+    r"(?:有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我)",
     re.I,
 )
 
@@ -73,7 +78,7 @@ def diagnose_override_reason(
     chosen_code: str = "",
     recommended: str = "",
 ) -> tuple[str, str]:
-    """7.108 / 7.113 / 7.115（REG-076 / REG-081 / REG-083）：将人类改判/反问归因为 5 类可执行自进化根因。"""
+    """7.108 / 7.113 / 7.115 / 7.118（REG-076 / REG-081 / REG-083 / REG-086）：将人类改判/反问归因为 5 类可执行自进化根因。"""
     s = (ans_body or "").strip()
     if re.search(
         r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看)",
@@ -83,6 +88,7 @@ def diagnose_override_reason(
         return ("peer_or_owner_delegate", "未先找专席或Owner")
     if re.search(
         r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢|"
+        r"有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我|"
         r"测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理)",
         s,
         re.I,
@@ -440,7 +446,12 @@ def parse_transcript_steps(
     return steps[-max_steps:]
 
 
-def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_floor: str = "") -> dict:
+def classify_escalation(
+    row: sqlite3.Row | dict,
+    answer_content: str = "",
+    ask_floor: str = "",
+    followup_critique: str = "",
+) -> dict:
     """将找人决策单归类为：accepted（采纳建议）/ overridden（推翻或改判）/ auto_resolved（旁路结案）/ pending（待拍板）。"""
     text = str(row["text"] or "")
     closed_at = row["closed_at"]
@@ -448,6 +459,9 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
     close_reason = str(row["close_reason"] or "")
     resolved_by = str(row["resolved_by"] or "")
     resolve_note = str(row["resolve_note"] or "")
+    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+    raw_critique = followup_critique or (str(row["followup_critique"] or "") if "followup_critique" in row_keys else "")
+    critique_clean = clean_ui_text(raw_critique, 120) if raw_critique else ""
 
     options: list[dict] = []
     for m in _OPTION_LINE_RE.finditer(text):
@@ -511,7 +525,14 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
                 alignment = "accepted"
                 alignment_label = "采纳建议 (带参/直接放行)"
         elif chosen_code in ("A", "B", "C", "D", "E"):
-            if recommended and chosen_code != recommended:
+            if critique_clean and _SYMBOLIC_CRITIQUE_RE.search(critique_clean):
+                alignment = "overridden"
+                override_code, override_reason = diagnose_override_reason(
+                    text, critique_clean, chosen_code, recommended
+                )
+                alignment_label = f"{override_reason}（点选 {chosen_code} 后追问纠偏）"
+                ans_clean = f"{ans_clean} · 追问：{critique_clean}"
+            elif recommended and chosen_code != recommended:
                 alignment = "overridden"
                 override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
                 alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
@@ -1203,7 +1224,13 @@ class WorkbenchService:
                 """SELECT e.*,
                           am.content AS answer_content,
                           pm.content AS possible_content,
-                          (SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1) AS ask_floor
+                          (SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1) AS ask_floor,
+                          (SELECT fm.content FROM messages fm
+                           WHERE (fm.topic_id = e.topic_id OR fm.reason = 'decision_hub_hint' OR fm.tags_json LIKE '%' || e.message_id || '%')
+                             AND e.answered_at IS NOT NULL
+                             AND unixepoch(fm.create_time) BETWEEN unixepoch(e.answered_at) - 60 AND unixepoch(e.answered_at) + 600
+                             AND (fm.content LIKE '%决策点%' OR fm.content LIKE '%还需要问我%' OR fm.content LIKE '%象征性问问%' OR fm.content LIKE '%不用问我%')
+                           ORDER BY fm.create_time ASC LIMIT 1) AS followup_critique
                    FROM escalations e
                    LEFT JOIN messages am ON am.message_id = e.answer_message_id
                    LEFT JOIN messages pm ON pm.message_id = e.possibly_handled_message_id

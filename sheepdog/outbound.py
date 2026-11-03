@@ -398,7 +398,9 @@ _TEST_ENV_IAM_GRANT_ASK_RE = re.compile(
     re.I,
 )
 _PROD_OR_DESTRUCTIVE_IAM_RE = re.compile(
-    r"(?:(?<!非)(?<!不涉及)生产|taplabs-453508|tpn-prod-506507|remove-iam-policy-binding|delete|删除|移除|roles/owner|roles/editor|roles/resourcemanager\.projectIamAdmin)",
+    r"(?:taplabs-453508|tpn-prod-506507|remove-iam-policy-binding|delete|删除|移除|"
+    r"roles/owner|roles/editor|roles/resourcemanager\.projectIamAdmin|"
+    r"(?<!非)(?<!不涉及)(?<!登记)(?<!测试与)生产(?:环境|项目|库|集群|\s*IAM|\s*Secret|\s*权限))",
     re.I,
 )
 _TENCENT_MAIN_ACCOUNT_CONSOLE_ASK_RE = re.compile(
@@ -431,6 +433,36 @@ _LAOHU_PROXY_OR_CONFIRMED_ASK_RE = re.compile(
     r"(?:助理代发|Claude\s*代[^\n。]{0,16}发|在老胡本人确认后|待老胡本人确认|老胡本人确认)",
     re.I,
 )
+_SYMBOLIC_RELEASE_SCHEDULE_ASK_RE = re.compile(
+    r"(?:(?:提请|提议|申请|计划)[^\n。]{0,18}排期[^\n。]{0,28}(?:发版|上线|窗口)|"
+    r"同意排期[^\n。]{0,28}待[^\n。]{0,24}(?:Review|评审|合入|提测)后|"
+    r"B[.、:：]\s*调整排期时间或[^\n。]{0,24}有其他要求)",
+    re.I,
+)
+_GENUINE_SCHEDULE_CONFLICT_RE = re.compile(
+    r"(?:不合理|封网冲突|资源冲突|破坏性变更|不兼容|停机维护|架构违规|高风险异常)",
+    re.I,
+)
+_DB_USER_ACCOUNT_ASK_RE = re.compile(
+    r"(?:数据库[^\n。]{0,24}(?:连接串[^\n。]{0,12}只读账号|只读(?:账号|账密|用户)|User\s*账号)|"
+    r"只读(?:账号|账密|用户)[^\n。]{0,24}(?:创建|开通|发放|申请|密码)|"
+    r"(?:migrator|主账号|root|postgres)[^\n。]{0,24}凭据[^\n。]{0,24}创建[^\n。]{0,16}只读(?:账号|用户)|"
+    r"\belaine_readonly\b)",
+    re.I,
+)
+_RECENT_OWNER_HOLD_VETO_RE = re.compile(
+    r"(?:这个不动|暂时不动|先不动|不用动|暂不开|忽略吧|先忽略|不用管了|暂缓开通|暂不执行)",
+    re.I,
+)
+_LOGIN_PWD_RESET_ASK_RE = re.compile(
+    r"(?:登录[^\n。]{0,20}提示密码不正确|申请重设[^\n。]{0,20}临时密码)"
+    r"[\s\S]{0,160}(?:请求查询[^\n。]{0,24}并重设|重设临时密码私发)",
+    re.I,
+)
+_LOGIN_DB_LOG_VERIFIED_EVIDENCE_RE = re.compile(
+    r"(?:已查(?:库|验)|已核查\s*auth\.users|GoTrue\s*返回|登录日志显示|报错日志为)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -445,19 +477,21 @@ def check_ask_pre_flight_guard(
     floor_type: str | None = None,
     options: str = "",
 ) -> None:
-    """7.108 / 7.110 / 7.113 / 7.114 / 7.115 / 7.116 / 7.117（REG-076 / REG-078 / REG-081 / REG-082 / REG-083 / REG-084 / REG-085）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110 / 7.113 / 7.114 / 7.115 / 7.116 / 7.117 / 7.118（REG-076 ~ REG-086）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     0. 发起待拍板 ask 卡片（含写明『建议选 A』或启用聚合台/白话总结折叠模式）时，必须提供至少 2 个可解析的 A/B 互斥选项，严禁发无选项按钮的空头决策卡；
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
     2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
-    3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask；
+    3. 同一 (topic_id, key) 在途未消费主人刚给出的批复、主人已批复『这个不动/忽略』、或近 2 小时已点击选项 A 批准由专席执行时，拦截重复 ask；
     4. 请示执行 gh pr merge 或直接合入 PR 打 Tag 发布生产前，必须显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/N 未过）；
     5. 请示确认 CORS / Origin 域名白名单或『是否有其他前端域名调用』前，必须先扫描云上真实流量日志 + 本地记录并与技术负责人（如 tp_laohu）核对；
     6. 请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先与该单技术负责人（如 tp_laohu）核对；
     7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示；
-    8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）属于预授权测试环境操作，拦截向主人 ask 请示；
+    8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator、secretAccessor）属于预授权测试环境操作，拦截向主人 ask 请示；
     9. 因腾讯云子账号权限不足（UnauthorizedOperation）请示主人登录控制台创建 API Key / 资源前，必须先核查本机 ~/.tccli/ 下的主账号凭据（如 tencent-cn.credential）；
     10. 内部同学因切换办公专线 / VPS 出口 IP 申请数据库白名单（Cloud SQL / AlloyDB / ADB / RDS）前，必须先向 tp_3x-ui-ops 拉齐整套 VPS 出口 IP 清单并协调 Nicky 老师（tp_nicky）全量数据库一次性加白，严禁按单人单 IP 散装打扰；
-    11. 老胡（laohu / Andy Hu）的需求（含助理代发待老胡本人确认）属于 VIP 预授权范围（『laohu 的需求 只要经过他本人确认 你就给他弄』），先向老胡本人确认后直接执行并 report，严禁未触及 3 条底线就向主人 ask。"""
+    11. 老胡（laohu / Andy Hu）的需求（含助理代发待老胡本人确认）属于 VIP 预授权范围（『laohu 的需求 只要经过他本人确认 你就给他弄』），先向老胡本人确认后直接执行并 report，严禁未触及 3 条底线就向主人 ask；
+    12. 常规发版排期/窗口报备（PR 仍在等待他人 Review 合入、无架构/封网冲突，选项 B 为『调整排期时间或有其他要求』）无实质决策点（『这玩意有啥决策点吗 还需要问我』），拦截象征性 ask；
+    13. 申请数据库内部 User / 只读账号密码与连接串（含尚未入 DBA 台账的新库）统一归口 Nicky 老师（tp_nicky）纳管发放（『如果是数据库里面的 User 账号密码什么的，那就找 Nicky』），拦截向主人 ask。"""
     from . import decision_hub
     from .card_callback import _DISABLED_SPECS, _MORE_LINE_RE, parse_ask_options
 
@@ -475,7 +509,32 @@ def check_ask_pre_flight_guard(
                 "发起待拍板决策卡时，必须在正文中显式列出至少 2 个互斥选项（如 `A. 同意...\\nB. 暂缓...` 或 `选项：A. ...；B. ...`），"
                 "或传 `--options \"A:方案一|B:方案二\"`，严禁只写『建议选 A：...』却不提供 A/B 选项列表导致飞书卡片无按钮！（没有发送）",
             )
-    if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
+    if floor or floor_type:
+        return
+    if _SYMBOLIC_RELEASE_SCHEDULE_ASK_RE.search(full_text) and not _GENUINE_SCHEDULE_CONFLICT_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "常规发版窗口排期报备（PR 尚在等待同行 Code Review 合入、无封网/架构冲突，选项 B 仅为『调整排期时间或有其他要求』）无实质决策点"
+            "（主人 2026-11-03 20:13:53 明确批评：『这玩意有啥决策点吗 还需要问我 是哪里不合理吗 还是说你只是象征性问问』）："
+            "请直接在群内或私聊配合对齐，并用 `sheepdog report`（`--ball other` 或 `doing`）报备进展；"
+            "待 PR 完成人工 Code Review 合入、真正进入生产触发/切流授权或遇到真实架构冲突时再发起请示（REG-086 防象征性发问门禁，没有发送）",
+        )
+    if topic_id != "tp_nicky" and _DB_USER_ACCOUNT_ASK_RE.search(full_text) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "申请数据库内部 User 账号密码 / 只读账号（如 elaine_readonly）或数据库连接串属于 DBA 统一纳管职责"
+            "（主人 2026-11-03 19:26:17 与 20:13:12 明确指示：『如果是 IAM 权限，那就给他。如果是数据库里面的 User 账号密码什么的，那就找 Nicky』『仍交由 Nicky 老师纳入 DBA 资产台账后再统一开通发放』）："
+            "① 若在总线 `tp_bus`，请直接 `sheepdog forward` 转交对应专席处理，严禁在总线直接向主人 ask；"
+            "② 若涉及云平台 IAM 角色权限，请按最小权限直接授权并回读后 `sheepdog report`；"
+            "③ 若涉及数据库内部 User 账密 / 只读账号（含尚未入 DBA 台账的新库），请直接通过 `sheepdog tell --to tp_nicky` 交由 Nicky 老师纳入 DBA 资产台账后统一开通发放，严禁绕过 DBA 用 migrator 凭据代建或向主人 ask（REG-086 防打扰门禁，没有发送）",
+        )
+    if _LOGIN_PWD_RESET_ASK_RE.search(full_text) and not _LOGIN_DB_LOG_VERIFIED_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "因用户反馈登录提示密码不正确请示重设临时密码前，必须先执行只读库表与日志排查（核查 `auth.users` 账号是否存在、最近登录时间、GoTrue 真实报错日志是否仅输错账号/密码），"
+            "并在正文中写明目标站点域名（如 `cinemap-stage.tapnow.tv`）、只读查库结论与申请人全名，严禁未查库核实前因后果就发模糊 ask 让主人反问『啥意思』（REG-086 防打扰门禁，没有发送）",
+        )
+    if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return
     if _VPS_DB_WHITELIST_SINGLE_IP_ASK_RE.search(full_text) and not _VPS_FLEET_WHITELIST_EVIDENCE_RE.search(full_text):
         raise OutboundError(
@@ -553,10 +612,11 @@ def check_ask_pre_flight_guard(
             "独立回读确认后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（REG-082 防打扰门禁，没有发送）",
         )
     nk = duty.norm_key(key) if key else ""
-    if nk and _REASK_MANUAL_OPTION_RE.search(full_text) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):
+    if nk:
         since_iso = (datetime.now().astimezone() - timedelta(minutes=120)).isoformat(timespec="seconds")
         prior = store.conn.execute(
-            """SELECT e.message_id, e.answered_at, m.content AS ans_content
+            """SELECT e.message_id, e.answered_at, s.title AS prior_title,
+                      m.content AS ans_content, m.dispatch_state AS ans_dispatch_state, m.batch_id AS ans_batch_id
                FROM escalations e
                JOIN sends s ON s.message_id = e.message_id
                LEFT JOIN messages m ON m.message_id = e.answer_message_id
@@ -567,13 +627,51 @@ def check_ask_pre_flight_guard(
         ).fetchone()
         if prior is not None:
             ans_c = (prior["ans_content"] or "").strip()
-            if ans_c.startswith("[卡片回调] A：") and any(w in ans_c for w in ("由专席", "授权", "同意", "执行", "挂载", "注入", "创建", "配置")):
+            in_flight_sent_at = ""
+            cur_b = current_batch(store, topic_id)
+            if cur_b:
+                d_row = store.get_dispatch(cur_b)
+                if d_row is not None and d_row["state"] == "sent":
+                    in_flight_sent_at = str(d_row["sent_at"] or "")
+            if _RECENT_OWNER_HOLD_VETO_RE.search(ans_c) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):
+                raise OutboundError(
+                    EXIT_INVALID,
+                    f"同一钥匙 (--key {key}) 主人已于 {prior['answered_at']} 明确批复暂不操作（「{ans_c}」）："
+                    "请严格遵守主人『暂不动 / 忽略』指令用 `sheepdog report` 或直接收尾，严禁就同一事项再次发起重复 ask 打扰主人！"
+                    "（REG-086 防重复追问门禁，没有发送）",
+                )
+            if (
+                _REASK_MANUAL_OPTION_RE.search(full_text)
+                and not _REASK_BLOCKER_EXEMPT_RE.search(full_text)
+                and ans_c.startswith("[卡片回调] A：")
+                and any(w in ans_c for w in ("由专席", "授权", "同意", "执行", "挂载", "注入", "创建", "配置"))
+            ):
                 raise OutboundError(
                     EXIT_INVALID,
                     f"同一钥匙 (--key {key}) 主人刚于 {prior['answered_at']} 点击选项 A 批准由专席执行（「{ans_c}」）："
                     "同一事项后续子步骤请直接继承该授权闭环执行（查同项目关联 Cloud Run 服务 env/挂载卷与 Secret），"
                     "严禁再次发起『由专席执行 vs 由主人手动操作』的重复 ask 打扰主人！"
                     "（若确遇新物理权限报错或方案分叉，请在正文中写明报错详情或『需二次拍板：...』；REG-078 防打扰门禁，没有发送）",
+                )
+            same_ask_title = bool(
+                (prior["prior_title"] or "").strip()
+                and (prior["prior_title"] or "").strip() == (title or "").strip()
+            )
+            if (
+                ans_c
+                and in_flight_sent_at
+                and str(prior["answered_at"] or "") >= in_flight_sent_at
+                and (
+                    (prior["ans_dispatch_state"] or "") == "pending"
+                    or (cur_b and (prior["ans_batch_id"] or "") != cur_b)
+                    or same_ask_title
+                )
+            ):
+                raise OutboundError(
+                    EXIT_INVALID,
+                    f"同一钥匙 (--key {key}) 主人刚于 {prior['answered_at']} 拍板批复了上一张卡（{prior['message_id']}，「{ans_c}」），"
+                    "当前会话在途批次尚未消费该批复，严禁在途并发重发第 2 张重复 ask 卡片打扰主人！"
+                    "请先按主人上述批复直接收尾或在本轮交回执后消费最新批复（REG-086 防并发重发门禁，没有发送）",
                 )
 
 
