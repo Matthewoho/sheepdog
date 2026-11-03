@@ -319,6 +319,149 @@ duty = "负责 111 个服务迁移"
         ov = svc.get_overview()
         self.assertEqual(ov["version"], "1.1.99")
 
+    def test_reg_091_transitional_workaround_report_guard_and_defer_item(self) -> None:
+        from sheepdog import outbound
+
+        self.store.upsert_topic(
+            "tp_tapnow-prod-topology",
+            title="TapNow 生产拓扑与跨云迁移",
+            kind="adopted",
+            conversation_id="d0758da6-274e-4954-89fa-9507823ec9d8",
+        )
+        # Initialize ssl-cert-lifecycle-steward in confirm mode with a probe.py script (testing auto-discovery)
+        init_spec = loops.init_loop(
+            self.cfg,
+            self.store,
+            "ssl-cert-lifecycle-steward",
+            template="ssl-cert-lifecycle-steward",
+            autonomy="confirm",
+            load_cmd="",
+        )
+        assert init_spec.path is not None
+        probe_py = init_spec.path.parent / "probe.py"
+        probe_py.write_text("import sys\nprint('[]')\n", encoding="utf-8")
+        spec = loops.get_loop_spec(self.cfg, self.store, "ssl-cert-lifecycle-steward")
+        assert spec is not None
+        self.assertIn("probe.py", spec.load_cmd)
+
+        # Simulate Subagent SYSTEM_MESSAGE handoff in transcript containing the transitional A-record workaround
+        subagent_transcript = (
+            "[System Notification]\n"
+            "Sender ID: 03c96300-6908-4da5-ba4c-0038cd7f5ff5\n"
+            "4. **DNSPod (`tapnow.tv`)**：已添加 `app-cn.tapnow.tv` 解析记录（RecordId `2442607029`，"
+            "当前指向 `129.211.237.172` 确保 HTTPS 立即 200 可通；待 EO `app-cn.tapnow.tv.eo.dnse4.com` "
+            "从 `process` 变 `online` 后可一键切 CNAME）。"
+        )
+        sanitized_summary = (
+            "已在南京TKE建好 chat-service/bff/fe-app-tapnow 及 app-cn.tapnow.tv HTTPS 证书与解析，"
+            "实测公网返回200，可发给开封联调。"
+        )
+        sanitized_body = (
+            "已完成南京生产 TKE 集群的三服务部署、Ingress TLS 证书与公网域名接入：\n"
+            "1. 公网 HTTPS 端到端实测返回 HTTP/2 200。"
+        )
+        fake_source = MagicMock()
+        fake_source.send_to_chat.return_value = {"message_id": "om_rep_091_1", "thread_id": ""}
+        fake_source.send_to_user.return_value = {"message_id": "om_rep_091_1", "thread_id": ""}
+
+        # 1) Calling report with sanitized first screen & no --defer-item MUST be blocked by REG-091!
+        with self.assertRaises(outbound.OutboundError) as ctx1:
+            outbound.send_to_owner(
+                self.cfg,
+                self.store,
+                fake_source,
+                outbound.REPORT,
+                "tp_tapnow-prod-topology",
+                "app-cn.tapnow.tv与南京TKE三服务已就绪",
+                sanitized_body,
+                key="tapnow-prod-topology",
+                summary=sanitized_summary,
+                ball="done",
+                transcript_text=subagent_transcript,
+            )
+        self.assertIn("REG-091", str(ctx1.exception))
+        self.assertIn("临时过渡态防隐瞒与防漏收尾门禁", str(ctx1.exception))
+
+        # 2) Disclosing temporary A record in summary BUT passing --ball done without --defer-item MUST ALSO be blocked!
+        disclosed_summary = (
+            "已在南京TKE建好三服务，因EO证书还在部署中，目前先用临时 A 记录指向南京CLB保HTTPS 200，"
+            "待证书就绪后切回CNAME。"
+        )
+        with self.assertRaises(outbound.OutboundError) as ctx2:
+            outbound.send_to_owner(
+                self.cfg,
+                self.store,
+                fake_source,
+                outbound.REPORT,
+                "tp_tapnow-prod-topology",
+                "app-cn.tapnow.tv与南京TKE三服务已就绪（临时A记录过渡）",
+                sanitized_body,
+                key="tapnow-prod-topology",
+                summary=disclosed_summary,
+                ball="done",
+                transcript_text=subagent_transcript,
+            )
+        self.assertIn("REG-091", str(ctx2.exception))
+        self.assertIn("防假结案门禁", str(ctx2.exception))
+
+        # 3) Passing --defer-item and --defer-check-cmd registers into loop_items and appends badge to first screen!
+        flag_file = Path(self.tmp.name) / "eo_cert_ready.flag"
+        check_cmd = f'test -f "{flag_file}" && echo "EO cert deployed"'
+        res_ok = outbound.send_to_owner(
+            self.cfg,
+            self.store,
+            fake_source,
+            outbound.REPORT,
+            "tp_tapnow-prod-topology",
+            "app-cn.tapnow.tv与南京TKE三服务已就绪（临时A记录过渡）",
+            sanitized_body,
+            key="tapnow-prod-topology",
+            summary=disclosed_summary,
+            ball="doing",
+            defer_item="eo-cname-app-cn.tapnow.tv:待 EdgeOne 证书变为 deployed 后把 app-cn.tapnow.tv 从临时 A 记录切回 CNAME",
+            defer_check_cmd=check_cmd,
+            transcript_text=subagent_transcript,
+        )
+        self.assertEqual(res_ok.message_id, "om_rep_091_1")
+        self.assertIn("⏳ 在途收尾项（已挂入 Loop `ssl-cert-lifecycle-steward` 自动盯盘）", res_ok.text)
+        active_items = loops.list_loop_items(self.store, "ssl-cert-lifecycle-steward", status="active")
+        self.assertEqual(len(active_items), 1)
+        self.assertEqual(active_items[0]["item_key"], "eo-cname-app-cn.tapnow.tv")
+        self.assertEqual(active_items[0]["stage"], "awaiting_async_ready")
+
+        # 4a) Tick while flag_file does not exist (defer_check_cmd exits 1) -> 0 tokens spent!
+        tick_waiting = loops.run_loop_tick(self.cfg, self.store, "ssl-cert-lifecycle-steward", force=True)
+        self.assertEqual(tick_waiting["status"], "empty")
+        items_still_waiting = loops.list_loop_items(self.store, "ssl-cert-lifecycle-steward", status="active")
+        self.assertEqual(items_still_waiting[0]["stage"], "awaiting_async_ready")
+
+        # 4b) Once EdgeOne cert is deployed (flag_file created -> defer_check_cmd exits 0), tick wakes tp_tapnow-prod-topology!
+        flag_file.write_text("deployed", encoding="utf-8")
+        tick_ready = loops.run_loop_tick(self.cfg, self.store, "ssl-cert-lifecycle-steward", force=True)
+        self.assertEqual(tick_ready["status"], "dispatched")
+        self.assertEqual(tick_ready["topic_id"], "tp_tapnow-prod-topology")
+        items_ready = loops.list_loop_items(self.store, "ssl-cert-lifecycle-steward", status="active")
+        self.assertEqual(items_ready[0]["stage"], "async_ready_to_cutover")
+
+        # 5) Reporting final CNAME cutover with --ball done passes cleanly!
+        fake_source.send_to_chat.return_value = {"message_id": "om_rep_091_2", "thread_id": "omt_091"}
+        fake_source.send_to_user.return_value = {"message_id": "om_rep_091_2", "thread_id": "omt_091"}
+        fake_source.reply_to.return_value = {"message_id": "om_rep_091_2", "thread_id": "omt_091"}
+        final_res = outbound.send_to_owner(
+            self.cfg,
+            self.store,
+            fake_source,
+            outbound.REPORT,
+            "tp_tapnow-prod-topology",
+            "已将app-cn.tapnow.tv切换为EdgeOne CNAME",
+            "已将 DNSPod 的 app-cn 正式切换为 CNAME app-cn.tapnow.tv.eo.dnse4.com 并实测 HTTP/2 200。",
+            key="tapnow-prod-topology",
+            summary="现在证书已部署完成，已将DNSPod的 app-cn 正式切换为 CNAME app-cn.tapnow.tv.eo.dnse4.com 并实测EO链路HTTP/2 200。",
+            ball="done",
+            transcript_text=subagent_transcript,
+        )
+        self.assertEqual(final_res.message_id, "om_rep_091_2")
+
 
 if __name__ == "__main__":
     unittest.main()

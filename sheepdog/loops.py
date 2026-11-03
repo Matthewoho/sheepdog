@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -301,6 +302,8 @@ def load_loop_spec(loop_md_path: Path) -> LoopSpec:
     active_interval = float(meta.get("active_interval_minutes") or min(5.0, interval))
     active_hours = str(meta.get("active_hours") or "").strip()
     load_cmd = str(meta.get("load_cmd") or "").strip()
+    if not load_cmd and (loop_md_path.parent / "probe.py").is_file():
+        load_cmd = f'"{sys.executable}" "{loop_md_path.parent / "probe.py"}"'
     load_timeout = float(meta.get("load_timeout_seconds") or 15.0)
     dedup_key = str(meta.get("dedup_key") or "key").strip()
     autopause = int(meta.get("autopause_after_failures") or 3)
@@ -1049,6 +1052,86 @@ def update_loop_item(
     return items[0] if items else {"loop_id": loop_id, "item_key": item_key, "status": resolved_status}
 
 
+def register_deferred_report_item(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    defer_item: str,
+    *,
+    defer_loop: str = "",
+    defer_check_cmd: str = "",
+    next_minutes: float = 5.0,
+) -> dict[str, Any]:
+    """REG-091：由 `sheepdog report --defer-item` 原生登记在途异步收尾事项到 `loop_items`，
+    自动进入 `awaiting_async_ready` 阶段并绑定零 Token `defer_check_cmd`。
+    """
+    ensure_loop_tables(store)
+    raw = (defer_item or "").strip()
+    if not raw:
+        raise ValueError("--defer-item 不能为空（格式：'<item_key>:<待收尾说明>'）")
+    if ":" in raw:
+        ikey_raw, _, ititle_raw = raw.partition(":")
+        ikey = ikey_raw.strip()
+        ititle = ititle_raw.strip() or ikey
+    else:
+        ikey = f"defer-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]}"
+        ititle = raw
+    if not ikey:
+        ikey = f"defer-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]}"
+
+    target_loop = (defer_loop or "").strip()
+    specs = discover_loops(cfg, store)
+    spec_ids = {s.id for s in specs}
+    if not target_loop:
+        for s in specs:
+            if s.topic_id == topic_id:
+                target_loop = s.id
+                break
+    if not target_loop:
+        low_text = f"{topic_id} {raw} {defer_check_cmd}".lower()
+        if any(w in low_text for w in ("ssl", "cert", "tls", "cname", "edgeone", "teo", "dnspod", "dns", "证书", "解析")):
+            target_loop = "ssl-cert-lifecycle-steward"
+        elif "service-release-guardian" in spec_ids:
+            target_loop = "service-release-guardian"
+        elif specs:
+            target_loop = specs[0].id
+        else:
+            target_loop = "service-release-guardian"
+    if target_loop not in spec_ids:
+        init_loop(
+            cfg,
+            store,
+            target_loop,
+            template=target_loop if target_loop in LOOP_TEMPLATES else "service-release-guardian",
+            topic_id=topic_id or "tp_bus",
+        )
+
+    payload = {
+        "source_topic": topic_id,
+        "defer_check_cmd": (defer_check_cmd or "").strip(),
+        "deferred_at": now_iso(),
+    }
+    updated = update_loop_item(
+        cfg,
+        store,
+        target_loop,
+        ikey,
+        title=ititle,
+        stage="awaiting_async_ready",
+        status=ITEM_ACTIVE,
+        note=f"由 {topic_id} report --defer-item 挂入自动盯盘",
+        next_minutes=next_minutes,
+        payload=payload,
+    )
+    return {
+        "loop_id": target_loop,
+        "item_key": ikey,
+        "title": ititle,
+        "stage": updated.get("stage") or "awaiting_async_ready",
+        "defer_check_cmd": (defer_check_cmd or "").strip(),
+    }
+
+
 def _append_memory_note(mem_path: Path, line: str) -> None:
     mem_path.parent.mkdir(parents=True, exist_ok=True)
     existing = mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
@@ -1495,11 +1578,49 @@ def run_loop_tick(
             )
 
     all_active = list_loop_items(store, loop_id, status=ITEM_ACTIVE)
-    due_items = [
+    raw_due_items = [
         it
         for it in all_active
         if not it.get("next_check_at") or str(it["next_check_at"]) <= now_s or force
     ]
+    due_items: list[dict[str, Any]] = []
+    for it in raw_due_items:
+        pl = dict(it.get("payload") or {})
+        d_cmd = str(pl.get("defer_check_cmd") or "").strip()
+        if d_cmd and it.get("stage") == "awaiting_async_ready":
+            d_rc, d_out, d_err = _run_load_command(
+                d_cmd,
+                timeout_seconds=spec.load_timeout_seconds,
+                cwd=spec.path.parent if spec.path else None,
+            )
+            if d_rc == 0:
+                pl["defer_check_ready_at"] = now_s
+                pl["defer_check_output"] = (d_out or "").strip()[:300]
+                it = update_loop_item(
+                    cfg,
+                    store,
+                    loop_id,
+                    it["item_key"],
+                    stage="async_ready_to_cutover",
+                    note="零 Token 异步前置条件已就绪，立即唤醒会话执行最终切换收尾",
+                    payload=pl,
+                )
+                due_items.append(it)
+            else:
+                pl["last_defer_check_rc"] = d_rc
+                pl["last_defer_check_at"] = now_s
+                update_loop_item(
+                    cfg,
+                    store,
+                    loop_id,
+                    it["item_key"],
+                    note=f"异步前置条件未就绪 (exit={d_rc})，零 Token 顺延等待",
+                    next_minutes=spec.active_interval_minutes,
+                    payload=pl,
+                )
+        else:
+            due_items.append(it)
+    all_active = list_loop_items(store, loop_id, status=ITEM_ACTIVE)
 
     # Step 3: 零 Token 空跑拦截（无 due_items 且非无脚本强制试跑时，0 Token 记 empty 结束）
     if not due_items and not (force and not spec.load_cmd):
@@ -1570,21 +1691,32 @@ def run_loop_tick(
         run_id=run_id,
         trigger_reason=trigger_reason,
     )
-    if store.get_topic(spec.topic_id) is None:
-        store.create_topic(
-            spec.topic_id,
-            spec.title,
-            "adopted",
-            spec.description or spec.title,
-            sm.ACTIVE,
-            host=ANTIGRAVITY,
+    source_topics = list(
+        dict.fromkeys(
+            str((it.get("payload") or {}).get("source_topic") or "").strip()
+            for it in due_items
+            if str((it.get("payload") or {}).get("source_topic") or "").strip()
         )
-    dispatched_mid = store.add_system_message(
-        spec.topic_id,
-        "loop_tick",
-        prompt_text,
-        tags=[f"loop:{spec.id}", f"loop_run:{run_id}", f"autonomy:{spec.autonomy}"],
     )
+    target_topics = source_topics if (source_topics and len(source_topics) == 1 and len(due_items) == sum(1 for it in due_items if (it.get("payload") or {}).get("source_topic"))) else [spec.topic_id, *[t for t in source_topics if t != spec.topic_id]]
+    for target_tid in target_topics:
+        if store.get_topic(target_tid) is None:
+            store.create_topic(
+                target_tid,
+                spec.title,
+                "adopted",
+                spec.description or spec.title,
+                sm.ACTIVE,
+                host=ANTIGRAVITY,
+            )
+        mid_cur = store.add_system_message(
+            target_tid,
+            "loop_tick",
+            prompt_text,
+            tags=[f"loop:{spec.id}", f"loop_run:{run_id}", f"autonomy:{spec.autonomy}"],
+        )
+        if not dispatched_mid:
+            dispatched_mid = mid_cur
     if dispatcher is not None:
         try:
             dispatcher.dispatch_once()
@@ -1629,6 +1761,8 @@ def run_loop_tick(
         "run_id": run_id,
         "autonomy": spec.autonomy,
         "status": run_status,
+        "topic_id": target_topics[0] if target_topics else spec.topic_id,
+        "target_topics": target_topics,
         "newly_added": newly_added,
         "due_items_count": len(due_items),
         "active_items_count": len(all_active),

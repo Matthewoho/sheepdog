@@ -2382,6 +2382,9 @@ def cmd_ask(args) -> int:
     floor = getattr(args, "floor", "") or ""
     floor_type = getattr(args, "floor_type", None)
     ball, fyi = getattr(args, "ball", "") or "", bool(getattr(args, "fyi", False))
+    defer_loop = getattr(args, "defer_loop", "") or ""
+    defer_item = getattr(args, "defer_item", "") or ""
+    defer_check_cmd = getattr(args, "defer_check_cmd", "") or ""
     vips = _ask_vips(cfg) if kind == outbound.ASK else {}
     if not cfg.source.enabled:
         if not outbound.target_ok(store, tid):
@@ -2394,7 +2397,11 @@ def cmd_ask(args) -> int:
                 outbound.check_vip_floor(cfg, store, tid, getattr(args, "about", None), vips, floor, args.batch, floor_type=floor_type)
             else:
                 from . import decision_hub
-                decision_hub.enforce_report_contract(cfg, store, tid, args.title, body, key=args.key, ball=ball, fyi=fyi)
+                ball = decision_hub.enforce_report_contract(cfg, store, tid, args.title, body, key=args.key, ball=ball, fyi=fyi)
+                outbound.check_transitional_state_report_guard(
+                    cfg, store, tid, args.title, summary, body,
+                    defer_item=defer_item, ball=ball, fyi=fyi,
+                )
         except outbound.OutboundError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return e.code
@@ -2402,6 +2409,23 @@ def cmd_ask(args) -> int:
         except ValueError as e:
             print(f"{kind} 没发: {e}", file=sys.stderr)
             return outbound.EXIT_INVALID
+        if kind == outbound.REPORT and defer_item.strip():
+            from . import loops as lp
+            try:
+                def_info = lp.register_deferred_report_item(
+                    cfg, store, tid, defer_item,
+                    defer_loop=defer_loop, defer_check_cmd=defer_check_cmd,
+                )
+            except ValueError as e:
+                print(f"{kind} 没发: {e}", file=sys.stderr)
+                return outbound.EXIT_INVALID
+            badge_line = f"⏳ 在途收尾项（已挂入 Loop `{def_info['loop_id']}` 自动盯盘）：{def_info['title']}"
+            if badge_line not in resolved_body:
+                if "\n---more---\n" in resolved_body:
+                    head_part, sep_part, tail_part = resolved_body.partition("\n---more---\n")
+                    resolved_body = f"{head_part.rstrip()}\n{badge_line}{sep_part}{tail_part}"
+                else:
+                    resolved_body = f"{resolved_body.rstrip()}\n{badge_line}"
         if cfg.notify_path is not None: clear_handled_owner_reactions(store, None, tid)
         return _test_env_write(cfg, "需要你定" if kind == outbound.ASK else "汇报",
                                outbound.compose(cfg, kind, tid, args.title, resolved_body))
@@ -2409,7 +2433,8 @@ def cmd_ask(args) -> int:
         r = outbound.send_to_owner(cfg, store, _source(cfg), kind, tid, args.title, body, args.key, args.batch,
                                    about=getattr(args, "about", None) or None, track=getattr(args, "track", False),
                                    floor=floor, vips=vips, summary=summary, floor_type=floor_type,
-                                   options=getattr(args, "options", "") or "", ball=ball, fyi=fyi)
+                                   options=getattr(args, "options", "") or "", ball=ball, fyi=fyi,
+                                   defer_loop=defer_loop, defer_item=defer_item, defer_check_cmd=defer_check_cmd)
     except outbound.OutboundError as e:
         print(f"{kind} 没发: {e}", file=sys.stderr)
         return e.code
@@ -3032,6 +3057,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sp.add_argument("--ball", default="", help="球权归属（done=已办结 | doing=继续推进 | other=等第三方；球在主人脚下必须用 ask）")
             sp.add_argument("--fyi", action="store_true", help="纯知会备案（含选项示例但无需主人拍板时显式声明）")
+            sp.add_argument("--defer-loop", default="", help="异步在途收尾项挂载的目标 Loop ID（不传则按会话/内容自动路由，如 ssl-cert-lifecycle-steward）")
+            sp.add_argument("--defer-item", default="", help="异步在途收尾项（格式 '<key>:<待收尾动作说明>'，如 'eo-cname-app-cn.tapnow.tv:待EO证书变为deployed后把app-cn.tapnow.tv从临时A记录切回CNAME'；自动写入 loop_items 并在卡片首屏展示）")
+            sp.add_argument("--defer-check-cmd", default="", help="异步在途收尾项的零 Token 探活命令（返回码 0 时自动唤醒原会话执行最终收尾切换）")
         sp.set_defaults(func=cmd_ask)
     sp = sub.add_parser("resolve", help="结案自己名下还开着的「需要你定」（写依据）；机器人在话题里补一句「已结案」")
     sp.add_argument("--topic", required=True, help="你自己的会话（tp_x）")

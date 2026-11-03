@@ -361,6 +361,9 @@ def is_short_message(text: str, *, for_reply: bool = False) -> bool:
     return len(s.splitlines()) <= SHORT_MESSAGE_MAX_LINES and len(s) <= SHORT_MESSAGE_MAX_CHARS
 
 
+_DEFERRED_LOOP_BADGE_LINE_RE = re.compile(r"^\s*⏳\s*在途收尾项（已挂入\s*Loop\b[^\n]*$", re.M)
+
+
 def validate_summary(summary: str, *, for_reply: bool = True) -> str:
     """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 6 类机器符号；7.119 交付物首屏 ≤12 行、≤520 字；ask/report 为 ≤6 行、≤220 字）。"""
     s = (summary or "").strip("\n")
@@ -368,17 +371,18 @@ def validate_summary(summary: str, *, for_reply: bool = True) -> str:
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
     if _CODE_FENCE_RE.search(s):
         raise ValueError(f"白话总结不能含代码块（代码块请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
-    is_deliv = for_reply and is_deliverable_payload(s)
+    s_for_check = _DEFERRED_LOOP_BADGE_LINE_RE.sub("", s).strip("\n") or s
+    is_deliv = for_reply and is_deliverable_payload(s_for_check)
     max_lines = DELIVERABLE_MAX_LINES if is_deliv else (REPLY_SUMMARY_MAX_LINES if for_reply else SUMMARY_MAX_LINES)
     max_chars = DELIVERABLE_MAX_CHARS if is_deliv else (REPLY_SUMMARY_MAX_CHARS if for_reply else SUMMARY_MAX_CHARS)
-    lines = s.splitlines()
+    lines = s_for_check.splitlines()
     if len(lines) > max_lines:
         raise ValueError(f"白话总结超过 {max_lines} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
-    visible_len = len(_AT_TAG_RE.sub("", s).strip())
+    visible_len = len(_AT_TAG_RE.sub("", s_for_check).strip())
     if visible_len > max_chars:
         raise ValueError(f"白话总结超过 {max_chars} 字（当前 {visible_len} 字）。{SUMMARY_REQUIRED_GUIDE}")
     if for_reply:
-        hit = _find_deliverable_forbidden_symbol(s) if is_deliv else _find_machine_symbol(s)
+        hit = _find_deliverable_forbidden_symbol(s_for_check) if is_deliv else _find_machine_symbol(s_for_check)
         if hit is not None:
             raise ValueError(f"白话总结不能含{hit[0]}（{hit[1]!r} 请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
     return s

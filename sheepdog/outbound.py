@@ -723,11 +723,159 @@ def check_ask_pre_flight_guard(
                 )
 
 
+_TRANSITIONAL_WORKAROUND_RE = re.compile(
+    r"(?:"
+    r"(?:暂将|先把|先将|临时将|临时把|先用|暂用)[^\n。；]{0,60}(?:临时指向|指向|切到|设为|用)?[^\n。；]{0,30}(?:A\s*记录|Ingress|CLB|直连|直通)"
+    r"|临时\s*(?:A\s*记录|指向|直连|直通|绕过|过渡|顶上|兜底)"
+    r"|(?:待|等)\s*(?:EO|EdgeOne|边缘节点|证书|SSL|TLS|CNAME|加速域名)[^\n。；]{0,80}(?:从\s*[`'\"]?process\w*[`'\"]?\s*变|部署完成|签发完成|生效|online|deployed)[^\n。；]{0,40}(?:后|再)?[^\n。；]{0,20}(?:可|一键|平滑|正式)?\s*切(?:换|回|到)?\s*CNAME"
+    r"|(?:证书|边缘节点|加速域名|DomainStatus)[^\n。；]{0,40}(?:还在|处于|仍为|正在)\s*(?:最后节点同步\s*)?[`'\"]?(?:部署中|签发中|processing|process(?:\s*->\s*online)?)[`'\"]?"
+    r")",
+    re.I,
+)
+
+_TRANSITIONAL_RESOLVED_RE = re.compile(
+    r"(?:"
+    r"(?:已将|已把|现已将|已经把)[^\n。；]{0,80}(?:从\s*A\s*记录)?[^\n。；]{0,30}(?:正式)?切(?:换|回)为?\s*[`'\"]?CNAME"
+    r"|(?:证书|边缘节点)已部署完成[^\n。；]{0,60}切(?:换|回)为?\s*[`'\"]?CNAME"
+    r"|RecordType\s*=\s*[\"'`]?CNAME[\"'`]?"
+    r")",
+    re.I,
+)
+
+_FIRST_SCREEN_TRANSITIONAL_DISCLOSURE_RE = re.compile(
+    r"(?:临时|过渡态?|暂用|暂指|待切|待收尾|待切换|还在部署中|部署中|签发中|processing|process\s*->\s*online|⏳\s*在途收尾项)",
+    re.I,
+)
+
+
+def _read_current_turn_transcript_text(
+    store: Store,
+    topic_id: str,
+    transcript_file: Path | None = None,
+) -> str:
+    """REG-091：读取当前会话本轮次（自上一轮结束或上一次成功外发以来）的 transcript.jsonl 文本（含 Subagent SYSTEM_MESSAGE 回报）。"""
+    p = transcript_file
+    if p is None:
+        if store is None or not hasattr(store, "get_topic"):
+            return ""
+        t = store.get_topic(topic_id)
+        cid = (t["conversation_id"] or "").strip() if t is not None and "conversation_id" in t.keys() else ""
+        if not cid:
+            return ""
+        from .sink.agentapi import transcript_path
+
+        p = transcript_path(cid)
+    if p is None or not p.is_file():
+        return ""
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > 262_144:
+                f.seek(size - 262_144)
+                raw_bytes = f.read()
+                nl = raw_bytes.find(b"\n")
+                if nl >= 0:
+                    raw_bytes = raw_bytes[nl + 1 :]
+            else:
+                raw_bytes = f.read()
+        lines = raw_bytes.decode("utf-8", errors="replace").split("\n")
+    except OSError:
+        return ""
+
+    parsed_steps: list[dict] = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            d = json.loads(ln)
+            if isinstance(d, dict):
+                parsed_steps.append(d)
+        except Exception:
+            continue
+
+    collected: list[str] = []
+    for step in reversed(parsed_steps[-30:]):
+        stype = str(step.get("type") or "")
+        content = step.get("content")
+        text = content if isinstance(content, str) else ""
+        tcs = step.get("tool_calls") or []
+        if stype == "PLANNER_RESPONSE" and not tcs and text.strip():
+            break
+        if stype == "GENERIC" and any(
+            marker in text for marker in ("已发到钥匙", "已发给主人", "新开了事项", "发到了话题群里的事项")
+        ):
+            break
+        if stype in ("USER_INPUT", "SYSTEM_MESSAGE", "PLANNER_RESPONSE") and text.strip():
+            collected.append(text)
+    collected.reverse()
+    return "\n".join(collected)
+
+
+def check_transitional_state_report_guard(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    title: str,
+    summary: str,
+    body: str,
+    *,
+    defer_item: str = "",
+    ball: str = "",
+    fyi: bool = False,
+    transcript_text: str | None = None,
+    transcript_file: Path | None = None,
+) -> None:
+    """7.121（REG-091）：跨源防隐瞒与防静默蒸发门禁。
+    当会话在本轮 transcript（含 Subagent 汇报）或 report 正文中采用了『临时 A 记录 / 待证书或节点就绪后再切 CNAME』等过渡态方案，
+    却在飞书卡片首屏（--title / --summary）隐瞒不报、或未挂入 --defer-item 就直接传 --ball done 假结案时，当场拦截。
+    """
+    if fyi:
+        return
+    combined_report = f"{title or ''}\n{summary or ''}\n{body or ''}"
+    if _TRANSITIONAL_RESOLVED_RE.search(combined_report):
+        return
+    turn_txt = (
+        transcript_text
+        if transcript_text is not None
+        else _read_current_turn_transcript_text(store, topic_id, transcript_file=transcript_file)
+    )
+    scan_source = f"{body or ''}\n{turn_txt}"
+    m = _TRANSITIONAL_WORKAROUND_RE.search(scan_source)
+    if m is None:
+        return
+    matched_snippet = " ".join(m.group(0).split())[:100]
+    if (summary or "").strip():
+        first_screen = f"{title or ''}\n{summary.strip()}"
+    elif "\n---more---\n" in (body or ""):
+        first_screen = f"{title or ''}\n{(body or '').partition('---more---')[0]}"
+    else:
+        first_screen = f"{title or ''}\n{body or ''}"
+
+    has_disclosure = bool(_FIRST_SCREEN_TRANSITIONAL_DISCLOSURE_RE.search(first_screen))
+    has_defer = bool((defer_item or "").strip())
+    if not has_disclosure and not has_defer:
+        raise OutboundError(
+            EXIT_INVALID,
+            f"report 拒绝（REG-091 临时过渡态防隐瞒与防漏收尾门禁）：检测到当前轮次或正文中存在未收尾的临时过渡方案（『{matched_snippet}』），"
+            "但飞书卡片首屏（--title / --summary）只报喜未披露该临时过渡态，也未通过 --defer-item 挂入 Loop 自动盯盘（主人批评：『这个东西以后要报啊 不能啥也不说』）！\n"
+            "请：① 在 --summary 首屏如实写明当前临时过渡态与待切换条件；"
+            "② 强烈建议同时传 `--defer-item \"<key>:<待收尾动作说明>\" [--defer-check-cmd \"<零Token探活命令>\"]`，由系统自动挂入 Loop 盯盘并在首屏展示在途收尾项（没有发送）。",
+        )
+    if (ball or "").strip().lower() == "done" and not has_defer:
+        raise OutboundError(
+            EXIT_INVALID,
+            f"report 拒绝（REG-091 临时过渡态防假结案门禁）：检测到当前存在未收尾的临时过渡方案（『{matched_snippet}』），"
+            "在最终切换（如切回 CNAME）完成前严禁传 `--ball done` 假结案！请传 `--defer-item \"<key>:<待收尾说明>\"` 挂入 Loop 自动盯盘收尾，或改用 `--ball doing`（没有发送）。",
+        )
+
+
 def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, title: str, body: str, key: str = "",
                   batch: str = "", about: list[str] | None = None, track: bool = False, floor: str = "",
-                  vips: dict | None = None, summary: str = "", floor_type: str | None = None, options: str = "", ball: str = "", fyi: bool = False) -> SendResult:
+                  vips: dict | None = None, summary: str = "", floor_type: str | None = None, options: str = "",
+                  ball: str = "", fyi: bool = False, defer_loop: str = "", defer_item: str = "",
+                  defer_check_cmd: str = "", transcript_text: str | None = None) -> SendResult:
     """ask / report：以机器人身份私聊主人（或发进话题群），ask 发前核 VIP 底线并当场记来源与 floor。"""
-    from . import decision_hub, topicgroup as tg
+    from . import decision_hub, loops as lp, topicgroup as tg
     check_not_lamb(store, kind, topic_id=topic_id)
     canon_mode = decision_hub.canonical_group_mode(cfg, store)
     if track and not _one_line(key) and not canon_mode:
@@ -748,9 +896,29 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
         check_ask_pre_flight_guard(cfg, store, topic_id, title, combined_for_check, key=key, floor=raw_floor, floor_type=floor_type, options=options)
-    else: ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
+    else:
+        ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
+        check_transitional_state_report_guard(
+            cfg, store, topic_id, title, summary, body,
+            defer_item=defer_item, ball=ball, fyi=fyi, transcript_text=transcript_text,
+        )
     try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
+    if kind == REPORT and (defer_item or "").strip():
+        try:
+            def_info = lp.register_deferred_report_item(
+                cfg, store, topic_id, defer_item,
+                defer_loop=defer_loop, defer_check_cmd=defer_check_cmd,
+            )
+        except ValueError as e:
+            raise OutboundError(EXIT_INVALID, str(e))
+        badge_line = f"⏳ 在途收尾项（已挂入 Loop `{def_info['loop_id']}` 自动盯盘）：{def_info['title']}"
+        if badge_line not in resolved_body:
+            if "\n---more---\n" in resolved_body:
+                head_part, sep_part, tail_part = resolved_body.partition("\n---more---\n")
+                resolved_body = f"{head_part.rstrip()}\n{badge_line}{sep_part}{tail_part}"
+            else:
+                resolved_body = f"{resolved_body.rstrip()}\n{badge_line}"
     text, eff_batch = compose(cfg, kind, topic_id, title, resolved_body), (batch or current_batch(store, topic_id))
     ik = idem_key(kind, topic_id, nk, eff_batch, text)
     origin, srcs, n_chats = ask_sources(cfg, store, topic_id, about, batch) if kind == ASK else ("", [], 0)
