@@ -1340,6 +1340,88 @@ class GateTest(Base):
         self.assertFalse(any("ERROR/Traceback" in w for w in obs["warns"]), obs["warns"])
         self.assertTrue(any("瞬时网络抖动已自动从水位线恢复" in i for i in obs["infos"]), obs["infos"])
 
+    def test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis(self):
+        """REG-081 (7.113):
+        1. 专席发起包含 gh pr merge（或直接合入 PR 打 Tag 发布生产）的 sheepdog ask 时，若正文未显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/6 未过），check_ask_pre_flight_guard 当场以退出码 2 拦截；补齐人工 Review 状态后放行；
+        2. 主人在卡片回调回复『[其他] review 过了吗』时，classify_escalation 与 diagnose_override_reason 精准识别为 overridden + context_incomplete（缺环境/调用链反问）。
+        """
+        from sheepdog import outbound
+        from sheepdog.admin_web import classify_escalation, diagnose_override_reason
+
+        # 1. 未写人工 Review 状态的 gh pr merge 生产发版请示被当场拦截
+        title_no_rev = "FE-1639六个后端服务合入与生产发布授权"
+        body_no_rev = (
+            "六个后端服务的跨域预检代码评审单已在测试环境全部实测通过，且已核实六个仓库主干与当前生产现网版本均为零业务代码差异。\n"
+            "---more---\n"
+            "事情：billing-center#763 CI 12/12 全绿，Greptile P2 线程待处理。\n"
+            "```zsh\n"
+            "gh pr merge 763 --repo Tamar-Edge-AI/billing-center --squash --delete-branch=false\n"
+            "```\n"
+            "选项：\n"
+            "A. 授权由本会话直接合入上述 6 个 PR、推送对应 Release Tag 发上生产\n"
+            "B. 不直接合入，由本会话按 tap-pr-review-submit 规范发到「前后端 PR Review」群由后端 Owner 合入发版\n"
+            "建议：A"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-081 防打扰门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_alpha", title_no_rev, body_no_rev, key="fe-1639-cors"
+            )
+
+        # 补齐『人工 Review：0/6 未过 / reviewDecision』或『人工 Review 已通过（APPROVED）』后放行
+        body_with_unreviewed = (
+            "人工代码评审还没过：目前只跑过了仓库自动化检查与机器人代码审查。\n"
+            "---more---\n"
+            "1. 人工 Review：0/6（未提交评审群，GitHub reviewDecision 均为空，尚无人类 Reviewer Approve）。\n"
+            "```zsh\n"
+            "gh pr merge 763 --repo Tamar-Edge-AI/billing-center --squash --delete-branch=false\n"
+            "```\n"
+            "选项：\n"
+            "A. 先发前后端 PR Review 群等人工评审通过后再发生产\n"
+            "B. 直接合入这 6 个 PR 并打 Tag 发生产\n"
+            "建议：选 A"
+        )
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_alpha", title_no_rev, body_with_unreviewed, key="fe-1639-cors"
+        )
+
+        body_with_approved = (
+            "六个后端 PR 已全部获得人类 Reviewer 人工 Review 通过（reviewDecision: APPROVED）。\n"
+            "---more---\n"
+            "```zsh\n"
+            "gh pr merge 763 --repo Tamar-Edge-AI/billing-center --squash --delete-branch=false\n"
+            "```\n"
+            "选项：\n"
+            "A. 授权直接合入上述 6 个 PR 并打 Tag 发布到生产\n"
+            "B. 暂缓发布\n"
+            "建议：选 A"
+        )
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_alpha", title_no_rev, body_with_approved, key="fe-1639-cors"
+        )
+
+        # 2. 人类改判归因：『review 过了吗』归入 context_incomplete
+        code, reason = diagnose_override_reason(body_no_rev, "review 过了吗", "其他", "A")
+        self.assertEqual(code, "context_incomplete")
+        self.assertEqual(reason, "缺环境/调用链反问")
+
+        cls_rev = classify_escalation(
+            {
+                "message_id": "om_test_rev_ask_81",
+                "topic_id": "tp_alpha",
+                "text": f"🐕 需要你定 · {title_no_rev} [tp_alpha]\n{body_no_rev}",
+                "asked_at": "2026-11-03T13:54:07+08:00",
+                "answered_at": "2026-11-03T14:10:33+08:00",
+                "closed_at": "2026-11-03T14:10:30+08:00",
+                "close_reason": "answered",
+                "resolved_by": "",
+                "resolve_note": "",
+                "nudge_count": 0,
+            },
+            answer_content="[卡片回调] 其他：review 过了吗",
+        )
+        self.assertEqual(cls_rev["alignment"], "overridden")
+        self.assertEqual(cls_rev["override_code"], "context_incomplete")
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1453,6 +1535,7 @@ class SecurityCliTest(GateTest):
     test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard = None
     test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing = None
     test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery = None
+    test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis = None
 
 
 if __name__ == "__main__":

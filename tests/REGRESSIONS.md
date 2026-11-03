@@ -534,6 +534,12 @@
 | --- | --- | --- |
 | 7.112 | 主人对来源消息点 `👌` 表情触发 `pending.detect`（标记 `possibly_handled_at`）并派发 `escalation_check` 唤醒专席（如 `tp_kaifeng`）核实结案后，专席调用 `sheepdog resolve`（不带 `--quote` 或带 `--quote <来源消息ID>`）均被 `decision_hub.verify_resolve_allowed` 拒绝（因其只查 `messages` 表未认领 `possibly_handled_at` 与 `owner_reactions`），随后专席退而调用 `sheepdog track done` 与 `sheepdog work done` 又未同步关闭同钥匙下已有『可能已处理』证据的 `escalations` 与聚合台卡片，逼得主人在聚合台手动点 `[其他] 我直接撤回了`；且 `classify_escalation` 把『我直接撤回了』误判为 `overridden`（`option_or_schedule_redirect`）；以及本机离线期间 `lark-cli` 输出 `[lark-cli] [WARN] uat-client: refresh attempt ... no such host` 前缀导致 `json.loads` 报 `SourceError: lark-cli 输出无法解析` 且网络恢复后 `observe` 未归入已自愈网络抖动（REG-080） | `test_security.GateTest.test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery`（`tests/test_security.py::GateTest::test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery`） |
 
+## 7.113 PR 合入与生产发布授权 `sheepdog ask` 必报人工 Code Review 状态前置防打扰门禁与『`review 过了吗`』人类改判错题本归因（REG-081）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.113 | 专席（如 `tp_laohu` 在 `om_test_laohu_pr_merge_ask`）在测试环境跑通且 GitHub CI / Greptile 机器人跑完后，发起包含 `gh pr merge`（或请求直接合入 PR 并打 Tag 发布生产）的 `sheepdog ask` 并把『直接合入发生产』列为 `建议：A`，但正文只字未提 6 个 PR 的人工 Code Review 状态（实为 `0/6` 未提交评审群、GitHub `reviewDecision` 为空），迫使主人点 `[其他]` 反问『`review 过了吗`』后才补发第 2 张卡；且 `diagnose_override_reason` 未覆盖 `review 过了吗 / 评审过了吗`，将其误归因为 `option_or_schedule_redirect` 而非 `context_incomplete`（REG-081） | `test_security.GateTest.test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis`（`tests/test_security.py::GateTest::test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis`） |
+
 
 
 

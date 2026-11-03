@@ -352,6 +352,14 @@ _REASK_BLOCKER_EXEMPT_RE = re.compile(
     r"(?:余额不足|权限不足|报错|失败|冲突|403|PermissionDenied|无法访问|需二次拍板)",
     re.I,
 )
+_PR_MERGE_EXEC_ASK_RE = re.compile(
+    r"(?:\bgh\s+pr\s+merge\b|(?:直接合入|同意合入)[^。\n]{0,24}(?:PR|评审单)[^。\n]{0,24}(?:打\s*(?:Tag|标签)|推送.{0,8}Tag|发布到生产|发上生产))",
+    re.I,
+)
+_PR_HUMAN_REVIEW_STATUS_RE = re.compile(
+    r"(?:人工\s*(?:Code\s*)?Review|人工(?:代码)?评审|reviewDecision|APPROVED|人类\s*Reviewer|已(?:通过|完成)\s*(?:人工\s*)?(?:PR\s*)?Review|未(?:过|提交)\s*(?:人工\s*)?(?:PR\s*)?Review)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -365,10 +373,11 @@ def check_ask_pre_flight_guard(
     floor: str = "",
     floor_type: str | None = None,
 ) -> None:
-    """7.108 / 7.110（REG-076 / REG-078）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110 / 7.113（REG-076 / REG-078 / REG-081）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
     2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
-    3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask。"""
+    3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask；
+    4. 请示执行 gh pr merge 或直接合入 PR 打 Tag 发布生产前，必须显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/N 未过）。"""
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
     full_text = f"{title}\n{body}"
@@ -383,6 +392,13 @@ def check_ask_pre_flight_guard(
             EXIT_INVALID,
             "请示 LiveKit 凭据或子成员账号时，必须在标题或正文中显式声明『明确是测试环境（tap-testing-env）』或『明确是生产环境（taplabs-453508）』"
             "（或『目标环境：Stage/测试/生产』），严禁让主人反问『他是测试还是生产呀 / 哪个环境的子成员账号』（REG-076 防打扰门禁，没有发送）",
+        )
+    if _PR_MERGE_EXEC_ASK_RE.search(full_text) and not _PR_HUMAN_REVIEW_STATUS_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示执行 `gh pr merge` 或直接合入 PR 打 Tag 发布生产前，必须先核查并在正文中显式写明『人工 Code Review 状态』"
+            "（如 GitHub `reviewDecision: APPROVED`、已按 `tap-pr-review-submit` 过人工评审，或明确声明『人工 Review：0/N 未过』），"
+            "严禁只写 CI/Greptile 机器人审查就请主人拍板合入发生产，让主人反问『review 过了吗』（REG-081 防打扰门禁，没有发送）",
         )
     nk = duty.norm_key(key) if key else ""
     if nk and _REASK_MANUAL_OPTION_RE.search(full_text) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):
