@@ -2104,7 +2104,9 @@ def cmd_ask(args) -> int:
         print(hint)
     if r.note:
         print(f"⚠ {r.note}")
-    if r.already:
+    if r.patched_in_place:
+        print(f"已在原决策卡原地更新内容与按钮（message_id {r.message_id}，未新刷第 2 张卡，无需换 --key 重发）")
+    elif r.already:
         print(f"之前已经发过同样的内容（防重编号相同，这次没再发）：message_id {r.message_id}")
     elif r.item:
         what = "新开了事项" if r.new_item else "重开了事项" if r.reopened else "发到了话题群里的事项"

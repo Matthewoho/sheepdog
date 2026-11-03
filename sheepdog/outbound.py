@@ -53,6 +53,7 @@ class SendResult:
     new_item: bool = False          # 这次新开了这件事项（发了标题卡）
     reopened: bool = False          # 这件事办完 / 归档了，这次重开
     note: str = ""                  # 给会话看的一句提示（--track 没生效、群不可用退回私聊等）
+    patched_in_place: bool = False  # 7.116：已在原未决 ask 卡片原地更新内容与按钮（并非防重跳过未发）
 
 
 @dataclass
@@ -400,6 +401,18 @@ _PROD_OR_DESTRUCTIVE_IAM_RE = re.compile(
     r"(?:(?<!非)(?<!不涉及)生产|taplabs-453508|tpn-prod-506507|remove-iam-policy-binding|delete|删除|移除|roles/owner|roles/editor|roles/resourcemanager\.projectIamAdmin)",
     re.I,
 )
+_TENCENT_MAIN_ACCOUNT_CONSOLE_ASK_RE = re.compile(
+    r"(?:腾讯云|AGS|ags:|cam:|UIN)[\s\S]{0,280}"
+    r"(?:UnauthorizedOperation|子账号.{0,16}(?:无|缺|没有).{0,16}权限|主账号控制台)"
+    r"[\s\S]{0,220}"
+    r"(?:(?:Matthew|主人|您)[^。\n]{0,20}(?:登录|去|在)[^。\n]{0,16}控制台[^。\n]{0,20}(?:创建|建|生成|开通|申请)|"
+    r"登录(?:主账号)?控制台[^。\n]{0,20}(?:创建|建|生成|开通))",
+    re.I,
+)
+_LOCAL_TCCLI_CHECK_EVIDENCE_RE = re.compile(
+    r"(?:~/\.tccli|\.tccli/|tencent-cn\.credential|tccli\s+凭据|本机\s*(?:tccli|腾讯云主账号)\s*凭据)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -423,7 +436,8 @@ def check_ask_pre_flight_guard(
     5. 请示确认 CORS / Origin 域名白名单或『是否有其他前端域名调用』前，必须先扫描云上真实流量日志 + 本地记录并与技术负责人（如 tp_laohu）核对；
     6. 请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先与该单技术负责人（如 tp_laohu）核对；
     7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示；
-    8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）属于预授权测试环境操作，拦截向主人 ask 请示。"""
+    8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）属于预授权测试环境操作，拦截向主人 ask 请示；
+    9. 因腾讯云子账号权限不足（UnauthorizedOperation）请示主人登录控制台创建 API Key / 资源前，必须先核查本机 ~/.tccli/ 下的主账号凭据（如 tencent-cn.credential）。"""
     from . import decision_hub
     from .card_callback import _DISABLED_SPECS, _MORE_LINE_RE, parse_ask_options
 
@@ -443,6 +457,14 @@ def check_ask_pre_flight_guard(
             )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
+    if _TENCENT_MAIN_ACCOUNT_CONSOLE_ASK_RE.search(full_text) and not _LOCAL_TCCLI_CHECK_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "因腾讯云子账号权限不足（UnauthorizedOperation）请示主人登录控制台创建 API Key / 云资源前，"
+            "必须先核查本机 `~/.tccli/` 下的主账号凭据（如 `~/.tccli/tencent-cn.credential` / `default.credential`）："
+            "若本机已有主账号 AK/SK 且属于低风险常规研发/测试沙箱资源，请直接或请示授权后用本机 `~/.tccli/` 凭据调 API/SDK 代建并回读，"
+            "或把『由专席使用本机 ~/.tccli/ 主账号凭据代建』列为推荐选项 A，并在正文中写明本机 `~/.tccli/` 凭据核查结果，严禁未查本机凭据就把手工登录控制台活推给主人（REG-084 防打扰门禁，没有发送）",
+        )
     if _TEST_ENV_IAM_GRANT_ASK_RE.search(full_text) and not _PROD_OR_DESTRUCTIVE_IAM_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
@@ -553,10 +575,11 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
-    if kind == ASK and nk and decision_hub.hub_active(cfg, store):
+    if kind == ASK and (nk or (origin == pend.ORIGIN_ABOUT and srcs)) and decision_hub.hub_active(cfg, store):
         _, ask_card = owner_content(cfg, text, at=True, kind=ASK, topic_id=topic_id, key=key, title=title, options=options)
-        if (patched := decision_hub.try_patch_open_ask(cfg, store, source, topic_id, key, nk, title, text, ask_card, options_spec=options)) is not None:
-            res = SendResult(patched["message_id"], already=True, root_message_id=patched["root_message_id"], text=text, batch_chats=n_chats)
+        about_ids = [m for m, _ in srcs] if origin == pend.ORIGIN_ABOUT else []
+        if (patched := decision_hub.try_patch_open_ask(cfg, store, source, topic_id, key, nk, title, text, ask_card, options_spec=options, about_ids=about_ids)) is not None:
+            res = SendResult(patched["message_id"], already=True, patched_in_place=True, root_message_id=patched["root_message_id"], text=text, batch_chats=n_chats)
             return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
     route = tg.route_for_send(cfg, store, topic_id, key, track, kind=kind, title=title, batch_id=batch)
     if route.group:

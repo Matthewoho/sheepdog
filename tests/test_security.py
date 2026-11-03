@@ -1651,6 +1651,204 @@ class GateTest(Base):
         )
         self.assertTrue(any("Ingest Ack SLA" in w for w in rep_warn["warns"]), rep_warn["warns"])
 
+    def test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done(self):
+        """REG-084（Spec 7.116）：
+        1. 通用会话钥匙（如 T-42）或不同 --about 来源的全新无关提问拒绝覆盖已有未决 ask；同 --about 来源更换 --key 重发时原地 PATCH 更新同一张卡（不新刷第 2 张重复卡），且 CLI 明确提示『已在原决策卡原地更新内容与按钮』而非误导性的『这次没再发』；若同源重复卡并存，主人拍板主卡时自动联动结案重复兄弟卡；
+        2. 因腾讯云子账号 UnauthorizedOperation 请示主人登录控制台创建 API Key / 资源前，强制要求先核查本机 ~/.tccli/ 主账号凭据（如 tencent-cn.credential）；
+        3. 主人在来源私聊/话题发『正在开会，稍后联系你。』『啥事你先总结一下我在开会』等忙碌延后语时，pending.detect 与 hit_of 严禁误标 possibly_handled = owner_spoke；
+        4. 会话调用 sheepdog resolve 结案（或主人拍板）时，立即同步将关联的 waiting_owner 在办项收口（自动补项转 done、申报项转 doing），消除 60s 周期 _sync_duty 前交 receipt 误报『死球真空』。"""
+        from sheepdog import decision_hub, duty, outbound, pending as pend
+
+        self.cfg.topic_group.decision_hub = True
+
+        # 1. 准备两条不同来源消息：om_test_about_meeting（开会对齐）与 om_test_about_ags（腾讯云 AGS Key）
+        self.poll([
+            msg(message_id="om_test_about_meeting", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="今晚开会对齐测试团队介入"),
+            msg(message_id="om_test_about_ags", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="申请腾讯云 AGS 沙箱 API Key"),
+        ])
+
+        # (1a) 先用通用钥匙 T-42 发第一条提问（开会对齐）
+        res_m = outbound.send_to_owner(
+            self.cfg,
+            self.store,
+            None,
+            outbound.ASK,
+            "tp_alpha",
+            "kc提议测试团队介入与今晚开会对齐",
+            "需要你定：kc 提议今晚开会对齐测试团队介入方案。\nA. 同意今晚开会对齐\nB. 暂不开会先异步对齐",
+            key="T-42",
+            about=["om_test_about_meeting"],
+        )
+        self.store.add_escalation(res_m.message_id, "tp_alpha", "oc_test_owner", res_m.text, "2026-11-03T16:02:10+08:00")
+
+        # (2) 腾讯云子账号 UnauthorizedOperation 请示主人登录控制台建 Key，未查本机 ~/.tccli/ -> 拦截
+        with self.assertRaises(outbound.OutboundError) as ctx_tccli:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "kc申请腾讯云AGS沙箱API Key",
+                "需要你定：kc 在国内版腾讯云账号下通过 API 创建 AGS 沙箱 API Key 失败，"
+                "报错 AuthFailure.UnauthorizedOperation，原因是子账号无 cam:PassRole 及 ags:CreateAPIKey 权限。"
+                "建议选 A：由 Matthew 登录主账号控制台在广州区创建 Key 后发给 kc。\n"
+                "A. Matthew 登录控制台建 Key 并私聊发给 kc（推荐）\n"
+                "B. 给 kc 子账号临时授予权限",
+                key="T-42",
+            )
+        self.assertEqual(ctx_tccli.exception.code, outbound.EXIT_INVALID)
+        self.assertIn(".tccli", str(ctx_tccli.exception))
+
+        # 写明已核查 ~/.tccli/tencent-cn.credential 后放行，且因为 --key T-42 虽相同但 --about 与标题主题完全无关，绝不覆盖 res_m！
+        ags_body_v1 = (
+            "已核查 ~/.tccli/tencent-cn.credential，请确认是否代建。\n"
+            "A. 授权用 ~/.tccli/ 代建\n"
+            "B. 授权子账号"
+        )
+        res_ags1 = outbound.send_to_owner(
+            self.cfg,
+            self.store,
+            None,
+            outbound.ASK,
+            "tp_alpha",
+            "kc申请腾讯云AGS沙箱API Key",
+            ags_body_v1,
+            key="T-42",
+            about=["om_test_about_ags"],
+        )
+        self.assertNotEqual(res_ags1.message_id, res_m.message_id)
+        self.assertFalse(res_ags1.patched_in_place)
+        self.assertIn("今晚开会对齐", self.store.get_escalation(res_m.message_id)["text"])
+        self.store.add_escalation(res_ags1.message_id, "tp_alpha", "oc_test_owner", res_ags1.text, "2026-11-03T17:44:49+08:00")
+
+        # (1b) 同一会话随后换 --key tencent-ags-apikey 但针对同一 --about om_test_about_ags 重发同主题提问 -> 原地更新 res_ags1，不刷第 2 张卡！
+        ags_body_v2 = (
+            "已核查 ~/.tccli/tencent-cn.credential（修订版）。\n"
+            "A. 授权用 ~/.tccli/ 代建\n"
+            "B. 授权子账号"
+        )
+        res_ags2 = outbound.send_to_owner(
+            self.cfg,
+            self.store,
+            None,
+            outbound.ASK,
+            "tp_alpha",
+            "kc申请腾讯云AGS沙箱Key",
+            ags_body_v2,
+            key="tencent-ags-apikey",
+            about=["om_test_about_ags"],
+        )
+        self.assertEqual(res_ags2.message_id, res_ags1.message_id)
+        self.assertTrue(res_ags2.patched_in_place)
+        self.assertIn("修订版", self.store.get_escalation(res_ags1.message_id)["text"])
+        self.assertEqual(self.store.send_by_message(res_ags1.message_id)["norm_key"], "TENCENT-AGS-APIKEY")
+
+        # (1c) 若历史存量中同一会话、同一 --about 存在两张同主题未决卡，主人拍板其中一张时自动结案另一张同源重复卡
+        dup_mid = "om_test_ags_dup_legacy"
+        self.store.add_escalation(dup_mid, "tp_alpha", "oc_test_owner", "🐕 需要你定 · kc申请腾讯云AGS沙箱API Key [tp_alpha]\n旧卡", "2026-11-03T17:44:45+08:00")
+        self.store.add_escalation_sources(dup_mid, "tp_alpha", [("om_test_about_ags", "oc_test_alpha_p2p")], pend.ORIGIN_ABOUT)
+        decision_hub.sync_escalation_dual_cards(
+            self.cfg,
+            self.store,
+            None,
+            res_ags1.message_id,
+            chosen_display="A：授权代建",
+            topic_id="tp_alpha",
+            answer_mid="om_test_owner_ans_ags",
+        )
+        dup_esc = self.store.get_escalation(dup_mid)
+        self.assertEqual(dup_esc["close_reason"], "resolved")
+        self.assertIsNotNone(dup_esc["closed_at"])
+
+        # (3) 主人在来源私聊发『正在开会，稍后联系你。』『啥事你先总结一下我在开会』 -> 绝不误标 possibly_handled = owner_spoke
+        self.assertTrue(pend.is_owner_busy_or_defer_text("正在开会，稍后联系你。"))
+        self.assertTrue(pend.is_owner_busy_or_defer_text("啥事你先总结一下我在开会"))
+        self.assertFalse(pend.is_owner_busy_or_defer_text("我在开会，先同意按方案 A 执行"))
+
+        self.store.upsert_message(
+            msg(
+                message_id="om_test_owner_busy_1",
+                chat_type="p2p",
+                chat_id="oc_test_alpha_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="正在开会，稍后联系你。",
+                create_time="2026-11-03T17:45:00+08:00",
+            ),
+            "drop",
+            "self",
+            [],
+        )
+        self.store.upsert_message(
+            msg(
+                message_id="om_test_owner_busy_2",
+                chat_type="p2p",
+                chat_id="oc_test_alpha_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="啥事你先总结一下我在开会",
+                create_time="2026-11-03T17:45:10+08:00",
+            ),
+            "drop",
+            "self",
+            [],
+        )
+        esc_m = self.store.get_escalation(res_m.message_id)
+        self.assertIsNone(pend.detect(self.cfg, self.store, esc_m))
+        # 即便旧版已误标 possibly_handled_message_id = om_test_owner_busy_1，hit_of 与 verify_resolve_allowed 也会过滤掉该误标
+        self.store.mark_possibly_handled(res_m.message_id, "om_test_owner_busy_1", pend.PH_SPOKE, "2026-11-03T17:45:27+08:00")
+        esc_m_marked = self.store.get_escalation(res_m.message_id)
+        self.assertIsNone(pend.hit_of(self.cfg, self.store, esc_m_marked))
+        with self.assertRaises(outbound.OutboundError):
+            decision_hub.verify_resolve_allowed(self.cfg, self.store, [esc_m_marked])
+
+        # (4) 当会话通过合法 --quote 结案最后一条未决提问时，关联的 waiting_owner 在办项立即同步收口，紧接着交 receipt 零『死球真空』报错
+        duty.auto_work(
+            self.store,
+            "tp_alpha",
+            "T-42",
+            f"escalation:{res_m.message_id}",
+            duty.SRC_ESCALATION,
+            duty.WAITING_OWNER,
+            title="kc提议测试团队介入与今晚开会对齐",
+            waiting_on=duty.OWNER_NAME_FIELD,
+        )
+        self.assertEqual(self.store.get_work("tp_alpha", "T-42")["state"], duty.WAITING_OWNER)
+        self.store.upsert_message(
+            msg(
+                message_id="om_test_owner_real_ok",
+                chat_type="p2p",
+                chat_id="oc_test_alpha_p2p",
+                sender_id=ME,
+                sender_name="Matthew",
+                content="同意今晚开会对齐测试方案",
+                create_time="2026-11-03T17:50:00+08:00",
+            ),
+            "dispatch",
+            "owner_reply",
+            ["owner_verified"],
+            topic_id="tp_alpha",
+        )
+        res_rel = outbound.resolve(
+            self.cfg,
+            self.store,
+            None,
+            "tp_alpha",
+            "主人已同意今晚开会对齐",
+            message_id=res_m.message_id,
+            quote="同意今晚开会对齐测试方案",
+        )
+        self.assertEqual(res_rel.closed, [res_m.message_id])
+        self.assertEqual(self.store.get_work("tp_alpha", "T-42")["state"], duty.DONE)
+        self.assertIsNone(
+            decision_hub.verify_receipt_no_dead_ball(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "b_test_084",
+                {"status": "handled", "summary": "已按主人批复闭环并同步 kc"},
+            )
+        )
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1767,6 +1965,7 @@ class SecurityCliTest(GateTest):
     test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis = None
     test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards = None
     test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen = None
+    test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done = None
 
 
 if __name__ == "__main__":

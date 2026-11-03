@@ -191,6 +191,7 @@ def verify_receipt_no_dead_ball(cfg, store, topic_id: str, batch_id: str, receip
     if status == "needs_decision" and not open_escs:
         return 'receipt 没收: status="needs_decision" 但当前会话在飞书没有任何未决的 sheepdog ask 待拍板卡片（open_escalations=0）！必须先调用 sheepdog ask 把决策卡发到飞书，再交回执。'
     if status in ("handled", "waiting", "waiting_external", "done") and not open_escs:
+        reconcile_closed_escalation_work(store, tid)
         r_works = [w for w in (receipt.get("work") or []) if isinstance(w, dict)]
         cleared = {duty.norm_key(str(w.get("key") or "")) for w in r_works if w.get("key") and str(w.get("state") or "doing").strip().lower() in ("done", "handed_off", "waiting_other", "doing") and not _OWNER_WAIT_RE.search(str(w.get("waiting_on") or ""))}
         work_dead = any(str(w.get("state") or "").strip().lower() == "waiting_owner" or _OWNER_WAIT_RE.search(str(w.get("waiting_on") or "")) for w in r_works)
@@ -200,6 +201,60 @@ def verify_receipt_no_dead_ball(cfg, store, topic_id: str, batch_id: str, receip
         if work_dead:
             return "receipt 没收: 检测到『死球真空』（当前飞书无未决 sheepdog ask，但账本 work_items 或回执 work 显示事项仍在等主人拍板 waiting_owner / waiting_on=主人）！若需主人拍板，必须先调用 sheepdog ask 发飞书决策卡；若已不再等主人，请先用 sheepdog work set --state doing/done（或 report --ball doing|done）更新状态后再交回执。"
     return None
+
+
+def reconcile_closed_escalation_work(store, topic_id: str = "", *, why_override: str = "") -> list[int]:
+    """7.116 (REG-084): 当提问结案（resolve）或主人拍板（answer）时，立即同步收敛关联的 waiting_owner 在办项，
+    消除守护进程 60s 周期 _sync_duty 之前的『死球真空』时间窗。"""
+    if store is None or not hasattr(store, "conn"):
+        return []
+    tids = list(dict.fromkeys([t for t in (topic_id, base_topic_id(topic_id)) if t])) if topic_id else []
+    where_tid = f"AND topic_id IN ({','.join('?' * len(tids))})" if tids else ""
+    rows = store.conn.execute(
+        f"SELECT * FROM work_items WHERE closed_at IS NULL {where_tid} ORDER BY id",
+        (*tids,),
+    ).fetchall()
+    changed: list[int] = []
+    for w in rows:
+        wtid, wnk = w["topic_id"], w["norm_key"]
+        if find_open_escalation_for_key(store, wtid, wnk) is not None:
+            continue
+        ref = (w["source_ref"] or "").strip()
+        ref_mid = ref.removeprefix("escalation:") if ref.startswith("escalation:") else ""
+        ref_esc = store.get_escalation(ref_mid) if ref_mid and hasattr(store, "get_escalation") else None
+        if ref_esc is not None and not ref_esc["closed_at"] and not ref_esc["answered_at"]:
+            continue
+        if not w["declared"] and w["source"] == duty.SRC_ESCALATION:
+            if why_override:
+                why = f"会话已结案：{duty.short(why_override, 40)}"
+            elif ref_esc is not None and ref_esc["close_reason"] == "resolved":
+                why = f"会话已结案：{duty.short(ref_esc['resolve_note'] or '', 40)}"
+            elif ref_esc is not None and (ref_esc["close_reason"] == "answered" or ref_esc["answered_at"]):
+                why = "主人已答"
+            else:
+                why = "提问已结案"
+            store.update_work(w["id"], state=duty.DONE, result=why, closed_at=now_iso())
+            duty.record_closed(store, store.conn.execute("SELECT * FROM work_items WHERE id=?", (w["id"],)).fetchone())
+            changed.append(w["id"])
+        elif w["declared"] and (w["state"] == duty.WAITING_OWNER or _OWNER_WAIT_RE.search(w["waiting_on"] or "")):
+            mids = {ref_mid} if ref_mid else set()
+            mids |= {
+                r[0]
+                for r in store.conn.execute(
+                    "SELECT message_id FROM sends WHERE kind='ask' AND topic_id=? AND (norm_key=? OR item_key=?)",
+                    (wtid, wnk, wnk),
+                ).fetchall()
+            }
+            closed_escs = [
+                e for mid in mids if mid and (e := store.get_escalation(mid)) is not None and (e["closed_at"] or e["answered_at"])
+            ]
+            if closed_escs:
+                latest_closed = max((e["closed_at"] or e["answered_at"] or "") for e in closed_escs)
+                decl_ts = (w["declared_at"] or w["updated_at"] or "")
+                if why_override or _ts_not_before(latest_closed, decl_ts):
+                    store.update_work(w["id"], state=duty.DOING, waiting_on=None)
+                    changed.append(w["id"])
+    return changed
 
 def apply_report_ball_state(store, topic_id: str, key: str, ball: str) -> None:
     """7.81 report --ball 联动更新 work_items 状态。"""
@@ -254,14 +309,22 @@ def _has_possibly_handled_or_reaction_evidence(cfg, store, e, *, quote: str = ""
     if store is None or e is None:
         return False
     ekeys = set(e.keys()) if hasattr(e, "keys") else set()
-    if "possibly_handled_at" in ekeys and str(e["possibly_handled_at"] or "").strip():
-        return True
     try:
         from . import pending as pend
-        if cfg is not None and pend.detect(cfg, store, e) is not None:
-            return True
     except Exception:
-        pass
+        pend = None
+    if "possibly_handled_at" in ekeys and str(e["possibly_handled_at"] or "").strip():
+        ph_reason = (e["possibly_handled_reason"] if "possibly_handled_reason" in ekeys else "") or ""
+        ph_mid = (e["possibly_handled_message_id"] if "possibly_handled_message_id" in ekeys else "") or ""
+        ph_msg = store.get_message(ph_mid) if (ph_reason == "owner_spoke" and ph_mid and hasattr(store, "get_message")) else None
+        if not (ph_msg is not None and pend is not None and pend.is_owner_busy_or_defer_text(ph_msg["content"])):
+            return True
+    if pend is not None and cfg is not None:
+        try:
+            if pend.detect(cfg, store, e) is not None:
+                return True
+        except Exception:
+            pass
     q = (quote or "").strip()
     asked_at = (e["asked_at"] if "asked_at" in ekeys and e["asked_at"] else "") or ""
     if me and hasattr(store, "conn"):
@@ -422,12 +485,92 @@ def _build_hub_mirror_card(cfg, shown: str, *, origin_mid: str, topic_id: str, k
                 if isinstance(beh.get("value"), dict): beh["value"]["message_id"] = origin_mid
     return mirror_text, (card if card_fits(card) else None)
 
-def try_patch_open_ask(cfg, store, source, topic_id: str, key: str, norm_key: str, title: str, shown: str, card: dict | None, *, options_spec: str = "auto") -> dict | None:
-    """同一 (topic_id, key) 已有未结提问时，原地 PATCH 更新业务话题卡与聚合台镜像卡，不刷第 2 张卡。"""
-    if not (nk := norm_key or (duty.norm_key(key) if key else "")) or (esc := find_open_escalation_for_key(store, topic_id, nk)) is None: return None
+_TITLE_PREFIX_STRIP_RE = re.compile(r"^\s*🐕\s*需要你定\s*·\s*|\s*\[[^\[\]]*\]\s*$", re.I)
+_TITLE_STOP_BIGRAMS = frozenset({
+    "需要", "要你", "你定", "申请", "请示", "确认", "提议", "关于", "是否", "问题", "处理", "方案", "定夺", "拍板",
+})
+
+
+def _clean_ask_title(raw: str, topic_id: str = "") -> str:
+    first = ((raw or "").strip().splitlines() or [""])[0]
+    cleaned = _TITLE_PREFIX_STRIP_RE.sub("", first).strip()
+    t_short = base_topic_id(topic_id).removeprefix("tp_").strip()
+    if t_short:
+        cleaned = re.sub(rf"^\s*{re.escape(t_short)}\s*[:：·\-]?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^\s*[a-z0-9_\-]{2,16}\s*(?=(?:提议|申请|请示|询问|请求|反馈|需要|想|要))", "", cleaned, flags=re.I)
+    return cleaned.strip()
+
+
+def _titles_same_subject(title_a: str, title_b: str, *, topic_id: str = "") -> bool:
+    a, b = _clean_ask_title(title_a, topic_id).lower(), _clean_ask_title(title_b, topic_id).lower()
+    if not a or not b:
+        return True
+    if a == b or a in b or b in a:
+        return True
+    ascii_a = {w for w in re.findall(r"[a-z0-9]{2,}", a) if w not in ("tp", "key")}
+    ascii_b = {w for w in re.findall(r"[a-z0-9]{2,}", b) if w not in ("tp", "key")}
+    if ascii_a & ascii_b:
+        return True
+    cjk_a = "".join(re.findall(r"[\u4e00-\u9fff]+", a))
+    cjk_b = "".join(re.findall(r"[\u4e00-\u9fff]+", b))
+    bigrams_a = {cjk_a[i : i + 2] for i in range(max(0, len(cjk_a) - 1))} - _TITLE_STOP_BIGRAMS
+    bigrams_b = {cjk_b[i : i + 2] for i in range(max(0, len(cjk_b) - 1))} - _TITLE_STOP_BIGRAMS
+    return len(bigrams_a & bigrams_b) >= 2
+
+
+def _is_generic_session_key(topic_id: str, norm_key: str) -> bool:
+    nk = duty.norm_key(norm_key) if norm_key else ""
+    if not nk:
+        return True
+    if re.match(r"^T-\d+$", nk):
+        return True
+    t_short = duty.norm_key(base_topic_id(topic_id).removeprefix("tp_"))
+    return bool(t_short and nk in (t_short, duty.norm_key(base_topic_id(topic_id))))
+
+
+def try_patch_open_ask(cfg, store, source, topic_id: str, key: str, norm_key: str, title: str, shown: str, card: dict | None, *, options_spec: str = "auto", about_ids: list[str] | None = None) -> dict | None:
+    """同一 (topic_id, key) 已有未结提问（或同一 --about 来源且同主题的未结提问）时，原地 PATCH 更新业务话题卡与聚合台镜像卡，不刷第 2 张卡；
+    若旧卡使用的是通用会话钥匙（如 T-42 / 会话名）或不同 --about 来源且标题主题完全无关，则拒绝覆盖旧未决提问（REG-084）。"""
+    nk = norm_key or (duty.norm_key(key) if key else "")
+    new_about_set = {str(m).strip() for m in (about_ids or []) if str(m).strip().startswith("om_")}
+    esc = find_open_escalation_for_key(store, topic_id, nk) if nk else None
+    if esc is not None:
+        s_row = store.send_by_message(esc["message_id"]) if hasattr(store, "send_by_message") else None
+        old_title = (s_row["title"] if s_row is not None and "title" in s_row.keys() and s_row["title"] else "") or (esc["text"] or "")
+        existing_about = {
+            r["about_message_id"]
+            for r in (store.escalation_sources(esc["message_id"]) if hasattr(store, "escalation_sources") else [])
+            if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
+        }
+        same_subj = _titles_same_subject(old_title, title, topic_id=topic_id)
+        disjoint_about = bool(existing_about and new_about_set and existing_about.isdisjoint(new_about_set))
+        if not same_subj and (disjoint_about or _is_generic_session_key(topic_id, nk)):
+            esc = None
+    if esc is None and new_about_set and hasattr(store, "escalation_sources"):
+        for cand in store.conn.execute(
+            "SELECT * FROM escalations WHERE topic_id=? AND closed_at IS NULL AND answered_at IS NULL ORDER BY asked_at DESC, rowid DESC",
+            (topic_id,),
+        ).fetchall():
+            cand_about = {
+                r["about_message_id"]
+                for r in store.escalation_sources(cand["message_id"])
+                if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
+            }
+            if cand_about and (cand_about & new_about_set):
+                s_cand = store.send_by_message(cand["message_id"]) if hasattr(store, "send_by_message") else None
+                cand_title = (s_cand["title"] if s_cand is not None and "title" in s_cand.keys() and s_cand["title"] else "") or (cand["text"] or "")
+                if _titles_same_subject(cand_title, title, topic_id=topic_id):
+                    esc = cand
+                    break
+    if esc is None:
+        return None
     canon_mid = esc["message_id"]
     with store.tx() as c:
-        c.execute("UPDATE escalations SET text=? WHERE message_id=?", (shown, canon_mid)); c.execute("UPDATE sends SET text=?, title=? WHERE message_id=?", (shown, title, canon_mid))
+        c.execute("UPDATE escalations SET text=? WHERE message_id=?", (shown, canon_mid))
+        if nk and not _is_generic_session_key(topic_id, nk):
+            c.execute("UPDATE sends SET text=?, title=?, key=?, norm_key=? WHERE message_id=?", (shown, title, key, nk, canon_mid))
+        else:
+            c.execute("UPDATE sends SET text=?, title=? WHERE message_id=?", (shown, title, canon_mid))
     if source is not None and hasattr(source, "patch_card"):
         if card is None and getattr(getattr(cfg, "notify", None), "owner_card", True):
             try: card = attach_ask_interactions(build_owner_card(shown, getattr(cfg, "self_open_id", "") or ""), text=shown, options_spec=options_spec or "auto", topic_id=topic_id, key=key, title=title, interactive=True)
@@ -473,17 +616,45 @@ def sync_escalation_dual_cards(cfg, store, source, any_mid: str, *, chosen_displ
     rkeys = set(esc.keys()) if esc is not None else set()
     hub_mid = str(esc["hub_message_id"] or "") if "hub_message_id" in rkeys else ""
     text_to_use, tid = _truncate_hub_more(orig_text or (esc["text"] if esc is not None and esc["text"] else "")), topic_id or (esc["topic_id"] if esc is not None and esc["topic_id"] else "")
-    green_card = build_answered_owner_card(text_to_use, chosen_display=chosen_display, topic_id=tid, answered_at=answered_at or now_iso())
+    ans_ts = answered_at or now_iso()
+    green_card = build_answered_owner_card(text_to_use, chosen_display=chosen_display, topic_id=tid, answered_at=ans_ts)
     if source is not None and hasattr(source, "patch_card"):
         for mid in dict.fromkeys([m for m in (canon_mid, hub_mid, any_mid) if m]):
             try: source.patch_card(mid, copy.deepcopy(green_card), identity="bot")
             except Exception as e: log.warning("双端同步绿卡失败（%s）: %s", mid, e)
+    if answer_mid and tid and hasattr(store, "escalation_sources"):
+        about_mids = [
+            r["about_message_id"]
+            for r in store.escalation_sources(canon_mid)
+            if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
+        ]
+        if about_mids:
+            for sib_src in store.sources_about(about_mids):
+                sib_mid = sib_src["ask_message_id"]
+                if not sib_mid or sib_mid == canon_mid:
+                    continue
+                sib = store.get_escalation(sib_mid)
+                if sib is None or sib["topic_id"] != tid or sib["closed_at"] or sib["answered_at"]:
+                    continue
+                if _titles_same_subject(text_to_use, sib["text"] or "", topic_id=tid):
+                    why_dup = f"同源重复提问已随主卡 {canon_mid} 一并拍板（{chosen_display}）"
+                    if store.resolve_escalation(sib_mid, tid, why_dup, resolved_by=tid):
+                        sib_hub = str(sib["hub_message_id"] or "") if "hub_message_id" in sib.keys() else ""
+                        sib_green = build_answered_owner_card(_truncate_hub_more(sib["text"] or ""), chosen_display=f"已结案（{why_dup}）", topic_id=tid, answered_at=ans_ts)
+                        if source is not None and hasattr(source, "patch_card"):
+                            for smid in dict.fromkeys([m for m in (sib_mid, sib_hub) if m]):
+                                try: source.patch_card(smid, copy.deepcopy(sib_green), identity="bot")
+                                except Exception as e: log.warning("同步同源重复提问绿卡失败（%s）: %s", smid, e)
+    if tid:
+        reconcile_closed_escalation_work(store, tid)
     refresh_hub_root_card(cfg, store, source); return canon_mid
 
 settle_escalation_views = sync_escalation_dual_cards
 
 def on_escalations_resolved(cfg, store, source, targets: list, *, why: str = "") -> None:
-    for e in targets: sync_escalation_dual_cards(cfg, store, source, e["message_id"], chosen_display=f"已结案（{why or 'resolved'}）", topic_id=e["topic_id"], orig_text=e["text"] or "")
+    for e in targets:
+        sync_escalation_dual_cards(cfg, store, source, e["message_id"], chosen_display=f"已结案（{why or 'resolved'}）", topic_id=e["topic_id"], orig_text=e["text"] or "")
+        reconcile_closed_escalation_work(store, e["topic_id"], why_override=why or "resolved")
 
 
 def auto_resolve_handled_escalations(cfg, store, topic_id: str, key: str, why: str, source=None) -> list[str]:

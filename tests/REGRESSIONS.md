@@ -552,6 +552,12 @@
 | --- | --- | --- |
 | 7.115 | 专席（如 `tp_edm-testing-whitelist`）连续触发三类交互与自治缺陷：① 发起 4 张 `sheepdog ask` 决策卡时在总结里写『建议选 A：...』但正文与 `--options` 均未提供 A/B 选项列表，导致飞书渲染出无任何按钮的空头决策卡，迫使主人批评『`你没有给我提供选项啊`』，且单行『`选项：A. ...；B. ...`』未被 `parse_ask_options` 识别；② 在已有未决 `ask` 时错用 `sheepdog report` 发『`前置卡点已扫清，等你决策卡拍板后即可推进 / 等待你在上一条决策卡点选 A 授权`』，迫使主人批评『`@Mattheuu 你是不是用错了 你要用ask`』，而 `classify_escalation` 把这两类批评误判为 `accepted`；③ 为内部同事在测试环境（`tap-testing-env`）开通非破坏性服务账号权限（`roles/iam.serviceAccountTokenCreator`）连发 3 次 `ask` 打扰主人；④ `observe.py` 阶段 1（Ingest Ack SLA）按消息 `create_time` 而非入账时间 `first_seen` 计 90s 超时，导致拉取耗时 ~94s 的消息刚入账 1s 即误报超时（REG-083） | `test_security.GateTest.test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen`（`tests/test_security.py::GateTest::test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen`） |
 
+## 7.116 通用钥匙异源未决 `ask` 防误覆盖与同 `--about` 原地更新防双卡、腾讯云子账号报错先查本机 `~/.tccli/` 门禁、主人开会延后语防误标 `possibly_handled` 与 `resolve` 即时收口 `waiting_owner` 门禁（REG-084）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.116 | 实战中暴露四类系统性摩擦：① 专席名下有 `--key T-42` 未决提问（`om_test_kc_meeting_ask`，`kc提议测试团队介入与今晚开会对齐`，`--about om_test_about_meeting`）时，再发另一件新事 `--key T-42 --about om_test_about_ags`（`kc申请腾讯云AGS沙箱API Key`）被 `try_patch_open_ask` 误把原未答提问覆盖掉，且 `cli.cmd_ask` 因 `already=True` 误报『`之前已经发过同样的内容（防重编号相同，这次没再发）`』，诱使专席 6 秒后换 `--key tencent-ags-apikey` 再发第 2 张同源重复卡（`om_test_kc_ags_dup_ask`）；② 专席遇腾讯云子账号 `UnauthorizedOperation` 时未先检查本机 `~/.tccli/tencent-cn.credential` 主账号凭据，就发 `ask` 让主人手工登录控制台建 Key；③ 主人在私聊回复『`正在开会，稍后联系你。`』『`啥事你先总结一下我在开会`』被 `pending.detect` 误标 `possibly_handled_reason = 'owner_spoke'` 并触发虚假唤醒；④ 专席调用 `sheepdog resolve` 结案后 8 秒内调 `sheepdog receipt` 被误拦『`死球真空（work_items 中有 waiting_owner 事项）`』，因 `close_auto_work` 仅在守护进程 60s 周期运行而未在 `resolve` 时即时收口（REG-084） | `test_security.GateTest.test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done`（`tests/test_security.py::GateTest::test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done`） |
+
 
 
 

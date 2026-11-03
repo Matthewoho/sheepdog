@@ -248,6 +248,26 @@ class Hit:
         return {k: v for k, v in self.__dict__.items()}
 
 
+_OWNER_BUSY_OR_DEFER_RE = re.compile(
+    r"(?:正在开会|在开会|开会中|稍后联系|稍后回(?:复|你)?|晚点(?:再)?(?:回|看|说|联系)|"
+    r"等(?:一)?(?:会|下)(?:儿)?(?:再)?(?:回|看|说|联系)|先总结一下.{0,12}开会|开完会(?:再)?(?:说|回|看))",
+    re.I,
+)
+_OWNER_DIRECT_DECISION_RE = re.compile(
+    r"(?:同意|批准|放行|确认按|按方案|选\s*[A-E]|点选\s*[A-E]|已经(?:处理|搞定|建好|配好|发了))",
+    re.I,
+)
+
+
+def is_owner_busy_or_defer_text(content: str) -> bool:
+    """7.116 (REG-084): 主人在来源私聊/话题发『正在开会，稍后联系你。』『啥事你先总结一下我在开会』等忙碌/延后回复时，
+    不属于已处理提问，严禁在 pending.detect 中误标 possibly_handled = owner_spoke。"""
+    txt = plain_text(content or "").strip()
+    if not txt or len(txt) > 120:
+        return False
+    return bool(_OWNER_BUSY_OR_DEFER_RE.search(txt) and not _OWNER_DIRECT_DECISION_RE.search(txt))
+
+
 def is_agent_text(cfg, content: str) -> bool:
     suffix = cfg.session.reply_suffix
     return eng.is_agent_reply(content, cfg.owner_context) or eng.has_reply_suffix(content, suffix)
@@ -318,7 +338,13 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
         best = None
         for r in _owner_followups(cfg, store, srcs):
             at = _parse(r["create_time"])
-            if at is None or at <= asked or not _before(at, until) or is_agent_text(cfg, r["content"]):
+            if (
+                at is None
+                or at <= asked
+                or not _before(at, until)
+                or is_agent_text(cfg, r["content"])
+                or is_owner_busy_or_defer_text(r["content"])
+            ):
                 continue
             if best is None or (at, r["message_id"]) < best[0]:
                 best = ((at, r["message_id"]), r)
@@ -364,6 +390,8 @@ def hit_of(cfg, store: Store, e) -> Hit | None:
         return None
     reason, mid = e["possibly_handled_reason"] or "", e["possibly_handled_message_id"] or ""
     if reason == PH_SPOKE and (m := store.get_message(mid)) is not None:
+        if is_owner_busy_or_defer_text(m["content"]):
+            return detect(cfg, store, e)
         return Hit(PH_SPOKE, mid, m["create_time"] or "", m["chat_id"], m["chat_name"] or "", m["chat_type"] or "",
                    _short(m["content"], OWNER_TEXT_CHARS))
     if reason == PH_REACTION:
