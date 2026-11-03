@@ -582,6 +582,13 @@
 | --- | --- | --- |
 | 1.0.1 | Antigravity 的 `language_server` 重启并监听新动态端口（如 `localhost:49333` -> `localhost:52430`）后，旧 `sheepdog run` 守护进程被孤儿化（`PPID=1`）但仍持有 `sheepdog.run.lock`，其 `os.environ` 里的旧 `ANTIGRAVITY_LS_ADDRESS` 已不可达（`dial tcp 127.0.0.1:49333: connect: connection refused`），导致全部会话（`tp_kaifeng`/`tp_bus`/`tp_release`/`tp_api-resale` 等）连续 57 分钟收不到消息也无法代回飞书；而新 `language_server` 每 60s 拉起、携带正确新端口的 sidecar 在 `sheepdog init` 先塞入重复 `init` 动作后，在 `_acquire_daemon_lock` 看到旧锁就盲目礼让退出（`已有 sheepdog run 常驻进程持有单实例锁，本实例安全退出`）；同时 `tp_kaifeng` 在未向 Sammy Shi 确认美区物理跨境合规口径前发起 `ask` 请示为非美区同事开通 `tpn-prod-506507` 日志只读权限（REG-088） | `test_version_and_observe.VersionAndObserveTest.test_reg088_stale_ls_lock_preemption_and_agentapi_env_reload`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg088_stale_ls_lock_preemption_and_agentapi_env_reload`） |
 
+## 1.1.0 原生业务自动化循环引擎（Sheepdog Loops：5-Slot `LOOP.md` 契约、0-Token 前置 `load` 探针与幂等去重、跨周期多阶段状态机 + 自适应倍速、`shadow -> confirm -> auto` 三阶信任晋升与飞书卡片一键升档/熔断，REG-089）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 1.1.0 | 周期性巡检与长周期业务管家（如发版引航 `tp_release`、多云资源利用率与成本治理 `cloud-cost-steward`、服务上线后自动盯盘/修 Bug/发测试/请示上生产 `service-release-guardian`、14 台 VPS 与跳板机白名单同步、SSL 证书续期、腾讯云迁移日清）若靠会话内盲跑 LLM Cron，既在无变化时白烧 Token、缺乏跨周期单事项多阶段状态流转（`detected -> fixing -> testing -> awaiting_approval -> verifying -> closed`）与豁免记忆（`MEMORY.md`），又缺少新 Loop 先在 `shadow` 影子模式预览、飞书卡片一键升为 `confirm`/`auto` 及连续失败自动熔断（`autopause`）的安全护栏（REG-089） | `test_loops.SheepdogLoopsTest.test_reg_089_loop_spec_five_slots_and_templates`、`test_loops.SheepdogLoopsTest.test_reg_089_zero_token_preflight_dedup_and_memory_exempt`、`test_loops.SheepdogLoopsTest.test_reg_089_multi_stage_item_lifecycle_and_adaptive_cadence`、`test_loops.SheepdogLoopsTest.test_reg_089_autonomy_promotion_card_callback_and_autopause_breaker` |
+
+
 
 
 

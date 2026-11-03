@@ -828,6 +828,8 @@ class Config:
     playbook_dir: str = ""
     # 安全规则文件（相对本配置文件所在目录）；留空 = security.toml，不存在 = 没有规则
     security_path: str = ""
+    # 声明式业务循环目录（相对本配置文件所在目录）；留空 = loops/
+    loops_dir_path: str = "loops"
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
@@ -947,6 +949,11 @@ class Config:
     @property
     def evolve_skill_file(self) -> Path:
         p = Path(self.self_evolve.skill_path or "skills/sheepdog-evolve/SKILL.md").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
+    def loops_dir(self) -> Path:
+        p = Path(self.loops_dir_path or "loops").expanduser()
         return p if p.is_absolute() else self.config_path.parent / p
 
     @property

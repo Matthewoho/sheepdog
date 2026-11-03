@@ -316,6 +316,38 @@ def build_evolve_digest(
     if failed_lambs:
         action_reasons.append(f"failed_lambs({len(failed_lambs)})")
 
+    # D7: 声明式业务循环 (Business Loops & Loop-Improver)
+    d7_loops: dict = {"total_loops": 0, "paused_loops": [], "feedback_runs": []}
+    try:
+        from . import loops as loops_mod
+        ov_loops = loops_mod.build_loops_overview(cfg, store)
+        paused_list = [
+            {"id": lp["id"], "title": lp["title"], "reason": (lp.get("state") or {}).get("paused_reason", "")}
+            for lp in (ov_loops.get("loops") or [])
+            if (lp.get("state") or {}).get("paused")
+        ]
+        fb_rows = store.conn.execute(
+            """SELECT run_id, loop_id, human_feedback, started_at
+               FROM loop_runs
+               WHERE human_feedback != '' AND started_at >= ?
+               ORDER BY started_at DESC LIMIT 10""",
+            (window_iso,),
+        ).fetchall()
+        fb_list = [dict(r) for r in fb_rows]
+        if paused_list:
+            action_reasons.append(f"paused_loops({len(paused_list)})")
+        if fb_list:
+            action_reasons.append(f"loop_feedback({len(fb_list)})")
+        d7_loops = {
+            "total_loops": int(ov_loops.get("total_loops") or 0),
+            "empty_runs": int(ov_loops.get("total_empty_runs") or 0),
+            "action_runs": int(ov_loops.get("total_action_runs") or 0),
+            "paused_loops": paused_list,
+            "feedback_runs": fb_list,
+        }
+    except Exception:
+        pass
+
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "window_minutes": float(since_minutes),
@@ -356,6 +388,7 @@ def build_evolve_digest(
             "latest_mail_id": latest_mail_id,
             "peer_mails": peer_mails,
         },
+        "d7_business_loops": d7_loops,
     }
 
 
@@ -403,6 +436,14 @@ def format_evolve_prompt(
     lines.append(f"- D6 同行反馈收件箱（`{d6.get('topic_id')}`）：`{len(d6.get('peer_mails') or [])}` 条留言")
     for pm in d6.get("peer_mails") or []:
         lines.append(f"  - 📩 来自 `{pm.get('from_topic')}` (#{pm.get('id')}): {pm.get('body')}")
+    d7 = digest.get("d7_business_loops") or {}
+    lines.append(
+        f"- D7 业务循环（Loop-Improver）：共 `{d7.get('total_loops', 0)}` 条 | 零Token空跑 `{d7.get('empty_runs', 0)}` 次 | 触发执行 `{d7.get('action_runs', 0)}` 次 | 熔断暂停 `{len(d7.get('paused_loops') or [])}` 条"
+    )
+    for pl in d7.get("paused_loops") or []:
+        lines.append(f"  - ⏸ 熔断循环 `{pl.get('id')}` ({pl.get('title')}): {pl.get('reason')}")
+    for fb in d7.get("feedback_runs") or []:
+        lines.append(f"  - 🧠 循环人工反馈 `{fb.get('loop_id')}` ({fb.get('run_id')}): {fb.get('human_feedback')}")
 
     lines.append(
         "\n请按 `skills/sheepdog-evolve/SKILL.md` 的四步根因思考法与六大自进化职责处置上述异常；若修复了代码或规则，完成可证伪测试后执行 `sheepdog upgrade --no-pull` 原地热升级（带回滚按钮）。"

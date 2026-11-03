@@ -1501,7 +1501,7 @@
             <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
             <span>管辖名单与自愈热更</span>
           </span>
-          <span class="lens-badge" id="badge-admin-version">v0.7</span>
+          <span class="lens-badge" id="badge-admin-version">v1.1.0</span>
         </button>
       </nav>
 
@@ -1529,7 +1529,7 @@
             <button class="icon-btn mobile-menu-trigger" id="btn-mobile-nav" title="展开导航栏" aria-label="展开导航栏">
               <svg viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
             </button>
-            <span class="breadcrumb-pill mono" id="center-lens-sub">v0.7.99 · 在线</span>
+            <span class="breadcrumb-pill mono" id="center-lens-sub">v1.1.0 · 在线</span>
           </div>
 
           <!-- Dynamic Island (Silent flatline & "" text when 0 events) -->
@@ -1808,7 +1808,7 @@
       const ackP50 = lat.t1_t2_ack && lat.t1_t2_ack.p50_ms;
       const e2eP50 = lat.t0_t5_e2e_reply && lat.t0_t5_e2e_reply.p50_ms;
       const decTotal = (STATE.decisionsData && STATE.decisionsData.summary && STATE.decisionsData.summary.total) || 0;
-      const ver = ov.version || "0.7.99";
+      const ver = ov.version || "1.1.0";
 
       document.getElementById("badge-sessions-count").textContent = String(sessCount);
       document.getElementById("badge-waterfall-p50").textContent = fmtMs(ackP50);
@@ -2451,7 +2451,7 @@
           <div class="settings-panel-col">
             <div class="settings-row-item">
               <div>
-                <div style="font-weight:600;color:var(--text);">当前运行版本 · <span class="mono">v${escapeHtml(ov.version || "0.7.99")}</span></div>
+                <div style="font-weight:600;color:var(--text);">当前运行版本 · <span class="mono">v${escapeHtml(ov.version || "1.1.0")}</span></div>
                 <div style="font-size:13px;color:var(--muted);margin-top:2px;">回滚锚点 <span class="mono">${escapeHtml(ov.rollback_commit || "HEAD~1")}</span> · 状态 ${escapeHtml((ov.ws_health && ov.ws_health.status) || "online")}</div>
               </div>
               <div style="display:flex;gap:8px;">
@@ -2759,7 +2759,7 @@
             <div style="font-weight:600;color:var(--text);">当前操作员 · Matthew Hong</div>
             <div style="font-size:13px;color:var(--muted);">常驻授权策略：自主修复 + 保留回滚锚点 + 每次更新说明</div>
           </div>
-          <span class="pill-tag ok">v${escapeHtml(ov.version || "0.7.99")}</span>
+          <span class="pill-tag ok">v${escapeHtml(ov.version || "1.1.0")}</span>
         </div>
       `;
       modal.classList.add("open");

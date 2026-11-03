@@ -4,12 +4,19 @@ receipt / session-reset / work / tell / board / notices / ask / report / resolve
 """
 from __future__ import annotations
 
-import argparse, fcntl, json, logging, os, re, shutil, signal, subprocess, sys, time, tomllib, uuid
+import argparse, fcntl, json, logging, os, re, shutil, signal, subprocess, sys, time as _std_time, tomllib, types, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+time = types.SimpleNamespace(
+    sleep=_std_time.sleep,
+    monotonic=_std_time.monotonic,
+    time=_std_time.time,
+    strftime=_std_time.strftime,
+)
+
 from . import (__version__, _git_run, actions, decision_hub, default_repo_dir, duty, evolve, guard, identity as ident, lastgood,
-               observe as obs, outbound, parse_version_tuple, session as sm, version_info, version_watch)
+               loops as loops_mod, observe as obs, outbound, parse_version_tuple, session as sm, version_info, version_watch)
 from .ack import Acker, _clear_handled_owner_reactions, clear_handled_owner_reactions
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
 from .config import ANTIGRAVITY, CLI_HOSTS, HOSTS, NORMAL, ConfigError, default_config_path, load_config
@@ -736,6 +743,173 @@ def cmd_evolve(args) -> int:
         store.close()
 
 
+def cmd_loop(args) -> int:
+    """sheepdog loop（7.120）：声明式业务循环引擎（list / init / show / run / promote / pause / resume / item / recommend）。"""
+    cfg = _load_cfg()
+    store = Store(cfg.db_path)
+    sub_cmd = getattr(args, "loop_cmd", "") or "list"
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if sub_cmd == "list":
+            ov = loops_mod.build_loops_overview(cfg, store)
+            if as_json:
+                print(json.dumps(ov, ensure_ascii=False, indent=2))
+                return 0
+            print(f"🔄 声明式业务循环（目录: {ov['loops_dir']}，共 {ov['total_loops']} 条，零Token空跑 {ov['total_empty_runs']} 次，触发执行 {ov['total_action_runs']} 次）")
+            if not ov["loops"]:
+                print("  （尚未创建业务循环，可运行 `sheepdog loop recommend` 查看建议或 `sheepdog loop init <id>` 创建）")
+                return 0
+            for lp in ov["loops"]:
+                st = lp["state"]
+                status_badge = "⏸已暂停" if st.get("paused") else ("✓启用" if lp.get("enabled") else "✗禁用")
+                print(
+                    f"- {lp['id']} [{status_badge} | 水位={lp['autonomy']}] {lp['title']} (会话={lp['topic_id']}, "
+                    f"闲时={lp['interval_minutes']:g}m / 有活={lp['active_interval_minutes']:g}m)"
+                )
+                print(
+                    f"    在途跟进={lp['active_items_count']} 项 | 已办结={lp['closed_items_count']} 项 | 豁免={lp['exempted_items_count']} 项 | "
+                    f"最近运行={st.get('last_run_at') or '-'} ({st.get('last_status') or '-'})"
+                )
+            return 0
+
+        if sub_cmd == "init":
+            spec = loops_mod.init_loop(
+                cfg,
+                store,
+                args.loop_id,
+                template=getattr(args, "template", "") or "",
+                title=getattr(args, "title", "") or "",
+                topic_id=getattr(args, "topic", "") or "",
+                autonomy=getattr(args, "autonomy", "") or "",
+                load_cmd=getattr(args, "load_cmd", "") or "",
+                interval_minutes=getattr(args, "interval", None),
+                active_interval_minutes=getattr(args, "active_interval", None),
+                overwrite=bool(getattr(args, "overwrite", False)),
+            )
+            if as_json:
+                print(json.dumps(spec.to_dict(), ensure_ascii=False, indent=2))
+            else:
+                print(f"已初始化业务循环 `{spec.id}`（水位={spec.autonomy}，会话={spec.topic_id}）")
+                print(f"  LOOP.md  : {spec.path}")
+                print(f"  MEMORY.md: {spec.memory_path}")
+            return 0
+
+        if sub_cmd == "show":
+            spec = loops_mod.get_loop_spec(cfg, store, args.loop_id)
+            if spec is None:
+                print(f"循环 {args.loop_id!r} 不存在", file=sys.stderr)
+                return 2
+            st = loops_mod.get_loop_state(store, spec.id)
+            items = loops_mod.list_loop_items(store, spec.id, limit=50)
+            runs = loops_mod.list_loop_runs(store, spec.id, limit=10)
+            data = {**spec.to_dict(), "state": st, "items": items, "recent_runs": runs}
+            if as_json:
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+                return 0
+            print(f"🔄 {spec.title} (`{spec.id}`) | 水位={spec.autonomy} | 会话={spec.topic_id}")
+            print(f"  阶段状态机: {' -> '.join(spec.stages)}")
+            print(f"  调度频率  : 闲时 {spec.interval_minutes:g}m / 有活 {spec.active_interval_minutes:g}m | 时段: {spec.active_hours or '全天'}")
+            print(f"  前置取料  : {spec.load_cmd or '（未配置脚本，按在途事项或手动触发）'}")
+            print(f"  运行统计  : 总计 {st['total_runs']} 次（empty={st['empty_runs']}，action={st['action_runs']}，连续失败={st['consecutive_failures']}）")
+            if items:
+                print("  事项账本:")
+                for it in items[:15]:
+                    print(f"    - [{it['status']}/{it['stage']}] `{it['item_key']}`: {it['title']} (更新于 {it['updated_at']})")
+            return 0
+
+        if sub_cmd == "run":
+            inj = None
+            raw_item = getattr(args, "item_json", "") or ""
+            if raw_item.strip():
+                parsed_item = json.loads(raw_item)
+                inj = parsed_item if isinstance(parsed_item, list) else [parsed_item]
+            src = _source(cfg) if (cfg.source.enabled and not getattr(args, "no_notify", False)) else None
+            res = loops_mod.run_loop_tick(
+                cfg,
+                store,
+                args.loop_id,
+                source=src,
+                force=bool(getattr(args, "force", False)),
+                trigger_reason="cli_manual",
+                injected_items=inj,
+            )
+            if as_json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"循环 `{args.loop_id}` 执行结果: triggered={res.get('triggered')} | status={res.get('status')} | "
+                    f"run_id={res.get('run_id', '-')} | message_id={res.get('message_id') or '-'}"
+                )
+            return 0
+
+        if sub_cmd == "promote":
+            st = loops_mod.promote_loop(cfg, store, args.loop_id, args.to)
+            if as_json:
+                print(json.dumps(st, ensure_ascii=False, indent=2))
+            else:
+                print(f"已将循环 `{args.loop_id}` 自治水位切换为 `{st['autonomy']}`")
+            return 0
+
+        if sub_cmd == "pause":
+            st = loops_mod.pause_loop(cfg, store, args.loop_id, reason=getattr(args, "reason", "") or "CLI 手动暂停")
+            if as_json:
+                print(json.dumps(st, ensure_ascii=False, indent=2))
+            else:
+                print(f"已暂停循环 `{args.loop_id}`（原因：{st['paused_reason']}）")
+            return 0
+
+        if sub_cmd == "resume":
+            st = loops_mod.resume_loop(cfg, store, args.loop_id)
+            if as_json:
+                print(json.dumps(st, ensure_ascii=False, indent=2))
+            else:
+                print(f"已恢复循环 `{args.loop_id}`（水位={st['autonomy']}）")
+            return 0
+
+        if sub_cmd == "item":
+            it = loops_mod.update_loop_item(
+                cfg,
+                store,
+                args.loop_id,
+                args.key,
+                title=getattr(args, "title", None),
+                stage=getattr(args, "stage", None),
+                status=getattr(args, "status", None),
+                note=getattr(args, "note", "") or "",
+                next_minutes=getattr(args, "next_minutes", None),
+            )
+            if as_json:
+                print(json.dumps(it, ensure_ascii=False, indent=2))
+            else:
+                print(f"已更新事项 `{args.loop_id}/{args.key}` -> status={it.get('status')} | stage={it.get('stage')}")
+            return 0
+
+        if sub_cmd == "recommend":
+            recs = loops_mod.recommend_loops(cfg, store)
+            if getattr(args, "init_all", False):
+                for r in recs:
+                    loops_mod.init_loop(cfg, store, r["id"], template=r["template"])
+                recs = loops_mod.recommend_loops(cfg, store)
+            if as_json:
+                print(json.dumps(recs, ensure_ascii=False, indent=2))
+                return 0
+            print("💡 建议升格为声明式业务 Loop 的现有工作流清单：")
+            for idx, r in enumerate(recs, 1):
+                mark = "✅已初始化" if r["installed"] else "⏳待初始化"
+                print(f"{idx}. [{r['priority']} | {mark}] {r['title']} (`{r['id']}` -> `{r['topic_id']}`)")
+                print(f"   - 现状痛点: {r['current_pain']}")
+                print(f"   - 升级收益: {r['loop_upgrade_benefit']}")
+                print(f"   - 一键启用: `{r['init_cmd']}`")
+            return 0
+
+        return 2
+    except ValueError as e:
+        print(f"loop 操作失败: {e}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
 def identity_report(cfg, store: Store) -> list[str]:
     """doctor：区分智能体身份和本人身份（7.26）。机器人接收在不在、最近一次收到事件的时间、机器人不在而代回退回本人的群。"""
     ic = cfg.identity
@@ -1179,6 +1353,11 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                         dispatcher.dispatch_once()
                 except Exception as e:
                     logging.warning("自进化管家巡检异常（不中断主循环）: %s", e)
+            if not getattr(args, "dry_run", False):
+                try:
+                    loops_mod.run_due_loops_tick(cfg, store, dispatcher, source)
+                except Exception as e:
+                    logging.warning("业务循环调度异常（不中断主循环）: %s", e)
             if time.time() - last_prune > 3600:
                 pruned = _prune(store, cfg)
                 last_prune = time.time()
@@ -1240,7 +1419,9 @@ def cmd_init(args) -> int:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
     else:
         skill_p = evolve.ensure_evolve_skill_file(cfg)
+        intake_p = loops_mod.ensure_loop_intake_skill(cfg)
         print(f"自进化配置: {skill_p}")
+        print(f"建循环技能: {intake_p}")
     print(f"名册: {cfg.roster_file}（{len(roster.managed)} managed / {len(roster.sessions) - len(roster.managed)} known）")
     rep = Dispatcher(cfg, store, sink, roster, security).init()
     for k, label in (("created", "新登记"), ("updated", "已更新"), ("reopened", "重新启用"), ("closed", "已移除→closed")):
@@ -2695,6 +2876,55 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("loops")
     sp.add_argument("--clear", default="", help="手动解除这个聊天的冷却")
     sp.set_defaults(func=cmd_loops)
+    sp = sub.add_parser("loop", help="声明式业务循环引擎（7.120）：list / init / show / run / promote / pause / resume / item / recommend")
+    lpsub = sp.add_subparsers(dest="loop_cmd")
+    lp_list = lpsub.add_parser("list", help="列出全部业务循环及其水位与统计")
+    lp_list.add_argument("--json", action="store_true")
+    lp_init = lpsub.add_parser("init", help="初始化一条业务循环（生成 LOOP.md 与 MEMORY.md）")
+    lp_init.add_argument("loop_id", help="循环唯一标识（如 cloud-cost-steward）")
+    lp_init.add_argument("--template", default="", help="内置模板名（cloud-cost-steward / service-release-guardian / prod-release-pilot / vps-node-and-whitelist-steward / ssl-cert-lifecycle-steward / infra-migration-daily-steward）")
+    lp_init.add_argument("--title", default="", help="循环标题")
+    lp_init.add_argument("--topic", default="", help="绑定会话 topic_id（如 tp_studio）")
+    lp_init.add_argument("--autonomy", default="", choices=("", "shadow", "confirm", "auto"), help="初始自治水位（默认 shadow）")
+    lp_init.add_argument("--load-cmd", default="", help="零 Token 前置取料命令")
+    lp_init.add_argument("--interval", type=float, default=None, help="闲时巡检间隔（分钟）")
+    lp_init.add_argument("--active-interval", type=float, default=None, help="有在途事项时的高频盯盘间隔（分钟）")
+    lp_init.add_argument("--overwrite", action="store_true", help="覆盖已有 LOOP.md")
+    lp_init.add_argument("--json", action="store_true")
+    lp_show = lpsub.add_parser("show", help="查看单条业务循环详情、阶段事项与运行记录")
+    lp_show.add_argument("loop_id")
+    lp_show.add_argument("--json", action="store_true")
+    lp_run = lpsub.add_parser("run", help="立即执行一次业务循环 Tick（默认带前置取料与去重）")
+    lp_run.add_argument("loop_id")
+    lp_run.add_argument("--force", action="store_true", help="忽略间隔与暂停状态强制跑一轮")
+    lp_run.add_argument("--item-json", default="", help="注入测试或手工事项 JSON")
+    lp_run.add_argument("--no-notify", action="store_true", help="不向飞书发送试跑预览卡片（仅本地入账）")
+    lp_run.add_argument("--json", action="store_true")
+    lp_prom = lpsub.add_parser("promote", help="切换业务循环自治水位（shadow -> confirm -> auto）")
+    lp_prom.add_argument("loop_id")
+    lp_prom.add_argument("--to", required=True, choices=("shadow", "confirm", "auto"), help="目标自治水位")
+    lp_prom.add_argument("--json", action="store_true")
+    lp_pause = lpsub.add_parser("pause", help="暂停业务循环")
+    lp_pause.add_argument("loop_id")
+    lp_pause.add_argument("--reason", default="", help="暂停原因")
+    lp_pause.add_argument("--json", action="store_true")
+    lp_resume = lpsub.add_parser("resume", help="恢复已暂停或熔断的业务循环")
+    lp_resume.add_argument("loop_id")
+    lp_resume.add_argument("--json", action="store_true")
+    lp_item = lpsub.add_parser("item", help="推进、关闭或豁免业务循环下的跟进事项（跨周期多阶段状态机）")
+    lp_item.add_argument("loop_id")
+    lp_item.add_argument("--key", required=True, help="事项唯一键 item_key")
+    lp_item.add_argument("--title", default=None, help="事项标题")
+    lp_item.add_argument("--stage", default=None, help="推进到的新阶段名")
+    lp_item.add_argument("--status", default=None, choices=("active", "closed", "exempted"), help="事项状态（exempted 自动写入 MEMORY.md）")
+    lp_item.add_argument("--note", default="", help="阶段备注或豁免说明")
+    lp_item.add_argument("--next-minutes", type=float, default=None, help="多少分钟后再次检查该事项")
+    lp_item.add_argument("--json", action="store_true")
+    lp_rec = lpsub.add_parser("recommend", help="扫描现有工作流并输出最值得升级为 Loop 的建议清单")
+    lp_rec.add_argument("--init-all", action="store_true", help="一键将全部推荐工作流初始化为 shadow 模式循环")
+    lp_rec.add_argument("--json", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_loop)
     sp = sub.add_parser("redeliver")
     sp.add_argument("--batch", default="", help="按批次号重投")
     sp.add_argument("--topic", default="", help="按会话重投最近一批 uncertain 或未进会话记录的批次")

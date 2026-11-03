@@ -364,6 +364,44 @@ def _handle_version_callback(val: dict, *, cb_msg_id: str, card_mid: str, chat_i
     return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=content, msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw, _sd_card_callback=cb_meta))
 
 
+def _handle_loop_callback(
+    val: dict, *, cb_msg_id: str, card_mid: str, chat_id: str, chat_type: str,
+    operator_id: str, create_time: str, raw: dict, tgt: dict, cfg, store, source
+) -> Message | None:
+    from . import loops as loops_mod
+    act = str(val.get("sd_action") or "").strip()
+    loop_id = str(val.get("loop_id") or "").strip()
+    topic_id = str(val.get("topic_id") or tgt.get("topic_id") or "tp_bus").strip()
+    if not loop_id:
+        return None
+    send_row, out_row, orig_msg = tgt["send"], tgt["outbox"], tgt["orig_message"]
+    orig_text = ((send_row and send_row["text"]) or (out_row and out_row["text"]) or (orig_msg and plain_text(orig_msg["content"])) or f"🐕 汇报 · 循环试跑预览：{loop_id} [{topic_id}]")
+    try:
+        if act == "loop_promote":
+            target_autonomy = str(val.get("target_autonomy") or "confirm").strip().lower()
+            loops_mod.promote_loop(cfg, store, loop_id, target_autonomy)
+            chosen = f"已将循环 `{loop_id}` 升格为 `{target_autonomy}` 模式"
+            content = f"[卡片回调] 循环 {loop_id} 升为 {target_autonomy}"
+        elif act == "loop_pause":
+            loops_mod.pause_loop(cfg, store, loop_id, reason="主人在飞书试跑卡片一键暂停")
+            chosen = f"已暂停循环 `{loop_id}`"
+            content = f"[卡片回调] 暂停循环 {loop_id}"
+        else:
+            loops_mod.resume_loop(cfg, store, loop_id)
+            chosen = f"已恢复循环 `{loop_id}`"
+            content = f"[卡片回调] 恢复循环 {loop_id}"
+    except Exception as e:
+        log.warning("处理循环卡片回调失败 (%s/%s): %s", loop_id, act, e)
+        return None
+    if source is not None and hasattr(source, "patch_card") and card_mid:
+        try:
+            source.patch_card(card_mid, build_answered_owner_card(orig_text, chosen_display=chosen, topic_id=topic_id, answered_at=create_time), identity="bot")
+        except Exception as e:
+            log.warning("回写循环卡片失败（%s）: %s", card_mid, e)
+    cb_meta = {"kind": act, "loop_id": loop_id, "topic_id": topic_id, "card_message_id": card_mid, "chosen_display": chosen}
+    return Message(message_id=cb_msg_id, chat_id=chat_id, chat_name="", chat_type=chat_type, sender_id=operator_id, sender_name="", sender_type="user", content=content, msg_type="text", create_time=create_time, reply_to=card_mid, raw=dict(raw, _sd_card_callback=cb_meta))
+
+
 def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | None:
     """处理飞书 card.action.trigger 事件：双层幂等、主人校验、双锚点路由、羊圈槽位复活、绿卡回写与归一化 Message。"""
     if not is_card_action_event(raw):
@@ -390,6 +428,10 @@ def process_card_action_event(raw: dict, *, cfg, store, source) -> Message | Non
         return _handle_version_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
                                         chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,
                                         raw=raw, tgt=tgt, store=store, source=source)
+    if val.get("sd_action") in ("loop_promote", "loop_pause", "loop_resume"):
+        return _handle_loop_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
+                                     chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,
+                                     raw=raw, tgt=tgt, cfg=cfg, store=store, source=source)
     if (val.get("kind") or val.get("action") or val.get("cmd")) == "tg_move":
         return _handle_tg_move_callback(val, cb_msg_id=cb_msg_id, card_mid=card_mid, chat_id=resolved_chat_id,
                                         chat_type=resolved_chat_type, operator_id=operator_id, create_time=create_time,

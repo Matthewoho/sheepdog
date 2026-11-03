@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, default_repo_dir, duty, session as sm
+from . import __version__, default_repo_dir, duty, parse_version_tuple, read_disk_version, session as sm
 from .config import Config, default_config_path, load_config
 from .hook import call_log_dir, clear_stop_state, count_path
 try:
@@ -36,6 +36,38 @@ except ImportError:  # pragma: no cover
 from .roster import load_roster
 from .sink.agentapi import transcript_path
 from .store import Store, is_standing_topic, now_iso
+
+
+def resolve_live_version(
+    conn: sqlite3.Connection | None = None,
+    repo_dir: Path | None = None,
+) -> str:
+    """动态解析当前真实运行版本（优先磁盘代码与 SQLite meta['daemon_runtime'] 的最新语义版本，杜绝 Web 进程内存常量陈旧）。"""
+    candidates: list[str] = [__version__]
+    try:
+        disk_ver = read_disk_version(repo_dir or default_repo_dir())
+        if disk_ver:
+            candidates.append(disk_ver)
+    except Exception:
+        pass
+    if conn is not None:
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='daemon_runtime'").fetchone()
+            if row and row["value"]:
+                obj = json.loads(row["value"])
+                if isinstance(obj, dict) and obj.get("version"):
+                    candidates.append(str(obj["version"]).strip())
+        except Exception:
+            pass
+    best = __version__
+    best_tuple = parse_version_tuple(best)
+    for cand in candidates:
+        ct = parse_version_tuple(cand)
+        if ct and ct >= best_tuple:
+            best = cand.strip().lstrip("vV")
+            best_tuple = ct
+    return best
+
 
 
 _EMOJI_STRIP_RE = re.compile(
@@ -662,6 +694,7 @@ class WorkbenchService:
             ).fetchone()[0]
 
             last_commit = ""
+            live_ver = resolve_live_version(conn)
             self_evolve_state: dict[str, Any] = {}
             try:
                 meta_row = conn.execute("SELECT value FROM meta WHERE key='upgrade_prev_commit'").fetchone()
@@ -684,7 +717,7 @@ class WorkbenchService:
             conn.close()
 
         return {
-            "version": __version__,
+            "version": live_ver,
             "now": now_iso(),
             "rollback_commit": last_commit,
             "ws_health": ws_health,
@@ -1474,9 +1507,12 @@ class WorkbenchService:
         finally:
             conn.close()
 
+        loops_summary = self.get_loops_state()
+
         return {
             "people": people_list,
             "static_topics": static_topics,
+            "loops": loops_summary,
             "work_items": [
                 {
                     "topic_id": w["topic_id"],
@@ -1501,6 +1537,18 @@ class WorkbenchService:
                 for t in tracked
             ],
         }
+
+    def get_loops_state(self) -> dict:
+        """获取业务自动化循环（Sheepdog Loops）全景状态与升级推荐。"""
+        from . import loops as loops_mod
+        st = Store(self.cfg.db_path)
+        try:
+            overview = loops_mod.build_loops_overview(self.cfg, st)
+            recs = loops_mod.recommend_loops(self.cfg, st)
+            overview["recommendations"] = recs
+            return overview
+        finally:
+            st.close()
 
     def get_workspace_files(self) -> dict:
         """提供右栏 `agy app` 同款全高左右分栏的统一目录树数据（Active Realm 状态与配置 ⊥ Whole Drive 仓库源码）。"""
@@ -1534,6 +1582,34 @@ class WorkbenchService:
                 "real_path": str(self.cfg.state_dir / "bot_ws_health.json"),
             },
         ]
+        # 加入业务循环文件 loops/*/LOOP.md & MEMORY.md
+        if self.cfg.loops_dir.is_dir():
+            for ldir in sorted(self.cfg.loops_dir.iterdir()):
+                if not ldir.is_dir():
+                    continue
+                loop_md = ldir / "LOOP.md"
+                if loop_md.is_file():
+                    active_realm_files.append(
+                        {
+                            "path": f"loops/{ldir.name}/LOOP.md",
+                            "name": f"{ldir.name}/LOOP.md",
+                            "badge": "LOOP",
+                            "group": "active_realm",
+                            "real_path": str(loop_md),
+                        }
+                    )
+                mem_md = ldir / "MEMORY.md"
+                if mem_md.is_file():
+                    active_realm_files.append(
+                        {
+                            "path": f"loops/{ldir.name}/MEMORY.md",
+                            "name": f"{ldir.name}/MEMORY.md",
+                            "badge": "MEM",
+                            "group": "active_realm",
+                            "real_path": str(mem_md),
+                        }
+                    )
+
         # 加入最新 stop-log
         log_dir = call_log_dir(self.cfg.state_dir)
         if log_dir.is_dir():
@@ -1552,6 +1628,7 @@ class WorkbenchService:
         whole_drive_files = []
         for rel, badge in (
             ("sheepdog/engine.py", "PY"),
+            ("sheepdog/loops.py", "PY"),
             ("sheepdog/hook.py", "PY"),
             ("sheepdog/decision_hub.py", "PY"),
             ("sheepdog/store.py", "PY"),
@@ -1678,13 +1755,60 @@ class WorkbenchService:
                 st.close()
             return {"ok": True, "action": action, "id": watch_id}
 
+        if action in ("loop_promote", "loop_pause", "loop_resume", "loop_run_once", "loop_item_update", "loop_init"):
+            from . import loops as loops_mod
+            st = Store(self.cfg.db_path)
+            try:
+                if action == "loop_promote":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    mode = str(payload.get("mode") or payload.get("autonomy") or "confirm").strip()
+                    res = loops_mod.promote_loop(self.cfg, st, lid, mode)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_pause":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    reason = str(payload.get("reason") or "管理后台暂停").strip()
+                    res = loops_mod.pause_loop(self.cfg, st, lid, reason=reason)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_resume":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    res = loops_mod.resume_loop(self.cfg, st, lid)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_run_once":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    res = loops_mod.run_loop_tick(self.cfg, st, lid, force=True, trigger_reason="admin_web")
+                    return {"ok": True, "action": action, "result": res}
+                if action == "loop_item_update":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    ikey = str(payload.get("item_key") or "").strip()
+                    res = loops_mod.update_loop_item(
+                        self.cfg,
+                        st,
+                        lid,
+                        ikey,
+                        stage=payload.get("stage"),
+                        status=payload.get("status"),
+                        note=str(payload.get("note") or payload.get("exemption_reason") or ""),
+                    )
+                    return {"ok": True, "action": action, "item": res}
+                if action == "loop_init":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    tmpl = str(payload.get("template") or lid).strip()
+                    mode = str(payload.get("mode") or payload.get("autonomy") or "shadow").strip()
+                    spec = loops_mod.init_loop(self.cfg, st, lid, template=tmpl, autonomy=mode)
+                    return {"ok": True, "action": action, "loop_id": spec.id, "path": str(spec.path), "autonomy": spec.autonomy}
+            finally:
+                st.close()
+
         return {"ok": False, "error": f"未知动作: {action}"}
 
 
 def _load_ui_html() -> bytes:
     ui_path = Path(__file__).with_name("admin_ui.html")
     if ui_path.is_file():
-        return ui_path.read_bytes()
+        live_ver = resolve_live_version()
+        text = ui_path.read_text(encoding="utf-8")
+        text = text.replace("0.7.99", live_ver).replace("1.1.0", live_ver)
+        return text.encode("utf-8")
     return b"<!doctype html><html><body><h1>Sheepdog Workbench UI missing</h1></body></html>"
 
 
@@ -1742,6 +1866,8 @@ def make_handler(service: WorkbenchService):
                     self._send_json(service.get_event_trace(mid))
                 elif path == "/api/decisions":
                     self._send_json(service.get_decisions_analytics())
+                elif path == "/api/loops":
+                    self._send_json(service.get_loops_state())
                 elif path == "/api/admin/state":
                     self._send_json(service.get_admin_state())
                 elif path == "/api/files":
