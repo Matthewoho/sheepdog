@@ -33,10 +33,41 @@ REPLY_SUMMARY_MAX_LINES = 3
 REPLY_SUMMARY_MAX_CHARS = 100
 REPLY_SHORT_MESSAGE_MAX_LINES = 3
 REPLY_SHORT_MESSAGE_MAX_CHARS = 100
-_MORE_SPLIT_RE = re.compile(r"^[ \t]*---(?:more|agent-read)---[ \t]*$", re.M)
+DELIVERABLE_MAX_LINES = 12
+DELIVERABLE_MAX_CHARS = 520
+_MORE_SPLIT_RE = re.compile(r"(?:^[ \t]*|[ \t]+)(?<!`)---(?:more|agent-read)---(?!`)(?:[ \t]*$|[ \t]+)", re.M)
 _CODE_FENCE_RE = re.compile(r"```")
 _FENCED_BLOCK_RE = re.compile(r"```.*?```", re.S)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_DELIVERABLE_URL_RE = re.compile(r"(?:https?|vless|trojan|vmess|ss)://[A-Za-z0-9_./?=&%#:~+@!-]+", re.I)
+_SINGLE_LINE_URI_FENCE_RE = re.compile(
+    r"```[A-Za-z0-9_-]*\s*\n\s*((?:vless|trojan|vmess|ss)://[^\s`]+)\s*\n```",
+    re.I,
+)
+_DELIVERABLE_STRONG_RE = re.compile(
+    r"(?:临时登录密码|临时密码|初始密码|登录密码|(?:密码|Password|Token)\*{0,2}\s*[:：]|密码\s*[（(]Password[)）]"
+    r"|SecretId|SecretKey|AccessKeyId|AccessKeySecret|API\s*Key|Access\s*Token"
+    r"|订阅链接|订阅地址|节点链接|直连链接|子用户登录入口|登录入口|登录地址|切换\s*Prod\s*账号直连链接|一键直达"
+    r"|(?:vless|trojan|vmess|ss)://\S+)",
+    re.I,
+)
+_DELIVERABLE_KV_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]|\d+\.)?\s*\*{0,2}(?:"
+    r"子用户名|用户名|账号|登录账号|登录邮箱|邮箱|Email|主账号(?:\s*ID)?|临时登录密码|临时密码|初始密码|登录密码|密码"
+    r"|SecretId|SecretKey|AccessKeyId|AccessKeySecret|API\s*Key|Access\s*Token|Token"
+    r"|(?:公网\s*|内网\s*)?Host|数据库地址|内网地址|端口|Port|Database|数据库(?:名)?|库名"
+    r"|子用户登录入口|子账号登录入口|登录入口|登录地址|一键直达|切换[^：:\n]{0,16}(?:链接|直达)|订阅链接|订阅地址|节点链接|直连链接"
+    r")(?:\s*[（(][^）)\n]*[)）])?\*{0,2}\s*[:：]\s*\S+",
+    re.I,
+)
+_DELIVERABLE_STANDALONE_URI_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?`?(?:vless|trojan|vmess|ss)://[^\s`]+`?\s*$",
+    re.I,
+)
+_LOCAL_PATH_RULE_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_.-])(?:/|~/|\./)[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+"
+    r"|(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+/[A-Za-z0-9_./-]+\.(?:py|go|ts|tsx|js|mjs|json|yaml|yml|toml|md|sh|sql)(?![A-Za-z0-9_.-]))"
+)
 _AT_TAG_RE = re.compile(
     r'<at\s+(?:id|user_id)=["\']?(?P<target>ou_[A-Za-z0-9_]+|all)["\']?\s*>.*?</at>',
     re.I | re.S,
@@ -144,12 +175,12 @@ def build_more_panel(detail: str) -> dict:
 
 
 def split_more(text: str) -> tuple[str, str]:
-    """按第一行 ---more---（兼容 ---agent-read---）拆成 (白话总结, 原文)；没有分隔线时返回 ("", 原文)。"""
+    """按第一处 ---more---（兼容 ---agent-read---，支持独占一行或行内带空格分隔）拆成 (白话总结, 原文)；没有分隔线时返回 ("", 原文)。"""
     s = text or ""
     m = _MORE_SPLIT_RE.search(s)
     if m is None:
         return "", s.strip("\n")
-    return s[:m.start()].strip("\n"), s[m.end():].strip("\n")
+    return s[:m.start()].strip(" \t\n"), s[m.end():].strip(" \t\n")
 
 
 def _find_machine_symbol(text: str) -> tuple[str, str] | None:
@@ -161,8 +192,146 @@ def _find_machine_symbol(text: str) -> tuple[str, str] | None:
     return None
 
 
+def is_deliverable_payload(text: str) -> bool:
+    """7.119：识别含账号、密码、临时密码、SecretId/SecretKey、API Key、Token、登录入口或节点订阅链接的核心交付物文本。"""
+    unwrapped = _SINGLE_LINE_URI_FENCE_RE.sub(r"`\1`", text or "")
+    s = _FENCED_BLOCK_RE.sub("", unwrapped)
+    if not s.strip() or not _DELIVERABLE_STRONG_RE.search(s):
+        return False
+    if _INLINE_CODE_RE.search(s) or _DELIVERABLE_URL_RE.search(s):
+        return True
+    return any(_DELIVERABLE_KV_LINE_RE.match(ln) for ln in s.splitlines())
+
+
+def _find_deliverable_forbidden_symbol(text: str) -> tuple[str, str] | None:
+    """7.119：核心交付物首屏豁免行内反引号凭证与登录/订阅 URL，但仍拦截 Cloud Run revision、裸 Git SHA、代码文件路径与飞书内部 ID。"""
+    cleaned = _AT_TAG_RE.sub("", text or "")
+    cleaned = _INLINE_CODE_RE.sub(" ", cleaned)
+    cleaned = _DELIVERABLE_URL_RE.sub(" ", cleaned)
+    for label, rx in (
+        _MACHINE_SYMBOL_RULES[0],
+        _MACHINE_SYMBOL_RULES[1],
+        ("URL 或文件路径", _LOCAL_PATH_RULE_RE),
+        _MACHINE_SYMBOL_RULES[3],
+    ):
+        if m := rx.search(cleaned):
+            return label, m.group(0).strip()
+    return None
+
+
+def _strip_more_pointer_clauses(summary: str) -> str:
+    """7.119：当把凭据/链接自动提回首屏后，剥除总结里『在下方展开查看 / 点开下方 more 即可复制』等冗余引导词。"""
+    s = summary or ""
+    s = re.sub(
+        r"\s*[（(][^（）()\n]*(?:下方|下面|more|展开|点开)[^（）()\n]*(?:查看|复制|展开|点开|使用)[^（）()\n]*[）)]",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        r"[，,；;]\s*[^，,；;。\n]*(?:(?:下方|下面|more)[^，,；;。\n]*(?:查看|复制|展开|点开|使用)|(?:展开|点开)(?:下方|下面|more|卡片)[^，,；;。\n]*)",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"(?:已整理|整理)?在(?:下方|下面)(?:卡片)?(?:中|里)?", "如下", s)
+    s = re.sub(r"[，,；;：:]+\s*([。！!])", r"\1", s)
+    return s.strip()
+
+
+def _norm_dedup_text(text: str) -> str:
+    cleaned = _AT_TAG_RE.sub("", text or "")
+    return re.sub(r"[\s，,。！!？?；;：:、~～]+", "", cleaned).lower()
+
+
+def _is_redundant_more(summary: str, detail: str, *, for_reply: bool = True) -> bool:
+    """7.119：识别 summary 与 detail 实质重复的假折叠（完全一致，或 detail 本身也是无凭据短句且高度重合）。"""
+    s_norm = _norm_dedup_text(summary)
+    d_norm = _norm_dedup_text(detail)
+    if not s_norm or not d_norm:
+        return False
+    if s_norm == d_norm:
+        return True
+    if for_reply and not is_deliverable_payload(detail):
+        d_stripped = (detail or "").strip()
+        vis_len = len(_AT_TAG_RE.sub("", d_stripped).strip())
+        if (
+            not _CODE_FENCE_RE.search(d_stripped)
+            and len(d_stripped.splitlines()) <= REPLY_SHORT_MESSAGE_MAX_LINES
+            and vis_len <= REPLY_SHORT_MESSAGE_MAX_CHARS
+            and _find_machine_symbol(d_stripped) is None
+        ):
+            s_set, d_set = set(s_norm), set(d_norm)
+            overlap = len(s_set & d_set) / max(1, min(len(s_set), len(d_set)))
+            if overlap >= 0.65:
+                return True
+    return False
+
+
+def _hoist_deliverables_and_dedup(
+    summary: str,
+    detail: str,
+    *,
+    for_reply: bool = True,
+) -> tuple[str, str]:
+    """7.119：(1) 消除 summary == detail 假折叠；(2) 把被藏在 more 里的账号/密码/密钥/Token/登录或订阅链接自动提回首屏。"""
+    if _is_redundant_more(summary, detail, for_reply=for_reply):
+        return "", summary
+    if not for_reply or is_deliverable_payload(summary) or not is_deliverable_payload(detail):
+        return summary, detail
+    normalized_detail = _SINGLE_LINE_URI_FENCE_RE.sub(r"`\1`", detail)
+    fenced_spans = [m.span() for m in _FENCED_BLOCK_RE.finditer(normalized_detail)]
+
+    def _in_fence(offset: int) -> bool:
+        return any(a <= offset < b for a, b in fenced_spans)
+
+    hoisted: list[str] = []
+    remaining_lines: list[str] = []
+    pos = 0
+    for ln in normalized_detail.splitlines(keepends=True):
+        raw_ln = ln.rstrip("\r\n")
+        if not _in_fence(pos) and (
+            _DELIVERABLE_KV_LINE_RE.match(raw_ln) or _DELIVERABLE_STANDALONE_URI_LINE_RE.match(raw_ln)
+        ):
+            hoisted.append(raw_ln.strip())
+        else:
+            remaining_lines.append(raw_ln)
+        pos += len(ln)
+    if not hoisted:
+        return summary, detail
+    cleaned_sum = _strip_more_pointer_clauses(summary)
+    candidate_sum = f"{cleaned_sum}\n" + "\n".join(hoisted)
+    vis_len = len(_AT_TAG_RE.sub("", candidate_sum).strip())
+    if (
+        len(candidate_sum.splitlines()) > DELIVERABLE_MAX_LINES
+        or vis_len > DELIVERABLE_MAX_CHARS
+        or _find_deliverable_forbidden_symbol(candidate_sum) is not None
+    ):
+        return summary, detail
+    # 清理残留在 detail 里失去了下属列表项的引导空标题（如『新的登录信息如下：』『### 1. 单节点直连链接』）
+    pruned_rem: list[str] = []
+    for ln in remaining_lines:
+        stripped = ln.strip()
+        if not stripped:
+            if pruned_rem and pruned_rem[-1] != "":
+                pruned_rem.append("")
+            continue
+        if re.match(
+            r"^(?:#{1,4}\s*|\d+\.\s*)?\*{0,2}[^。\n]{0,60}(?:信息如下|连接信息如下|凭证如下|节点链接|登录入口)(?:\s*[（(][^）)\n]*[)）])?\*{0,2}[：:]?$",
+            stripped,
+        ):
+            continue
+        pruned_rem.append(ln)
+    rem_text = "\n".join(pruned_rem).strip()
+    if not rem_text:
+        return "", candidate_sum
+    if not _CODE_FENCE_RE.search(rem_text) and len(rem_text.splitlines()) <= 2 and len(rem_text) <= 100:
+        return "", candidate_sum
+    return candidate_sum, rem_text
+
+
 def is_short_message(text: str, *, for_reply: bool = False) -> bool:
-    """短消息：不传 --summary 时直接平铺，无需套 more 折叠框。7.70：reply 收紧为 ≤3 行、≤100 字且禁含机器符号。"""
+    """短消息：不传 --summary 时直接平铺，无需套 more 折叠框。7.70：reply 收紧为 ≤3 行、≤100 字且禁含机器符号；7.119：核心交付物放宽至 ≤12 行、≤520 字。"""
     s = (text or "").strip()
     if not s:
         return True
@@ -170,6 +339,12 @@ def is_short_message(text: str, *, for_reply: bool = False) -> bool:
         return False
     if for_reply:
         vis_len = len(_AT_TAG_RE.sub("", s).strip())
+        if is_deliverable_payload(s):
+            return (
+                len(s.splitlines()) <= DELIVERABLE_MAX_LINES
+                and vis_len <= DELIVERABLE_MAX_CHARS
+                and _find_deliverable_forbidden_symbol(s) is None
+            )
         return (
             len(s.splitlines()) <= REPLY_SHORT_MESSAGE_MAX_LINES
             and vis_len <= REPLY_SHORT_MESSAGE_MAX_CHARS
@@ -179,22 +354,25 @@ def is_short_message(text: str, *, for_reply: bool = False) -> bool:
 
 
 def validate_summary(summary: str, *, for_reply: bool = True) -> str:
-    """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 6 类机器符号；ask/report 为 ≤6 行、≤220 字）。"""
+    """校验卡片首屏（7.70 reply 为 ≤3 行、≤100 字、禁含 6 类机器符号；7.119 交付物首屏 ≤12 行、≤520 字；ask/report 为 ≤6 行、≤220 字）。"""
     s = (summary or "").strip("\n")
     if not s.strip():
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
     if _CODE_FENCE_RE.search(s):
         raise ValueError(f"白话总结不能含代码块（代码块请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
-    max_lines = REPLY_SUMMARY_MAX_LINES if for_reply else SUMMARY_MAX_LINES
-    max_chars = REPLY_SUMMARY_MAX_CHARS if for_reply else SUMMARY_MAX_CHARS
+    is_deliv = for_reply and is_deliverable_payload(s)
+    max_lines = DELIVERABLE_MAX_LINES if is_deliv else (REPLY_SUMMARY_MAX_LINES if for_reply else SUMMARY_MAX_LINES)
+    max_chars = DELIVERABLE_MAX_CHARS if is_deliv else (REPLY_SUMMARY_MAX_CHARS if for_reply else SUMMARY_MAX_CHARS)
     lines = s.splitlines()
     if len(lines) > max_lines:
         raise ValueError(f"白话总结超过 {max_lines} 行（当前 {len(lines)} 行）。{SUMMARY_REQUIRED_GUIDE}")
     visible_len = len(_AT_TAG_RE.sub("", s).strip())
     if visible_len > max_chars:
         raise ValueError(f"白话总结超过 {max_chars} 字（当前 {visible_len} 字）。{SUMMARY_REQUIRED_GUIDE}")
-    if for_reply and (hit := _find_machine_symbol(s)) is not None:
-        raise ValueError(f"白话总结不能含{hit[0]}（{hit[1]!r} 请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
+    if for_reply:
+        hit = _find_deliverable_forbidden_symbol(s) if is_deliv else _find_machine_symbol(s)
+        if hit is not None:
+            raise ValueError(f"白话总结不能含{hit[0]}（{hit[1]!r} 请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
     return s
 
 
@@ -206,7 +384,7 @@ def resolve_summary_and_body(
     hoist_at: bool = True,
     for_reply: bool | None = None,
 ) -> tuple[str, str, str]:
-    """7.62 / 7.70：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。"""
+    """7.62 / 7.70 / 7.119：解析并校验 (白话总结, 原文, 记账/建卡用的合并文本)。"""
     raw = (body or "").strip("\n")
     if not raw.strip():
         raise ValueError("正文为空")
@@ -220,6 +398,9 @@ def resolve_summary_and_body(
             raise ValueError(f"more 折叠区原文为空。{SUMMARY_REQUIRED_GUIDE}")
         if hoist_at:
             s, d = _hoist_at_tags(s, d)
+        s, d = _hoist_deliverables_and_dedup(s, d, for_reply=is_reply)
+        if not s:
+            return "", d, d
         return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
     if has_delim:
         s = validate_summary(inline_sum, for_reply=is_reply)
@@ -228,6 +409,9 @@ def resolve_summary_and_body(
         d = inline_det
         if hoist_at:
             s, d = _hoist_at_tags(s, d)
+        s, d = _hoist_deliverables_and_dedup(s, d, for_reply=is_reply)
+        if not s:
+            return "", d, d
         return s, d, f"{s}\n{MORE_DELIMITER}\n{d}"
     if is_short_message(raw, for_reply=is_reply) or not require_summary:
         return "", body, body
@@ -242,7 +426,7 @@ def _card_body_elements(body_text: str, summary: str = "", *, hoist_at: bool = T
     s, d, _ = resolve_summary_and_body(body_text, summary, require_summary=False, hoist_at=hoist_at)
     if s:
         return [{"tag": "markdown", "content": s}, build_more_panel(d)]
-    return [{"tag": "markdown", "content": body_text}]
+    return [{"tag": "markdown", "content": d}]
 
 
 def build_reply_card(text: str, suffix: str, width_mode: str = "compact", summary: str = "") -> dict:

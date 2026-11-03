@@ -463,6 +463,16 @@ _LOGIN_DB_LOG_VERIFIED_EVIDENCE_RE = re.compile(
     r"(?:已查(?:库|验)|已核查\s*auth\.users|GoTrue\s*返回|登录日志显示|报错日志为)",
     re.I,
 )
+_NEW_VPS_PURCHASE_FULL_ASK_RE = re.compile(
+    r"(?:(?:新购|采买)[^\n。]{0,20}(?:专属\s*)?(?:住宅\s*)?VPS[\s\S]{0,180}(?:满编|0\s*空闲|无空闲)|"
+    r"(?:满编|0\s*空闲|无空闲)[\s\S]{0,180}(?:新购|采买)[^\n。]{0,20}(?:专属\s*)?(?:住宅\s*)?VPS)",
+    re.I,
+)
+_OVERALL_VPS_ROSTER_EVIDENCE_RE = re.compile(
+    r"(?:(?:总体|全网|全部|14\s*台|各节点)[^\n。]{0,20}(?:在用|使用|占用)[^\n。]{0,12}(?:人员)?名单|"
+    r"(?=[\s\S]*\blsg1\b)(?=[\s\S]*\blsg2\b)(?=[\s\S]*\blsg3\b)(?=[\s\S]*\blsg4\b))",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -533,6 +543,13 @@ def check_ask_pre_flight_guard(
             EXIT_INVALID,
             "因用户反馈登录提示密码不正确请示重设临时密码前，必须先执行只读库表与日志排查（核查 `auth.users` 账号是否存在、最近登录时间、GoTrue 真实报错日志是否仅输错账号/密码），"
             "并在正文中写明目标站点域名（如 `cinemap-stage.tapnow.tv`）、只读查库结论与申请人全名，严禁未查库核实前因后果就发模糊 ask 让主人反问『啥意思』（REG-086 防打扰门禁，没有发送）",
+        )
+    if _NEW_VPS_PURCHASE_FULL_ASK_RE.search(full_text) and not _OVERALL_VPS_ROSTER_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "因现有专线/住宅节点满编（0空闲）请示新购/采买 VPS 时，必须在 `---more---` 中一并附上『目前总体 VPS 在用人员名单（各节点当前占用人员明细）』"
+            "（主人 2026-11-03 22:19:26 明确要求：『那我去买新的 你可以再给我一次目前总体的vps在使用人员名单』）："
+            "请先从 `tp_3x-ui-ops` 或 VPS 台账拉齐当前全网各节点（如 lsg1~lsg6、res1 等）在用人员名单并附在 `---more---` 中，严禁只写『全部满编』却不附总体使用人员名单（REG-087 防打扰门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return

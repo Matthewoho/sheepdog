@@ -8,7 +8,7 @@ import argparse, fcntl, json, logging, os, re, shutil, subprocess, sys, time, to
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import (__version__, _git_run, actions, decision_hub, default_repo_dir, duty, guard, identity as ident, lastgood,
+from . import (__version__, _git_run, actions, decision_hub, default_repo_dir, duty, evolve, guard, identity as ident, lastgood,
                observe as obs, outbound, parse_version_tuple, session as sm, version_info, version_watch)
 from .ack import Acker, _clear_handled_owner_reactions, clear_handled_owner_reactions
 from .card import build_reply_card, owner_title, plain_text, resolve_summary_and_body
@@ -603,6 +603,17 @@ def cmd_observe(args) -> int:
         cfg = _load_cfg()
     except Exception:
         cfg = None
+    if getattr(args, "evolve_digest", False) and cfg is not None:
+        store = Store(Path(args.db).expanduser() if getattr(args, "db", None) else cfg.db_path)
+        try:
+            digest = evolve.build_evolve_digest(cfg, store, since_minutes=args.since_minutes or 65.0)
+            if args.json:
+                print(json.dumps(digest, ensure_ascii=False, indent=2))
+            else:
+                print(evolve.format_evolve_prompt(cfg, digest, trigger_reason="cli_observe"))
+            return 0 if digest.get("ok", True) else 1
+        finally:
+            store.close()
     db_path = Path(args.db).expanduser() if getattr(args, "db", None) else None
     state_path = Path(args.state).expanduser() if getattr(args, "state", None) else None
     res = obs.run_observe(
@@ -618,6 +629,41 @@ def cmd_observe(args) -> int:
     )
     print(obs.render_observe_output(res, as_json=args.json))
     return 1 if res["warns"] else 0
+
+
+def cmd_evolve(args) -> int:
+    """sheepdog evolve（7.119）：管理与执行内置自进化管家循环（初始化 SKILL.md、查看状态、输出 6 维体检摘要、立即跑一轮）。"""
+    cfg = _load_cfg()
+    if getattr(args, "init_skill", False):
+        p = evolve.ensure_evolve_skill_file(cfg, overwrite=bool(getattr(args, "overwrite", False)))
+        print(f"已准备自进化管家配置文件: {p}")
+        return 0
+    store = Store(cfg.db_path)
+    try:
+        if getattr(args, "status", False):
+            st = evolve.read_evolve_state(store)
+            if getattr(args, "json", False):
+                print(json.dumps(st, ensure_ascii=False, indent=2))
+            else:
+                print(f"自进化管家: {'开启' if cfg.self_evolve.enabled else '关闭'} | 会话={cfg.self_evolve.topic_id} | 间隔={cfg.self_evolve.interval_minutes:g}m | SKILL={cfg.evolve_skill_file}")
+                if st:
+                    print(f"最近巡检: iter #{st.get('iteration', 0)} @ {st.get('last_run_at', '-')} ({st.get('last_trigger_reason', '-')}) -> {st.get('last_status', '-')}")
+            return 0
+        if getattr(args, "run_once", False):
+            res = evolve.run_evolve_tick(cfg, store, force=True)
+            if getattr(args, "json", False):
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                print(f"已执行自进化巡检 iter #{res.get('iteration')} -> {res.get('status')} (message_id={res.get('message_id') or '-'})")
+            return 0
+        digest = evolve.build_evolve_digest(cfg, store, since_minutes=float(getattr(args, "minutes", 65.0) or 65.0))
+        if getattr(args, "json", False):
+            print(json.dumps(digest, ensure_ascii=False, indent=2))
+        else:
+            print(evolve.format_evolve_prompt(cfg, digest, trigger_reason="cli_evolve"))
+        return 0 if digest.get("ok", True) else 1
+    finally:
+        store.close()
 
 
 def identity_report(cfg, store: Store) -> list[str]:
@@ -1050,6 +1096,13 @@ def _run_loop(args, cfg, store: Store, source, collector: Collector, dispatcher:
                 return 0
             if cfg.version.enabled:
                 _check_version_update(cfg, store, dispatcher, runtime_info=runtime_info)
+            if cfg.self_evolve.enabled and not getattr(args, "dry_run", False):
+                try:
+                    ev_res = evolve.run_evolve_tick(cfg, store, dispatcher)
+                    if ev_res.get("message_id"):
+                        dispatcher.dispatch_once()
+                except Exception as e:
+                    logging.warning("自进化管家巡检异常（不中断主循环）: %s", e)
             if time.time() - last_prune > 3600:
                 pruned = _prune(store, cfg)
                 last_prune = time.time()
@@ -1107,6 +1160,9 @@ def cmd_init(args) -> int:
         return rc
     if args.dry_run:
         print("[dry-run] 在账本内存副本上执行，不写真实账本、不调用 agentapi\n")
+    else:
+        skill_p = evolve.ensure_evolve_skill_file(cfg)
+        print(f"自进化配置: {skill_p}")
     print(f"名册: {cfg.roster_file}（{len(roster.managed)} managed / {len(roster.sessions) - len(roster.managed)} known）")
     rep = Dispatcher(cfg, store, sink, roster, security).init()
     for k, label in (("created", "新登记"), ("updated", "已更新"), ("reopened", "重新启用"), ("closed", "已移除→closed")):
@@ -2488,6 +2544,15 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("observe", help="深度水位巡检（Watchdog 2.0）")
     obs.add_observe_arguments(sp)
     sp.set_defaults(func=cmd_observe)
+    sp = sub.add_parser("evolve", help="内置自进化管家（6 维体检摘要、SKILL.md 初始化与单次巡检触发）")
+    sp.add_argument("--digest", action="store_true", help="输出 6 维自进化巡检摘要（默认动作）")
+    sp.add_argument("--status", action="store_true", help="查看当前自进化管家状态")
+    sp.add_argument("--init-skill", action="store_true", help="在配置目录生成默认 skills/sheepdog-evolve/SKILL.md")
+    sp.add_argument("--overwrite", action="store_true", help="配合 --init-skill 覆盖已有 SKILL.md")
+    sp.add_argument("--run-once", action="store_true", help="立即执行一次自进化管家巡检并更新状态")
+    sp.add_argument("--minutes", type=float, default=65.0, help="巡检回看窗口分钟数（默认 65）")
+    sp.add_argument("--json", action="store_true", help="以 JSON 格式输出")
+    sp.set_defaults(func=cmd_evolve)
     sp = sub.add_parser("poll")
     sp.add_argument("--dry-run", action="store_true", help="不真正投递，只打印")
     sp.add_argument("--no-dispatch", action="store_true", help="只拉取与路由，不投递")

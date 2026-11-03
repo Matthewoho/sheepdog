@@ -2193,6 +2193,43 @@ class GateTest(Base):
         self.assertNotIn("Proxy locally with", g_sum)
         self.assertIn("=== Studio Backend Test Deploy Done ===", g_sum)
 
+    def test_reg_087_new_vps_purchase_ask_requires_overall_roster_and_diagnosis(self):
+        """7.119（REG-087）：
+        1. 因现有节点满编（0空闲/全部满编）发起 `sheepdog ask` 请示新购/采买 VPS 时，若未在 `---more---` 附上目前总体 VPS 在用人员名单（或各节点占用人员明细），被 `check_ask_pre_flight_guard` 拦截；附上总体名单后放行；
+        2. `diagnose_override_reason` 将主人在 `[其他]` 中追要『那我去买新的 你可以再给我一次目前总体的vps在使用人员名单』精准归因为 `context_incomplete`。
+        """
+        from sheepdog.admin_web import diagnose_override_reason
+        from sheepdog.outbound import OutboundError, check_ask_pre_flight_guard
+
+        code, reason = diagnose_override_reason(
+            "🐕 需要你定 · 核查无空闲，请示新购CC住宅专网VPS [tp_alpha]",
+            "那我去买新的 你可以再给我一次目前总体的vps在使用人员名单",
+            "其他",
+            "A",
+        )
+        self.assertEqual(code, "context_incomplete")
+        self.assertIn("缺环境/调用链反问", reason)
+
+        with self.assertRaises(OutboundError) as cm:
+            check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "核查无空闲，请示新购CC住宅专网VPS",
+                "目前全网防封住宅专线（res1/lsg4）全部满编跑CC（0空闲），请示是否新购1台专属住宅VPS。\n---more---\n选项：\nA. 采买新购 1 台专属住宅 VPS\nB. 暂不新购\n建议：选 A",
+            )
+        self.assertIn("REG-087", str(cm.exception))
+
+        check_ask_pre_flight_guard(
+            self.cfg,
+            self.store,
+            "tp_alpha",
+            "核查无空闲，请示新购CC住宅专网VPS",
+            "目前全网防封住宅专线（res1/lsg4）全部满编跑CC（0空闲），请示是否新购1台专属住宅VPS。\n---more---\n"
+            "目前总体 VPS 在用人员名单：lsg1(Alice/Bob)、lsg2(Carol)、lsg3(Dave)、lsg4(Eve/Frank)、res1(Felix Lin)。\n"
+            "选项：\nA. 采买新购 1 台专属住宅 VPS\nB. 暂不新购\n建议：选 A",
+        )
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -2312,6 +2349,7 @@ class SecurityCliTest(GateTest):
     test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done = None
     test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards = None
     test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail = None
+    test_reg_087_new_vps_purchase_ask_requires_overall_roster_and_diagnosis = None
 
 
 if __name__ == "__main__":

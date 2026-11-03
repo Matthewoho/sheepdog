@@ -794,6 +794,9 @@ def run_observe(
                             t_name = str(tc.get("name") or tc.get("tool_name") or "")
                             t_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
                             if t_tid == bus_topic_id and t_name in _BUS_FORBIDDEN_TOOLS:
+                                wf_path = str(t_args.get("Path") or t_args.get("path") or "").strip() if t_name == "write_file" else ""
+                                if t_name == "write_file" and wf_path.startswith(("/tmp/", "/private/tmp/")) and wf_path.endswith(".md"):
+                                    continue
                                 bad_calls.append(t_name)
                             elif t_name == "run_command":
                                 raw_cmd = decode_command_line(t_args.get("CommandLine") or t_args.get("command") or "")
@@ -1133,6 +1136,15 @@ def run_observe(
         alert_cooldown_minutes=alert_cooldown_minutes, infos=info, bus_topic_id=bus_topic_id,
     )
 
+    self_evolve_meta: dict = {}
+    if db.exists():
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as _ec:
+                _er = _ec.execute("SELECT value FROM meta WHERE key='self_evolve_state'").fetchone()
+                self_evolve_meta = json.loads(_er[0]) if (_er and _er[0]) else {}
+        except Exception:
+            self_evolve_meta = {}
+
     return {
         "ok": len(warn) == 0,
         "checked_at": iso(ref_now),
@@ -1140,6 +1152,7 @@ def run_observe(
         "warns": warn,
         "infos": [i for i in info if i],
         "self_healed": self_healed,
+        "self_evolve": self_evolve_meta,
     }
 
 
@@ -1153,6 +1166,7 @@ def add_observe_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--simulate-warn", action="append", default=[], help="注入模拟告警字符串（用于自测）")
     ap.add_argument("--json", action="store_true", help="以 JSON 格式输出体检结果")
     ap.add_argument("--self-heal", action="store_true", help="对做完活忘交回执的假 running 会话写入 stop hook 自愈标记")
+    ap.add_argument("--evolve-digest", action="store_true", help="输出 6 维自进化管家巡检摘要（D1~D6）")
 
 
 def render_observe_output(res: dict, *, as_json: bool = False, now_dt: datetime | None = None) -> str:

@@ -767,6 +767,38 @@ class VersionConfig:
             raise ConfigError("[version].check_interval_minutes 不能小于 0")
 
 
+@dataclass
+class SelfEvolveConfig:
+    """[self_evolve]（7.119）：内置自进化管家循环配置（按 SKILL.md 周期性或事件驱动巡检并自治优化）。"""
+    enabled: bool = True
+    interval_minutes: float = 60.0
+    trigger_on_override: bool = True
+    cooldown_minutes: float = 10.0
+    skill_path: str = "skills/sheepdog-evolve/SKILL.md"
+    topic_id: str = "tp_sheepdog"
+    title: str = "🐕 Sheepdog 自进化管家"
+    host: str = ""
+    auto_upgrade: bool = True
+
+    def validate(self) -> None:
+        for k in ("enabled", "trigger_on_override", "auto_upgrade"):
+            if not isinstance(getattr(self, k), bool):
+                raise ConfigError(f"[self_evolve] {k} 必须是 true/false")
+        for k in ("interval_minutes", "cooldown_minutes"):
+            v = getattr(self, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                raise ConfigError(f"[self_evolve] {k} 必须是 >= 0 的数字")
+        for k in ("skill_path", "topic_id", "title", "host"):
+            if not isinstance(getattr(self, k), str):
+                raise ConfigError(f"[self_evolve] {k} 必须是字符串")
+        self.topic_id = self.topic_id.strip() or "tp_sheepdog"
+        if not self.topic_id.startswith("tp_"):
+            raise ConfigError("[self_evolve] topic_id 必须以 tp_ 开头")
+        self.host = self.host.strip()
+        if self.host and self.host not in HOSTS:
+            raise ConfigError(f"[self_evolve] 未知宿主 {self.host!r}，只能是 {' / '.join(HOSTS)}")
+
+
 # 7.56「这个群该不该管」：Config.chat_scope 的三种结果
 OWNER_SIDE = "owner_side"   # 找主人那一侧（找主人聊天、7.51 的话题群）：走自己的分支，先于普通路由，不受 ignore 影响
 IGNORED = "ignored"         # [routing] ignore_chat_ids：不送、不当背景、不当指令、不按话题归属
@@ -819,6 +851,7 @@ class Config:
     media: MediaConfig = field(default_factory=MediaConfig)
     lamb: LambConfig = field(default_factory=LambConfig)
     version: VersionConfig = field(default_factory=VersionConfig)
+    self_evolve: SelfEvolveConfig = field(default_factory=SelfEvolveConfig)
     hosts: dict = field(default_factory=lambda: {h: HostConfig(name=h) for h in CLI_HOSTS})
     state_dir: Path = field(default_factory=default_state_dir)
     config_path: Path = field(default_factory=default_config_path)
@@ -912,6 +945,11 @@ class Config:
         return p if p.is_absolute() else self.config_path.parent / p
 
     @property
+    def evolve_skill_file(self) -> Path:
+        p = Path(self.self_evolve.skill_path or "skills/sheepdog-evolve/SKILL.md").expanduser()
+        return p if p.is_absolute() else self.config_path.parent / p
+
+    @property
     def roster_required(self) -> bool:
         # 显式配置了 roster_path 时文件必须存在，避免路径写错后静默退回「无名册」
         return bool(self.roster_path)
@@ -969,6 +1007,7 @@ def _apply_file(cfg: "Config", data: dict) -> None:
     _apply(cfg.media, data.get("media", {}))
     _apply(cfg.lamb, data.get("lamb", {}))
     _apply(cfg.version, data.get("version", {}))
+    _apply(cfg.self_evolve, data.get("self_evolve", {}))
     hosts = data.get("hosts", {})
     if not isinstance(hosts, dict) or set(hosts) - set(CLI_HOSTS):
         raise ConfigError(f"[hosts] 只认 {' / '.join(f'[hosts.{h}]' for h in CLI_HOSTS)}")
@@ -1015,6 +1054,7 @@ def load_config(path: Path | None = None) -> Config:
     cfg.media.validate()
     cfg.lamb.validate()
     cfg.version.validate()
+    cfg.self_evolve.validate()
     if not isinstance(cfg.cli_name, str) or not cfg.cli_name.strip():
         raise ConfigError("cli_name 必须是非空字符串")
     cfg.cli_name = cfg.cli_name.strip()

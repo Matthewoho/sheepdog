@@ -570,6 +570,13 @@
 | --- | --- | --- |
 | 7.118 | 实战巡检与跨会话留言暴露五类系统性摩擦：① 主人在『`🐕 拍板总台`』点按钮 A 拍板后 34s 内直接发不带子卡引用的截图追问『`这玩意有啥决策点吗 还需要问我 是哪里不合理吗 还是说你只是象征性问问`』，因 `len(opens) != 1` 被 `handle_hub_text_reply` 拒收并由 `_topic_group_message` 标为 `DROP (decision_hub_hint)` 弹出说教提示，迫使主人去原话题重发，且 `classify_escalation` 未结合点选后追问将该单归入 `overridden`；② `tp_api-resale` 在 PR 仍在等待 Sammy Review、无任何冲突时发起『同意排期明天 18:00 窗口 vs 调整排期时间或有其他要求』的象征性 `ask`；③ `tp_ziyi-zhang` 在途批次运行期间主人已点『其他：这个不动...』结案旧卡，11s 后会话在途再调同 `--key` 的 `sheepdog ask` 刷出第 2 张重复卡；④ `tp_bus` 与专席将数据库内部 User / 只读账号（`elaine_readonly`）创建与发放发 `ask` 找主人，且 `tp_edm-testing-whitelist` 因正文含『登记生产模板（测试与生产共用）』绕过测试环境 IAM 免问门禁；⑤ `_summarize_cli_lamb_log` 对截断的日志末尾输出裸 JSON 属性碎片与 `gcloud` 进度/proxy 提示噪音（REG-086） | `test_security.GateTest.test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail`（`tests/test_security.py::GateTest::test_reg_086_hub_unquoted_followup_symbolic_schedule_in_flight_veto_db_nicky_and_lamb_json_tail`） |
 
+## 1.0.0（7.119） 交付物（账密/Token/连接地址/订阅链接）首屏直出与自动上浮 + 假 `more` 去重、内置 `SKILL.md` 驱动的 `sheepdog-evolve` 自进化管家循环与满编新购 VPS 强制附总体名单门禁（REG-087）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 1.0.0 | 实战暴露三类系统性体验与自治架构问题：① 专席向同事交付账号、密码、临时密码、`SecretId`/`SecretKey`、`Token`、数据库连接地址、登录 URL 或 `vless://` 订阅链接时，因 `7.70` 一刀切拦截反引号与 URL 且限制首屏 `<=3` 行/`<=100` 字，把核心交付物全部塞进默认折叠的 `---more---` 并在外层写『点开下方 more 即可复制』，不习惯展开 `more` 的同事找不到账密，且短回复把同样一句话在总结与 `more` 重复写两遍制造假 `more`；② Sheepdog 的巡检、错题本自进化、性能追踪与热升级此前依赖外部会话的临时 `schedule` Cron，别人安装 Sheepdog 时无法自带这套由 `SKILL.md` 驱动的内置自进化管家循环；③ 专席在节点满编请示新购 VPS 时未附目前总体 VPS 在用人员名单（迫使主人追问『那我去买新的 你可以再给我一次目前总体的vps在使用人员名单』），且 `observe` 误报 `tp_bus` 写 `/tmp/*.md` 临时草稿、`lamb` 日志残留 `Container ... Waiting/Healthy` 与 `"Tags": [],` 碎片（REG-087） | `test_more_card.MoreCardTest.test_7119_deliverable_credentials_first_screen_hoist_and_fake_more_dedup`、`test_version_and_observe.VersionAndObserveTest.test_7119_self_evolve_digest_and_tick_and_tmp_md_exempt_and_lamb_summary`、`test_security.GateTest.test_reg_087_new_vps_purchase_ask_requires_overall_roster_and_diagnosis` |
+
+
 
 
 

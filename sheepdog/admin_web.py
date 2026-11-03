@@ -89,7 +89,8 @@ def diagnose_override_reason(
     if re.search(
         r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢|"
         r"有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我|"
-        r"测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理)",
+        r"测试还是生产|哪个环境|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
+        r"给我一次.{0,24}(?:名单|列表|台账)|再发一次.{0,24}(?:名单|列表|台账)|总体.{0,16}(?:在使用|在用).{0,12}(?:人员)?名单)",
         s,
         re.I,
     ):
@@ -661,6 +662,7 @@ class WorkbenchService:
             ).fetchone()[0]
 
             last_commit = ""
+            self_evolve_state: dict[str, Any] = {}
             try:
                 meta_row = conn.execute("SELECT value FROM meta WHERE key='upgrade_prev_commit'").fetchone()
                 if meta_row:
@@ -671,6 +673,11 @@ class WorkbenchService:
                     if isinstance(ic_obj, dict):
                         ws_health.update(ic_obj)
                         ws_health["status"] = "online" if ic_obj.get("state") == "running" else "degraded"
+                ev_row = conn.execute("SELECT value FROM meta WHERE key='self_evolve_state'").fetchone()
+                if ev_row and ev_row["value"]:
+                    ev_obj = json.loads(ev_row["value"])
+                    if isinstance(ev_obj, dict):
+                        self_evolve_state = ev_obj
             except (sqlite3.OperationalError, ValueError):
                 pass
         finally:
@@ -681,6 +688,7 @@ class WorkbenchService:
             "now": now_iso(),
             "rollback_commit": last_commit,
             "ws_health": ws_health,
+            "self_evolve": self_evolve_state,
             "counts": {
                 "topics_running": state_map.get("running", 0),
                 "topics_active": state_map.get("active", 0),

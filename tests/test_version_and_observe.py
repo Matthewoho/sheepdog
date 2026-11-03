@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "0.7.118")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (0, 7, 118))
+        self.assertEqual(cur_ver, "1.0.0")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (1, 0, 0))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -107,7 +107,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertIn(cur_ver, buf.getvalue())
 
             # 4. 常驻进程 _check_version_update：本机磁盘升版提醒 + 远端 tag 提醒 + 幂等防重
-            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "0.7.119"\n', encoding="utf-8")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.0.1"\n', encoding="utf-8")
             fake_dispatcher = mock.MagicMock()
             now_dt = datetime(2026, 10, 21, 20, 0, 0, tzinfo=observe.TZ)
             real_run = subprocess.run
@@ -122,7 +122,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt
                 )
                 self.assertEqual(len(sent1), 1)
-                self.assertIn("0.7.119", sent1[0])
+                self.assertIn("1.0.1", sent1[0])
                 self.assertIn(cur_ver, sent1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
@@ -133,8 +133,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertEqual(sent2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
-            # 远端出现更高版本 v0.7.120 时单次提醒
-            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v0.7.120\n"
+            # 远端出现更高版本 v1.0.2 时单次提醒
+            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v1.0.2\n"
 
             def has_remote_tag(cmd, *a, **kw):
                 if isinstance(cmd, list) and "ls-remote" in cmd:
@@ -144,7 +144,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             with mock.patch("subprocess.run", side_effect=has_remote_tag):
                 sent_remote1 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=35))
                 self.assertEqual(len(sent_remote1), 1)
-                self.assertIn("v0.7.120", sent_remote1[0])
+                self.assertIn("v1.0.2", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
                 sent_remote2 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=70))
@@ -557,9 +557,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v0.7.100）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v1.0.0）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v0.7.118")
+        self.assertEqual(expected_sig, "🐕SheepDog v1.0.0")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -1196,6 +1196,119 @@ class VersionAndObserveTest(unittest.TestCase):
             res_warn = observe.run_observe(cfg, now_dt=ref_now, since_minutes=60.0, check_processes=False, check_log=False)
             self.assertTrue(any("羔羊同一 conversation_id 重复登记 2 行：tp_jev cid=06a8c3ff" in w for w in res_warn["warns"]), res_warn["warns"])
             self.assertTrue(any(f"CLI 羔羊 lamb_cli_long（tp_rel，pid={dead_pid}）进程已退出但状态仍为 running" in w for w in res_warn["warns"]), res_warn["warns"])
+
+    def test_7119_self_evolve_digest_and_tick_and_tmp_md_exempt_and_lamb_summary(self):
+        """7.119（REG-087）：
+        1. `evolve.ensure_evolve_skill_file` 自动生成默认 `skills/sheepdog-evolve/SKILL.md` 模板（零机密词泄漏）；
+        2. `evolve.build_evolve_digest` 汇总 D1~D6 六维自进化体检指标，且 `evolve.run_evolve_tick` 在检测到异常或 `force=True` 时自动注册 `tp_sheepdog`、写入 `system_messages` 入账信号并更新 `meta['self_evolve_state']`；
+        3. `observe` 对 `tp_bus` 向 `/tmp/*.md` 或 `/private/tmp/*.md` 写入临时交接草稿予以豁免，但仍拦截向业务仓库或笔记库调用 `write_file`；
+        4. `_summarize_cli_lamb_log` 过滤 `Container ... Waiting/Healthy/Running/Recreate` 噪音与 JSON 数组属性碎片（`"Tags": [],`），且末尾含 `"ok":true` / ` is live on ` 时清除前置瞬态重试报错。
+        """
+        from sheepdog import evolve
+        from sheepdog.config import SelfEvolveConfig
+        from sheepdog.engine import _summarize_cli_lamb_log
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            skill_path = tmp_path / "skills" / "sheepdog-evolve" / "SKILL.md"
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=tmp_path / "state",
+                self_evolve=SelfEvolveConfig(
+                    enabled=True,
+                    interval_minutes=60.0,
+                    topic_id="tp_sheepdog",
+                    title="🐕 Sheepdog 自进化管家",
+                    skill_path=str(skill_path),
+                    auto_upgrade=True,
+                    trigger_on_override=True,
+                ),
+            )
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            # 1) 默认 SKILL.md 模板自动创建且包含六大职责结构
+            ensured = evolve.ensure_evolve_skill_file(cfg)
+            self.assertTrue(ensured.is_file())
+            skill_txt = ensured.read_text(encoding="utf-8")
+            self.assertIn("name: sheepdog-evolve", skill_txt)
+            self.assertIn("六大日常自进化职责", skill_txt)
+
+            # 2) D1~D6 摘要与 run_evolve_tick 触发投递
+            ref_now = datetime(2026, 11, 3, 22, 30, 0, tzinfo=observe.TZ)
+            store.add_mail("tp_alpha", "tp_sheepdog", "gate-1", "建议新增一条防呆门禁")
+            digest = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=ref_now)
+            self.assertTrue(digest["needs_action"])
+            self.assertTrue(any(r.startswith("unread_peer_mail") for r in digest["action_reasons"]))
+
+            tick_res = evolve.run_evolve_tick(cfg, store, now_dt=ref_now)
+            self.assertTrue(tick_res["triggered"])
+            self.assertIn("self_evolve_digest_", tick_res["message_id"])
+            tp_sd = store.get_topic("tp_sheepdog")
+            self.assertIsNotNone(tp_sd)
+            st_saved = json.loads(store.get_meta("self_evolve_state") or "{}")
+            self.assertEqual(st_saved.get("last_message_id"), tick_res["message_id"])
+
+            # 3) observe 豁免 tp_bus 写 /tmp/*.md，但仍拦截写业务文件
+            tp_dir = tmp_path / "brain" / "cid_bus_7119" / ".system_generated" / "logs"
+            tp_dir.mkdir(parents=True, exist_ok=True)
+            store.upsert_topic("tp_bus", title="收件箱", kind="bus", conversation_id="cid_bus_7119")
+            tp_file = tp_dir / "transcript.jsonl"
+            tp_file.write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": ref_now.isoformat(timespec="seconds"),
+                    "tool_calls": [{"name": "write_file", "args": {"Path": "/tmp/reply_draft.md", "Content": "ok"}}],
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch("sheepdog.sink.agentapi.transcript_path", return_value=tp_file):
+                res_tmp = observe.run_observe(cfg, now_dt=ref_now, since_minutes=60.0, check_processes=False, check_log=False)
+            self.assertFalse(any("tp_bus Boundary Guard" in w for w in res_tmp["warns"]), res_tmp["warns"])
+
+            tp_file.write_text(
+                json.dumps({
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": ref_now.isoformat(timespec="seconds"),
+                    "tool_calls": [{"name": "write_file", "args": {"Path": "/var/workspace/repo/main.py", "Content": "x"}}],
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch("sheepdog.sink.agentapi.transcript_path", return_value=tp_file):
+                res_bad = observe.run_observe(cfg, now_dt=ref_now, since_minutes=60.0, check_processes=False, check_log=False)
+            self.assertTrue(any("tp_bus Boundary Guard" in w for w in res_bad["warns"]), res_bad["warns"])
+
+            # 4) _summarize_cli_lamb_log 清洗 Container 噪音与 JSON 数组属性碎片
+            raw_docker = (
+                "Error response from daemon: removal of container abc is already in progress\n"
+                "deploy: retry 1: ssh failed\n"
+                "Container cinemap-db Waiting\n"
+                "Container cinemap-db Healthy\n"
+                '{"ok":true,"version":"4b783ca8a5"}\n'
+                "deploy: cinemap/web:4b783ca8a5 is live on ubuntu@198.51.100.1\n"
+            )
+            sum_docker, err_docker = _summarize_cli_lamb_log(raw_docker)
+            self.assertFalse(err_docker)
+            self.assertNotIn("Container cinemap-db", sum_docker)
+            self.assertNotIn("Error response from daemon", sum_docker)
+            self.assertIn("deploy: cinemap/web:4b783ca8a5 is live", sum_docker)
+
+            raw_tccli = (
+                "Error: transient\n"
+                "=== Organization members and policies ===\n"
+                "{\n"
+                '  "Tags": [],\n'
+                '{"Total": 1, "Items": [1], "RequestId": "req-123"}\n'
+            )
+            sum_tccli, err_tccli = _summarize_cli_lamb_log(raw_tccli)
+            self.assertFalse(err_tccli)
+            self.assertNotIn('"Tags": []', sum_tccli)
+            self.assertIn("JSON(Total=1", sum_tccli)
 
 
 if __name__ == "__main__":

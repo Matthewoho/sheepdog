@@ -6312,11 +6312,11 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
 _GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", re.M)
 _INTERMEDIATE_POLL_LINE_RE = re.compile(r"\bpoll\s+\d+\s*:.*\bstatus=(?:WORKING|QUEUED|PENDING)\b", re.I)
 _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
-    r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|Done\.|Proxy locally with:\s*gcloud\b)",
+    r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b)",
     re.I | re.M,
 )
 _JSON_PROP_FRAGMENT_LINE_RE = re.compile(
-    r'^"[^"]+"\s*:\s*(?:\{|\[|[-0-9.]+|true|false|null|"[^"]*")\s*,?\s*$',
+    r'^"[^"]+"\s*:\s*(?:\{\s*\}?|\[\s*\]?|[-0-9.]+|true|false|null|"[^"]*")\s*,?\s*$',
     re.I,
 )
 _JSON_OBJECT_KEY_LINE_RE = re.compile(r'^"([^"]+)"\s*:\s*\{\s*$')
@@ -6354,7 +6354,21 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
     has_err = any(k in recent_window for k in ("Traceback", "Fatal", "Error", "ERROR"))
     tail_10 = non_empty[-10:]
     pass_idx = next(
-        (i for i in range(len(tail_10) - 1, -1, -1) if any(ok_m in tail_10[i] for ok_m in ("=== VERIFICATION PASSED ===", "=== ALL PASSED ===", "VERIFICATION PASSED"))),
+        (
+            i
+            for i in range(len(tail_10) - 1, -1, -1)
+            if any(
+                ok_m in tail_10[i]
+                for ok_m in (
+                    "=== VERIFICATION PASSED ===",
+                    "=== ALL PASSED ===",
+                    "VERIFICATION PASSED",
+                    '"ok":true',
+                    '"ok": true',
+                    " is live on ",
+                )
+            )
+        ),
         None,
     )
     if pass_idx is not None and not any(
@@ -6370,13 +6384,20 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                 obj = json.loads(cand)
                 if isinstance(obj, dict):
                     st_val = str(obj.get("status") or "").strip()
-                    if obj.get("ok") is False or st_val.lower() in ("failed", "error", "failure", "timeout", "cancelled") or obj.get("error"):
+                    if obj.get("ok") is False or st_val.lower() in ("failed", "error", "failure", "timeout", "cancelled") or obj.get("error") or obj.get("Error"):
                         has_err = True
-                    elif obj.get("ok") is True or st_val.upper() in ("SUCCESS", "OK", "DONE", "HANDLED"):
+                    elif (
+                        obj.get("ok") is True
+                        or st_val.upper() in ("SUCCESS", "OK", "DONE", "HANDLED")
+                        or ("RequestId" in obj and "Error" not in obj)
+                    ):
                         has_err = False
                     raw_prefix = [
                         ln.strip() for ln in stripped[:idx].splitlines()
-                        if ln.strip() and not re.match(r"^[}\],;:\s]+$", ln.strip())
+                        if ln.strip()
+                        and not re.match(r"^[{}\[\],;:\s]+$", ln.strip())
+                        and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln.strip())
+                        and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln.strip())
                     ] if idx != -1 else []
                     if not has_err:
                         tb_idx = next((i for i, ln in enumerate(raw_prefix) if ln.startswith("Traceback")), None)
@@ -6389,6 +6410,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                             and not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):", ln)
                             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
                             and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+                            and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)
                         ]
                     prefix_lines = raw_prefix[-1:] if not has_err else raw_prefix[-2:]
                     priority_keys = (
@@ -6414,13 +6436,18 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
         non_grep = [
             ln for ln in meaningful
             if not _GREP_MATCH_LINE_RE.match(ln)
-            and not ln.startswith(("STDERR: ERROR:", "ERROR: (gcloud."))
+            and not ln.startswith(("STDERR: ERROR:", "ERROR: (gcloud.", "Error response from daemon:", "deploy: retry "))
+            and "Error response from daemon: removal of container" not in ln
             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
             and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
         ]
         if non_grep:
             meaningful = non_grep
     tail_lines = (meaningful or non_empty)[-5:]
+    if tail_lines and not all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
+        non_json_frag = [ln for ln in tail_lines if not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)]
+        if non_json_frag:
+            tail_lines = non_json_frag
     if tail_lines and all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
         obj_keys = [m.group(1) for ln in meaningful if (m := _JSON_OBJECT_KEY_LINE_RE.match(ln))]
         kv_pairs = []

@@ -321,3 +321,72 @@ class MoreCardTest(ThreadsBase):
         plain_words = "<at id=ou_f7c171b535ffd721>Ren Ryan</at> 收到 feedback，我们在 cafe 聊过 deadbeef 和 decade 方案，20261022 前搞定。"
         rc_pw, out_pw, err_pw = self.cli("reply-card", "--summary", plain_words, "--text", LONG_DETAIL)
         self.assertEqual(rc_pw, 0, err_pw)
+
+    def test_7119_deliverable_credentials_first_screen_hoist_and_fake_more_dedup(self):
+        """7.119（REG-087）：
+        1. 账号/密码/Token/SecretId/连接地址/登录链接/vless:// 订阅链接等交付物支持在首屏直接展示（放宽至 <=12 行、<=520 字，放行行内反引号与 URL/URI，但继续拦截 Cloud Run revision、裸 SHA、飞书 om_/oc_ ID、多行代码块）；
+        2. 当专席把账密/Token/链接藏进 `---more---` 且外层写了『在下方展开查看 / 点开下方 more 即可复制』时，自动把核心交付物上浮到首屏并剔除『点开下方 more』空话；若上浮后 `more` 无实质长背景则直接取消 `more` 折叠面板；
+        3. 当外层总结与 `---more---` 重复或高度重合（假 `more`）时，自动消掉冗余 `more` 面板。
+        """
+        m_alice = self.lark.add(chat_id=ALPHA_P2P, sender_id=ALICE, content="请把测试账号密码和订阅发我")
+        self.pull(m_alice)
+        self.deliver()
+
+        # 1) 直接把交付物（含反引号账密、登录 URL）作为首屏直发（无 ---more---），零报错且无 more 面板
+        direct_cred = (
+            f"<at id={ALICE}></at> 你的测试环境账号已开通：\n"
+            "- 登录地址：https://cinemap-stage.tapnow.tv\n"
+            "- 账号：`alice@tamaredge.ai`\n"
+            "- 临时密码：`CinemaP#2026!`"
+        )
+        rc1, out1, err1 = self.cli("reply", "--topic", "tp_alpha", "--to", m_alice, "--card-text", direct_cred)
+        self.assertEqual(rc1, 0, out1 + err1)
+        els1 = card_of(self.lark.sent("+messages-reply")[-1])["body"]["elements"]
+        self.assertFalse(any(e.get("tag") == "collapsible_panel" for e in els1))
+        self.assertIn("`CinemaP#2026!`", els1[0]["content"])
+        self.assertIn("https://cinemap-stage.tapnow.tv", els1[0]["content"])
+
+        # 2) 专席把临时密码藏进 ---more--- 且外层写「点开下方 more 即可直接复制」：自动上浮账密到首屏并消掉空壳 more
+        folded_pwd = (
+            f"<at id={ALICE}></at> 临时密码已经帮你重设好了，点开下方 more 即可直接复制登录。"
+            " ---more--- 你的测试环境账号临时密码已重设完成：\n"
+            "- 登录邮箱：`alice@tamaredge.ai`\n"
+            "- 临时密码：`Reset#2026!`\n"
+            "请使用邮箱+密码直接登录。"
+        )
+        rc2, out2, err2 = self.cli("reply-card", "--text", folded_pwd)
+        self.assertEqual(rc2, 0, err2)
+        els2 = json.loads(out2)["body"]["elements"]
+        self.assertFalse(any(e.get("tag") == "collapsible_panel" for e in els2))
+        self.assertNotIn("点开下方", els2[0]["content"])
+        self.assertIn("`Reset#2026!`", els2[0]["content"])
+
+        # 3) 专席把单行 ```vless://...``` 订阅链接藏进 ---more---，且附有长说明：订阅链接自动解围栏上浮首屏，剩余说明保留在 more
+        folded_vless = (
+            "已为你开通专属节点，连接串在下方展开复制。\n---more---\n"
+            "节点链接：\n```text\nvless://11111111-2222-3333-4444-555555555555@198.51.100.10:443?security=reality#US-Node\n```\n"
+            + LONG_DETAIL
+        )
+        rc3, out3, err3 = self.cli("reply-card", "--text", folded_vless)
+        self.assertEqual(rc3, 0, err3)
+        els3 = json.loads(out3)["body"]["elements"]
+        self.assertTrue(any(e.get("tag") == "collapsible_panel" for e in els3))
+        self.assertIn("`vless://11111111-2222-3333-4444-555555555555@198.51.100.10:443?security=reality#US-Node`", els3[0]["content"])
+        self.assertNotIn("在下方展开", els3[0]["content"])
+        self.assertEqual(els3[1]["tag"], "collapsible_panel")
+
+        # 4) 假 more 去重：外层与 ---more--- 高度重合的两句话，自动消掉 more 面板
+        fake_more = (
+            "收到！专属网络目前连接正常吗？如果节点有疑问或需要独立专线，随时跟我说，我来给你配。"
+            " ---more--- 收到！专属网络环境目前连着正常吗？如果节点有任何连接疑问、或者需要单独配一条单人专线，随时跟我说，我这边来帮你处理。"
+        )
+        rc4, out4, err4 = self.cli("reply-card", "--text", fake_more)
+        self.assertEqual(rc4, 0, err4)
+        els4 = json.loads(out4)["body"]["elements"]
+        self.assertFalse(any(e.get("tag") == "collapsible_panel" for e in els4))
+
+        # 5) 安全边界：即使带了密码字样，若首屏混入内部工程噪音（Cloud Run revision 00005-5vc 或飞书 om_ ID），照旧以退出码 2 拦截
+        bad_deliverable = "账号：`alice`，临时密码：`Pass#123`，已在 00005-5vc 上线。"
+        rc5, out5, err5 = self.cli("reply-card", "--summary", bad_deliverable, "--text", LONG_DETAIL)
+        self.assertEqual(rc5, 2, out5 + err5)
+        self.assertIn("00005-5vc", err5)
