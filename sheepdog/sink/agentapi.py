@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,78 @@ from . import SinkError, SinkTimeout
 AGENTAPI_TIMEOUT = 60
 
 _REQUIRED_ENV = ("ANTIGRAVITY_AGENTAPI_EXE", "ANTIGRAVITY_LS_ADDRESS", "ANTIGRAVITY_CSRF_TOKEN")
+ENV_CACHE_FILENAME = "antigravity_env.json"
+
+
+def is_ls_address_reachable(ls_address: str, timeout: float = 0.5) -> bool:
+    """探测 ANTIGRAVITY_LS_ADDRESS（如 localhost:52430）TCP 端口是否存活可达（REG-088）。"""
+    addr = (ls_address or "").strip()
+    if not addr or ":" not in addr:
+        return False
+    host, _, port_str = addr.rpartition(":")
+    host = host.strip("[]") or "127.0.0.1"
+    try:
+        port = int(port_str)
+    except ValueError:
+        return False
+    if port <= 0 or port > 65535:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def save_live_agentapi_env(state_dir: Path | None) -> bool:
+    """当当前进程携带存活可达的 ANTIGRAVITY_* 凭据时，原子写入 state_dir/antigravity_env.json（REG-088）。"""
+    if state_dir is None:
+        return False
+    if any(not os.environ.get(k) for k in _REQUIRED_ENV):
+        return False
+    ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+    if not is_ls_address_reachable(ls_addr):
+        return False
+    try:
+        state_dir = Path(state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        target = state_dir / ENV_CACHE_FILENAME
+        tmp = state_dir / f".{ENV_CACHE_FILENAME}.tmp.{os.getpid()}"
+        payload = {
+            "ANTIGRAVITY_AGENTAPI_EXE": os.environ["ANTIGRAVITY_AGENTAPI_EXE"],
+            "ANTIGRAVITY_LS_ADDRESS": ls_addr,
+            "ANTIGRAVITY_CSRF_TOKEN": os.environ["ANTIGRAVITY_CSRF_TOKEN"],
+            "ANTIGRAVITY_APP_DATA_DIR": os.environ.get("ANTIGRAVITY_APP_DATA_DIR", ""),
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+        }
+        tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except OSError:
+        return False
+
+
+def load_live_agentapi_env(state_dir: Path | None) -> dict[str, str] | None:
+    """从 state_dir/antigravity_env.json 读取且经 TCP 存活验证的最新宿主凭据（REG-088）。"""
+    if state_dir is None:
+        return None
+    target = Path(state_dir) / ENV_CACHE_FILENAME
+    if not target.exists():
+        return None
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or any(not data.get(k) for k in _REQUIRED_ENV):
+        return None
+    ls_addr = str(data.get("ANTIGRAVITY_LS_ADDRESS") or "")
+    if not is_ls_address_reachable(ls_addr):
+        return None
+    out = {k: str(data[k]) for k in _REQUIRED_ENV}
+    if data.get("ANTIGRAVITY_APP_DATA_DIR"):
+        out["ANTIGRAVITY_APP_DATA_DIR"] = str(data["ANTIGRAVITY_APP_DATA_DIR"])
+    return out
 
 
 def _app_data_dir() -> Path:
@@ -49,8 +122,28 @@ class AgentApiSink:
     name = "agentapi"
     host = "antigravity"
 
+    def __init__(self, state_dir: Path | None = None):
+        self.state_dir = Path(state_dir) if state_dir is not None else None
+
+    def _reload_saved_env(self, *, force: bool = False) -> bool:
+        saved = load_live_agentapi_env(self.state_dir)
+        if saved is None:
+            return False
+        if not force and all(os.environ.get(k) for k in _REQUIRED_ENV):
+            return False
+        if (
+            force
+            and saved.get("ANTIGRAVITY_LS_ADDRESS") == os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+            and saved.get("ANTIGRAVITY_CSRF_TOKEN") == os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+        ):
+            return False
+        os.environ.update(saved)
+        return True
+
     def available(self) -> tuple[bool, str]:
         missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+        if missing and self._reload_saved_env():
+            missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
         if missing:
             return False, f"缺少环境变量 {missing}：需在 Antigravity App 托管的 sidecar 或 App 内终端中运行"
         return True, "ok"
@@ -65,9 +158,23 @@ class AgentApiSink:
         except subprocess.TimeoutExpired as e:
             # 7.47 第 7 条：不再冲出 dispatch_once 中断整轮。send-message 超时可能其实送到了，由调用方按 SinkTimeout 处理
             raise SinkTimeout(f"agentapi {args[0] if args else ''} 超过 {AGENTAPI_TIMEOUT} 秒没返回（可能已经送到）") from e
-        # language_server 会往 stderr 打启动日志，只解析 stdout 里的 JSON
         out = proc.stdout.strip()
         start = out.find("{")
+        if proc.returncode != 0 or start < 0:
+            err_tail = (proc.stderr or out)[-400:]
+            err_low = err_tail.lower()
+            if (
+                ("connection refused" in err_low or "code = unavailable" in err_low or "csrf" in err_low)
+                and self._reload_saved_env(force=True)
+            ):
+                exe = os.environ["ANTIGRAVITY_AGENTAPI_EXE"]
+                try:
+                    proc = subprocess.run([exe, "agentapi", *args], capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
+                except subprocess.TimeoutExpired as e:
+                    raise SinkTimeout(f"agentapi {args[0] if args else ''} 超过 {AGENTAPI_TIMEOUT} 秒没返回（可能已经送到）") from e
+                out = proc.stdout.strip()
+                start = out.find("{")
+        # language_server 会往 stderr 打启动日志，只解析 stdout 里的 JSON
         if proc.returncode != 0 or start < 0:
             raise SinkError(f"agentapi 失败 rc={proc.returncode}: {(proc.stderr or out)[-400:]}")
         try:

@@ -46,8 +46,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
     def test_release_gate_rejects_version_mismatch_and_daemon_notifies_once(self):
         # 1. 单一版本事实源与 pyproject.toml 动态读取
         cur_ver = sheepdog.__version__
-        self.assertEqual(cur_ver, "1.0.0")
-        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (1, 0, 0))
+        self.assertEqual(cur_ver, "1.0.1")
+        self.assertEqual(sheepdog.parse_version_tuple(cur_ver), (1, 0, 1))
         pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("version", pyproject["project"].get("dynamic", []))
         self.assertNotIn("version", pyproject["project"])
@@ -107,7 +107,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertIn(cur_ver, buf.getvalue())
 
             # 4. 常驻进程 _check_version_update：本机磁盘升版提醒 + 远端 tag 提醒 + 幂等防重
-            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.0.1"\n', encoding="utf-8")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.0.2"\n', encoding="utf-8")
             fake_dispatcher = mock.MagicMock()
             now_dt = datetime(2026, 10, 21, 20, 0, 0, tzinfo=observe.TZ)
             real_run = subprocess.run
@@ -122,7 +122,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                     cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt
                 )
                 self.assertEqual(len(sent1), 1)
-                self.assertIn("1.0.1", sent1[0])
+                self.assertIn("1.0.2", sent1[0])
                 self.assertIn(cur_ver, sent1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
@@ -133,8 +133,8 @@ class VersionGateAndNoticeTest(unittest.TestCase):
                 self.assertEqual(sent2, [])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 1)
 
-            # 远端出现更高版本 v1.0.2 时单次提醒
-            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v1.0.2\n"
+            # 远端出现更高版本 v1.0.3 时单次提醒
+            ls_remote_out = "9999999999999999999999999999999999999999\trefs/tags/v1.0.3\n"
 
             def has_remote_tag(cmd, *a, **kw):
                 if isinstance(cmd, list) and "ls-remote" in cmd:
@@ -144,7 +144,7 @@ class VersionGateAndNoticeTest(unittest.TestCase):
             with mock.patch("subprocess.run", side_effect=has_remote_tag):
                 sent_remote1 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=35))
                 self.assertEqual(len(sent_remote1), 1)
-                self.assertIn("v1.0.2", sent_remote1[0])
+                self.assertIn("v1.0.3", sent_remote1[0])
                 self.assertEqual(fake_dispatcher._notify_owner.call_count, 2)
 
                 sent_remote2 = cli._check_version_update(cfg, store, fake_dispatcher, runtime_info=rt, repo_dir=repo, now=now_dt + timedelta(minutes=70))
@@ -557,9 +557,9 @@ class Version769SignatureAndUpgradeTest(unittest.TestCase):
         from sheepdog.engine import Collector, has_reply_suffix, is_agent_reply
         from sheepdog.pending import is_agent_text
 
-        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v1.0.0）
+        # 1. 默认右下角签名动态跟随 __version__（🐕SheepDog v1.0.1）
         expected_sig = f"🐕SheepDog v{sheepdog.__version__}"
-        self.assertEqual(expected_sig, "🐕SheepDog v1.0.0")
+        self.assertEqual(expected_sig, "🐕SheepDog v1.0.1")
         self.assertEqual(default_reply_suffix(), expected_sig)
         self.assertEqual(SessionConfig().reply_suffix, expected_sig)
 
@@ -1233,7 +1233,7 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertTrue(ensured.is_file())
             skill_txt = ensured.read_text(encoding="utf-8")
             self.assertIn("name: sheepdog-evolve", skill_txt)
-            self.assertIn("六大日常自进化职责", skill_txt)
+            self.assertIn("六大自进化职责", skill_txt)
 
             # 2) D1~D6 摘要与 run_evolve_tick 触发投递
             ref_now = datetime(2026, 11, 3, 22, 30, 0, tzinfo=observe.TZ)
@@ -1309,6 +1309,148 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertFalse(err_tccli)
             self.assertNotIn('"Tags": []', sum_tccli)
             self.assertIn("JSON(Total=1", sum_tccli)
+
+    def test_reg088_stale_ls_lock_preemption_and_agentapi_env_reload(self):
+        """1.0.1（REG-088）：
+        1) language_server 重启换新动态端口后，AgentApiSink 遇 connection refused 自动从 state_dir/antigravity_env.json 热重载最新端口与 token 并重试成功；
+        2) _acquire_daemon_lock 检测到锁持有者绑定的旧 ls_address 已失联、而本进程携带存活可达的新 ls_address 时，自动 SIGTERM 回收旧孤儿进程并接管单实例锁；若锁持有者宿主仍存活则正常礼让不误杀；
+        3) _queued 对未执行的 init 动作幂等合并，防止 sidecar 周期拉起时堆积重复 init 动作。
+        """
+        import socket
+        from types import SimpleNamespace
+        from sheepdog.sink.agentapi import AgentApiSink, is_ls_address_reachable, load_live_agentapi_env, save_live_agentapi_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_dir = tmp_path / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+
+            # 分配一个真实存活监听端口 (live_srv) 和一个已关闭的死端口 (dead_port)
+            live_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            live_srv.bind(("127.0.0.1", 0))
+            live_srv.listen(128)
+            self.addCleanup(live_srv.close)
+            live_addr = f"127.0.0.1:{live_srv.getsockname()[1]}"
+
+            dead_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            dead_srv.bind(("127.0.0.1", 0))
+            dead_addr = f"127.0.0.1:{dead_srv.getsockname()[1]}"
+            dead_srv.close()
+
+            self.assertTrue(is_ls_address_reachable(live_addr))
+            self.assertFalse(is_ls_address_reachable(dead_addr))
+
+            # 1) 模拟新 sidecar 启动时将存活宿主凭据写入 antigravity_env.json
+            fresh_env = {
+                "ANTIGRAVITY_AGENTAPI_EXE": "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+                "ANTIGRAVITY_LS_ADDRESS": live_addr,
+                "ANTIGRAVITY_CSRF_TOKEN": "fresh-csrf-token-101",
+            }
+            with mock.patch.dict(os.environ, fresh_env, clear=False):
+                self.assertTrue(save_live_agentapi_env(state_dir))
+
+            loaded = load_live_agentapi_env(state_dir)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["ANTIGRAVITY_LS_ADDRESS"], live_addr)
+            self.assertEqual(loaded["ANTIGRAVITY_CSRF_TOKEN"], "fresh-csrf-token-101")
+
+            # 旧常驻进程 os.environ 仍拿着 dead_addr，第一次 _call 报 connection refused，自动重载 antigravity_env.json 后第二次成功
+            stale_env = {
+                "ANTIGRAVITY_AGENTAPI_EXE": "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+                "ANTIGRAVITY_LS_ADDRESS": dead_addr,
+                "ANTIGRAVITY_CSRF_TOKEN": "stale-csrf-token-000",
+            }
+            seen_addrs: list[str] = []
+
+            def fake_run(cmd, **kwargs):
+                cur_a = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+                seen_addrs.append(cur_a)
+                if cur_a == dead_addr:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, stdout="",
+                        stderr=f'rpc error: code = Unavailable desc = "transport: Error while dialing: dial tcp {dead_addr}: connect: connection refused"',
+                    )
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout='{"response":{"sendMessage":{"ok":true}}}', stderr=""
+                )
+
+            with mock.patch.dict(os.environ, stale_env, clear=False), \
+                 mock.patch("sheepdog.sink.agentapi.subprocess.run", side_effect=fake_run):
+                sink = AgentApiSink(state_dir)
+                sink.send_message("conv_reg088", "hello after ls restart")
+                self.assertEqual(seen_addrs, [dead_addr, live_addr])
+                self.assertEqual(os.environ["ANTIGRAVITY_LS_ADDRESS"], live_addr)
+                self.assertEqual(os.environ["ANTIGRAVITY_CSRF_TOKEN"], "fresh-csrf-token-101")
+
+            # 2) 子进程持有 sheepdog.run.lock 且绑定在 dead_addr，当前进程携带 live_addr 调用 _acquire_daemon_lock 应抢占成功
+            lock_script = (
+                "import fcntl, json, sys, time\n"
+                "p = sys.argv[1]; addr = sys.argv[2]\n"
+                "f = open(p, 'a+', encoding='utf-8')\n"
+                "fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "f.seek(0); f.truncate()\n"
+                "f.write(json.dumps({'pid': __import__('os').getpid(), 'ppid': 1, 'ls_address': addr}) + '\\n')\n"
+                "f.flush()\n"
+                "print('LOCKED', flush=True)\n"
+                "time.sleep(30)\n"
+            )
+            lock_path = state_dir / "sheepdog.run.lock"
+            orphan_proc = subprocess.Popen(
+                [sys.executable, "-c", lock_script, str(lock_path), dead_addr],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda: (orphan_proc.kill(), orphan_proc.wait()) if orphan_proc.poll() is None else None)
+            self.assertEqual(orphan_proc.stdout.readline().strip(), "LOCKED")
+
+            with mock.patch.dict(os.environ, fresh_env, clear=False):
+                lk = cli._acquire_daemon_lock(state_dir)
+                self.assertIsNotNone(lk, "Expected _acquire_daemon_lock to preempt orphan holding dead ls_address")
+                try:
+                    holder_now = json.loads(lock_path.read_text(encoding="utf-8"))
+                    self.assertEqual(holder_now["pid"], os.getpid())
+                    self.assertEqual(holder_now["ls_address"], live_addr)
+                    # 且当锁持有者本身绑定在存活的 live_addr 时，另一个进程不得抢占
+                    should_p, _, _ = cli._should_preempt_stale_holder(holder_now, live_addr)
+                    self.assertFalse(should_p)
+                finally:
+                    cli._release_daemon_lock(lk)
+            orphan_proc.wait(timeout=3)
+
+            # 3) _queued 对 pending 的 init 动作幂等复用同一条记录
+            cfg = Config(state_dir=state_dir)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            args = SimpleNamespace(dry_run=False)
+            with mock.patch("sheepdog.actions.is_resident", return_value=False):
+                rc1 = cli._queued(args, store, cfg, "init", {})
+                rc2 = cli._queued(args, store, cfg, "init", {})
+            self.assertEqual(rc1, 0)
+            self.assertEqual(rc2, 0)
+            inits = [a for a in store.pending_actions() if a["kind"] == "init"]
+            self.assertEqual(len(inits), 1)
+
+            # 4) 美区生产 GCP 项目 (tpn-prod-506507) 为同事开通只读日志权限前未找 Sammy 确认合规口径，check_ask 拦截（REG-088）
+            from sheepdog import outbound
+            with self.assertRaises(outbound.OutboundError) as ctx_us:
+                outbound.check_ask_pre_flight_guard(
+                    cfg, store, "tp_kaifeng",
+                    "Kai申请生产GCP日志只读权限",
+                    "Kai申请开通tpn-prod-506507日志只读权限(roles/logging.viewer)用于排查语音丢句与延迟，建议选A\n---more---\n"
+                    "事情：Kai Feng 提请为他的 Google 账号开通 TapNow 生产 GCP 项目（tpn-prod-506507）的日志只读权限（roles/logging.viewer）。\n"
+                    "选项：\nA. 同意开通（若 matthewohmygosh 账号无该项目 IAM 权限，由主人操作或指引找 Sammy Shi 开通）\nB. 暂不开通，由专席代拉日志包\n"
+                    "建议：选 A。\n回复：打 A / B",
+                )
+            self.assertIn("tpn-prod-506507", str(ctx_us.exception))
+            self.assertIn("Sammy", str(ctx_us.exception))
+
+            # 已找 Sammy Shi 确认合规口径后放行
+            outbound.check_ask_pre_flight_guard(
+                cfg, store, "tp_kaifeng",
+                "Kai申请生产GCP日志只读权限",
+                "已向 Sammy Shi 确认美区只读合规口径，请示开通 tpn-prod-506507 日志只读权限\n---more---\n"
+                "事情：已向 Sammy Shi 确认美区只读合规口径允许开通 roles/logging.viewer（tpn-prod-506507）。\n"
+                "选项：\nA. 同意由专席按合规口径配置并回读\nB. 暂不开通\n建议：选 A。\n回复：打 A / B",
+            )
 
 
 if __name__ == "__main__":

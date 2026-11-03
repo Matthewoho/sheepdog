@@ -576,6 +576,12 @@
 | --- | --- | --- |
 | 1.0.0 | 实战暴露三类系统性体验与自治架构问题：① 专席向同事交付账号、密码、临时密码、`SecretId`/`SecretKey`、`Token`、数据库连接地址、登录 URL 或 `vless://` 订阅链接时，因 `7.70` 一刀切拦截反引号与 URL 且限制首屏 `<=3` 行/`<=100` 字，把核心交付物全部塞进默认折叠的 `---more---` 并在外层写『点开下方 more 即可复制』，不习惯展开 `more` 的同事找不到账密，且短回复把同样一句话在总结与 `more` 重复写两遍制造假 `more`；② Sheepdog 的巡检、错题本自进化、性能追踪与热升级此前依赖外部会话的临时 `schedule` Cron，别人安装 Sheepdog 时无法自带这套由 `SKILL.md` 驱动的内置自进化管家循环；③ 专席在节点满编请示新购 VPS 时未附目前总体 VPS 在用人员名单（迫使主人追问『那我去买新的 你可以再给我一次目前总体的vps在使用人员名单』），且 `observe` 误报 `tp_bus` 写 `/tmp/*.md` 临时草稿、`lamb` 日志残留 `Container ... Waiting/Healthy` 与 `"Tags": [],` 碎片（REG-087） | `test_more_card.MoreCardTest.test_7119_deliverable_credentials_first_screen_hoist_and_fake_more_dedup`、`test_version_and_observe.VersionAndObserveTest.test_7119_self_evolve_digest_and_tick_and_tmp_md_exempt_and_lamb_summary`、`test_security.GateTest.test_reg_087_new_vps_purchase_ask_requires_overall_roster_and_diagnosis` |
 
+## 1.0.1 宿主 `language_server` 重启换端口后孤儿常驻进程死锁抢占、存活 `antigravity_env.json` 凭据热重载与 `init` 动作幂等合并（REG-088）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 1.0.1 | Antigravity 的 `language_server` 重启并监听新动态端口（如 `localhost:49333` -> `localhost:52430`）后，旧 `sheepdog run` 守护进程被孤儿化（`PPID=1`）但仍持有 `sheepdog.run.lock`，其 `os.environ` 里的旧 `ANTIGRAVITY_LS_ADDRESS` 已不可达（`dial tcp 127.0.0.1:49333: connect: connection refused`），导致全部会话（`tp_kaifeng`/`tp_bus`/`tp_release`/`tp_api-resale` 等）连续 57 分钟收不到消息也无法代回飞书；而新 `language_server` 每 60s 拉起、携带正确新端口的 sidecar 在 `sheepdog init` 先塞入重复 `init` 动作后，在 `_acquire_daemon_lock` 看到旧锁就盲目礼让退出（`已有 sheepdog run 常驻进程持有单实例锁，本实例安全退出`）；同时 `tp_kaifeng` 在未向 Sammy Shi 确认美区物理跨境合规口径前发起 `ask` 请示为非美区同事开通 `tpn-prod-506507` 日志只读权限（REG-088） | `test_version_and_observe.VersionAndObserveTest.test_reg088_stale_ls_lock_preemption_and_agentapi_env_reload`（`tests/test_version_and_observe.py::VersionAndObserveTest::test_reg088_stale_ls_lock_preemption_and_agentapi_env_reload`） |
+
 
 
 

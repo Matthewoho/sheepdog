@@ -473,6 +473,14 @@ _OVERALL_VPS_ROSTER_EVIDENCE_RE = re.compile(
     r"(?=[\s\S]*\blsg1\b)(?=[\s\S]*\blsg2\b)(?=[\s\S]*\blsg3\b)(?=[\s\S]*\blsg4\b))",
     re.I,
 )
+_US_PROD_GCP_IAM_ASK_RE = re.compile(
+    r"(?=[\s\S]*\btpn-prod-506507\b)(?=[\s\S]*(?:开通|授予|赋权|申请)[^\n。]{0,36}(?:日志|只读|IAM|权限|roles/logging\.viewer|viewer))",
+    re.I,
+)
+_SAMMY_US_COMPLIANCE_CONFIRMED_RE = re.compile(
+    r"(?:已(?:向|找|经|同)\s*Sammy(?:\s*Shi)?\s*(?:确认|核实|对齐)|Sammy(?:\s*Shi)?\s*(?:已确认|已同意|已批复|回复可以))",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -550,6 +558,14 @@ def check_ask_pre_flight_guard(
             "因现有专线/住宅节点满编（0空闲）请示新购/采买 VPS 时，必须在 `---more---` 中一并附上『目前总体 VPS 在用人员名单（各节点当前占用人员明细）』"
             "（主人 2026-11-03 22:19:26 明确要求：『那我去买新的 你可以再给我一次目前总体的vps在使用人员名单』）："
             "请先从 `tp_3x-ui-ops` 或 VPS 台账拉齐当前全网各节点（如 lsg1~lsg6、res1 等）在用人员名单并附在 `---more---` 中，严禁只写『全部满编』却不附总体使用人员名单（REG-087 防打扰门禁，没有发送）",
+        )
+    if _US_PROD_GCP_IAM_ASK_RE.search(full_text) and not _SAMMY_US_COMPLIANCE_CONFIRMED_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "美区生产 GCP 项目（tpn-prod-506507）受物理跨境合规约束，默认禁止向物理上不在美国的同事个人账号直接开通访问权限"
+            "（主人 2026-11-03 23:59:27 明确指示：『这个东西得问一下 Sammy 看一下他那个只读权限可不可以给别人开，就是美区，原本定的是美区的 Project 不能用我们任何一个物理上不在美国的同事的账号去访问』）："
+            "请先通过 `sheepdog tell --to tp_sammy` 或在原群向 Sammy Shi 确认美区只读权限合规口径（或由专席代拉所需时间窗脱敏日志包交付），"
+            "严禁未向 Sammy 核实合规口径前发 ask 让主人拍板或写『由主人操作』（REG-088 防打扰门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return

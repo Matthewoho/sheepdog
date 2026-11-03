@@ -4,7 +4,7 @@ receipt / session-reset / work / tell / board / notices / ask / report / resolve
 """
 from __future__ import annotations
 
-import argparse, fcntl, json, logging, os, re, shutil, subprocess, sys, time, tomllib, uuid
+import argparse, fcntl, json, logging, os, re, shutil, signal, subprocess, sys, time, tomllib, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,7 +25,8 @@ from .prompts import with_cli
 from .roster import Roster, RosterError, check_hosts, load_roster
 from .security import HOLD, TAG, SecurityConfig, SecurityError, load_security
 from .sink import SinkError
-from .sink.agentapi import AgentApiSink, DryRunSink, transcript_contains, transcript_path
+from .sink.agentapi import (AgentApiSink, DryRunSink, is_ls_address_reachable, save_live_agentapi_env,
+                            transcript_contains, transcript_path)
 from .sink.claude import ClaudeSink
 from .sink.codex import CodexSink, codex_home
 from .sink.codex_profile import ProfileError, profile_overrides
@@ -179,7 +180,7 @@ def _group_source(source, args):
 
 def _sinks(cfg, store: Store, dry: bool) -> dict:
     """按宿主建 sink（7.18）：sink = dryrun 只管 Antigravity；--dry-run 一律打印。没启用的宿主不建。"""
-    sinks: dict = {ANTIGRAVITY: DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink()}
+    sinks: dict = {ANTIGRAVITY: DryRunSink() if dry or cfg.sink == "dryrun" else AgentApiSink(cfg.state_dir)}
     for h in CLI_HOSTS:
         if cfg.hosts[h].enabled:
             sinks[h] = DryRunSink(h) if dry else SINK_CLASSES[h](cfg.hosts[h], store, cfg.runs_dir)
@@ -556,23 +557,92 @@ def cmd_upgrade(args, *, repo_dir: Path | None = None) -> int:
         store.close()
 
 
+def _read_lock_holder(lock_path: Path) -> dict:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+        data = json.loads(raw) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _should_preempt_stale_holder(holder: dict, cur_ls: str) -> tuple[bool, int, str]:
+    """当新启动的常驻进程携带存活可达的 ANTIGRAVITY_LS_ADDRESS，而锁持有者的 ls_address 已死且不同时，抢占孤儿锁（REG-088）。"""
+    cur_ls = (cur_ls or "").strip()
+    if not cur_ls or not is_ls_address_reachable(cur_ls):
+        return False, 0, ""
+    try:
+        old_pid = int(holder.get("pid") or 0)
+    except (TypeError, ValueError):
+        old_pid = 0
+    if old_pid <= 0 or old_pid == os.getpid():
+        return False, 0, ""
+    old_ls = str(holder.get("ls_address") or "").strip()
+    if old_ls == cur_ls:
+        return False, old_pid, old_ls
+    if old_ls and is_ls_address_reachable(old_ls):
+        return False, old_pid, old_ls
+    return True, old_pid, old_ls
+
+
 def _acquire_daemon_lock(state_dir: Path):
-    """常驻进程单实例内核级排他锁（7.69 REG-008）：
+    """常驻进程单实例内核级排他锁（7.69 REG-008 / 1.0.1 REG-088）：
     对 state_dir / 'sheepdog.run.lock' 加非阻塞 LOCK_EX | LOCK_NB。
-    若已被另一个常驻进程持有，返回 None；成功则返回打开的文件对象（随进程生命周期保持打开）。
+    若已被另一个常驻进程持有：当本进程携带存活的 ANTIGRAVITY_LS_ADDRESS 且旧持有者宿主端口已失联时，
+    自动终止旧孤儿常驻进程并接管单实例锁；否则返回 None。成功则返回打开的文件对象（随进程生命周期保持打开）。
     """
     state_dir.mkdir(parents=True, exist_ok=True)
+    save_live_agentapi_env(state_dir)
     lock_path = state_dir / "sheepdog.run.lock"
     f = open(lock_path, "a+", encoding="utf-8")
+    cur_ls = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
     try:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
-        f.close()
-        return None
+        holder = _read_lock_holder(lock_path)
+        preempt, old_pid, old_ls = _should_preempt_stale_holder(holder, cur_ls)
+        if not preempt:
+            f.close()
+            return None
+        logging.warning(
+            "检测到旧常驻进程 pid=%s 绑定的宿主 (%s) 已失联，当前新宿主 (%s) 可达，正在接管单实例锁",
+            old_pid,
+            old_ls or "unknown",
+            cur_ls,
+        )
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        acquired = False
+        deadline = time.monotonic() + 3.0
+        killed_hard = False
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if not killed_hard and deadline - time.monotonic() < 1.0:
+                    killed_hard = True
+                    try:
+                        os.kill(old_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+        if not acquired:
+            f.close()
+            return None
     try:
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({"pid": os.getpid(), "ppid": os.getppid(), "started_at": now_iso()}, ensure_ascii=False) + "\n")
+        f.write(
+            json.dumps(
+                {"pid": os.getpid(), "ppid": os.getppid(), "ls_address": cur_ls, "started_at": now_iso()},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         f.flush()
     except OSError:
         pass
@@ -949,9 +1019,15 @@ def cmd_poll(args) -> int:
 
 
 def _queued(args, store: Store, cfg, kind: str, payload: dict) -> int | None:
-    """不在常驻进程里、又不是 --dry-run：入队并返回退出码 0；否则返回 None 表示本地执行（7.12）。"""
+    """不在常驻进程里、又不是 --dry-run：入队并返回退出码 0；否则返回 None 表示本地执行（7.12 / 1.0.1 REG-088）。"""
     if getattr(args, "dry_run", False) or actions.is_resident():
         return None
+    if kind == "init":
+        existing = [a for a in store.pending_actions() if a["kind"] == "init"]
+        if existing:
+            aid = existing[0]["id"]
+            print(f"动作 #{aid}（{kind}）{with_cli(actions.QUEUED_HINT, cfg.cli_command)}")
+            return 0
     aid = actions.enqueue(store, kind, payload)
     print(f"动作 #{aid}（{kind}）{with_cli(actions.QUEUED_HINT, cfg.cli_command)}")
     return 0
@@ -1156,6 +1232,8 @@ def cmd_inbox_clear(args) -> int:
 
 def cmd_init(args) -> int:
     cfg, store, _source, sink, roster, security = _build(args)
+    if not getattr(args, "dry_run", False):
+        save_live_agentapi_env(cfg.state_dir)
     if (rc := _queued(args, store, cfg, "init", {})) is not None:
         return rc
     if args.dry_run:
