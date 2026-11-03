@@ -1849,6 +1849,131 @@ class GateTest(Base):
             )
         )
 
+    def test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards(self):
+        """REG-085（7.117）：
+        1. 已投递消息编辑后再次被轮询拉取时，_handle_change 先经 _unwrap_edited_content 解包最新正文幂等比对，
+           不递归套娃『（已编辑）旧：（已编辑）旧：...』、不重复标回 pending 轰炸会话；已撤回消息再次轮询时不覆写丢掉『（已撤回）原文：...』；
+        2. _summarize_cli_lamb_log 在 CLI 羔羊成功结束时过滤中间轮询行『poll N: build ... status=WORKING/QUEUED/PENDING』，
+           确保首屏摘要直接展示最终 status=SUCCESS 与 JSON(ok=True, ...)；
+        3. 内部同学切换办公专线 / VPS 出口 IP 申请数据库白名单（Cloud SQL / ADB / RDS）前，必须先向 tp_3x-ui-ops 拉齐整套 VPS 出口 IP 清单并协调 Nicky 老师全量数据库一次性加白；
+        4. 老胡（laohu / Andy Hu）的需求（含助理代发待老胡本人确认）属于 VIP 预授权范围，拦截把『助理代发 / 待老胡本人确认』推给主人拍板。"""
+        from sheepdog import engine, outbound
+
+        # (1) 编辑消息重扫幂等与单层解包 + 撤回消息重扫不丢原文
+        self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                       sender_id="ou_test_jerry", sender_name="Jerry", content="<p>@Andy Hu k可以的</p>")])
+        self.d.dispatch_once()
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+        self.assertEqual(self.store.get_message("om_test_edit_loop")["dispatch_state"], "acked")
+
+        # 第一次真实编辑：<p>@Andy Hu k可以的</p> -> <p>@Andy Hu 可以的</p>
+        st1 = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                             sender_id="ou_test_jerry", sender_name="Jerry", content="<p>@Andy Hu 可以的</p>", updated=True)])
+        self.assertEqual(st1["changed"], 1)
+        row1 = self.store.get_message("om_test_edit_loop")
+        self.assertEqual(row1["content"], "（已编辑）旧：<p>@Andy Hu k可以的</p>\n新：<p>@Andy Hu 可以的</p>")
+        self.assertEqual(row1["dispatch_state"], "pending")
+
+        # 尚未投递前再次被轮询拉取同一编辑内容：changed=0，保持 pending 与单层『（已编辑）旧：』不被冲掉
+        st2 = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                             sender_id="ou_test_jerry", sender_name="Jerry", content="<p>@Andy Hu 可以的</p>", updated=True)])
+        self.assertEqual(st2["changed"], 0)
+        self.assertEqual(self.store.get_message("om_test_edit_loop")["content"], "（已编辑）旧：<p>@Andy Hu k可以的</p>\n新：<p>@Andy Hu 可以的</p>")
+
+        # 投递并 ack 后，后续 3 次轮询重扫同一编辑内容：changed 均为 0，绝不套娃『（已编辑）旧：（已编辑）旧：』，绝不重新入队 pending
+        self.d.dispatch_once()
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+        for _ in range(3):
+            st_repoll = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                                       sender_id="ou_test_jerry", sender_name="Jerry", content="<p>@Andy Hu 可以的</p>", updated=True)])
+            self.assertEqual(st_repoll["changed"], 0)
+            row_after = self.store.get_message("om_test_edit_loop")
+            self.assertEqual(row_after["dispatch_state"], "acked")
+            self.assertEqual(row_after["content"], "（已编辑）旧：<p>@Andy Hu k可以的</p>\n新：<p>@Andy Hu 可以的</p>")
+
+        # 若用户真正发生第二次编辑：只保留单层『（已编辑）旧：<上次正文>\n新：<本次正文>』
+        st_edit2 = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                                  sender_id="ou_test_jerry", sender_name="Jerry", content="<p>@Andy Hu 可以的，已确认</p>", updated=True)])
+        self.assertEqual(st_edit2["changed"], 1)
+        self.assertEqual(
+            self.store.get_message("om_test_edit_loop")["content"],
+            "（已编辑）旧：<p>@Andy Hu 可以的</p>\n新：<p>@Andy Hu 可以的，已确认</p>",
+        )
+
+        # 撤回后再次轮询返回 [Invalid text JSON]：changed=0，保留『（已撤回）原文：...』不被覆写
+        self.d.dispatch_once()
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+        st_rec = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                                sender_id="ou_test_jerry", sender_name="Jerry", content="[Invalid text JSON]", deleted=True)])
+        self.assertEqual(st_rec["changed"], 1)
+        self.assertEqual(self.store.get_message("om_test_edit_loop")["content"], "（已撤回）原文：<p>@Andy Hu 可以的，已确认</p>")
+        st_rec_repoll = self.poll([msg(message_id="om_test_edit_loop", chat_type="p2p", chat_id="oc_test_alpha_p2p",
+                                       sender_id="ou_test_jerry", sender_name="Jerry", content="[Invalid text JSON]", deleted=True)])
+        self.assertEqual(st_rec_repoll["changed"], 0)
+        self.assertEqual(self.store.get_message("om_test_edit_loop")["content"], "（已撤回）原文：<p>@Andy Hu 可以的，已确认</p>")
+
+        # 历史已经套了 5 层的脏数据解包验证
+        dirty_5 = (
+            "（已编辑）旧：" * 5
+            + "<p>@Andy Hu k可以的</p>"
+            + "\n新：<p>@Andy Hu 可以的</p>" * 5
+        )
+        self.assertEqual(engine._unwrap_edited_content(dirty_5), ("<p>@Andy Hu k可以的</p>", "<p>@Andy Hu 可以的</p>"))
+
+        # (2) CLI 羔羊日志摘要过滤中间 poll N: ... status=WORKING 行
+        sample_lamb_log = (
+            "[chat-service] poll 10: build 58073244-aaec-42a2-8d41-02bc2c375215 status=WORKING\n"
+            "[chat-service] poll 11: build 58073244-aaec-42a2-8d41-02bc2c375215 status=WORKING\n"
+            "[chat-service] poll 12: build 58073244-aaec-42a2-8d41-02bc2c375215 status=SUCCESS\n"
+            "[chat-service-worker] poll 13: build 99073244-aaec-42a2-8d41-02bc2c375299 status=WORKING\n"
+            '{\n  "ok": true,\n  "lane_id": "lane_1_202611030032",\n  "completed_layers": 1\n}\n'
+        )
+        lamb_sum, lamb_err = engine._summarize_cli_lamb_log(sample_lamb_log)
+        self.assertFalse(lamb_err)
+        self.assertNotIn("status=WORKING", lamb_sum)
+        self.assertIn("status=SUCCESS", lamb_sum)
+        self.assertIn("JSON(ok=True, lane_id=lane_1_202611030032, completed_layers=1)", lamb_sum)
+
+        # (3) 专线 / VPS 出口 IP 申请数据库白名单（Cloud SQL / ADB）单点散装 ask 防打扰门禁
+        with self.assertRaises(outbound.OutboundError) as ctx_db:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "Carl申请生产Cloud SQL白名单",
+                "Carl Pan 切换新专线（lsg6）申请将本机出口 IP 192.220.99.55/32 加入生产 Cloud SQL 白名单。\n"
+                "选项：\nA. 同意追加该单点 IP 到生产白名单\nB. 暂缓追加\n建议：选 A",
+            )
+        self.assertIn("REG-085", str(ctx_db.exception))
+        self.assertIn("tp_3x-ui-ops", str(ctx_db.exception))
+        self.assertIn("Nicky", str(ctx_db.exception))
+
+        # 已向 tp_3x-ui-ops 拉齐整套 VPS 清单或联系 Nicky 后放行
+        outbound.check_ask_pre_flight_guard(
+            self.cfg,
+            self.store,
+            "tp_alpha",
+            "生产Cloud SQL全套14台VPS白名单拉齐确认",
+            "已向 tp_3x-ui-ops 核实拉齐全部 14 台专线 VPS 出口 IP 清单并同步 Nicky 老师在 ADB 一次性加上。\n"
+            "选项：\nA. 同意将全套 14 台 VPS 出口 IP 一次性加入生产 Cloud SQL\nB. 暂缓\n建议：选 A",
+        )
+
+        # (4) 老胡（laohu / Andy Hu）助理代发或本人确认需求预授权防打扰门禁
+        with self.assertRaises(outbound.OutboundError) as ctx_lh:
+            outbound.check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_alpha",
+                "FE-1657 国内Web双发腾讯云与GitHub密钥权限配置",
+                "老胡助理代发（Claude 代 panda 发）国内双发流水线与站点清单，申请在腾讯云国内主账号创建存储桶与配置。\n"
+                "选项：\nA. 同意在老胡本人确认后按清单完成配置\nB. 暂不配置\n建议：选 A",
+            )
+        self.assertIn("REG-085", str(ctx_lh.exception))
+        self.assertIn("laohu 的需求 只要经过他本人确认 你就给他弄", str(ctx_lh.exception))
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1966,6 +2091,7 @@ class SecurityCliTest(GateTest):
     test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards = None
     test_reg_083_ask_missing_options_test_iam_autonomy_report_ask_misuse_and_ingest_ack_first_seen = None
     test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done = None
+    test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards = None
 
 
 if __name__ == "__main__":

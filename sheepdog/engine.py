@@ -1397,7 +1397,7 @@ class Collector:
     def _owner_edit(self, old, m: Message, recalled: bool) -> None:
         if not self._owner_context_wanted(m):
             return
-        old_text = old["content"] or ""
+        _, old_text = _unwrap_edited_content(old["content"] or "")
         if is_agent_reply(old_text, self.cfg.owner_context):
             return  # 原文是会话代回的
         ref = row_to_message(old)   # 话题 / 引用以账本里那份为准（编辑通知不一定带全）
@@ -2340,9 +2340,13 @@ class Collector:
         return "\n".join(lines)
 
     def _handle_change(self, old, m: Message, ctx: RouteContext) -> bool:
-        """编辑 / 撤回：按原消息的路由级别处理（设计稿 2.2.1）。返回是否有变化。"""
-        content_changed = (old["content"] or "") != (m.content or "")
-        recalled = m.deleted and not old["deleted"]
+        """编辑 / 撤回：按原消息的路由级别处理（设计稿 2.2.1 / 7.117 REG-085）。返回是否有变化。"""
+        if old["deleted"] and m.deleted:
+            return False
+        orig_old, latest_old = _unwrap_edited_content(old["content"] or "")
+        incoming_new = m.content or ""
+        recalled = bool(m.deleted and not old["deleted"])
+        content_changed = (not m.deleted) and (latest_old != incoming_new)
         if not content_changed and not recalled:
             return False
         me = self.cfg.self_open_id
@@ -2360,16 +2364,23 @@ class Collector:
         if old_route == DISPATCH and old_state in ("delivered", "acked", "missed"):
             # 已推送过：通知原来那个 session（topic_id 不变；撤回附原文，编辑附新内容）
             if recalled:
-                m.content = f"（已撤回）原文：{old['content']}"
+                m.content = f"（已撤回）原文：{latest_old}"
             else:
-                m.content = f"（已编辑）旧：{old['content']}\n新：{m.content}"
+                m.content = f"（已编辑）旧：{latest_old}\n新：{incoming_new}"
             self.store.update_content(m.message_id, m, DISPATCH, "recalled" if recalled else "edited", "pending")
             if me and m.sender_id == me and m.chat_id in self.cfg.owner_chat_ids:
                 self._echo_record(m, "recalled" if recalled else "edited")   # 7.52：主人改口 / 撤回，重新记账
             self._secure(m.message_id)  # 编辑后重新判定：改成危险内容会被拉回总线
         elif old_route == DISPATCH:
-            # 尚未投递：直接更新内容，并重新判定
-            self.store.update_content(m.message_id, m)
+            # 尚未投递：直接更新内容，并重新判定（若此前已处于 edited / recalled 待推态，保留单层包装防止丢原文）
+            if recalled:
+                m.content = f"（已撤回）原文：{orig_old}"
+                self.store.update_content(m.message_id, m, DISPATCH, "recalled", "pending")
+            elif old["reason"] == "edited":
+                m.content = f"（已编辑）旧：{orig_old}\n新：{incoming_new}"
+                self.store.update_content(m.message_id, m)
+            else:
+                self.store.update_content(m.message_id, m)
             self._secure(m.message_id)
         else:
             # Inbox / drop：重新路由，若升级为直推则投递
@@ -6295,11 +6306,32 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
 
 
 _GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", re.M)
+_INTERMEDIATE_POLL_LINE_RE = re.compile(r"\bpoll\s+\d+\s*:.*\bstatus=(?:WORKING|QUEUED|PENDING)\b", re.I)
+_EDITED_PREFIX = "（已编辑）旧："
+_RECALLED_PREFIX = "（已撤回）原文："
+
+
+def _unwrap_edited_content(text: str) -> tuple[str, str]:
+    """7.117（REG-085）：从可能包裹了单层或多层『（已编辑）旧：...\\n新：...』或『（已撤回）原文：...』的账本正文中，
+    还原出 (原始旧正文, 最新正文)。用于 _handle_change 幂等比对与单层差异构造，防止轮询重扫造成递归套娃与重复投递风暴。"""
+    s = text or ""
+    while s.startswith(_RECALLED_PREFIX):
+        s = s[len(_RECALLED_PREFIX):]
+    depth = 0
+    while s.startswith(_EDITED_PREFIX):
+        s = s[len(_EDITED_PREFIX):]
+        depth += 1
+    if depth == 0:
+        return s, s
+    parts = s.rsplit("\n新：", depth)
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return s, s
 
 
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
-    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
-    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音及已恢复 JSON 前的中间 Traceback 行。"""
+    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
+    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行及中间轮询 status=WORKING 行。"""
     if not raw_text:
         return "", False
     non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -6342,8 +6374,9 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                             if not ln.startswith(("Traceback", 'File "', "raise "))
                             and not re.match(r"^[~^]{2,}$", ln)
                             and not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):", ln)
+                            and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
                         ]
-                    prefix_lines = raw_prefix[-2:]
+                    prefix_lines = raw_prefix[-1:] if not has_err else raw_prefix[-2:]
                     priority_keys = (
                         "ok", "status", "id", "build_id", "lane_id", "service", "target_runtime",
                         "latestReadyRevisionName", "revisionName", "completed_layers", "url", "error",
@@ -6368,6 +6401,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             ln for ln in meaningful
             if not _GREP_MATCH_LINE_RE.match(ln)
             and not ln.startswith(("STDERR: ERROR:", "ERROR: (gcloud."))
+            and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
         ]
         if non_grep:
             meaningful = non_grep

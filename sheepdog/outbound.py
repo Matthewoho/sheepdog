@@ -413,6 +413,24 @@ _LOCAL_TCCLI_CHECK_EVIDENCE_RE = re.compile(
     r"(?:~/\.tccli|\.tccli/|tencent-cn\.credential|tccli\s+凭据|本机\s*(?:tccli|腾讯云主账号)\s*凭据)",
     re.I,
 )
+_VPS_DB_WHITELIST_SINGLE_IP_ASK_RE = re.compile(
+    r"(?:(?:专线|本机出口\s*IP|出口\s*IP|lsg\d+|Titan|家宽)[\s\S]{0,220}"
+    r"(?:Cloud\s*SQL|AlloyDB|ADB|RDS|数据库[^\n。]{0,16}白名单|授权网络|authorized\s*networks)"
+    r"|(?:Cloud\s*SQL|AlloyDB|ADB|RDS|数据库[^\n。]{0,16}白名单)[\s\S]{0,220}"
+    r"(?:专线|本机出口\s*IP|出口\s*IP|lsg\d+|Titan|家宽))",
+    re.I,
+)
+_VPS_FLEET_WHITELIST_EVIDENCE_RE = re.compile(
+    r"(?:tp_3x-ui-ops|3x-ui[\s\S]{0,36}(?:全量|全部|全套|14\s*台|清单)|"
+    r"(?:全量|全部|全套)\s*(?:需要加白的\s*)?(?:专线|VPS)\s*(?:出口\s*)?IP\s*清单|"
+    r"Nicky|tp_nicky)",
+    re.I,
+)
+_LAOHU_PROXY_OR_CONFIRMED_ASK_RE = re.compile(
+    r"(?:老胡|laohu|Andy\s*Hu)[\s\S]{0,260}"
+    r"(?:助理代发|Claude\s*代[^\n。]{0,16}发|在老胡本人确认后|待老胡本人确认|老胡本人确认)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -427,7 +445,7 @@ def check_ask_pre_flight_guard(
     floor_type: str | None = None,
     options: str = "",
 ) -> None:
-    """7.108 / 7.110 / 7.113 / 7.114 / 7.115（REG-076 / REG-078 / REG-081 / REG-082 / REG-083）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110 / 7.113 / 7.114 / 7.115 / 7.116 / 7.117（REG-076 / REG-078 / REG-081 / REG-082 / REG-083 / REG-084 / REG-085）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     0. 发起待拍板 ask 卡片（含写明『建议选 A』或启用聚合台/白话总结折叠模式）时，必须提供至少 2 个可解析的 A/B 互斥选项，严禁发无选项按钮的空头决策卡；
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
     2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
@@ -437,7 +455,9 @@ def check_ask_pre_flight_guard(
     6. 请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先与该单技术负责人（如 tp_laohu）核对；
     7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示；
     8. 测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator）属于预授权测试环境操作，拦截向主人 ask 请示；
-    9. 因腾讯云子账号权限不足（UnauthorizedOperation）请示主人登录控制台创建 API Key / 资源前，必须先核查本机 ~/.tccli/ 下的主账号凭据（如 tencent-cn.credential）。"""
+    9. 因腾讯云子账号权限不足（UnauthorizedOperation）请示主人登录控制台创建 API Key / 资源前，必须先核查本机 ~/.tccli/ 下的主账号凭据（如 tencent-cn.credential）；
+    10. 内部同学因切换办公专线 / VPS 出口 IP 申请数据库白名单（Cloud SQL / AlloyDB / ADB / RDS）前，必须先向 tp_3x-ui-ops 拉齐整套 VPS 出口 IP 清单并协调 Nicky 老师（tp_nicky）全量数据库一次性加白，严禁按单人单 IP 散装打扰；
+    11. 老胡（laohu / Andy Hu）的需求（含助理代发待老胡本人确认）属于 VIP 预授权范围（『laohu 的需求 只要经过他本人确认 你就给他弄』），先向老胡本人确认后直接执行并 report，严禁未触及 3 条底线就向主人 ask。"""
     from . import decision_hub
     from .card_callback import _DISABLED_SPECS, _MORE_LINE_RE, parse_ask_options
 
@@ -457,6 +477,24 @@ def check_ask_pre_flight_guard(
             )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
+    if _VPS_DB_WHITELIST_SINGLE_IP_ASK_RE.search(full_text) and not _VPS_FLEET_WHITELIST_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部同学切换办公专线 / VPS 出口 IP 申请数据库白名单（Cloud SQL / AlloyDB / 阿里云 ADB / RDS）时，严禁按单人单 IP 散装发起 ask"
+            "（主人 2026-11-03 18:16:54 明确指示：『你可以整理一全套的需要加白的ip的vps清单让nicky老师所有数据库都一次性加上 别动不动烦别人』）："
+            "请先通过 `sheepdog tell --to tp_3x-ui-ops` 拉齐当前全套需要加白的办公专线 VPS 出口 IP 清单（14 台节点），"
+            "整理成完整清单后请 Nicky 老师（`tp_nicky`）所有数据库一次性加上，并在完成后用 `sheepdog report` 报备（REG-085 防打扰门禁，没有发送）",
+        )
+    if _LAOHU_PROXY_OR_CONFIRMED_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "老胡（laohu / Andy Hu）的需求属于 VIP 预授权范围"
+            "（主人 2026-11-03 18:18:00 明确指示：『laohu 的需求 只要经过他本人确认 你就给他弄』）："
+            "① 若消息由老胡的 AI 助理代发（如 Claude 代发 / ✦ 前缀）尚未经老胡本人确认，请先直接用 `sheepdog reply` 在原会话向老胡本人确认是否执行，"
+            "严禁把『助理代发 / 待老胡本人确认』推给主人拍板；"
+            "② 一旦经老胡本人确认，除触及 3 条硬底线（`--floor-type credentials|destructive|vip_conflict`）外，"
+            "请直接按需求闭环执行并在完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（REG-085 防打扰门禁，没有发送）",
+        )
     if _TENCENT_MAIN_ACCOUNT_CONSOLE_ASK_RE.search(full_text) and not _LOCAL_TCCLI_CHECK_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,

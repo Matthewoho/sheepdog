@@ -558,6 +558,12 @@
 | --- | --- | --- |
 | 7.116 | 实战中暴露四类系统性摩擦：① 专席名下有 `--key T-42` 未决提问（`om_test_kc_meeting_ask`，`kc提议测试团队介入与今晚开会对齐`，`--about om_test_about_meeting`）时，再发另一件新事 `--key T-42 --about om_test_about_ags`（`kc申请腾讯云AGS沙箱API Key`）被 `try_patch_open_ask` 误把原未答提问覆盖掉，且 `cli.cmd_ask` 因 `already=True` 误报『`之前已经发过同样的内容（防重编号相同，这次没再发）`』，诱使专席 6 秒后换 `--key tencent-ags-apikey` 再发第 2 张同源重复卡（`om_test_kc_ags_dup_ask`）；② 专席遇腾讯云子账号 `UnauthorizedOperation` 时未先检查本机 `~/.tccli/tencent-cn.credential` 主账号凭据，就发 `ask` 让主人手工登录控制台建 Key；③ 主人在私聊回复『`正在开会，稍后联系你。`』『`啥事你先总结一下我在开会`』被 `pending.detect` 误标 `possibly_handled_reason = 'owner_spoke'` 并触发虚假唤醒；④ 专席调用 `sheepdog resolve` 结案后 8 秒内调 `sheepdog receipt` 被误拦『`死球真空（work_items 中有 waiting_owner 事项）`』，因 `close_auto_work` 仅在守护进程 60s 周期运行而未在 `resolve` 时即时收口（REG-084） | `test_security.GateTest.test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done`（`tests/test_security.py::GateTest::test_reg_084_patch_in_place_same_about_dedup_tccli_guard_busy_defer_filter_and_resolve_work_done`） |
 
+## 7.117 编辑/撤回消息重扫解包幂等防递归套娃与重复投递风暴、CLI 羔羊 `status=WORKING` 中间轮询行过滤、专线 VPS 数据库白名单全量拉齐门禁与老胡（`laohu`）本人确认需求预授权门禁（REG-085）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.117 | 实战巡检暴露四类系统性缺陷：① 已投递消息在飞书被编辑一次后，`messages.content` 被覆写为『`（已编辑）旧：A\n新：B`』，导致后续每次轮询重扫时 `old["content"] != m.content`（`B`）恒成立，将同一条编辑消息递归套娃成 5 层『`（已编辑）旧：（已编辑）旧：...`』并连续 6 个批次（`b20261103183354`～`b20261103183741`）反复重投轰炸目标会话，且已撤回消息二次轮询时被 `[Invalid text JSON]` 覆写冲掉原文；② `_summarize_cli_lamb_log` 在 CLI 羔羊成功结束时把倒数第 2 行『`[service] poll N-1: build ... status=WORKING`』拼在最前，导致 140 字截断视图下已完工羔羊全部显示为 `status=WORKING`；③ 内部同学切换办公专线申请数据库白名单（Cloud SQL / ADB）时，专席未先找 `tp_3x-ui-ops` 拉齐 14 台全套 VPS 出口 IP 清单请 Nicky 老师一次性加白，而是按单人单 IP 散装发 `ask`；④ 老胡（`laohu`）AI 助理代发需求时，专席未先在原会话找老胡本人确认后直办，而是发 `ask` 让主人拍板『同意在老胡本人确认后执行』（REG-085） | `test_security.GateTest.test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards`（`tests/test_security.py::GateTest::test_reg_085_edited_recalled_idempotency_cli_lamb_poll_filter_and_vps_db_laohu_guards`） |
+
 
 
 
