@@ -528,6 +528,13 @@
 | --- | --- | --- |
 | 7.111 | 主人在飞书私聊或群内向总线（`tp_bus`）发消息询问进展或下达指令（`reason in {"owner_instruction", "owner_reply"}`，如 `om_test_owner_ask_kai`：『kai说的那个cinemap-stage.tapnow.tv那个事情 怎么样了 卡在哪』）时，`tp_bus` 既未 `sheepdog forward` 转交负责专席（`tp_kaifeng`），也未发任何飞书卡片（`ask`/`report`/`reply`），而是私自读取 SQLite 历史 `lambs` 后只在本机 Antigravity IDE 聊天面板里打字输出并交 `handled` 回执（『直接在会话中完整答复』），叠加 `owner_relay_after_minutes=5` 延迟导致主人在飞书上苦等 2 分钟毫无反应被迫追问『hello？』；随后 `tp_bus` 又慌忙调用 `sheepdog report --topic tp_bus --key cinemap-stage-compliance --ball doing`，既报了过时的二道贩子结论又把 `owner_threads` 业务话题锁死在 `tp_bus` 名下（REG-079） | `test_security.GateTest.test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing`（`tests/test_security.py::GateTest::test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing`） |
 
+## 7.112 统一 `pending.detect`（可能已处理 / 主人点表情）与 `resolve` / `track done` / `work done` 结案证据源、主理人亲自办结（`我直接撤回了`）采纳识别与 `lark-cli` `[WARN]` 前缀离线恢复自愈（REG-080）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.112 | 主人对来源消息点 `👌` 表情触发 `pending.detect`（标记 `possibly_handled_at`）并派发 `escalation_check` 唤醒专席（如 `tp_kaifeng`）核实结案后，专席调用 `sheepdog resolve`（不带 `--quote` 或带 `--quote <来源消息ID>`）均被 `decision_hub.verify_resolve_allowed` 拒绝（因其只查 `messages` 表未认领 `possibly_handled_at` 与 `owner_reactions`），随后专席退而调用 `sheepdog track done` 与 `sheepdog work done` 又未同步关闭同钥匙下已有『可能已处理』证据的 `escalations` 与聚合台卡片，逼得主人在聚合台手动点 `[其他] 我直接撤回了`；且 `classify_escalation` 把『我直接撤回了』误判为 `overridden`（`option_or_schedule_redirect`）；以及本机离线期间 `lark-cli` 输出 `[lark-cli] [WARN] uat-client: refresh attempt ... no such host` 前缀导致 `json.loads` 报 `SourceError: lark-cli 输出无法解析` 且网络恢复后 `observe` 未归入已自愈网络抖动（REG-080） | `test_security.GateTest.test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery`（`tests/test_security.py::GateTest::test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery`） |
+
+
 
 
 

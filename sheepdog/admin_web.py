@@ -45,7 +45,9 @@ _EMOJI_STRIP_RE = re.compile(
 _BOILERPLATE_RE = re.compile(r"ljl/matthew|P1-P8|MER-108|护栏正常", re.I)
 _OPTION_LINE_RE = re.compile(r"(?:^|\n)\s*([A-E])[\s:：.、)\]]+([^\n]{1,120})")
 _RECOMMEND_RE = re.compile(
-    r"(?:建议|推荐|优先|默认)[ \t]*(?:选|选择|按|走|用)?[ \t:`*「『（(]*([A-E])\b|([A-E])[ \t:：.、)\]]+[^\n]{0,60}\(\s*Recommended\s*\)",
+    r"(?:^|\n)\s*[*#-]*\s*(?:建议|推荐)\s*\**[ \t:：]*(?:优先|先)?(?:选|选择|按|走|用|采纳|方案|选项)*[ \t:：`*「『（(]*([A-E])(?![a-zA-Z0-9])"
+    r"|(?:建议|推荐)[ \t:：]*(?:优先|先)?(?:选|选择|采纳方案)[ \t:`*「『（(]*([A-E])(?![a-zA-Z0-9])"
+    r"|(?:^|\n)\s*([A-E])[ \t:：.、)\]]+[^\n]{0,80}[（(\[]\s*(?:Recommended|推荐)\s*[）)\]]",
     re.I,
 )
 _CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:]\s*(.*)", re.S)
@@ -53,6 +55,7 @@ _CHOICE_PREFIX_RE = re.compile(r"^\[(?:[A-E]|其他)\]\s*", re.I)
 _ACCEPT_WORDS_RE = re.compile(
     r"(?:^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
     r"|直接配|直接弄|帮我弄|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理|18点(?:执行|再动)"
+    r"|(?:我(?:已经|直接|自己|刚)?(?:撤回|删掉|删除|处理|弄好|发过|改好|搞定)了?|已(?:直接)?撤回)"
     r"|\bwsurl\s*[:=]|\bkey\s*[:=].*\bsecret\s*[:=])",
     re.I,
 )
@@ -453,7 +456,7 @@ def classify_escalation(row: sqlite3.Row | dict, answer_content: str = "", ask_f
     rec_match = _RECOMMEND_RE.search(text)
     recommended = ""
     if rec_match:
-        recommended = (rec_match.group(1) or rec_match.group(2) or "A").upper()
+        recommended = (rec_match.group(1) or rec_match.group(2) or rec_match.group(3) or "A").upper()
     elif options:
         recommended = "A"
 

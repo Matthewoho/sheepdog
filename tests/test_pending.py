@@ -742,7 +742,7 @@ FROZEN_NOW = datetime(2026, 10, 16, 15, 0, tzinfo=TZ8)
 
 def frozen_clock(test, now: datetime) -> None:
     """把测试里造数据的「现在」（test_threads.now8、本文件的 now8）和牧羊犬判断用的「现在」（engine._now）都钉在 now。"""
-    for target in ("test_threads.now8", "test_pending.now8"):
+    for target in ("test_threads.now8", f"{__name__}.now8"):
         p = mock.patch(target, return_value=now.replace(second=0, microsecond=0))
         p.start()
         test.addCleanup(p.stop)
@@ -844,7 +844,7 @@ class OwnerPendingTest(PendingBase):
         self.store.conn.execute("UPDATE messages SET create_time=? WHERE message_id=?",
                                 ("2026-10-16T23:54:00+08:00", a))
         self.store.conn.commit()
-        with mock.patch("test_threads.now8", return_value=self.clock), mock.patch("test_pending.now8", return_value=self.clock):
+        with mock.patch("test_threads.now8", return_value=self.clock), mock.patch(f"{__name__}.now8", return_value=self.clock):
             self.asked("--about", a, "--key", "T748", title="跨天")
         text, card = pend.owner_list(self.cfg, self.store, self.clock + timedelta(minutes=5))
         item = next(e for e in self.els(card) if e.startswith("**1. "))

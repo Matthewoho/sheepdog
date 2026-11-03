@@ -516,7 +516,20 @@ def run_observe(
             for l in raw_errs:
                 if (dispatch_fresh and last_dispatch and l[:19] < last_dispatch[:19]
                         and "ERROR 本轮失败（下一轮从水位线续跑）: SourceError:" in l
-                        and any(k in l for k in ("network/transport:", "timed out", "timeout", "EOF", "connection reset"))):
+                        and any(k in l for k in (
+                            "network/transport:",
+                            "timed out",
+                            "timeout",
+                            "EOF",
+                            "connection reset",
+                            "no such host",
+                            "uat-client: refresh attempt",
+                            "token refresh request failed",
+                            "network is unreachable",
+                            "no route to host",
+                            "connection refused",
+                            "tls handshake",
+                        ))):
                     recovered_net_errs.append(l)
                 else:
                     errs.append(l)

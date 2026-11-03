@@ -1892,6 +1892,8 @@ def cmd_work(args) -> int:
                                         to=_topic_arg(args.to), result=args.result)
         else:
             wid, others = duty.done_work(store, tid, args.key, args.result), []
+            decision_hub.auto_resolve_handled_escalations(cfg, store, tid, args.key, args.result or "work done",
+                                                          source=_source(cfg) if cfg.source.enabled else None)
     except duty.DutyError as e:
         print(f"work 被拒绝: {e}", file=sys.stderr); return 2
     w = store.conn.execute("SELECT * FROM work_items WHERE id=?", (wid,)).fetchone()
@@ -2254,7 +2256,11 @@ def cmd_track(args) -> int:
             print(f"{no} 已经{tg.STATUS_LABEL.get(item['state'], item['state'])}，这次没动")
             return outbound.EXIT_OK
         tg.close(store, item, tid, why)
-        print(f"已把 {no}「{item['title']}」标成办完了；牧羊犬下一轮在话题里补一行「✅ 办完了」并更新索引卡。"
+        closed_escs = decision_hub.auto_resolve_handled_escalations(
+            cfg, store, tid, key, why, source=_source(cfg) if cfg.source.enabled else None,
+        )
+        esc_note = f"（同步结案了 {len(closed_escs)} 条可能已处理的提问：{', '.join(closed_escs)}）" if closed_escs else ""
+        print(f"已把 {no}「{item['title']}」标成办完了{esc_note}；牧羊犬下一轮在话题里补一行「✅ 办完了」并更新索引卡。"
               f"同一把钥匙再发 ask / report 会把它重开")
         return outbound.EXIT_OK
     alias = " ".join((args.key or "").split())

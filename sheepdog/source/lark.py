@@ -97,6 +97,55 @@ def parse_event(raw: dict, tz: str = "+08:00") -> Message:
     )
 
 
+_TRANSIENT_STDERR_MARKERS = (
+    "network/transport:",
+    "dial tcp",
+    "no such host",
+    "uat-client: refresh attempt",
+    "token refresh request failed",
+    "timed out",
+    "timeout",
+    "eof",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+    "tls handshake",
+)
+
+
+def _parse_cli_output(stdout: str, stderr: str = ""):
+    """7.112 (REG-080): 解析 lark-cli 输出，自动剥离前置 [lark-cli] [WARN/INFO] 诊断行；
+    若无 JSON 对象但包含瞬态网络/DNS/UAT 刷新失败日志，合成标准可重试网络错误字典。
+    """
+    for candidate in ((stdout or "").strip(), (stderr or "").strip(), f"{stdout or ''}\n{stderr or ''}".strip()):
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if 0 <= start < end:
+            try:
+                return json.loads(candidate[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+    raw = ((stdout or "").strip() or (stderr or "").strip())
+    low = raw.lower()
+    if raw and any(m in low for m in _TRANSIENT_STDERR_MARKERS):
+        return {
+            "ok": False,
+            "error": {
+                "type": "network",
+                "subtype": "transport",
+                "retryable": True,
+                "message": raw[:300],
+            },
+        }
+    raise json.JSONDecodeError("unable to parse lark-cli JSON", raw, 0)
+
+
 def _exec_cli(cmd: list[str], *, timeout: float, identity: str | None = None) -> subprocess.CompletedProcess:
     if identity == "bot" and (subprocess.run is _REAL_SUBPROCESS_RUN or getattr(subprocess.run, "_accepts_env", False)):
         if (env := inject_bot_tat_env()) is not None:
@@ -136,7 +185,7 @@ class LarkCliSource:
                 raise LarkTimeout(f"lark-cli 超时 {args[:2]}（{e.timeout:g} 秒）") from e
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
-                data = json.loads(out)
+                data = _parse_cli_output(proc.stdout or "", proc.stderr or "")
             except json.JSONDecodeError:
                 raise SourceError(f"lark-cli 输出无法解析: {out[:300]}")
             if data.get("ok"):
@@ -234,7 +283,7 @@ class LarkCliSource:
                 raise LarkTimeout(f"lark-cli 超时 {args[:3]}（{e.timeout:g} 秒）") from e
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
-                data = json.loads(out)
+                data = _parse_cli_output(proc.stdout or "", proc.stderr or "")
             except json.JSONDecodeError:
                 raise SourceError(f"lark-cli 输出无法解析 rc={proc.returncode}: {out[:300]}")
             # 既接受 {"ok":..,"data":..} 外层，也接受原始 API 的 {"code":0,"data":..} 或直接返回数据

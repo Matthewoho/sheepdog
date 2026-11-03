@@ -235,8 +235,51 @@ def _has_prior_quote_corroboration(store, e, s_row, m_row, max_age_hours: float 
     )
     return has_post
 
+def _has_possibly_handled_or_reaction_evidence(cfg, store, e, *, quote: str = "", me: str = "") -> bool:
+    """7.112 (REG-080): 统一 pending.detect（可能已处理）与 owner_reactions 单一证据源。
+    若提问已被牧羊犬标记 possibly_handled_at，或实时命中 pending.detect（主人发言 / 点表情 / 同源兄弟提问结案），
+    或 --quote 指向的消息（或关联来源消息）上有主人（operator_id == me）在 asked_at 之后点的表情，则允许结案。
+    """
+    if store is None or e is None:
+        return False
+    ekeys = set(e.keys()) if hasattr(e, "keys") else set()
+    if "possibly_handled_at" in ekeys and str(e["possibly_handled_at"] or "").strip():
+        return True
+    try:
+        from . import pending as pend
+        if cfg is not None and pend.detect(cfg, store, e) is not None:
+            return True
+    except Exception:
+        pass
+    q = (quote or "").strip()
+    asked_at = (e["asked_at"] if "asked_at" in ekeys and e["asked_at"] else "") or ""
+    if me and hasattr(store, "conn"):
+        cand_mids: list[str] = []
+        if q.startswith("om_"):
+            cand_mids.append(q)
+        try:
+            for s in store.escalation_sources(e["message_id"]):
+                amid = (s["about_message_id"] if "about_message_id" in s.keys() else "") or ""
+                if amid and amid not in cand_mids:
+                    cand_mids.append(amid)
+        except Exception:
+            pass
+        if cand_mids:
+            marks = ",".join("?" * len(cand_mids))
+            try:
+                rows = store.conn.execute(
+                    f"SELECT seen_at FROM owner_reactions WHERE operator_id=? AND message_id IN ({marks})",
+                    (me, *cand_mids),
+                ).fetchall()
+                if any(_ts_not_before(r["seen_at"] or "", asked_at) for r in rows):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", superseded_by: str = "", vips: dict | None = None) -> None:
-    """7.81 / 7.92 / 7.96 严禁自关未答提问硬门禁：answered_at 为空时必须提供可验真的 --quote（主人或非底线提问的 VIP 批复）或 --superseded-by。"""
+    """7.81 / 7.92 / 7.96 / 7.112 严禁自关未答提问硬门禁：answered_at 为空时必须满足 possibly_handled/owner_reactions 证据、或提供可验真的 --quote（主人或非底线提问的 VIP 批复）或 --superseded-by。"""
     q, sup_id, me = (quote or "").strip(), (superseded_by or "").strip(), getattr(cfg, "self_open_id", "") or ""
     max_age_h = float(getattr(getattr(cfg, "security", None), "quote_max_age_hours", 24) or 24)
     eff_vips = dict(vips) if vips is not None else {}
@@ -249,6 +292,8 @@ def verify_resolve_allowed(cfg, store, targets: list, *, quote: str = "", supers
     from .prompts import vip_of
     for e in targets:
         if e["answered_at"]: continue
+        if _has_possibly_handled_or_reaction_evidence(cfg, store, e, quote=q, me=me):
+            continue
         if not q and not sup_id:
             raise _outbound_err(f"禁止自关未答提问（{e['message_id']}）：主人尚未拍板（answered_at IS NULL）。若主人或 VIP 已在别处批复请传 --quote <消息ID或原话>；若已被新 ask 替代请传 --superseded-by <新ask消息ID>")
         if q:
@@ -428,6 +473,31 @@ settle_escalation_views = sync_escalation_dual_cards
 
 def on_escalations_resolved(cfg, store, source, targets: list, *, why: str = "") -> None:
     for e in targets: sync_escalation_dual_cards(cfg, store, source, e["message_id"], chosen_display=f"已结案（{why or 'resolved'}）", topic_id=e["topic_id"], orig_text=e["text"] or "")
+
+
+def auto_resolve_handled_escalations(cfg, store, topic_id: str, key: str, why: str, source=None) -> list[str]:
+    """7.112 (REG-080): 当会话执行 track done 或 work done 时，自动结案同钥匙下已有『可能已处理 / 主人点表情』证据的未决提问，并同步刷新聚合台绿卡。"""
+    if store is None or not (key := (key or "").strip()) or not (topic_id := (topic_id or "").strip()):
+        return []
+    try:
+        from . import outbound
+        cands, _, _ = outbound._resolve_targets(cfg, store, topic_id, "", key)
+    except Exception:
+        return []
+    me = getattr(cfg, "self_open_id", "") or ""
+    targets = [e for e in cands if not e["answered_at"] and _has_possibly_handled_or_reaction_evidence(cfg, store, e, me=me)]
+    if not targets:
+        return []
+    reason = " ".join((why or "事项已办结").split())
+    closed = [e["message_id"] for e in targets if store.resolve_escalation(e["message_id"], e["topic_id"], reason, resolved_by=topic_id)]
+    if closed:
+        on_escalations_resolved(cfg, store, source, targets, why=reason)
+        try:
+            from .engine import clear_handled_owner_reactions
+            clear_handled_owner_reactions(store, source, topic_id)
+        except Exception:
+            pass
+    return closed
 
 def is_hub_message(store, m) -> bool:
     if m is None: return False

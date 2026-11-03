@@ -704,15 +704,21 @@ class GateTest(Base):
             ans_mid = f"om_auto_ans_{idx}"
             asked_ts = (ref_now - timedelta(minutes=30 - idx)).isoformat(timespec="seconds")
             ans_ts = (ref_now - timedelta(minutes=25 - idx)).isoformat(timespec="seconds")
+            cb_text = "[卡片回调] B：一次性全量追加新 VPS" if idx == 2 else "[卡片回调] A：同意按建议执行"
+            esc_body = (
+                "需要你定 · 常规方案确认\n选项：\nA. 单台加白\nB. 全量追加\n建议：选 B 。一次性全量追加避免重复发版"
+                if idx == 2
+                else "需要你定 · 常规方案确认\n选项：\nA. 执行\n建议：选 A"
+            )
             self.store.upsert_message(
-                msg(message_id=ans_mid, sender_id="ou_test_owner", content="[卡片回调] A：同意按建议执行", create_time=ans_ts),
+                msg(message_id=ans_mid, sender_id="ou_test_owner", content=cb_text, create_time=ans_ts),
                 "dispatch", "owner_reply", [], "tp_alpha",
             )
             with self.store.tx() as cur:
                 cur.execute(
                     """INSERT OR REPLACE INTO escalations(message_id, topic_id, text, asked_at, answered_at, closed_at, close_reason, answer_message_id)
-                       VALUES(?, 'tp_alpha', '需要你定 · 常规方案确认\n选项：\nA. 执行\n建议：选 A', ?, ?, ?, 'answered', ?)""",
-                    (mid, asked_ts, ans_ts, ans_ts, ans_mid),
+                       VALUES(?, 'tp_alpha', ?, ?, ?, ?, 'answered', ?)""",
+                    (mid, esc_body, asked_ts, ans_ts, ans_ts, ans_mid),
                 )
         # 插入一条 tp_bus 的新改判
         self.store.update_topic("tp_alpha", rules_hash="hash_alpha_old")
@@ -1214,6 +1220,126 @@ class GateTest(Base):
             ball="done",
         )
 
+    def test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery(self):
+        """REG-080 (7.112):
+        1. verify_resolve_allowed 统一认领 pending.detect（possibly_handled_at）与 owner_reactions 单一证据源，
+           当主人对原消息点 👌 触发 escalation_check 唤醒后，专席调用 resolve（无论是否带 --quote）均合法通过；
+        2. auto_resolve_handled_escalations 在专席执行 track done 或 work done 时自动结案同钥匙下带『可能已处理 / 主人点表情』证据的未决提问；
+        3. classify_escalation 将主人『[其他] 我直接撤回了 / 我已经处理了』识别为 accepted（主理人亲自办结），不误判为 overridden；
+        4. LarkCliSource._parse_cli_output 剥离 [lark-cli] [WARN] 前缀行，并在离线 DNS / UAT 刷新失败时转译为可自愈的 network/transport 错误，且 observe 将恢复后的 no such host / uat-client 计入已自愈网络抖动。
+        """
+        from sheepdog import decision_hub, observe, outbound
+        from sheepdog.admin_web import classify_escalation
+        from sheepdog.source.lark import _parse_cli_output
+
+        now_dt = datetime.now(timezone.utc).astimezone()
+        asked_iso = (now_dt - timedelta(minutes=6)).isoformat(timespec="seconds")
+        react_iso = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+
+        # 1. verify_resolve_allowed：主人对来源消息点 OK 表情并触发 possibly_handled_at 后，无 --quote 与带 --quote 原消息 ID 均放行
+        src_mid = "om_test_kaifeng_src_1"
+        esc_mid = "om_test_kaifeng_esc_1"
+        self.store.upsert_message(
+            msg(
+                message_id=src_mid,
+                chat_type="group",
+                chat_id="oc_test_alpha_grp",
+                sender_id="ou_kaifeng",
+                sender_name="Kai Feng",
+                content="请帮忙撤回刚才发错的卡片",
+                create_time=(now_dt - timedelta(minutes=10)).isoformat(timespec="seconds"),
+            ),
+            "dispatch",
+            "group",
+            [],
+            "tp_alpha",
+        )
+        self.store.add_escalation(esc_mid, "tp_alpha", "oc_test_owner_p2p", "🐕 需要你定 · 撤回卡片授权\n选项：\nA. 批准撤回\n建议：选 A", asked_iso)
+        self.store.add_escalation_sources(esc_mid, "tp_alpha", [(src_mid, "oc_test_alpha_grp")], "explicit")
+        self.store.add_owner_reaction(src_mid, "OK", ME, "react_ok_1", True)
+        self.store.mark_possibly_handled(esc_mid, src_mid, "owner_reaction", react_iso)
+
+        e_row = self.store.get_escalation(esc_mid)
+        # 无 --quote 直接 resolve 应通过（因为 possibly_handled_at / owner_reactions 已在场）
+        decision_hub.verify_resolve_allowed(self.cfg, self.store, [e_row], quote="")
+        # 传 --quote <来源消息 ID>（上面有主人点的 OK 表情）同样通过
+        decision_hub.verify_resolve_allowed(self.cfg, self.store, [e_row], quote=src_mid)
+
+        # 对照：若既无 possibly_handled_at 也无 owner_reactions 且无主人消息，无 --quote 仍被硬拦截
+        esc_unhandled = "om_test_kaifeng_esc_unhandled"
+        self.store.add_escalation(esc_unhandled, "tp_alpha", "oc_test_owner_p2p", "🐕 需要你定 · 未处理提问", asked_iso)
+        with self.assertRaisesRegex(outbound.OutboundError, "禁止自关未答提问"):
+            decision_hub.verify_resolve_allowed(self.cfg, self.store, [self.store.get_escalation(esc_unhandled)], quote="")
+
+        # 2. auto_resolve_handled_escalations：专席执行 work done / track done 时自动结案已有『可能已处理』证据的同钥匙提问
+        self.store.add_send(
+            "ik_esc_1", "ask", "tp_alpha", esc_mid, "🐕 需要你定 · 撤回卡片授权",
+            key="recall-loop-msg", norm_key="recall-loop-msg", root_message_id=esc_mid,
+        )
+        self.store.add_thread(esc_mid, "tp_alpha", "recall-loop-msg", "recall-loop-msg", "撤回卡片授权", "sent")
+        closed_ids = decision_hub.auto_resolve_handled_escalations(
+            self.cfg, self.store, "tp_alpha", "recall-loop-msg", "核实主人已亲自撤回目标消息",
+        )
+        self.assertEqual(closed_ids, [esc_mid])
+        self.assertEqual(self.store.get_escalation(esc_mid)["close_reason"], "resolved")
+        # 未处理的那条不受影响
+        self.assertIsNone(self.store.get_escalation(esc_unhandled)["closed_at"])
+
+        # 3. classify_escalation：主人回『[其他] 我直接撤回了』识别为 accepted，不误判为 overridden
+        cls_self_done = classify_escalation(
+            {
+                "message_id": esc_mid,
+                "topic_id": "tp_alpha",
+                "text": "🐕 需要你定 [tp_alpha] · 撤回卡片授权\n选项：\nA. 批准撤回\nB. 保留不撤回\n建议：选 A",
+                "asked_at": asked_iso,
+                "answered_at": react_iso,
+                "closed_at": react_iso,
+                "close_reason": "answered",
+                "resolved_by": "",
+                "resolve_note": "",
+                "nudge_count": 0,
+            },
+            answer_content="[卡片回调] 其他：我直接撤回了",
+        )
+        self.assertEqual(cls_self_done["alignment"], "accepted")
+
+        # 4. _parse_cli_output 剥离 [lark-cli] [WARN] 前缀 + 离线 DNS/UAT 刷新失败转译为 network/transport + observe 自愈归类
+        warn_plus_json = (
+            "[lark-cli] [WARN] uat-client: refresh attempt 1/2 failed for user token: dial tcp: lookup open.larksuite.com: no such host; retrying\n"
+            '{"ok": true, "data": {"items": []}}'
+        )
+        parsed = _parse_cli_output(warn_plus_json)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["data"]["items"], [])
+
+        warn_only_offline = (
+            "[lark-cli] [WARN] uat-client: refresh attempt 1/2 failed for user token: token refresh request failed: "
+            'Post "https://open.larksuite.com/open-apis/authen/v2/oauth/token": dial tcp: lookup open.larksuite.com: no such host; retrying'
+        )
+        parsed_offline = _parse_cli_output("", warn_only_offline)
+        self.assertFalse(parsed_offline["ok"])
+        self.assertEqual((parsed_offline["error"]["type"], parsed_offline["error"]["subtype"]), ("network", "transport"))
+
+        log_file = Path(self.tmp.name) / "sidecar.log"
+        t_err = (now_dt - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+        t_rec = (now_dt - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        log_file.write_text(
+            f"{t_err} ERROR 本轮失败（下一轮从水位线续跑）: SourceError: lark-cli 输出无法解析: [lark-cli] [WARN] uat-client: refresh attempt 1/2 failed: lookup open.larksuite.com: no such host\n"
+            f"{t_rec} INFO dispatch: {{'pending': 0, 'sent': 0}}\n",
+            encoding="utf-8",
+        )
+        obs = observe.run_observe(
+            db_path=Path(self.tmp.name) / "nonexistent.sqlite3",
+            state_path=Path(self.tmp.name) / "cursor_rec80.json",
+            log_path=log_file,
+            now_dt=now_dt,
+            since_minutes=30.0,
+            check_processes=False,
+            check_log=True,
+        )
+        self.assertFalse(any("ERROR/Traceback" in w for w in obs["warns"]), obs["warns"])
+        self.assertTrue(any("瞬时网络抖动已自动从水位线恢复" in i for i in obs["infos"]), obs["infos"])
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1326,6 +1452,7 @@ class SecurityCliTest(GateTest):
     test_reg_077_agent_en_footer_group_other_banner_shallow_find4_and_lamb_tee = None
     test_reg_078_cross_workspace_tell_tp_sheepdog_report_work_dump_guard_and_option_a_reask_guard = None
     test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing = None
+    test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery = None
 
 
 if __name__ == "__main__":
