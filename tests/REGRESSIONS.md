@@ -540,6 +540,13 @@
 | --- | --- | --- |
 | 7.113 | 专席（如 `tp_laohu` 在 `om_test_laohu_pr_merge_ask`）在测试环境跑通且 GitHub CI / Greptile 机器人跑完后，发起包含 `gh pr merge`（或请求直接合入 PR 并打 Tag 发布生产）的 `sheepdog ask` 并把『直接合入发生产』列为 `建议：A`，但正文只字未提 6 个 PR 的人工 Code Review 状态（实为 `0/6` 未提交评审群、GitHub `reviewDecision` 为空），迫使主人点 `[其他]` 反问『`review 过了吗`』后才补发第 2 张卡；且 `diagnose_override_reason` 未覆盖 `review 过了吗 / 评审过了吗`，将其误归因为 `option_or_schedule_redirect` 而非 `context_incomplete`（REG-081） | `test_security.GateTest.test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis`（`tests/test_security.py::GateTest::test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis`） |
 
+## 7.114 网关 CORS/调用方域名查日志+跨专席核实门禁、测试审批节点免 QA 核实门禁与测试环境跳板机白名单免问自治门禁（REG-082）
+
+| 规格 | 症状 | 守它的测试 |
+| --- | --- | --- |
+| 7.114 | 专席在发起 `sheepdog ask` 前未用尽本机日志与跨专席协同手段，把核实活推给主人：① `tp_sammy-shi` 在推进 `file-hub-gateway` CORS 白名单收敛时未先扫云端访问日志（Referer/Origin）并向 `tp_laohu` 核实，就直接发 `ask`（`om_test_cors_domain_ask`）问主人『生产是否还有其他业务前端域名直接跨域调用』；② `tp_ben` 在收到测试环境验收节点催办时未先向负责专席 `tp_laohu` 核实，就直接发 `ask`（`om_test_qa_bypass_ask`）问主人『是否无需 QA 介入直接点通过』；③ `tp_auth` 收到同事申请把新家宽出口 IP 加入 `tap-testing-env` 跳板机防火墙 `office-allow-all` 时，违背『测试环境可以直接动』常驻规则发 `ask`（`om_test_jumpbox_fw_ask`）找主人要授权，且未同步向 `tp_3x-ui-ops` 核对齐整批 14 台 VPS 出口 IP（REG-082） | `test_security.GateTest.test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards`（`tests/test_security.py::GateTest::test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards`） |
+
+
 
 
 

@@ -360,6 +360,31 @@ _PR_HUMAN_REVIEW_STATUS_RE = re.compile(
     r"(?:人工\s*(?:Code\s*)?Review|人工(?:代码)?评审|reviewDecision|APPROVED|人类\s*Reviewer|已(?:通过|完成)\s*(?:人工\s*)?(?:PR\s*)?Review|未(?:过|提交)\s*(?:人工\s*)?(?:PR\s*)?Review)",
     re.I,
 )
+_CORS_OR_CALLER_DOMAIN_ASK_RE = re.compile(
+    r"(?:(?:CORS|跨域|Origin)[^。\n]{0,20}白名单[^。\n]{0,20}(?:确认|域名)|"
+    r"(?:是否有|确认有无|有没有)[^。\n]{0,16}(?:其他|别的)(?:前端)?域名[^。\n]{0,16}调用)",
+    re.I,
+)
+_CORS_TRAFFIC_SCAN_EVIDENCE_RE = re.compile(
+    r"(?:云上流量|真实.{0,6}流量|gcloud\s+logging|Referer|访问日志|流量扫描|48\s*h|本地记录)",
+    re.I,
+)
+_PEER_OWNER_CONSULT_EVIDENCE_RE = re.compile(
+    r"(?:tp_laohu|老胡|laohu|sheepdog\s+tell|已与.{0,8}(?:老胡|laohu|负责人)[^。\n]{0,8}(?:确认|对齐|核对))",
+    re.I,
+)
+_TEST_APPROVAL_QA_BYPASS_ASK_RE = re.compile(
+    r"测试审批[^。\n]{0,24}(?:是否可)?(?:免测|直接放行|先走\s*QA)",
+    re.I,
+)
+_TEST_JUMPBOX_FIREWALL_ASK_RE = re.compile(
+    r"(?:tap-testing-env|测试环境)[^。\n]{0,40}(?:tap-testing-dev-jumpbox|测试跳板机|office-allow-all|allow-office-connect)[^。\n]{0,40}(?:tcp:22|防火墙放行|IP\s*白名单)",
+    re.I,
+)
+_DESTRUCTIVE_OR_PROD_FIREWALL_RE = re.compile(
+    r"(?:删除|移除|生产|taplabs-453508|tpn-prod-506507|0\.0\.0\.0/0)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -373,11 +398,14 @@ def check_ask_pre_flight_guard(
     floor: str = "",
     floor_type: str | None = None,
 ) -> None:
-    """7.108 / 7.110 / 7.113（REG-076 / REG-078 / REG-081）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
+    """7.108 / 7.110 / 7.113 / 7.114（REG-076 / REG-078 / REG-081 / REG-082）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     1. 申请 CC 专线 / 家宽节点 / 住宅 IP 前，必须先向 tp_3x-ui-ops 核实各线路当前人数与空余席位并写入正文；
     2. 申请 LiveKit 凭据或子成员账号时，必须显式标明『明确是测试环境 / 明确是生产环境 / 目标环境：...』；
     3. 同一 (topic_id, key) 主人已在近 2 小时内点击选项 A 批准由专席执行时，拦截子步骤重复发起『由专席执行 vs 由主人手动操作』的二次 ask；
-    4. 请示执行 gh pr merge 或直接合入 PR 打 Tag 发布生产前，必须显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/N 未过）。"""
+    4. 请示执行 gh pr merge 或直接合入 PR 打 Tag 发布生产前，必须显式写明『人工 Code Review 状态』（如 reviewDecision: APPROVED 或人工 Review 0/N 未过）；
+    5. 请示确认 CORS / Origin 域名白名单或『是否有其他前端域名调用』前，必须先扫描云上真实流量日志 + 本地记录并与技术负责人（如 tp_laohu）核对；
+    6. 请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先与该单技术负责人（如 tp_laohu）核对；
+    7. 测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作，拦截向主人 ask 请示，引导直接办理并联动 tp_3x-ui-ops 补齐 VPS IP 后用 report 报备。"""
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops") or floor or floor_type:
         return
     full_text = f"{title}\n{body}"
@@ -399,6 +427,28 @@ def check_ask_pre_flight_guard(
             "请示执行 `gh pr merge` 或直接合入 PR 打 Tag 发布生产前，必须先核查并在正文中显式写明『人工 Code Review 状态』"
             "（如 GitHub `reviewDecision: APPROVED`、已按 `tap-pr-review-submit` 过人工评审，或明确声明『人工 Review：0/N 未过』），"
             "严禁只写 CI/Greptile 机器人审查就请主人拍板合入发生产，让主人反问『review 过了吗』（REG-081 防打扰门禁，没有发送）",
+        )
+    if _CORS_OR_CALLER_DOMAIN_ASK_RE.search(full_text) and not (
+        _CORS_TRAFFIC_SCAN_EVIDENCE_RE.search(full_text) and _PEER_OWNER_CONSULT_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示确认 CORS / Origin 域名白名单或『是否有其他前端域名调用』前，必须先：① 扫描近 48h 真实云上流量日志（gcloud logging Referer/Origin）与本地记录信息；"
+            "② 通过 `sheepdog tell` 与技术负责人（如 `tp_laohu`）核对确认，并在正文中写明真实云上流量扫描与负责人核对实据后再发起 ask，"
+            "严禁未经自查与负责人对齐直接反问主人『是否有其他前端域名会调用』（REG-082 防打扰门禁，没有发送）",
+        )
+    if _TEST_APPROVAL_QA_BYPASS_ASK_RE.search(full_text) and not _PEER_OWNER_CONSULT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示发版单『测试审批是否可免测直接放行还是先走 QA』前，必须先通过 `sheepdog tell` 与该单技术负责人（如 `tp_laohu`）核对确认（或引导提问方找 `laohu` 确认），"
+            "并在正文中写明核对结论后再发起 ask，严禁未经内部对齐直接把测试审批放行问题抛给主人（REG-082 防打扰门禁，没有发送）",
+        )
+    if _TEST_JUMPBOX_FIREWALL_ASK_RE.search(full_text) and not _DESTRUCTIVE_OR_PROD_FIREWALL_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "测试环境（tap-testing-env）跳板机 / office-allow-all 白名单追加属于预授权非破坏性测试环境操作（『测试环境可以直接动』）："
+            "请直接优先将申请人出口 IP 加入 `office-allow-all`，同时通过 `sheepdog tell --to tp_3x-ui-ops` 核实全部 VPS 出口 IP 一并补齐进该白名单，"
+            "独立回读确认后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（REG-082 防打扰门禁，没有发送）",
         )
     nk = duty.norm_key(key) if key else ""
     if nk and _REASK_MANUAL_OPTION_RE.search(full_text) and not _REASK_BLOCKER_EXEMPT_RE.search(full_text):

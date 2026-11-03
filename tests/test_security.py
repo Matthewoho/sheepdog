@@ -1422,6 +1422,81 @@ class GateTest(Base):
         self.assertEqual(cls_rev["alignment"], "overridden")
         self.assertEqual(cls_rev["override_code"], "context_incomplete")
 
+    def test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards(self):
+        """REG-082 (Spec 7.114):
+        1. 询问某网关/服务是否有额外调用方域名（CORS 白名单范围）的 ask，若未先查云上访问日志（Referer/Origin）并向前端/领域负责专席（如 tp_laohu）核实，直接拦截；
+        2. 询问审批单测试验收节点能否豁免 QA 或直接代点的 ask，若未先向审批单发起人或负责专席（如 tp_laohu / tp_sammy-shi）核实，直接拦截；
+        3. 测试环境（tap-testing-env）跳板机或防火墙白名单（office-allow-all）仅追加同事/家宽出口 IP 的操作属于测试环境常驻授权范围，发起 ask 请示直接拦截并要求同步 tp_3x-ui-ops 直接放行 + 事后 report。
+        """
+        from sheepdog import outbound
+
+        # 1a. CORS 域名范围请示：缺云端流量日志 & 缺 tp_laohu 协同 -> 拦截
+        cors_title = "file-hub-gateway 生产 CORS 白名单域名范围确认"
+        cors_body_bad = (
+            "什么事：推进 file-hub-gateway 的 CORS 白名单收敛。\n"
+            "待拍板问题：除现有的 tapnow.ai 与 tapnow.tv 外，生产是否有其他前端域名会调用 file-hub-gateway？\n"
+            "A. 仅保留现有 6 个域名\n"
+            "B. 补充其他域名\n"
+            "建议：A"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-082 防打扰门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_sammy-shi", cors_title, cors_body_bad, key="file-hub-gateway-cors"
+            )
+
+        # 1b. CORS 域名范围请示：补齐云上 Referer/Origin 统计 + tp_laohu 核实后 -> 放行
+        cors_body_ok = (
+            "什么事：推进 file-hub-gateway 的 CORS 白名单收敛。\n"
+            "前置核查：已扫描 GCP Cloud Logging 过去 48h 真实云上流量 Referer/Origin 分布（99.8% 为 tapnow.ai/tv，发现 0.2% studio.tapnow.ai），"
+            "并已向 tp_laohu 核对确认 studio.tapnow.ai 需保留。\n"
+            "A. 将白名单收敛为这 7 个域名并发布生产\n"
+            "B. 暂缓发布\n"
+            "建议：A"
+        )
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_sammy-shi", cors_title, cors_body_ok, key="file-hub-gateway-cors"
+        )
+
+        # 2a. 测试审批是否可免测直接放行的 ask：未先问 tp_laohu -> 拦截
+        qa_title = "202611030018 (FE-1639) 测试审批是否可免测直接放行"
+        qa_body_bad = (
+            "什么事：Ben 私聊请处理审批单 202611030018 的测试审批节点。\n"
+            "为什么要你定：该单测试审批是否可免测直接放行还是先走 QA？\n"
+            "A. 免测直接放行\n"
+            "B. 先走 QA 验收\n"
+            "建议：A"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-082 防打扰门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_ben", qa_title, qa_body_bad, key="fe-1639-qa"
+            )
+
+        # 2b. 已向 tp_laohu 核实确认后 -> 放行
+        qa_body_ok = qa_body_bad + "\n前置协同：已通过 sheepdog tell 与老胡（tp_laohu）核对确认该批 6 个服务需等 QA 冒烟通过后再点。"
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_ben", qa_title, qa_body_ok, key="fe-1639-qa"
+        )
+
+        # 3a. 测试环境跳板机 office-allow-all 加白名单 IP 请示 -> 拦截（应直接执行并同步 tp_3x-ui-ops）
+        fw_title = "测试环境 tap-testing-dev-jumpbox 防火墙放行 Leon 新 IP 白名单"
+        fw_body_bad = (
+            "什么事：Leon 私聊反馈家宽 IP 更新为 198.51.100.77，无法连接 tap-testing-env 的 tap-testing-dev-jumpbox (tcp:22)。\n"
+            "待执行命令：gcloud compute firewall-rules update office-allow-all --project=tap-testing-env --source-ranges=...,198.51.100.77/32\n"
+            "A. 授权执行上述防火墙放行\n"
+            "B. 暂不添加\n"
+            "建议：A"
+        )
+        with self.assertRaisesRegex(outbound.OutboundError, "REG-082 防打扰门禁"):
+            outbound.check_ask_pre_flight_guard(
+                self.cfg, self.store, "tp_auth", fw_title, fw_body_bad, key="jumpbox-fw"
+            )
+
+        # 3b. 若涉及生产项目（taplabs-453508）或删除规则 -> 不拦截，允许正常 ask 请示
+        fw_body_prod = fw_body_bad.replace("tap-testing-env", "taplabs-453508")
+        outbound.check_ask_pre_flight_guard(
+            self.cfg, self.store, "tp_auth", fw_title, fw_body_prod, key="jumpbox-fw"
+        )
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):
@@ -1536,6 +1611,7 @@ class SecurityCliTest(GateTest):
     test_reg_079_bus_owner_instruction_no_silent_panel_reply_and_no_bus_ball_doing = None
     test_reg_080_possibly_handled_resolve_and_track_done_sync_and_lark_cli_warn_prefix_recovery = None
     test_reg_081_pr_merge_ask_requires_human_review_status_and_override_diagnosis = None
+    test_reg_082_cors_domain_test_approval_and_test_jumpbox_ask_pre_flight_guards = None
 
 
 if __name__ == "__main__":
