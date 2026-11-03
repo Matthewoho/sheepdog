@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock
 
-from sheepdog import __version__, admin_web, card_callback, evolve, loops
+from sheepdog import __version__, admin_web, card_callback, evolve, loops, parse_version_tuple
 from sheepdog.config import Config, EscalationConfig, SourceConfig
 from sheepdog.store import Store
 
@@ -63,7 +63,7 @@ duty = "负责 111 个服务迁移"
         self.tmp.cleanup()
 
     def test_reg_089_loop_spec_five_slots_and_templates(self) -> None:
-        self.assertEqual(__version__, "1.1.0")
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 0))
         skill_path = loops.ensure_loop_intake_skill(self.cfg)
         self.assertTrue(skill_path.is_file())
         self.assertIn("sheepdog-loop-intake", skill_path.read_text(encoding="utf-8"))

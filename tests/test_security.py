@@ -2230,6 +2230,29 @@ class GateTest(Base):
             "选项：\nA. 采买新购 1 台专属住宅 VPS\nB. 暂不新购\n建议：选 A",
         )
 
+        # REG-090：在物理隔离的腾讯云 Stage 独立成员账号（200053747813）只提最小受限策略未提 AdministratorAccess/admin 时拦截
+        with self.assertRaises(OutboundError) as cm_stage:
+            check_ask_pre_flight_guard(
+                self.cfg,
+                self.store,
+                "tp_kaifeng",
+                "Kai申请腾讯云中国站Stage资源权限",
+                "Kai 申请腾讯云中国站资源权限用于今晚 Stage 联调。\n---more---\n"
+                "选项：\nA. 在腾讯云 Stage 成员账号（200053747813）为 Kai 配置对应资源的最小受限策略\n"
+                "B. 不分配云权限，由专席代跑\n建议：选 A",
+            )
+        self.assertIn("REG-090", str(cm_stage.exception))
+
+        check_ask_pre_flight_guard(
+            self.cfg,
+            self.store,
+            "tp_kaifeng",
+            "Kai申请腾讯云中国站Stage资源权限",
+            "Kai 申请腾讯云中国站资源权限用于今晚 Stage 联调。\n---more---\n"
+            "选项：\nA. 在腾讯云 Stage 成员账号（200053747813）直接授予 AdministratorAccess（admin 权限，严格隔离主账号与生产）\n"
+            "B. 不分配云权限，由专席代跑\n建议：选 A",
+        )
+
 
 class QuoteVerifyTest(unittest.TestCase):
     def setUp(self):

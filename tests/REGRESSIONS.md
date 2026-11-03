@@ -587,6 +587,7 @@
 | 规格 | 症状 | 守它的测试 |
 | --- | --- | --- |
 | 1.1.0 | 周期性巡检与长周期业务管家（如发版引航 `tp_release`、多云资源利用率与成本治理 `cloud-cost-steward`、服务上线后自动盯盘/修 Bug/发测试/请示上生产 `service-release-guardian`、14 台 VPS 与跳板机白名单同步、SSL 证书续期、腾讯云迁移日清）若靠会话内盲跑 LLM Cron，既在无变化时白烧 Token、缺乏跨周期单事项多阶段状态流转（`detected -> fixing -> testing -> awaiting_approval -> verifying -> closed`）与豁免记忆（`MEMORY.md`），又缺少新 Loop 先在 `shadow` 影子模式预览、飞书卡片一键升为 `confirm`/`auto` 及连续失败自动熔断（`autopause`）的安全护栏（REG-089） | `test_loops.SheepdogLoopsTest.test_reg_089_loop_spec_five_slots_and_templates`、`test_loops.SheepdogLoopsTest.test_reg_089_zero_token_preflight_dedup_and_memory_exempt`、`test_loops.SheepdogLoopsTest.test_reg_089_multi_stage_item_lifecycle_and_adaptive_cadence`、`test_loops.SheepdogLoopsTest.test_reg_089_autonomy_promotion_card_callback_and_autopause_breaker` |
+| 1.1.1 | ① 专席代回交付物含未加反引号的裸密码且特殊字符后跟 7~40 位十六进制随机串（如 `KaiStage2026!643d1946`）时，`_find_deliverable_forbidden_symbol` 误将密码里的 `643d1946` 判为 `Git commit SHA` 而静默放弃把账密上浮到首屏；② 在物理隔离的腾讯云 Stage 独立成员账号（`200053747813`）为内部研发同学申请联调权限时，专席建议抠碎片最小受限策略被主人改判为『给他在stage配admin』（REG-090） | `test_more_card.MoreCardTest.test_7119_deliverable_credentials_first_screen_hoist_and_fake_more_dedup`、`test_security.GateTest.test_reg_087_new_vps_purchase_ask_requires_overall_roster_and_diagnosis` |
 
 
 

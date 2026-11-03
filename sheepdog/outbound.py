@@ -481,6 +481,14 @@ _SAMMY_US_COMPLIANCE_CONFIRMED_RE = re.compile(
     r"(?:已(?:向|找|经|同)\s*Sammy(?:\s*Shi)?\s*(?:确认|核实|对齐)|Sammy(?:\s*Shi)?\s*(?:已确认|已同意|已批复|回复可以))",
     re.I,
 )
+_STAGE_SUBACCOUNT_MINIMAL_IAM_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:\b200053747813\b|Stage\s*(?:独立\s*)?成员账号))(?:[\s\S]*(?:最小受限策略|最小策略|受限权限))",
+    re.I,
+)
+_STAGE_SUBACCOUNT_ADMIN_OPTION_RE = re.compile(
+    r"(?:AdministratorAccess|QcloudAdministratorAccess|\badmin\b\s*权限|配\s*admin)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -566,6 +574,13 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-03 23:59:27 明确指示：『这个东西得问一下 Sammy 看一下他那个只读权限可不可以给别人开，就是美区，原本定的是美区的 Project 不能用我们任何一个物理上不在美国的同事的账号去访问』）："
             "请先通过 `sheepdog tell --to tp_sammy` 或在原群向 Sammy Shi 确认美区只读权限合规口径（或由专席代拉所需时间窗脱敏日志包交付），"
             "严禁未向 Sammy 核实合规口径前发 ask 让主人拍板或写『由主人操作』（REG-088 防打扰门禁，没有发送）",
+        )
+    if _STAGE_SUBACCOUNT_MINIMAL_IAM_ASK_RE.search(full_text) and not _STAGE_SUBACCOUNT_ADMIN_OPTION_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "在物理隔离的腾讯云 Stage 独立成员账号（200053747813）为内部研发同学开通联调/部署权限时，首选建议应直接授予该 Stage 成员子账号的 `AdministratorAccess`（admin 权限，严格隔离主账号与生产）"
+            "（主人 2026-11-04 03:05:29 明确改判：『给他在stage配admin』）："
+            "请在选项 A 中直接提供或建议在 Stage 独立成员账号（200053747813）授予 `AdministratorAccess`（admin），避免在已隔离的 Stage 子账号里抠碎片最小策略导致联调反复卡壳（REG-090 防打扰门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return
