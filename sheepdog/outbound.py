@@ -534,6 +534,26 @@ _CONCRETE_STATUS_EVIDENCE_RE = re.compile(
     r"(?:已实测|已核查|实测现状|当前配置为|当前路由为|kubectl|secret|configmap)",
     re.I,
 )
+_RCA_GOV_ASK_RE = re.compile(
+    r"(?:根因治理(?:决策|排期|方案)?|询问[^\n]{0,24}(?:卡顿|故障|雪崩)是否修复及治理方案|(?:卡顿|雪崩)根因后[，,\s]*询问是否修复)",
+    re.I,
+)
+_RCA_TIMELINE_AND_IMPACT_EVIDENCE_RE = re.compile(
+    r"(?:前因后果|时间线|发生时间|故障时间|影响面|当前现状|目前状态|已恢复|已止血|报错率|P99|HTTP\s*[45]\d\d|\b\d{1,2}:\d{2}\b)",
+    re.I,
+)
+_OLD_IMAGE_PARTIAL_FIX_ASK_RE = re.compile(
+    r"(?:跑(?:着|的是)旧镜像[\s\S]{0,160}(?:留着\s*Stage|指向\s*Stage)|要先修[^\n]{0,24}还是连[^\n]{0,24}一起切)",
+    re.I,
+)
+_CICD_PROD_READY_EVIDENCE_RE = re.compile(
+    r"(?:ci/?cd|流水线|cloud\s*build|github\s*actions|cnb)[^\n]{0,40}(?:通的|打通|可(?:以)?部署到\s*prod|自动部署)",
+    re.I,
+)
+_EXISTING_VPS_SLOT_AVAILABLE_ASK_RE = re.compile(
+    r"(?=[\s\S]*申请[^\n。]{0,24}(?:Claude|VPS|CC|家宽)?[^\n。]{0,12}(?:专线|节点))(?:[\s\S]*(?:余\s*[1-9]\d*\s*(?:空额|空位|席)|空余\s*[1-9]\d*\s*(?:空额|空位|席)))",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -687,6 +707,30 @@ def check_ask_pre_flight_guard(
             EXIT_INVALID,
             "请示确认『渠道/配置/路由现状』（如『需确认...现状，以便...』）前，必须先由当前专席只读排查目标集群/环境的真实配置、路由与缺失项，"
             "弄清楚对方具体缺什么参数并整理出具体可执行的方案后再请主人决策（主人批评：『你先排查一下他需要什么弄清楚给我执行方案让我决策』，REG-099 防未排查甩锅门禁，没有发送）",
+        )
+    if _RCA_GOV_ASK_RE.search(full_text) and not _RCA_TIMELINE_AND_IMPACT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "故障/卡顿/根因治理类 sheepdog ask 严禁在 `---more---` 中只写一句口号式摘要而不交代前因后果"
+            "（主人反问：『能具体讲讲前因后果嘛』，REG-100 防缺前因后果门禁）："
+            "请在 `---more---` 中完整写明：① 前因与现象（发生时间窗、谁反馈、具体报错/P99耗时/影响面）；"
+            "② 完整因果链（请求怎么路由、哪一环阻塞或超时引发级联问题）；"
+            "③ 当前线上现状（目前是否已恢复/临时止血、线上实时状态）后再发起 ask（没有发送）",
+        )
+    if _OLD_IMAGE_PARTIAL_FIX_ASK_RE.search(full_text) and not _CICD_PROD_READY_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "生产服务因跑着旧镜像且关联服务留有 Stage 环境变量导致报错（如 404/500）时，严禁建议『只手改部分配置、把旧镜像留着不切』且不核查 CI/CD 部署链路"
+            "（主人纠偏：『直接跑新镜像呗 并且保证相关服务的cicd是通的 可以部署到prod』，REG-100 防半拉子手改门禁）："
+            "请先核实相关服务部署到 prod 的 CI/CD 流水线是否畅通，并在正文中写明 CI/CD 状态及直接推进新镜像上线 + 修正生产配置的完整闭环方案后再发起 ask（没有发送）",
+        )
+    if _EXISTING_VPS_SLOT_AVAILABLE_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部同学申请 VPS / Claude 专线且现有节点仍有空位（如『余 2 空额』）时，属于预授权自治范围"
+            "（主人 2026-11-04 17:18 明确指示：『有空位就给他』，REG-100 防打扰门禁）："
+            "请直接在有空位的节点为其开通专属账号并交付，完成后调用 `sheepdog report` 报备；"
+            "仅在全网现有节点全部满编（0 空位）需新购 VPS 时才附全量人员名单发起 `sheepdog ask`（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

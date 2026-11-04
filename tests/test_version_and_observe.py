@@ -2288,7 +2288,7 @@ class VersionAndObserveTest(unittest.TestCase):
         from sheepdog.config import Config
         from sheepdog.store import Store
 
-        self.assertEqual(parse_version_tuple(__version__), (1, 1, 10))
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 10))
 
         # 1) 反空头工单安抚承诺门禁
         hollow_reply_1 = (
@@ -2370,6 +2370,108 @@ class VersionAndObserveTest(unittest.TestCase):
             )
             self.assertEqual(code2, "context_incomplete")
             self.assertEqual(label2, "缺环境/调用链反问")
+
+    def test_reg100_rca_governance_ask_requires_timeline_context_and_old_image_ask_requires_cicd_readiness(self) -> None:
+        """REG-100（1.1.11）：
+        1) 故障/卡顿/根因治理决策类 ask 若在 ---more--- 中只写一句口号式摘要而不交代发生时间窗、报错/耗时现象与当前现状，拦截发送（防主人反问『能具体讲讲前因后果嘛』）；
+        2) 生产服务因跑着旧镜像且留有 Stage 环境变量导致报错时，若 ask 只建议手改部分配置而不推进新镜像且未核实 CI/CD 部署到 prod 的状态，拦截发送（防主人纠偏『直接跑新镜像呗 并且保证相关服务的cicd是通的 可以部署到prod』）；
+        3) diagnose_override_reason 将『能具体讲讲前因后果嘛』归入 context_incomplete，将『直接跑新镜像呗 并且保证相关服务的cicd是通的 可以部署到prod』归入 arch_or_config_posture。
+        """
+        from sheepdog import __version__, admin_web, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertEqual(parse_version_tuple(__version__), (1, 1, 11))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            store.upsert_topic("tp_arena-release-guard", title="专题·发版守卫", kind="dynamic", conversation_id="cid-arena")
+            store.upsert_topic("tp_tapnow-prod-topology", title="专题·生产拓扑", kind="dynamic", conversation_id="cid-topo")
+
+            rca_title = "file-hub-server根因治理决策"
+            hollow_rca_body = (
+                "Jerry Chu询问file-hub-server卡顿是否修复及治理方案。建议选A：安排根因治理排期（拔除坏死GA路由+连接池熔断异步化+Supervisor放宽至5s），彻底消除单点雪崩。\n---more---\n"
+                "事情：Jerry Chu 在运维群确认 file-hub-server 周期性卡顿根因后，询问是否修复及治理方案。根因为深圳 GA TLS 挂死 + 连接池持锁阻塞 + Supervisor 1.5s 误杀 Worker 级联排队。\n\n"
+                "选项：\n"
+                "A. 安排根因治理排期（拔除坏死 GA 路由走 Tokyo 本地 + 连接池加熔断与异步探测 + 放宽 Supervisor 超时），从系统架构上消除雪崩\n"
+                "B. 暂不改代码，仅排查并恢复深圳 GA 专线（tap-prod-file-hub-ga-tokyo）的网络与证书连通性\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_rca:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_arena-release-guard", rca_title, hollow_rca_body)
+            self.assertIn("REG-100", str(ctx_rca.exception))
+
+            complete_rca_body = (
+                "Jerry Chu询问file-hub-server卡顿是否修复及治理方案。建议选A：安排根因治理排期。\n---more---\n"
+                "事情（前因后果）：\n"
+                "- 发生时间与现象：11月3日 14:20~15:10 期间，生产 file-hub-server 出现周期性 HTTP 504 与 P99 飙升至 8s，影响面为文件上传签名接口。\n"
+                "- 因果链：请求经深圳 GA 专线转发时偶发 TLS 握手挂死，连接池持全局锁同步等待阻塞后续协程，进而触发 Supervisor 1.5s 探活超时误杀 Worker 引发级联重启排队。\n"
+                "- 当前现状：目前线上流量已恢复正常（已临时止血），Jerry Chu 询问长期根因治理排期。\n\n"
+                "选项：\n"
+                "A. 安排根因治理排期（拔除坏死 GA 路由走 Tokyo 本地 + 连接池加熔断与异步探测 + 放宽 Supervisor 超时），从系统架构上消除雪崩\n"
+                "B. 暂不改代码，仅排查并恢复深圳 GA 专线的网络与证书连通性\n\n"
+                "建议：选 A。"
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_arena-release-guard", rca_title, complete_rca_body)
+
+            topo_title = "tapnowprod：conversations:create 404 根因与 BFF/WebSocket 修复授权"
+            partial_old_img_body = (
+                "conversations:create 报 404 是因为正式 agent-gateway 还跑着旧镜像，新版只发在了 candidate 上。\n"
+                "另外查出 BFF 环境变量还留着 Stage 域名导致调上游报 500。要先修 BFF 和 WS，还是连 agent-gateway 一起切？\n---more---\n"
+                "1. POST /api/agent-gateway/v1/conversations:create 返回 404 根因：正式 svc/agent-gateway-api 跑的是旧镜像 :de3ca247。\n"
+                "2. deploy/app-tapnow-bff 环境变量仍指向 Stage。\n"
+                "3. 授权选项：\n"
+                "- 选项 A（推荐）：同意更新 tapnowprod 的 app-tapnow-bff 环境变量并重启 websocket-service\n"
+                "- 选项 B：同意更新 tapnowprod 的 app-tapnow-bff 环境变量、重启 websocket-service 并切换 agent-gateway 到新版"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_topo:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", topo_title, partial_old_img_body)
+            self.assertIn("REG-100", str(ctx_topo.exception))
+
+            complete_topo_body = (
+                partial_old_img_body
+                + "\n4. CI/CD 状态：已核实 agent-gateway 与 app-tapnow-bff 的 CNB CI/CD 流水线是通的，可以直接部署到 prod。"
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", topo_title, complete_topo_body)
+
+            c1, l1 = admin_web.diagnose_override_reason(hollow_rca_body, "能具体讲讲前因后果嘛", "其他", "A")
+            self.assertEqual((c1, l1), ("context_incomplete", "缺环境/调用链反问"))
+            c2, l2 = admin_web.diagnose_override_reason(
+                partial_old_img_body, "直接跑新镜像呗 并且保证相关服务的cicd是通的 可以部署到prod", "其他", "A"
+            )
+            self.assertEqual((c2, l2), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 4) 现有 VPS 节点仍有空位（如『余 2 空额』）时申请专线拦截 ask（主人批复『有空位就给他』），且 _ACCEPT_WORDS_RE 识别为采纳
+            store.upsert_topic("tp_3x-ui-ops", title="专席·3x-ui运维", kind="managed", conversation_id="cid-3x")
+            vps_slot_title = "Jean Xu申请Claude专线"
+            vps_slot_body = (
+                "Jean申请VPS专线跑Claude，极净节点lsg15仅kc一人余2空额，建议选A在lsg15开通专属账号交付。\n---more---\n"
+                "事情：Jean Xu 私聊申请 VPS 专线用于跑 Claude，目前干净双 ISP 节点 lsg15 仅 kc 1 人（余 2 空额）。\n\n"
+                "选项：\n"
+                "A. 批准在 lsg15 为 Jean Xu 开通专属双入站（Reality/Trojan）并交付\n"
+                "B. 新购一台专属干净 VPS 专线给 Jean 跑 Claude（约 $10/月）\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_vps:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_3x-ui-ops", vps_slot_title, vps_slot_body)
+            self.assertIn("REG-100", str(ctx_vps.exception))
+            self.assertIsNotNone(admin_web._ACCEPT_WORDS_RE.search("有空位就给他"))
+
+            # 5) Subagent 后台长任务 (.system_generated/tasks/task-*.log) 持续输出心跳与误判 timeout 自愈
+            from sheepdog import engine
+            fake_brain = root / "brain" / "cid-sub-backfill" / ".system_generated"
+            (fake_brain / "logs").mkdir(parents=True, exist_ok=True)
+            (fake_brain / "tasks").mkdir(parents=True, exist_ok=True)
+            tp_sub = fake_brain / "logs" / "transcript.jsonl"
+            tp_sub.write_text('{"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE"}\n', encoding="utf-8")
+            task_log = fake_brain / "tasks" / "task-184.log"
+            task_log.write_text("2500/10349 batches\n", encoding="utf-8")
+            mt = engine._subagent_latest_task_log_mtime(tp_sub)
+            self.assertIsNotNone(mt)
 
 
 if __name__ == "__main__":

@@ -4672,6 +4672,34 @@ class Dispatcher:
                             fallback_sum = after_lb["task_title"] or f"羔羊 {lb['lamb_id']} 已完成"
                         self.store.update_lamb(lb["lamb_id"], result_summary=fallback_sum)
             for lb in topic_lambs:
+                if (
+                    lb["state"] == "timeout"
+                    and lb["kind"] in ("subagent", "native_subagent")
+                    and (lb["conversation_id"] or "").strip()
+                ):
+                    has_newer_or_active = any(
+                        other["lamb_id"] != lb["lamb_id"]
+                        and (other["conversation_id"] or "").strip() == (lb["conversation_id"] or "").strip()
+                        and (other["state"] == "running" or (other["started_at"] or "") > (lb["started_at"] or ""))
+                        for other in topic_lambs
+                    )
+                    if has_newer_or_active:
+                        continue
+                    fin_dt = _parse(lb["finished_at"] or "")
+                    if fin_dt and (_now() - fin_dt) > timedelta(minutes=self.cfg.lamb.timeout_minutes * 2):
+                        continue
+                    tp_sub = transcript_path(lb["conversation_id"])
+                    task_act = _subagent_latest_task_log_mtime(tp_sub)
+                    if task_act is not None and (_now() - task_act) < timedelta(minutes=self.cfg.lamb.timeout_minutes):
+                        self.store.update_lamb(
+                            lb["lamb_id"],
+                            state="running",
+                            finished_at=None,
+                            reported_at=None,
+                            result_summary=None,
+                            last_act_at=task_act.astimezone().isoformat(timespec="seconds"),
+                        )
+                        continue
                 if lb["state"] in ("done", "failed") and lb["kind"] in ("cli", "bash_worker") and lb["log_path"]:
                     cur_sum = str(lb["result_summary"] or "").strip()
                     if cur_sum in ("", "后台进程已退出") and lb["state"] == "done":
@@ -4772,6 +4800,9 @@ class Dispatcher:
             if lb["conversation_id"]:
                 tp = transcript_path(lb["conversation_id"])
                 act = last_activity_at(ANTIGRAVITY, tp) if tp.exists() else None
+                task_act = _subagent_latest_task_log_mtime(tp)
+                if task_act is not None and (act is None or task_act > act):
+                    act = task_act
                 if act is not None and (last_dt is None or act > last_dt):
                     last_dt = act
                     self.store.update_lamb(lid, last_act_at=act.astimezone().isoformat(timespec="seconds"))
@@ -6490,6 +6521,28 @@ def _unwrap_edited_content(text: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return parts[0], parts[-1]
     return s, s
+
+
+def _subagent_latest_task_log_mtime(tp: Path) -> datetime | None:
+    """REG-100：当 subagent 发起后台长任务（.system_generated/tasks/task-*.log）等待唤醒时，transcript.jsonl 在运行期间无新行写入，
+    通过扫描同会话下的 tasks/*.log 最新文件修改时间作为真实活跃心跳，防止将仍在持续输出日志的后台任务误判为 20 分钟无心跳超时。"""
+    tasks_dir = tp.parent.parent / "tasks"
+    if not tasks_dir.is_dir():
+        return None
+    latest_ts: float | None = None
+    try:
+        for p in tasks_dir.glob("*.log"):
+            try:
+                mt = p.stat().st_mtime
+                if latest_ts is None or mt > latest_ts:
+                    latest_ts = mt
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if latest_ts is None:
+        return None
+    return datetime.fromtimestamp(latest_ts).astimezone()
 
 
 def _harvest_subagent_stall_state(tp: Path) -> tuple[bool, str]:
