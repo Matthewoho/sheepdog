@@ -633,7 +633,7 @@ def is_standing_topic(t) -> bool:
     keys = t.keys()
     kind = t["kind"] if "kind" in keys else None
     tid = t["topic_id"] if "topic_id" in keys else None
-    if kind == "adopted" or tid == "tp_bus":
+    if kind == "adopted" or tid in ("tp_bus", "tp_sheepdog"):
         return True
     if kind == "dynamic":
         lc = (t["lifecycle"] if "lifecycle" in keys else None) or ""

@@ -502,7 +502,7 @@ def format_evolve_prompt(
 
 
 def ensure_evolve_topic(cfg: Config, store: Store) -> dict | None:
-    """确保自进化管家会话（默认 `tp_sheepdog`）已在 `topics` 表登记。"""
+    """确保自进化管家会话（默认 `tp_sheepdog`）已在 `topics` 表登记且标记为常设（standing）。"""
     tid = cfg.self_evolve.topic_id
     t = store.get_topic(tid)
     host = cfg.self_evolve.host or ANTIGRAVITY
@@ -515,11 +515,20 @@ def ensure_evolve_topic(cfg: Config, store: Store) -> dict | None:
             duty_text,
             sm.ACTIVE,
             host=host,
+            lifecycle="standing",
         )
         t = store.get_topic(tid)
-    elif t["state"] == sm.CLOSED:
-        store.update_topic(tid, state=sm.ACTIVE, duty=t["duty"] or duty_text)
-        t = store.get_topic(tid)
+    else:
+        upd_fields: dict = {}
+        if t["state"] == sm.CLOSED:
+            upd_fields["state"] = sm.ACTIVE
+        if not t["duty"]:
+            upd_fields["duty"] = duty_text
+        if (t["lifecycle"] or "") != "standing":
+            upd_fields["lifecycle"] = "standing"
+        if upd_fields:
+            store.update_topic(tid, **upd_fields)
+            t = store.get_topic(tid)
     return dict(t) if t is not None else None
 
 
@@ -623,6 +632,13 @@ def run_evolve_tick(
             "self_evolve_digest",
             prompt_text,
             tags=[f"evolve_iter:{iteration}", f"trigger:{trigger_reason}"],
+        )
+        now_str = now.isoformat(timespec="seconds")
+        store.update_topic(
+            evolve_tid,
+            last_active=now_str,
+            dispatched_at=now_str,
+            summary=f"自进化巡检 #{iteration} ({trigger_reason})",
         )
         if dispatcher is not None:
             t_row = store.get_topic(evolve_tid)

@@ -5130,6 +5130,30 @@ class Dispatcher:
                     self._duty_recovered(self.store.get_topic(tid), state)
             except Exception as e:
                 log.warning("算会话 %s 的羊群看板卡片出错: %s", tid, e)
+        t_brain = self.store.get_topic(duty.SHEEPDOG_BRAIN_TOPIC_ID)
+        if t_brain is not None and t_brain["state"] != sm.CLOSED and duty.SHEEPDOG_BRAIN_TOPIC_ID not in tids:
+            try:
+                self._duty_scan(t_brain)
+                b_card = self.store.get_card(duty.SHEEPDOG_BRAIN_TOPIC_ID)
+                b_act_at = (b_card["last_act_at"] if b_card is not None else None) or ""
+                b_dt = _parse(b_act_at)
+                b_working = b_dt is not None and (_now() - b_dt) <= timedelta(seconds=120)
+                b_state = duty.WORKING if b_working else duty.IDLE
+                b_detail = ((b_card["action"] if b_card is not None else None) or "自进化主脑常驻巡检中") if b_working else "自进化主脑常驻待命"
+                self.store.upsert_card(
+                    duty.SHEEPDOG_BRAIN_TOPIC_ID,
+                    run_state=b_state,
+                    detail=b_detail,
+                    stuck_since=None,
+                    spinning=0,
+                    queued=self.store.count_pending_signals(duty.SHEEPDOG_BRAIN_TOPIC_ID),
+                    idle_since=(b_act_at or now_iso()) if b_state == duty.IDLE else None,
+                    no_record=int(self._record_missing(t_brain)),
+                )
+                if b_act_at and b_act_at > str(t_brain["last_active"] or ""):
+                    self.store.update_topic(duty.SHEEPDOG_BRAIN_TOPIC_ID, last_active=b_act_at)
+            except Exception as e:
+                log.warning("算自进化主脑会话 %s 的看板卡片出错: %s", duty.SHEEPDOG_BRAIN_TOPIC_ID, e)
 
     def _duty_scan(self, t) -> None:
         """增量读会话记录（复用护栏的 _follow，用途 duty）：最近一次工具调用、最近一次动作、空转计数、主人发言、压缩点。
@@ -5769,6 +5793,8 @@ class Dispatcher:
         body = "\n\n".join([header, *[(r["content"] or "") for r in rows]])
         self._send(t, body, bid)
         self.store.mark_batch(mids, bid, duty.SHEEPDOG_BRAIN_TOPIC_ID, "acked")
+        ts_now = now_iso()
+        self.store.update_topic(duty.SHEEPDOG_BRAIN_TOPIC_ID, last_active=ts_now, dispatched_at=ts_now)
         log.info("已直投 %d 条跨工作区来信至主脑 %s (%s)", len(mids), duty.SHEEPDOG_BRAIN_TOPIC_ID, cid)
         return mids
 

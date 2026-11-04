@@ -839,7 +839,7 @@ class WorkbenchService:
                 cid = str(t["conversation_id"] or "").strip()
                 gid = str(t["group_id"] or "").strip()
                 if not gid:
-                    if tid == "tp_bus":
+                    if tid in ("tp_bus", "tp_sheepdog"):
                         gid = "bus_core"
                     elif "#" in tid:
                         gid = tid.split("#", 1)[0].removeprefix("tp_")
@@ -923,6 +923,10 @@ class WorkbenchService:
         finally:
             conn.close()
 
+        if "bus_core" in groups_map:
+            groups_map["bus_core"]["sessions"].sort(
+                key=lambda s: (0 if s["topic_id"] == "tp_bus" else (1 if s["topic_id"] == "tp_sheepdog" else 2), s["topic_id"])
+            )
         groups_sorted = sorted(
             groups_map.values(),
             key=lambda g: (
@@ -951,7 +955,7 @@ class WorkbenchService:
     @staticmethod
     def _group_label(gid: str) -> str:
         labels = {
-            "bus_core": "中枢总线 (tp_bus)",
+            "bus_core": "中枢总线与自进化主脑 (tp_bus / tp_sheepdog)",
             "standing_specialists": "常驻职能与领域专席 (Standing)",
             "dynamic_oneshot": "动态专项会话 (Oneshot)",
             "laohu": "老胡并发会话组 (Session Group · laohu)",

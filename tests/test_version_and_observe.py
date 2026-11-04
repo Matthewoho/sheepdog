@@ -3339,6 +3339,70 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(len(dig2["d6_peer_feedback_inbox"]["peer_mails"]), 0)
             self.assertEqual(dig2["d6_peer_feedback_inbox"]["latest_mail_id"], 2342)
 
+    def test_reg109_tp_sheepdog_bus_core_pinning_and_evolve_activity_sync(self) -> None:
+        """REG-109 (v1.1.20):
+        1. store.is_standing_topic 将 tp_sheepdog（即使 kind='known' 且 lifecycle=None）识别为常设会话（standing）；
+        2. evolve.ensure_evolve_topic 对已存在的 known tp_sheepdog 自动补齐 lifecycle='standing' 与 duty；
+        3. evolve.run_evolve_tick 触发巡检时同步刷新 tp_sheepdog 的 last_active、dispatched_at 与 summary；
+        4. admin_web.WorkbenchService.get_sessions_tree 将 tp_sheepdog 归入顶层 bus_core（紧随 tp_bus 排第 2），不再沉入折叠的 dynamic_oneshot。
+        """
+        from datetime import datetime, timedelta, timezone
+        from sheepdog import admin_web, evolve
+        from sheepdog.config import Config
+        from sheepdog.store import Store, is_standing_topic
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=state_dir,
+                config_path=state_dir / "config.toml",
+                sink="dryrun",
+            )
+            store = Store(cfg.db_path)
+            store.create_topic("tp_bus", "总线", "adopted", "路由", "active")
+            store.create_topic(
+                "tp_sheepdog",
+                "🐕 Sheepdog 自治主脑",
+                "known",
+                "",
+                "active",
+            )
+            store.update_topic(
+                "tp_sheepdog",
+                conversation_id="c6677355-8d2c-4673-8699-01b1b91a7271",
+                last_active="2026-11-03T23:56:26+08:00",
+            )
+
+            # 1) is_standing_topic 认 tp_sheepdog
+            t0 = store.get_topic("tp_sheepdog")
+            self.assertTrue(is_standing_topic(t0))
+
+            # 2) ensure_evolve_topic 自动补齐 lifecycle='standing' 与 duty
+            ensured = evolve.ensure_evolve_topic(cfg, store)
+            self.assertIsNotNone(ensured)
+            self.assertEqual(ensured["lifecycle"], "standing")
+            self.assertIn("Sheepdog 内置自进化管家", ensured["duty"])
+
+            # 3) run_evolve_tick(force=True) 同步刷新 tp_sheepdog.last_active / dispatched_at / summary
+            now_dt = datetime(2026, 11, 5, 2, 22, 0, tzinfo=timezone(timedelta(hours=8)))
+            res = evolve.run_evolve_tick(cfg, store, force=True, now_dt=now_dt)
+            self.assertTrue(res["triggered"])
+            t1 = store.get_topic("tp_sheepdog")
+            self.assertEqual(t1["last_active"], "2026-11-05T02:22:00+08:00")
+            self.assertEqual(t1["dispatched_at"], "2026-11-05T02:22:00+08:00")
+            self.assertIn("自进化巡检 #1", t1["summary"])
+
+            # 4) WorkbenchService.get_sessions_tree 将 tp_bus 与 tp_sheepdog 同置顶于 bus_core
+            wb = admin_web.WorkbenchService(cfg)
+            tree = wb.get_sessions_tree()
+            self.assertGreaterEqual(len(tree["groups"]), 1)
+            g0 = tree["groups"][0]
+            self.assertEqual(g0["group_id"], "bus_core")
+            self.assertEqual([s["topic_id"] for s in g0["sessions"]], ["tp_bus", "tp_sheepdog"])
+            self.assertEqual(g0["sessions"][1]["lifecycle"], "standing")
+            self.assertEqual(g0["sessions"][1]["last_active"], "2026-11-05T02:22:00+08:00")
+
 
 if __name__ == "__main__":
     unittest.main()
