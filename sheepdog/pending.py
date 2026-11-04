@@ -40,6 +40,7 @@ PH_SPOKE = "owner_spoke"
 PH_REACTION = "owner_reaction"
 PH_SIBLING_ANSWERED = "sibling_answered"
 PH_SIBLING_RESOLVED = "sibling_resolved"
+PH_PANEL_SPOKE = "owner_panel_spoke"
 
 # sends 表里这两种是牧羊犬自己的话（7.36）：拉回来时一律丢弃，不登记「需要你定」、不投给任何会话
 SEND_RESOLVE = "resolve"
@@ -321,17 +322,63 @@ def _owner_followups(cfg, store: Store, srcs) -> list:
     return list(out.values())
 
 
+def _owner_panel_followup(cfg, store: Store, e, asked: datetime, until: datetime | None = None) -> Hit | None:
+    """1.1.17 (REG-106): 检查提问发出（asked）后，主人是否已在 Antigravity IDE 面板对该会话直接输入过指令（USER_EXPLICIT）。"""
+    tid = str(e["topic_id"] or "").strip()
+    if not tid:
+        return None
+    t = store.get_topic(tid)
+    if t is None or (t["host"] or eng.ANTIGRAVITY) != eng.ANTIGRAVITY:
+        return None
+    cid = str(t["conversation_id"] or "").strip()
+    if not cid:
+        return None
+    from pathlib import Path
+    bdir = getattr(cfg, "brain_dir_path", "") or ""
+    tp = (Path(bdir) / cid / ".system_generated" / "logs" / "transcript.jsonl") if bdir else eng.transcript_path(cid)
+    if not tp.is_file():
+        return None
+    from . import hook
+    tz = eng._tz(cfg.timezone_offset)[0]
+    try:
+        lines = hook._tail_lines(tp, hook.TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return None
+    for line in lines:
+        if b"USER_EXPLICIT" not in line:
+            continue
+        d = hook._json_line(line)
+        if not isinstance(d, dict) or d.get("type") != "USER_INPUT" or d.get("source") != "USER_EXPLICIT":
+            continue
+        at = _parse(str(d.get("created_at") or ""))
+        if at is None or at <= asked or not _before(at, until):
+            continue
+        raw_body = hook.message_body(str(d.get("content") or ""))
+        body = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*$", "", raw_body).replace("</USER_REQUEST>", "").strip()
+        if not body or body.startswith(("[牧羊犬", "【🐕", "[sheepdog]")):
+            continue
+        if is_owner_busy_or_defer_text(body):
+            continue
+        step_idx = d.get("step_index", 0)
+        return Hit(
+            PH_PANEL_SPOKE,
+            f"panel_step:{step_idx}",
+            at.astimezone(tz).isoformat(timespec="seconds"),
+            text=_short(body, OWNER_TEXT_CHARS),
+            other_topic=tid,
+        )
+    return None
+
+
 def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | None = None) -> Hit | None:
-    """只读：这条提问是不是「可能已处理」。依次看主人后来在来源聊天里的发言、对来源消息点的表情、同来源的另一条提问。
+    """只读：这条提问是不是「可能已处理」。依次看主人后来在来源聊天里的发言、对来源消息点的表情、同来源的另一条提问、或在 IDE 面板直接对该会话输入指令。
     until：只看这个时间以前的（回放用）。"""
     asked = _parse(e["asked_at"])
     if asked is None:
         return None
     srcs = sources if sources is not None else store.escalation_sources(e["message_id"])
-    if not srcs:
-        return None
     me = cfg.self_open_id
-    about = [s["about_message_id"] for s in srcs]
+    about = [s["about_message_id"] for s in srcs] if srcs else []
     # 1. 主人本人后来说过话（7.38 第 3 条）：来源是私聊的，主人之后在这个私聊说话就算；来源是群的，只认主人回复 / 引用
     #    来源消息、或在来源消息所在话题里说的
     if me and srcs:
@@ -367,20 +414,25 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
                        (m["chat_name"] or "") if m is not None else "", (m["chat_type"] or "") if m is not None else "",
                        _short(m["content"] if m is not None else "", 80), emoji=r["emoji_type"] or "")
     # 3. 同来源的另一条提问被主人答复或被会话结案
-    for other in dict.fromkeys(r["ask_message_id"] for r in store.sources_about(about)):
-        if other == e["message_id"]:
-            continue
-        o = store.get_escalation(other)
-        if o is None or o["close_reason"] not in ("answered", "resolved"):
-            continue
-        if not same_matter(e["topic_id"], srcs, o["topic_id"], store.escalation_sources(other)):
-            continue
-        at = _parse(o["closed_at"])
-        if at is None or at <= asked or not _before(at, until):
-            continue
-        return Hit(PH_SIBLING_RESOLVED if o["close_reason"] == "resolved" else PH_SIBLING_ANSWERED, other,
-                   o["closed_at"], text=ask_title(cfg, o["text"]), other_topic=o["topic_id"],
-                   note=o["resolve_note"] or "")
+    if srcs and about:
+        for other in dict.fromkeys(r["ask_message_id"] for r in store.sources_about(about)):
+            if other == e["message_id"]:
+                continue
+            o = store.get_escalation(other)
+            if o is None or o["close_reason"] not in ("answered", "resolved"):
+                continue
+            if not same_matter(e["topic_id"], srcs, o["topic_id"], store.escalation_sources(other)):
+                continue
+            at = _parse(o["closed_at"])
+            if at is None or at <= asked or not _before(at, until):
+                continue
+            return Hit(PH_SIBLING_RESOLVED if o["close_reason"] == "resolved" else PH_SIBLING_ANSWERED, other,
+                       o["closed_at"], text=ask_title(cfg, o["text"]), other_topic=o["topic_id"],
+                       note=o["resolve_note"] or "")
+    # 4. 主人在 IDE 面板（transcript.jsonl USER_EXPLICIT）直接对该会话输入了指令/讨论（1.1.17 REG-106）
+    panel_hit = _owner_panel_followup(cfg, store, e, asked, until)
+    if panel_hit is not None:
+        return panel_hit
     return None
 
 
@@ -464,6 +516,8 @@ def hit_line(cfg, store: Store, hit: Hit, me_word: str = "主人", short: bool =
                 f"{ref}")
     if hit.reason == PH_SIBLING_ANSWERED:
         return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复{ref}"
+    if hit.reason == PH_PANEL_SPOKE:
+        return f"{me_word} {at}已在 IDE 面板直接对该会话输入指令：「{hit.text}」{ref}"
     return f"标为可能已处理（{hit.reason or '-'}，{hit.message_id or '-'}）"
 
 
@@ -943,6 +997,8 @@ def _ph_phrase(cfg, store: Store, ph: dict, now: datetime) -> str:
         return f"{at} 同来源的另一条你已答复"
     if r == PH_SIBLING_RESOLVED:
         return f"{at} 同来源的另一条已结案"
+    if r == PH_PANEL_SPOKE:
+        return f"{at} 你已在 IDE 面板跟该会话讨论"
     return "标了可能已处理"
 
 

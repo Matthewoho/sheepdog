@@ -6,7 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
-__version__ = "1.1.16"
+__version__ = "1.1.17"
 
 
 def parse_version_tuple(ver: str) -> tuple[int, ...]:

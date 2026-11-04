@@ -2890,6 +2890,139 @@ class VersionAndObserveTest(unittest.TestCase):
             parsed_edm_opts = parse_ask_options(resolved_out)
             self.assertEqual([o.key for o in parsed_edm_opts], ["A", "B"])
 
+    def test_reg106_panel_spoke_escalation_nudge_guard_capacity_doc_guard_and_cli_lamb_json_brace_fix(self):
+        from sheepdog import (
+            __version__,
+            admin_web,
+            decision_hub,
+            engine,
+            outbound,
+            parse_version_tuple,
+            pending,
+        )
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 17))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            cfg.brain_dir_path = str(root / "brain")
+            Path(cfg.brain_dir_path).mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+
+            # 1) 多组件（PG + MySQL + Redis）压测/生产升配方案未附飞书文档链接时触发 REG-106 拦截；附上飞书文档链接后放行
+            cap_title = "南京生产DB与Redis压测升配方案"
+            cap_bad_body = (
+                "已摸清南京生产 PG(8C16G)/MySQL(4C8G)/Redis(4GB) 水位并对比东京压测基线，建议选 A 升配至 PG 16C64G + MySQL 16C32G + Redis 16GB。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意按标准压测档升配（PG 16C64G + MySQL 16C32G + Redis 16GB）\n"
+                "B. 按保守减半档升配（PG 16C32G + MySQL 8C16G + Redis 8GB）"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_cap:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", cap_title, cap_bad_body)
+            self.assertIn("REG-106", str(ctx_cap.exception))
+
+            cap_good_body = (
+                "已将南京生产全栈压测容量方案整理为飞书文档（https://example.SG.larksuite.com/docx/DocToken106），建议选 A。\n"
+                + cap_bad_body
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", cap_title, cap_good_body)
+
+            # 2) diagnose_override_reason 精准分类『给我完整的方案吧 用lark文档 我要仔细看看』与『我在agy里面跟session讨论...』
+            c_doc, l_doc = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · {cap_title} [tp_tapnow-prod-topology]\n{cap_bad_body}",
+                "给我完整的方案吧 用lark文档 我要仔细看看",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_doc, l_doc), ("context_incomplete", "缺环境/调用链反问"))
+
+            c_as, l_as = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · 南京生产压测剩余4项加固 [tp_tapnow-prod-topology]",
+                "这个能够自动扩缩容嘛",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_as, l_as), ("context_incomplete", "缺环境/调用链反问"))
+
+            c_agy, l_agy = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · 南京全栈压测容量方案(附飞书文档) [tp_tapnow-prod-topology]\n{cap_good_body}",
+                "我在agy里面跟session讨论 如果确定还是需要我拍板或者明确卡住了 再跟我提一次ask",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_agy, l_agy), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            # 3) 主人在 ask 发出后直接在对应会话的 Antigravity IDE 面板发了 USER_EXPLICIT 指令时，
+            #    pending.detect 识别为 owner_panel_spoke，且 nudge_open_escalations 自动标 possibly_handled 跳过 30 分钟飞书催办
+            cid = "d0758da6-274e-4954-89fa-9507823ec9d8"
+            store.upsert_topic("tp_tapnow-prod-topology", kind="custom", title="Topology", conversation_id=cid, state="active")
+            log_dir = Path(cfg.brain_dir_path) / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / "transcript.jsonl").write_text(
+                json.dumps(
+                    {
+                        "step_index": 15574,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "status": "DONE",
+                        "created_at": "2026-11-04T21:41:40+08:00",
+                        "content": "<USER_REQUEST>先看一下 K8s 节点 CPU 和内存水位</USER_REQUEST>",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store.add_escalation(
+                "om_test_panel_spoke_106",
+                "tp_tapnow-prod-topology",
+                "oc_hub_106",
+                f"🐕 需要你定 · 南京全栈压测容量方案(附飞书文档) [tp_tapnow-prod-topology]\n{cap_good_body}",
+                "2026-11-04T21:37:53+08:00",
+            )
+            e_row = store.get_escalation("om_test_panel_spoke_106")
+            ref_now = datetime.fromisoformat("2026-11-04T22:08:16+08:00")
+            hit = pending.detect(cfg, store, e_row, until=ref_now)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit.reason, pending.PH_PANEL_SPOKE)
+            self.assertIn("已在 IDE 面板直接对该会话输入指令", pending.hit_line(cfg, store, hit, ref_now))
+
+            nudged = decision_hub.nudge_open_escalations(cfg, store, None, now=ref_now)
+            self.assertEqual(nudged, [])
+            e_after = store.get_escalation("om_test_panel_spoke_106")
+            self.assertEqual(e_after["possibly_handled_reason"], pending.PH_PANEL_SPOKE)
+            self.assertEqual(int(e_after["nudge_count"] or 0), 0)
+
+            # 4) _summarize_cli_lamb_log 识别 === ALL_TENCENT_PG_VERIFIED === 横幅消除前置幂等 Error 假阴性，并过滤截断 JSON 孤立 '{' 行
+            pg_log = (
+                "Creating readonly user...\n"
+                "Error: [TencentCloudSDKError] Code=InvalidAccountStatus, Message=account already exist\n"
+                "Granting SELECT...\n"
+                "=== ALL_TENCENT_PG_VERIFIED ===\n"
+            )
+            pg_sum, pg_err = engine._summarize_cli_lamb_log(pg_log)
+            self.assertFalse(pg_err)
+            self.assertIn("=== ALL_TENCENT_PG_VERIFIED ===", pg_sum)
+
+            trunc_json_log = (
+                '{\n'
+                '  "step": 698,\n'
+                '  "tool_calls": [\n'
+                '    {\n'
+                '      "name": "run_command",\n'
+                '      "args": "kubectl get pods -n tapnowprod"\n'
+            )
+            trunc_sum, trunc_err = engine._summarize_cli_lamb_log(trunc_json_log)
+            self.assertFalse(trunc_err)
+            self.assertNotEqual(trunc_sum.strip(), "{")
+            self.assertIn("kubectl get pods", trunc_sum)
+
 
 if __name__ == "__main__":
     unittest.main()

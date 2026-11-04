@@ -807,12 +807,19 @@ def next_nudge_due_at(asked_at: datetime, nudge_count: int, last_nudged_at: date
     return None
 
 def nudge_open_escalations(cfg, store, source, *, now: datetime | None = None) -> list[dict]:
-    """扫描未答提问并按三阶阶梯在聚合台（或原话题）发送催办提醒，00:00~09:00 CST 静默。"""
+    """扫描未答提问并按三阶阶梯在聚合台（或原话题）发送催办提醒，00:00~09:00 CST 静默。
+    1.1.17 (REG-106): 若提问已标 possibly_handled_at 或实时命中 pending.detect（含主人在 Antigravity IDE 面板直接与该会话讨论），
+    自动标记 possibly_handled 并跳过飞书催办。"""
     if 0 <= (ref_now := (now or datetime.now(CST)).astimezone(CST)).hour < 9: return []
-    rows = store.conn.execute("SELECT * FROM escalations WHERE closed_at IS NULL AND answered_at IS NULL AND COALESCE(nudge_count, 0) < 3 ORDER BY asked_at ASC").fetchall()
+    from . import pending as pnd
+    rows = store.conn.execute("SELECT * FROM escalations WHERE closed_at IS NULL AND answered_at IS NULL AND possibly_handled_at IS NULL AND COALESCE(nudge_count, 0) < 3 ORDER BY asked_at ASC").fetchall()
     nudged, hub_root, me = [], (get_hub_meta(store).get("root_message_id") or ""), (getattr(cfg, "self_open_id", "") or "")
     at_tag = f" <at id={me}></at>" if me else ""
     for e in rows:
+        hit = pnd.detect(cfg, store, e, until=ref_now)
+        if hit is not None:
+            store.mark_possibly_handled(str(e["message_id"]), hit.message_id, hit.reason)
+            continue
         try: asked_dt, last_dt = datetime.fromisoformat(e["asked_at"]).astimezone(CST), (datetime.fromisoformat(e["last_nudged_at"]).astimezone(CST) if e["last_nudged_at"] else None)
         except Exception: continue
         if (due := next_nudge_due_at(asked_dt, cur_count := int(e["nudge_count"] or 0), last_dt)) is None or ref_now < due: continue

@@ -592,6 +592,17 @@ _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
     r"|给\s*(?:Sammy|Sammi)[^\n。]{0,24}(?:开通|开放|提供)[^\n。]{0,24}(?:权限|跳板机|入口)))",
     re.I,
 )
+_MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:压测|全栈|生产|容量|扩容|升配)[^\n。]{0,24}(?:升配|扩容|容量|规格)[^\n。]{0,16}方案)"
+    r"(?=[\s\S]*\b(?:PG|PostgreSQL)\b)"
+    r"(?=[\s\S]*\b(?:MySQL|ADB|AnalyticDB)\b)"
+    r"(?=[\s\S]*\bRedis\b)",
+    re.I,
+)
+_LARK_DOC_LINK_EVIDENCE_RE = re.compile(
+    r"(?:(?:larksuite\.com|feishu\.cn)/(?:docx|docs|wiki)/[A-Za-z0-9]+|飞书(?:云)?文档|Lark\s*文档)",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -803,6 +814,14 @@ def check_ask_pre_flight_guard(
             "凡未触及 3 条硬底线（`--floor-type credentials|destructive|vip_conflict`），我们平时用什么入口/方式操作"
             "（如南京生产 TKE `cls-gnui5plk` 跳板机 `ins-cey0hf6s` TAT/SSH、限单 IP 临时白名单、新建 K8s Secret 或对齐同级云权限），"
             "请直接给 Sammy / Sammi 提供完全一致的入口与同级权限并协助办结，完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（没有发送）",
+        )
+    if _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(full_text) and not _LARK_DOC_LINK_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "涉及多组件（PG + MySQL/ADB + Redis 等）生产/全栈压测升配与容量规划方案请示时，严禁只塞在飞书卡片正文里让主人盲批"
+            "（主人 2026-11-04 21:29 在 `[其他]` 明确要求：『给我完整的方案吧 用lark文档 我要仔细看看』，REG-106 多组件容量方案必附飞书文档门禁）："
+            "请先将完整的全栈容量对比、连接数/IOPS/内存水位测算、各组件目标规格与回缩预案整理成飞书云文档（Lark Docx）并授权主人可访问，"
+            "在 `sheepdog ask` 正文中附上飞书文档链接（`https://.../docx/...`）后再发起请示（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

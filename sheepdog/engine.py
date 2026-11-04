@@ -4747,6 +4747,7 @@ class Dispatcher:
                     if (
                         _GREP_MATCH_LINE_RE.search(cur_sum)
                         or _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(cur_sum)
+                        or cur_sum in ("{", "[")
                         or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
@@ -4761,7 +4762,7 @@ class Dispatcher:
                         )
                         or (
                             lb["state"] == "failed"
-                            and any(ok_m in cur_sum for ok_m in ("=== VERIFICATION PASSED ===", "=== ALL PASSED ==="))
+                            and bool(_CLI_PASS_BANNER_RE.search(cur_sum))
                         )
                     ):
                         try:
@@ -6622,9 +6623,20 @@ def _harvest_subagent_stall_state(tp: Path) -> tuple[bool, str]:
     return is_generic_done, harvested
 
 
+_CLI_PASS_BANNER_RE = re.compile(
+    r"(?:^===\s*.*(?:^|[\s_-])(?:PASSED|VERIFIED|DONE|COMPLETE|COMPLETED|OK|SUCCESS)(?:$|[\s_-]).*===$"
+    r"|=== VERIFICATION PASSED ==="
+    r"|=== ALL PASSED ==="
+    r"|VERIFICATION PASSED"
+    r"|\"ok\"\s*:\s*true"
+    r"| is live on )",
+    re.I | re.M,
+)
+
+
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
-    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
-    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片。"""
+    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）/ REG-106：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
+    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片（含孤立开闭括号）。"""
     if not raw_text:
         return "", False
     non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -6637,17 +6649,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
         (
             i
             for i in range(len(tail_10) - 1, -1, -1)
-            if any(
-                ok_m in tail_10[i]
-                for ok_m in (
-                    "=== VERIFICATION PASSED ===",
-                    "=== ALL PASSED ===",
-                    "VERIFICATION PASSED",
-                    '"ok":true',
-                    '"ok": true',
-                    " is live on ",
-                )
-            )
+            if _CLI_PASS_BANNER_RE.search(tail_10[i])
         ),
         None,
     )
@@ -6728,7 +6730,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                     return ("\n".join([*prefix_lines, f"JSON({json_summary})"]) if prefix_lines else f"JSON({json_summary})"), has_err
             except Exception:
                 pass
-    meaningful = [ln for ln in non_empty if not re.match(r"^[}\],;:\s]+$", ln)]
+    meaningful = [ln for ln in non_empty if not re.match(r"^[{}\[\],;:\s]+$", ln)]
     if not has_err:
         non_grep = [
             ln for ln in meaningful
