@@ -514,6 +514,53 @@ _BUS_CODEX_OR_BLOCKED_FORWARD_ASK_RE = re.compile(
     r"(?:\bcodex\b|转交[^\n。]{0,24}(?:被拒绝|失败|报错|失联|已收掉|closed))",
     re.I,
 )
+_WRITE_PERM_ASK_RE = re.compile(
+    r"申请[^\n。]{0,40}(?:修改权限|查看和修改权限|读写权限|写权限)",
+    re.I,
+)
+_REFUSAL_OR_RESTRICT_OPT_RE = re.compile(
+    r"(?:严守红线拒绝|拒绝[^\n]{0,20}权限|不开放|严禁下放|仅开[^\n]{0,20}只读|暂缓)",
+    re.I,
+)
+_GRANT_WRITE_PERM_OPT_RE = re.compile(
+    r"(?:(?:同意|批准|按申请|直接)?[^\n]{0,16}(?:给他|为其|向其|给\s*\S+)?(?:授权|开通|开放|授予|下放)[^\n]{0,24}(?:修改权限|写权限|读写权限|所申请权限|全部权限)|^(?:[A-E]\s*[.、:：]\s*)?(?:同意|批准)(?:授权|开通))",
+    re.I,
+)
+_UNINVESTIGATED_STATUS_ASK_RE = re.compile(
+    r"(?:(?:路由|配置|渠道|网络)[^\n。]{0,16}现状确认|需确认[^\n。]{0,48}现状[，,]\s*以便)",
+    re.I,
+)
+_CONCRETE_STATUS_EVIDENCE_RE = re.compile(
+    r"(?:已实测|已核查|实测现状|当前配置为|当前路由为|kubectl|secret|configmap)",
+    re.I,
+)
+_UNVERIFIED_TICKET_PROMISE_RE = re.compile(
+    r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
+    r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
+    r"|拿到(?:云厂商|腾讯云|阿里云|官方|工单)[^\n。；]{0,20}(?:确切结论|结论|答复)(?:与\s*ETA|或\s*ETA)?后第一时间[^\n。；]{0,16}同步)",
+    re.I,
+)
+_TICKET_NEGATION_OR_VERIFIED_ID_RE = re.compile(
+    r"(?:(?:并未|未|没有|尚无|暂无|无需|不用|不需)[^\n。；]{0,12}(?:提(?:交)?(?:云厂商)?工单|工单号|工单结论)"
+    r"|(?:工单(?:号|编号|ID)?|ticket(?:\s*id)?|case(?:\s*id)?)\s*(?:为|是|[:：#])\s*[A-Za-z0-9_-]{5,})",
+    re.I,
+)
+
+
+def check_unverified_ticket_promise_guard(text: str) -> None:
+    """REG-099：反空头安抚支票 / 严禁无实据承诺正在跟进云厂商工单门禁。"""
+    body = text or ""
+    m = _UNVERIFIED_TICKET_PROMISE_RE.search(body)
+    if m and not _TICKET_NEGATION_OR_VERIFIED_ID_RE.search(body):
+        snippet = " ".join(m.group(0).split())[:80]
+        raise OutboundError(
+            EXIT_INVALID,
+            f"reply 拒绝（REG-099 反空头安抚支票门禁）：检测到对外回复宣称『{snippet}』，但正文中既无真实可核查的工单号/单据 ID（如 `工单号: 2026...`），"
+            "也未如实说明『实际未提云厂商工单』（曾导致同事反复追问工单进展而 Matthew 本人毫不知情，引发人机协作信任摩擦）！\n"
+            "请：① 若实际未提单或未查到确切工单号，如实写明『目前未提云厂商工单 / 尚无确切工单号』，并直接给出代码侧/架构侧立即可执行的降级绕过方案；"
+            "② 若已有真实工单，请显式附上真实工单号（`工单号：xxx`）；"
+            "③ 若确需 Matthew 人工找云厂商提单或催办，必须同步通过 `sheepdog ask/report` 明确通知 Matthew 本人（没有发送）。",
+        )
 
 
 def check_ask_pre_flight_guard(
@@ -549,17 +596,31 @@ def check_ask_pre_flight_guard(
     full_text = f"{title}\n{body}"
     opt_spec = (options or "").strip()
     if opt_spec.lower() not in _DISABLED_SPECS:
+        parsed_opts = parse_ask_options(full_text, opt_spec)
         needs_explicit_opts = bool(
             _ASK_CLAIMS_RECOMMENDED_OPTION_RE.search(full_text)
             or (decision_hub.hub_active(cfg, store) and (cfg.notify.require_summary or _MORE_LINE_RE.search(full_text)))
         )
-        if needs_explicit_opts and len(parse_ask_options(full_text, opt_spec)) < 2:
+        if needs_explicit_opts and len(parsed_opts) < 2:
             raise OutboundError(
                 EXIT_INVALID,
                 "sheepdog ask 缺少可点击的 A/B 决策选项（主人批评：『你没有给我提供选项啊』，REG-083 防缺选项门禁）："
                 "发起待拍板决策卡时，必须在正文中显式列出至少 2 个互斥选项（如 `A. 同意...\\nB. 暂缓...` 或 `选项：A. ...；B. ...`），"
                 "或传 `--options \"A:方案一|B:方案二\"`，严禁只写『建议选 A：...』却不提供 A/B 选项列表导致飞书卡片无按钮！（没有发送）",
             )
+        if _WRITE_PERM_ASK_RE.search(full_text) and len(parsed_opts) >= 2:
+            opt_texts = [f"{o.key}. {o.label} {o.reply_text}" for o in parsed_opts]
+            if all(_REFUSAL_OR_RESTRICT_OPT_RE.search(t) for t in opt_texts) and not any(
+                _GRANT_WRITE_PERM_OPT_RE.search(t) for t in opt_texts
+            ):
+                raise OutboundError(
+                    EXIT_INVALID,
+                    "sheepdog ask 权限申请选项缺失正向授权分支（REG-099 防单向全拒绝假选择题门禁）："
+                    "当前请示为同事申请修改/读写权限，但提供的选项（A/B/C）全部为『拒绝/仅开只读/暂缓』，没有任何一个选项代表『同意授权/按申请开通』，"
+                    "迫使主人只能在『其他』里手动输入『给他授权』！\n"
+                    "即使你建议选 A（拒绝直接开放个人写权限、由 SRE 代跑），也必须在选项 B 或 C 中显式提供一个『同意授权开通所申请权限（配齐前置快照/水位注意事项）』的正向按钮选项，"
+                    "让主人能一键拍板（没有发送）。",
+                )
     if floor or floor_type:
         return
     if _SYMBOLIC_RELEASE_SCHEDULE_ASK_RE.search(full_text) and not _GENUINE_SCHEDULE_CONFLICT_RE.search(full_text):
@@ -620,6 +681,12 @@ def check_ask_pre_flight_guard(
             "请示调小/下调 Cloud NAT 网关 `minPortsPerVm`（`--min-ports-per-vm`）前，必须先通过 Cloud Monitoring 只读核查当前单实例（per-VM）最高端口使用数 / 已分配端口峰值及动态端口分配上限（`maxPortsPerVm`）"
             "（主人反问：『那会不会有什么影响呢 有办法看最高端口使用数的一个实例用了多少个端口吗』）："
             "请先查清当前单实例最高端口使用数（如 `nat/port_usage` / `allocated_ports` 单 VM 最大值）与调小后的实际影响评估并写入正文，严禁未附单实例峰值端口实测数据就发 ask（REG-096 防打扰门禁，没有发送）",
+        )
+    if _UNINVESTIGATED_STATUS_ASK_RE.search(full_text) and not _CONCRETE_STATUS_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示确认『渠道/配置/路由现状』（如『需确认...现状，以便...』）前，必须先由当前专席只读排查目标集群/环境的真实配置、路由与缺失项，"
+            "弄清楚对方具体缺什么参数并整理出具体可执行的方案后再请主人决策（主人批评：『你先排查一下他需要什么弄清楚给我执行方案让我决策』，REG-099 防未排查甩锅门禁，没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID
@@ -1462,6 +1529,7 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
         check_group_reply_allowed(cfg, store, topic_id, target, even_if_owner_replied=even_if_owner_replied)
     try: shown, card = reply_body(cfg, text, card_text, summary=summary)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
+    check_unverified_ticket_promise_guard(shown)
     ik = reply_idem(store, topic_id, target_id, shown)
     if (prev := store.get_send(ik)) is not None:
         return ReplyResult(prev["message_id"], already=True, text=shown, identity=(prev["identity"] or ident.USER) if enabled else ident.USER)

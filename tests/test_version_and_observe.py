@@ -2275,6 +2275,102 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertFalse(any(r.startswith("new_overrides") for r in digest["action_reasons"]), digest["action_reasons"])
             self.assertFalse(any(r.startswith("failed_lambs") for r in digest["action_reasons"]), digest["action_reasons"])
 
+    def test_reg099_unverified_ticket_promise_guard_and_permission_ask_grant_option_completeness(self) -> None:
+        """REG-099:
+        1) 严禁对外发送无真实工单号/单据 ID 的『正在跟进腾讯云工单进展 / 已提单咨询腾讯云架构师 / 拿到云厂商确切结论与 ETA 后第一时间同步』空头安抚承诺；
+           如实说明『实际未提云厂商工单』或附上可核查『工单号：202611049988』时正常放行；
+        2) 同事申请修改/读写权限的 sheepdog ask 若提供的 A/B/C 选项全部为拒绝/仅只读/暂缓而缺少『同意授权/按申请开通』正向选项，当场拦截；
+           补齐『同意授权开通...修改权限』选项后正常放行；
+        3) 未先只读排查集群现状就发『...现状确认 / 需确认...现状，以便...』的 ask 当场拦截；
+        4) 主人回复『[其他] 给他授权』或『[其他] 你先排查一下他需要什么弄清楚给我执行方案让我决策』时，diagnose_override_reason 精准归因为 context_incomplete。
+        """
+        from sheepdog import __version__, admin_web, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertEqual(parse_version_tuple(__version__), (1, 1, 10))
+
+        # 1) 反空头工单安抚承诺门禁
+        hollow_reply_1 = (
+            "赞同，当前私网候选环境跑通了基础链路。\n---more---\n"
+            "上海实测为 cgroup v1，代码中资源控制依赖 cgroup v2。目前已提单咨询腾讯云架构师，需评估是等平台支持还是做代码降级兼容。"
+        )
+        hollow_reply_2 = (
+            "<at id=ou_test_peer_1></at> 正在跟进腾讯云工单进展，稍后同步最新结论；技术上已确认目前实例为v1且无配置开关。\n"
+            "---more---\n- 正在跟进该工单的最新评估结果与升级窗口；\n- 拿到云厂商确切结论与 ETA 后第一时间在群里和下午对齐会上同步。"
+        )
+        for bad_txt in (hollow_reply_1, hollow_reply_2):
+            with self.assertRaises(outbound.OutboundError) as ctx_ticket:
+                outbound.check_unverified_ticket_promise_guard(bad_txt)
+            self.assertIn("REG-099", str(ctx_ticket.exception))
+
+        # 如实说明未提工单 + 代码降级绕过，或附真实工单号，应放行
+        honest_clarification = (
+            "目前未提云厂商工单，上海 AGS 固定为 cgroup v1，建议代码侧直接关闭 cgroup v2 强依赖降级兼容。"
+        )
+        verified_ticket = (
+            "正在跟进腾讯云工单进展（工单号：20261104009876），稍后同步最新结论。"
+        )
+        outbound.check_unverified_ticket_promise_guard(honest_clarification)
+        outbound.check_unverified_ticket_promise_guard(verified_ticket)
+
+        # 2) 权限申请 ask 选项完整性门禁 & 3) 未先只读排查现状确认门禁
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            store.upsert_topic("tp_kc", title="人·kc·需求对接", kind="dynamic", conversation_id="cid-kc")
+
+            ask_title = "kc申请腾讯云Prod数据库和Redis修改权限"
+            all_refusal_body = (
+                "kc申请生产数据库与双Redis修改权限用于压测批量造数。建议选A拒绝个人写权限。\n---more---\n"
+                "事情：kc 申请腾讯云国内 Prod 生产数据库及双 Redis 的查看和修改权限，称需批量造数据进行 PTS 压测。\n\n"
+                "选项：\n"
+                "A. 严守红线拒绝个人生产修改权限，由 SRE 专席配合前置物理快照并受控代跑造数与回滚\n"
+                "B. 仅开生产跳板机只读权限供查看，压测造数走业务 API 或离线生成 SQL 经评审后代执行\n"
+                "C. 暂缓生产造数，先引导在 Stage 环境完成全链路造数压测验证\n\n"
+                "建议：选 A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_perm:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_kc", ask_title, all_refusal_body)
+            self.assertIn("REG-099", str(ctx_perm.exception))
+
+            complete_options_body = (
+                "kc申请生产数据库与双Redis修改权限用于压测批量造数。建议选A拒绝个人写权限，或选B同意授权。\n---more---\n"
+                "事情：kc 申请腾讯云国内 Prod 生产数据库及双 Redis 的查看和修改权限，称需批量造数据进行 PTS 压测。\n\n"
+                "选项：\n"
+                "A. 严守红线拒绝个人生产修改权限，由 SRE 专席配合前置物理快照并受控代跑造数与回滚\n"
+                "B. 同意授权开通 Prod 数据库与双 Redis 修改权限（同步附上 DMC 控制台入口与水位注意事项）\n"
+                "C. 仅开生产跳板机只读权限供查看\n\n"
+                "建议：选 A 。"
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_kc", ask_title, complete_options_body)
+
+            uninvestigated_status_title = "南京 Prod Agent 国内渠道开通与路由现状确认"
+            uninvestigated_status_body = (
+                "Ziyi 需要确认南京 Prod Agent 国内渠道与路由现状以便跑 loader。建议按选项 A。\n---more---\n"
+                "事情：Ziyi 在排查南京 Prod Agent 配置，需确认国内模型渠道（TokenHub/DeepSeek/WIMGS）、国内媒体 CDN 与 AGS 正式 /control 私网路由现状，以便在独立版本目录生成配置并跑真实 loader。\n\n"
+                "选项：\n"
+                "A. 暂未开通渠道直接据实禁用；国内媒体 CDN 域名及正式 /control 路由按南京集群实际配置对接\n"
+                "B. 先行开通相关模型渠道凭据与媒体 CDN 域名，待全部就绪后再跑 loader\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_status:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_kc", uninvestigated_status_title, uninvestigated_status_body)
+            self.assertIn("REG-099", str(ctx_status.exception))
+
+            # 4) 主人回复「给他授权」或「你先排查一下他需要什么弄清楚给我执行方案让我决策」归入 context_incomplete
+            code, label = admin_web.diagnose_override_reason(all_refusal_body, "给他授权", "其他", "A")
+            self.assertEqual(code, "context_incomplete")
+            self.assertEqual(label, "缺环境/调用链反问")
+            code2, label2 = admin_web.diagnose_override_reason(
+                uninvestigated_status_body, "你先排查一下他需要什么弄清楚给我执行方案让我决策", "其他", "A"
+            )
+            self.assertEqual(code2, "context_incomplete")
+            self.assertEqual(label2, "缺环境/调用链反问")
+
 
 if __name__ == "__main__":
     unittest.main()
