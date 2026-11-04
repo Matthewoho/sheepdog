@@ -3645,6 +3645,99 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("完成本轮代码改进与问题修复", summary_c)
             self.assertNotIn("fix(engine):", summary_c)
 
+    def test_reg112_redirected_cli_lamb_error_extract_and_running_retry_recovery_and_ask_option_log_guard(self):
+        """1.1.23（REG-112）：
+        1. `engine._summarize_cli_lamb_log` 对 `subprocess.CalledProcessError` 含 `> /tmp/*.log` 重定向的失败 CLI 羔羊自动钻取重定向日志末尾的真实报错行（如 `RuntimeError: ...`），并剥离多行 JSON 过滤后残留在普通文本行尾的孤立 `{` / `[`；
+        2. `evolve.build_evolve_digest` D5 在母羊已派生更新的在途重试羔羊（`state IN ('done', 'running') AND started_at >= finished_at`）时将失败羔羊标为 `recovered_by_parent=True` 不误报 `failed_lambs`，且 `engine._deliver_brain_mail` 直投来信后同步推进 `self_evolve_state.last_mail_id` 防 D6 重复播报；
+        3. `outbound.check_ask_pre_flight_guard` 新增 `_RAW_STDOUT_IN_ASK_OPTION_RE` 门禁，拦截在 `sheepdog ask` 选项 A/B/C 中直接粘贴原始命令执行日志/报错输出（如 `[PROD] Status: FAILED`、`ERROR: column ... does not exist`）。
+        """
+        from sheepdog import config, engine, evolve, outbound, store
+        from sheepdog.engine import _summarize_cli_lamb_log
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) Redirected /tmp/*.log root-cause extraction & dangling '{' strip
+            redir_path = Path("/tmp/test_reg112_redirected_dag_exec.log")
+            try:
+                redir_path.write_text(
+                    "[conversation-service] poll 1: build 89edf3a3 status=WORKING\n"
+                    "[conversation-service] poll 2: build 89edf3a3 status=SUCCESS\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "/tmp/release_pilot.py", line 1266, in execute_dag_lane\n'
+                    "    raise RuntimeError('Layer 0 failed')\n"
+                    'RuntimeError: Layer 0 execution failed: [{"service": "conversation-service", "error": "Cannot find service [conversation-service-http]"}]\n',
+                    encoding="utf-8",
+                )
+                wrapper_log = (
+                    "Rejected b2557c27: CANCELLED\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "/tmp/run_cs_0054_direct.py", line 31, in <module>\n'
+                    '    subprocess.run("python3 release_pilot.py execute-dag > /tmp/test_reg112_redirected_dag_exec.log 2>&1", shell=True, check=True)\n'
+                    "subprocess.CalledProcessError: Command 'python3 release_pilot.py execute-dag > /tmp/test_reg112_redirected_dag_exec.log 2>&1' returned non-zero exit status 1.\n"
+                )
+                sum_err, has_err = _summarize_cli_lamb_log(wrapper_log)
+                self.assertTrue(has_err)
+                self.assertIn("-> RuntimeError: Layer 0 execution failed", sum_err)
+                self.assertIn("Cannot find service [conversation-service-http]", sum_err)
+            finally:
+                redir_path.unlink(missing_ok=True)
+
+            dangling_brace_log = (
+                "Rejected 0057 build c2fcd128-3d53-471f-b9d3-c42b2e85a23a {\n"
+                '  "name": "operations/build/taplabs-453508/YzJm",\n'
+                '  "metadata": {\n'
+                '    "@type": "type.googleapis.com/google.devtools.cloudbuild.v1.BuildOperationMetadata",\n'
+                "202611040058 execute-dag completed successfully!\n"
+            )
+            sum_ok, has_err_ok = _summarize_cli_lamb_log(dangling_brace_log)
+            self.assertFalse(has_err_ok)
+            self.assertIn("Rejected 0057 build c2fcd128-3d53-471f-b9d3-c42b2e85a23a\n202611040058 execute-dag completed successfully!", sum_ok)
+            self.assertNotIn("c2fcd128-3d53-471f-b9d3-c42b2e85a23a {", sum_ok)
+
+            # 2) evolve running retry lamb recovery
+            db_path = Path(tmp) / "sheepdog.sqlite3"
+            st = store.Store(db_path)
+            cfg = config.Config()
+            now_dt = datetime.now().astimezone()
+            t_fail_start = (now_dt - timedelta(minutes=6)).isoformat(timespec="seconds")
+            t_fail_end = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+            t_retry_start = (now_dt - timedelta(minutes=1)).isoformat(timespec="seconds")
+            st.create_lamb("lamb_fail01", "tp_release", "cli", "dag-0054")
+            st.update_lamb(
+                "lamb_fail01",
+                state="failed",
+                started_at=t_fail_start,
+                finished_at=t_fail_end,
+                result_summary="RuntimeError: Cannot find service",
+            )
+            st.create_lamb("lamb_retry02", "tp_release", "cli", "dag-0054-retry")
+            st.update_lamb(
+                "lamb_retry02",
+                state="running",
+                started_at=t_retry_start,
+            )
+            digest = evolve.build_evolve_digest(cfg, st, now_dt=now_dt)
+            lamb_map = {x["lamb_id"]: x for x in digest["d5_bus_and_lambs"]["recent_lambs"]}
+            self.assertTrue(lamb_map["lamb_fail01"]["recovered_by_parent"])
+            self.assertNotIn("failed_lambs(1)", digest["action_reasons"])
+
+            # 3) outbound ask option raw execution stdout guard
+            with self.assertRaises(outbound.OutboundError) as ctx:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "tapnow.tv 生产修复请示",
+                    "事情：南京生产修复方案请示。\n"
+                    "选项 A：立即执行生产变更\n"
+                    "[PROD] Status: FAILED, Code: 1\n"
+                    "ERROR: column f.category does not exist\n"
+                    "选项 B：保持现状观察\n"
+                    "[PROD] Status: SUCCESS, Code: 0\n"
+                    'deployment "billing-auth-central" successfully rolled out\n'
+                    "建议：选 A",
+                )
+            self.assertIn("REG-112", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

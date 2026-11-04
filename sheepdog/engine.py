@@ -4916,6 +4916,16 @@ class Dispatcher:
                             lb["state"] == "failed"
                             and bool(_CLI_PASS_BANNER_RE.search(cur_sum))
                         )
+                        or (
+                            "CalledProcessError" in cur_sum
+                            and ">" in cur_sum
+                            and "/tmp/" in cur_sum
+                            and "->" not in cur_sum
+                        )
+                        or any(
+                            ln.rstrip().endswith((" {", " [")) and not ln.lstrip().startswith(("{", "["))
+                            for ln in cur_sum.splitlines()
+                        )
                     ):
                         try:
                             lp = Path(lb["log_path"])
@@ -5865,6 +5875,22 @@ class Dispatcher:
         self.store.mark_batch(mids, bid, duty.SHEEPDOG_BRAIN_TOPIC_ID, "acked")
         ts_now = now_iso()
         self.store.update_topic(duty.SHEEPDOG_BRAIN_TOPIC_ID, last_active=ts_now, dispatched_at=ts_now)
+        try:
+            if self.store.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mailbox'").fetchone():
+                q_marks = ",".join("?" for _ in mids)
+                max_row = self.store.conn.execute(
+                    f"SELECT MAX(id) AS max_id FROM mailbox WHERE message_id IN ({q_marks})",
+                    tuple(mids),
+                ).fetchone()
+                max_mb_id = int((max_row["max_id"] if max_row else 0) or 0)
+                if max_mb_id > 0:
+                    raw_ev = self.store.get_meta("self_evolve_state")
+                    ev_st = json.loads(raw_ev) if raw_ev else {}
+                    if isinstance(ev_st, dict) and max_mb_id > int(ev_st.get("last_mail_id") or 0):
+                        ev_st["last_mail_id"] = max_mb_id
+                        self.store.set_meta("self_evolve_state", json.dumps(ev_st, ensure_ascii=False))
+        except Exception:
+            pass
         log.info("已直投 %d 条跨工作区来信至主脑 %s (%s)", len(mids), duty.SHEEPDOG_BRAIN_TOPIC_ID, cid)
         return mids
 
@@ -6818,9 +6844,12 @@ _CLI_PASS_BANNER_RE = re.compile(
     r"| is live on )",
     re.I | re.M,
 )
+_REDIRECTED_TMP_LOG_RE = re.compile(
+    r">\s*['\"]?(/(?:private/)?tmp/[A-Za-z0-9_./-]+\.(?:log|txt|out|err))['\"]?"
+)
 
 
-def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
+def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, bool]:
     """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）/ REG-106：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
     优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片（含孤立开闭括号）。"""
     if not raw_text:
@@ -6949,7 +6978,10 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
     if tail_lines and not all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
         non_json_frag = [ln for ln in tail_lines if not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)]
         if non_json_frag:
-            tail_lines = non_json_frag
+            tail_lines = [
+                re.sub(r"\s+[\{\[]$", "", ln) if not ln.lstrip().startswith(("{", "[")) else ln
+                for ln in non_json_frag
+            ]
     if tail_lines and all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
         obj_keys = [m.group(1) for ln in meaningful if (m := _JSON_OBJECT_KEY_LINE_RE.match(ln))]
         kv_pairs = []
@@ -6970,6 +7002,26 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             first_tb = next((i for i, ln in enumerate(tail_lines) if ln.startswith(('File "', "Traceback"))), 0)
             last_exc = exc_indices[-1]
             tail_lines = [*tail_lines[:first_tb], *tail_lines[last_exc:]]
+    if (
+        has_err
+        and _depth == 0
+        and tail_lines
+        and any("CalledProcessError" in ln or "returned non-zero exit status" in ln for ln in tail_lines)
+        and (m_redir := _REDIRECTED_TMP_LOG_RE.search("\n".join(tail_lines)))
+    ):
+        try:
+            p_redir = Path(m_redir.group(1))
+            if p_redir.is_file() and p_redir.stat().st_size <= 262144:
+                redir_sum, _ = _summarize_cli_lamb_log(
+                    p_redir.read_text(encoding="utf-8", errors="replace"),
+                    _depth=1,
+                )
+                redir_lines = [ln.strip() for ln in redir_sum.splitlines() if ln.strip()]
+                if redir_lines:
+                    root_err = redir_lines[-1]
+                    tail_lines.append(f"-> {root_err}")
+        except Exception:
+            pass
     if not has_err and tail_lines and (m_saved := _SAVED_TMP_JSON_RE.match(tail_lines[-1])):
         try:
             p_json = Path(m_saved.group(1))
@@ -6991,7 +7043,7 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                         tail_lines = [*tail_lines[:-1], f"{tail_lines[-1]} -> JSON({', '.join(saved_parts)})"]
         except Exception:
             pass
-    capped_tail = [ln[:237] + "..." if len(ln) > 240 else ln for ln in tail_lines]
+    capped_tail = [ln[:317] + "..." if len(ln) > 320 else ln for ln in tail_lines]
     return "\n".join(capped_tail), has_err
 
 

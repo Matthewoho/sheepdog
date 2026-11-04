@@ -786,7 +786,16 @@ def execute_upgrade(
         headline = f"✅ 当前代码已是最新 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程刷新运行态。"
 
     rb_info = _resolve_rollback_info(dispatcher.store, root, mem_ver, prev_sha, mem_disp, disk_after.get("git_sha") or "")
-    change_summary = summarize_upgrade_changes(
+    _summarize_fn = summarize_upgrade_changes
+    try:
+        import importlib
+        import sys as _sys
+        if __name__ in _sys.modules and (root / "sheepdog" / "version_watch.py").is_file():
+            _reloaded = importlib.reload(_sys.modules[__name__])
+            _summarize_fn = getattr(_reloaded, "summarize_upgrade_changes", summarize_upgrade_changes)
+    except Exception:
+        pass
+    change_summary = _summarize_fn(
         root,
         from_sha=prev_sha or str(rb_info.get("git_sha") or ""),
         to_sha=disk_after.get("git_sha") or "",

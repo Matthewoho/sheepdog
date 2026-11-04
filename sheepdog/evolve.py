@@ -283,7 +283,7 @@ def build_evolve_digest(
         recovered_by_parent = False
         if st_val == "failed" and p_tid and fin_at:
             has_newer_done_lamb = conn.execute(
-                "SELECT 1 FROM lambs WHERE parent_topic_id = ? AND state = 'done' AND started_at >= ? LIMIT 1",
+                "SELECT 1 FROM lambs WHERE parent_topic_id = ? AND state IN ('done', 'running') AND started_at >= ? LIMIT 1",
                 (p_tid, fin_at),
             ).fetchone() is not None
             has_post_ack = conn.execute(

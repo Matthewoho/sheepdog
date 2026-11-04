@@ -638,6 +638,14 @@ _TICKET_NEGATION_OR_VERIFIED_ID_RE = re.compile(
     r"|(?:工单(?:号|编号|ID)?|ticket(?:\s*id)?|case(?:\s*id)?)\s*(?:为|是|[:：#])\s*[A-Za-z0-9_-]{5,})",
     re.I,
 )
+_RAW_STDOUT_IN_ASK_OPTION_RE = re.compile(
+    r"(?:\[(?:PROD|TEST|STAGE)\]\s*Status:\s*(?:FAILED|SUCCESS)"
+    r"|,\s*Code:\s*\d+\b"
+    r"|ERROR:\s+column\s+\S+\s+does\s+not\s+exist"
+    r"|Traceback\s*\(most recent call last\)"
+    r"|deployment\s+\"[^\"]+\"\s+successfully\s+rolled\s+out)",
+    re.I,
+)
 
 
 def check_unverified_ticket_promise_guard(text: str) -> None:
@@ -700,6 +708,15 @@ def check_ask_pre_flight_guard(
                 "sheepdog ask 缺少可点击的 A/B 决策选项（主人批评：『你没有给我提供选项啊』，REG-083 防缺选项门禁）："
                 "发起待拍板决策卡时，必须在正文中显式列出至少 2 个互斥选项（如 `A. 同意...\\nB. 暂缓...` 或 `选项：A. ...；B. ...`），"
                 "或传 `--options \"A:方案一|B:方案二\"`，严禁只写『建议选 A：...』却不提供 A/B 选项列表导致飞书卡片无按钮！（没有发送）",
+            )
+        visible_head = _MORE_LINE_RE.split(full_text, maxsplit=1)[0]
+        if _RAW_STDOUT_IN_ASK_OPTION_RE.search(visible_head) or any(
+            _RAW_STDOUT_IN_ASK_OPTION_RE.search(f"{o.label} {o.reply_text}") for o in parsed_opts
+        ):
+            raise OutboundError(
+                EXIT_INVALID,
+                "sheepdog ask 首屏或选项 A/B/C 中严禁直接粘贴原始命令执行日志/报错输出（如 `[PROD] Status: FAILED/SUCCESS`、`ERROR: column ... does not exist`、`deployment ... successfully rolled out` 等，REG-112 选项与首屏纯净度门禁）："
+                "请把现场命令输出与报错堆栈放入 `---more---` 折叠详情区，首屏与选项 A/B/C 仅保留干净、互斥的决策动作文案后再发起 ask（没有发送）",
             )
         if _WRITE_PERM_ASK_RE.search(full_text) and len(parsed_opts) >= 2:
             opt_texts = [f"{o.key}. {o.label} {o.reply_text}" for o in parsed_opts]
