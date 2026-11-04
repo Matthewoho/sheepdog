@@ -658,7 +658,7 @@ def run_observe(
             if "messages" in tabs:
                 pending_rows = c.execute(
                     """
-                    SELECT message_id, topic_id, reason, tags_json, create_time
+                    SELECT message_id, topic_id, reason, tags_json, create_time, first_seen, last_seen
                     FROM messages
                     WHERE route = 'dispatch'
                       AND dispatch_state = 'pending'
@@ -666,11 +666,25 @@ def run_observe(
                       AND COALESCE(deleted, 0) = 0
                     """
                 ).fetchall()
+                relay_ts_by_topic: dict[str, str] = {}
+                for r in pending_rows:
+                    if r["reason"] == "bus_relay":
+                        tid_r = str(r["topic_id"] or "")
+                        ts_r = str(r["first_seen"] or r["create_time"] or "")
+                        if tid_r and ts_r and ts_r > relay_ts_by_topic.get(tid_r, ""):
+                            relay_ts_by_topic[tid_r] = ts_r
                 by_topic: dict[str, list[float]] = {}
                 for r in pending_rows:
                     if r["message_id"] in priority_msg_ids:
                         continue
-                    age_s = age_seconds(r["create_time"], ref_now)
+                    tags_raw = str(r["tags_json"] or "")
+                    is_forwarded = '"forwarded"' in tags_raw or '"forwarded_from:' in tags_raw
+                    if is_forwarded:
+                        tid_r = str(r["topic_id"] or "")
+                        q_ts = relay_ts_by_topic.get(tid_r) or str(r["last_seen"] or r["create_time"] or "")
+                    else:
+                        q_ts = str(r["create_time"] or "")
+                    age_s = age_seconds(q_ts, ref_now)
                     if age_s is None:
                         continue
                     by_topic.setdefault(r["topic_id"] or "-", []).append(age_s)

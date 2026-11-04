@@ -907,8 +907,8 @@ class Store:
         with self.tx() as c:
             c.execute(
                 """UPDATE messages SET route='dispatch', dispatch_state='pending', batch_id=NULL,
-                       topic_id=?, tags_json=? WHERE message_id=?""",
-                (topic_id, json.dumps(tags, ensure_ascii=False), message_id),
+                       topic_id=?, tags_json=?, last_seen=? WHERE message_id=?""",
+                (topic_id, json.dumps(tags, ensure_ascii=False), now_iso(), message_id),
             )
 
     def forwarded_message_targets(self, message_ids: list[str]) -> dict[str, str]:

@@ -113,7 +113,7 @@ def diagnose_override_reason(
     """7.108 / 7.113 / 7.115 / 7.118（REG-076 / REG-081 / REG-083 / REG-086）：将人类改判/反问归因为 5 类可执行自进化根因。"""
     s = (ans_body or "").strip()
     if re.search(
-        r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看)",
+        r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看|新开专席|转交专席|由专席(?:只读)?排查)",
         s,
         re.I,
     ):

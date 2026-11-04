@@ -1853,6 +1853,114 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(code, "stale_or_already_handled")
             store.close()
 
+    def test_reg095_forwarded_queue_hol_sla_timestamp_and_owner_lookup_ask_guard(self):
+        """REG-095: 经 sheepdog forward 转交的消息按转交入队时间计算 Queue Head-of-Line SLA 防误报 + 拦截未先检索代码仓/云服务就让主人充当人肉搜索引擎指认负责人的 ask。"""
+        from sheepdog import admin_web, outbound
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(self_open_id="ou_owner", state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            # 1) 消息在 14:39:00 发到群里并先入 tp_bus，5 分 45 秒后（14:44:45）经 forward 转交给新专席：
+            #    在 14:44:45 巡检时，该消息在新专席队列仅排队 0s，绝不可按 14:39:00 误报排队超 5 分钟
+            msg = Message(
+                message_id="om_reg095_orig_1439",
+                chat_id="oc_data_infra",
+                chat_name="Data Infra",
+                chat_type="group",
+                sender_id="ou_andy",
+                sender_name="Andy Xiao",
+                sender_type="user",
+                content="归因表 attribution_sessions 归 tracking-attribution-service，帮忙指一下负责人",
+                msg_type="interactive",
+                create_time="2026-11-04T14:39:00+08:00",
+            )
+            store.upsert_message(msg, "dispatch", "at_me", [], "tp_bus")
+            store.conn.execute(
+                "UPDATE messages SET dispatch_state='acked', first_seen='2026-11-04T14:39:15+08:00', last_seen='2026-11-04T14:42:25+08:00' WHERE message_id=?",
+                ("om_reg095_orig_1439",),
+            )
+            store.conn.execute(
+                "INSERT INTO acks (message_id, chat_id, reason, identity, reaction_id, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("om_reg095_orig_1439", "oc_data_infra", "at_me", "user", "r_ack1", "2026-11-04T14:39:16+08:00"),
+            )
+            store.upsert_topic(
+                "tp_tracking-attribution-investigation",
+                title="排查·tracking-attribution服务与归因表归属排查",
+                kind="dynamic",
+                duty="排查归属",
+                conversation_id="conv-reg095",
+                state="active",
+            )
+            store.forward_message(
+                "om_reg095_orig_1439",
+                "tp_tracking-attribution-investigation",
+                ["owner:tracking-attribution-investigation", "forwarded_from:tp_bus"],
+            )
+            # 模拟转交发生在 14:44:45，且巡检在同秒（14:44:45）触发
+            store.conn.execute(
+                "UPDATE messages SET last_seen='2026-11-04T14:44:45+08:00' WHERE message_id=?",
+                ("om_reg095_orig_1439",),
+            )
+            store.conn.commit()
+
+            now_1444 = datetime.fromisoformat("2026-11-04T14:44:45+08:00")
+            obs_fresh = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_1444,
+                check_processes=False,
+                check_log=False,
+            )
+            self.assertFalse(
+                any("Queue Head-of-Line SLA" in w for w in obs_fresh["warns"]),
+                f"Expected 0 Queue Head-of-Line SLA warn right after forward, got: {obs_fresh['warns']}",
+            )
+
+            # 若转交后真正在新专席队列里卡满 6 分钟（14:50:46 仍 pending），则必须正常触发 Queue Head-of-Line SLA 告警
+            now_1450 = datetime.fromisoformat("2026-11-04T14:50:46+08:00")
+            obs_stale = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_1450,
+                check_processes=False,
+                check_log=False,
+            )
+            self.assertTrue(
+                any("Queue Head-of-Line SLA" in w and "tp_tracking-attribution-investigation" in w for w in obs_stale["warns"]),
+                f"Expected Queue Head-of-Line SLA warn after 6m post-forward stall, got: {obs_stale['warns']}",
+            )
+
+            # 2) 未先新开专席检索代码仓与 Cloud Run 归属，就发 ask 让主人选「A. 指定负责人 / B. 新开专席排查」必须被拦截
+            with self.assertRaises(outbound.OutboundError) as cm:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_bus",
+                    "Andy 在 Data Infra 群问 tracking-attribution 负责人",
+                    "Andy 在 Data Infra 群 @你：AlloyDB 归因表 attribution_sessions 缓存约 4.7GiB，询问 tracking-attribution-service 负责人是谁。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 指定负责人（请直接告知负责人姓名，由总线在群内话题代回 Andy）\n"
+                    "B. 新开专席排查（执行：新开专席 tp_tracking-attribution-investigation 排查云上服务与代码归属）\n"
+                    "C. 稍后你亲自在群内回复",
+                )
+            self.assertIn("REG-094", str(cm.exception))
+
+            code, label = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · Andy 在 Data Infra 群问 tracking-attribution 负责人 [tp_bus]",
+                "[B] 新开专席排查（执行：tp_tracking-attribution-investigation）",
+                "B",
+                "A",
+            )
+            self.assertEqual(code, "peer_or_owner_delegate")
+
 
 if __name__ == "__main__":
     unittest.main()
