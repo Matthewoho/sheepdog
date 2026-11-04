@@ -2381,7 +2381,7 @@ class VersionAndObserveTest(unittest.TestCase):
         from sheepdog.config import Config
         from sheepdog.store import Store
 
-        self.assertEqual(parse_version_tuple(__version__), (1, 1, 11))
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 11))
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2472,6 +2472,126 @@ class VersionAndObserveTest(unittest.TestCase):
             task_log.write_text("2500/10349 batches\n", encoding="utf-8")
             mt = engine._subagent_latest_task_log_mtime(tp_sub)
             self.assertIsNotNone(mt)
+
+    def test_reg101_region_switch_ask_guard_and_owner_explicit_idle_receipt_unlock(self):
+        from sheepdog import __version__, admin_web, engine, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.roster import Roster
+        from sheepdog.security import SecurityConfig
+        from sheepdog.sink.agentapi import DryRunSink
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 12))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            store.upsert_topic("tp_tapnow-prod-topology", title="项目·TapNow生产脉络", kind="dynamic", conversation_id="cid-topo-101")
+
+            # 1) 针对国内外共享前端提出 Nginx sub_filter 热修或无开关彻底禁掉 CF Turnstile / Sentry 被拦截（REG-101）
+            ask_title = "tapnowprod：热修前端彻底禁掉 CF Turnstile 与 Sentry 上报"
+            bad_body = (
+                "查明 Ethan 注册被 CF 拦是因为 register.tsx 只看 IP 不看国内站域名，要现在热修线上 app-tapnow 禁掉 CF 和 Sentry 吗？\n---more---\n"
+                "事情：请授权在线上 deploy/app-tapnow 通过 Nginx sub_filter 立即热修强制使用阿里云验证码并清空 Sentry DSN。\n\n"
+                "选项：\n"
+                "A. 同意热修 tapnowprod 的 app-tapnow 禁用 CF Turnstile 与 Sentry 上报\n"
+                "B. 暂不热修，只走源码提交\n\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_sub:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", ask_title, bad_body)
+            self.assertIn("REG-101", str(ctx_sub.exception))
+
+            good_title = "tapnowprod：新增环境变量配置开关控制国内站验证码与 Sentry"
+            good_body = (
+                "查明 register.tsx 需按环境变量配置开关隔离国内外行为，要推进带配置开关的正式版本发布吗？\n---more---\n"
+                "事情：在 fe-app-tapnow 新增环境变量开关控制（什么配置下只给国内的就行，不影响海外站），不采用线上脏热修。\n\n"
+                "选项：\n"
+                "A. 同意按环境变量开关控制国内站专用配置并走标准 CI/CD 发布\n"
+                "B. 暂缓发布\n\n"
+                "建议：A"
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_tapnow-prod-topology", good_title, good_body)
+
+            # 2) diagnose_override_reason 精准将『这个修法你需要保证可以有个开关来控制 什么配置下只给国内的就行』归入 arch_or_config_posture
+            ans = "这个修法你需要保证可以有个开关来控制 什么配置下只给国内的就行"
+            self.assertIsNotNone(admin_web._OVERRIDE_WORDS_RE.search(ans))
+            cat, label = admin_web.diagnose_override_reason(bad_body, ans, "其他", "A")
+            self.assertEqual((cat, label), ("arch_or_config_posture", "技术姿势纠偏"))
+            cat_kc, label_kc = admin_web.diagnose_override_reason(
+                "kc申请开通国内CVM与PTS扣费", "我已经在跟kaichi的私聊里决策过了", "其他", "A"
+            )
+            self.assertEqual((cat_kc, label_kc), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            # 3) 主人在面板直接输入 USER_EXPLICIT（如『前端不要动手改』『你先停』）后会话停在 PLANNER_RESPONSE DONE 满 60s 时，
+            #    _check_stopped_in_flight 无需等 observe 告警即可自动发『严格遵照主人在面板的最新指令、仅补交回执』唤醒
+            cfg.session.human_attach_minutes = 0
+            ref_now = datetime(2026, 11, 4, 17, 47, 0, tzinfo=observe.TZ)
+            sent_dt = ref_now - timedelta(seconds=140)
+            stop_dt = ref_now - timedelta(seconds=65)
+            batch_id = "b20261104174215-tapnow-prod-topology"
+            store.update_topic(
+                "tp_tapnow-prod-topology",
+                state="running",
+                pending_batch_id=batch_id,
+                dispatched_at=sent_dt.isoformat(timespec="seconds"),
+            )
+            store.record_dispatch(batch_id, "tp_tapnow-prod-topology", ["om_cb_101"])
+            t_file = root / "topo_101.jsonl"
+            t_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "step_index": 1,
+                                "type": "SYSTEM_MESSAGE",
+                                "status": "DONE",
+                                "created_at": sent_dt.isoformat(timespec="seconds"),
+                                "content": f"The following is a <SYSTEM_MESSAGE>\n[Message] content=[sheepdog] 新信号批次 `{batch_id}`（topic `tp_tapnow-prod-topology`）",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "step_index": 2,
+                                "type": "USER_INPUT",
+                                "source": "USER_EXPLICIT",
+                                "status": "DONE",
+                                "created_at": (sent_dt + timedelta(seconds=60)).isoformat(timespec="seconds"),
+                                "content": "<USER_REQUEST>\n你先停\n</USER_REQUEST>",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "step_index": 3,
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "created_at": stop_dt.isoformat(timespec="seconds"),
+                                "content": "已立即停手，不再动前端任何东西。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dry_sink = DryRunSink()
+            disp = engine.Dispatcher(cfg, store, {"antigravity": dry_sink}, Roster(), SecurityConfig())
+            with mock.patch.object(disp, "_record_file", return_value=t_file), mock.patch.object(
+                dry_sink, "send_message", wraps=dry_sink.send_message
+            ) as mock_send:
+                woke = disp._check_stopped_in_flight(
+                    store.get_topic("tp_tapnow-prod-topology"), batch_id, sent_dt, ref_now, True
+                )
+            self.assertTrue(woke)
+            self.assertEqual(mock_send.call_count, 1)
+            self.assertIn("主人在面板直接下达了指令", mock_send.call_args[0][1])
+            self.assertIn("若主人叫停则保持停手", mock_send.call_args[0][1])
 
 
 if __name__ == "__main__":

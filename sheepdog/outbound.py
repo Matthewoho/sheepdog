@@ -554,6 +554,16 @@ _EXISTING_VPS_SLOT_AVAILABLE_ASK_RE = re.compile(
     r"(?=[\s\S]*申请[^\n。]{0,24}(?:Claude|VPS|CC|家宽)?[^\n。]{0,12}(?:专线|节点))(?:[\s\S]*(?:余\s*[1-9]\d*\s*(?:空额|空位|席)|空余\s*[1-9]\d*\s*(?:空额|空位|席)))",
     re.I,
 )
+_REGION_HARDCODE_OR_SUBFILTER_HOTFIX_ASK_RE = re.compile(
+    r"(?:Nginx\s+sub_filter[\s\S]{0,120}(?:热修|强制|清空|禁用)"
+    r"|(?:热修前端|热修线上)[\s\S]{0,120}(?:彻底禁掉|强制使用|清空\s*Sentry\s*DSN|禁用\s*(?:CF|Cloudflare|Turnstile|Sentry))"
+    r"|(?:彻底禁掉|强制使用)[\s\S]{0,120}(?:CF\s*Turnstile|Turnstile|阿里云验证码)[\s\S]{0,120}(?:Sentry|清空\s*Sentry\s*DSN))",
+    re.I,
+)
+_CONFIG_SWITCH_ISOLATION_EVIDENCE_RE = re.compile(
+    r"(?:配置开关|环境变量开关|开关(?:来)?控制|feature\s*flag|什么配置下只给国内|按(?:环境|配置)(?:开关|变量)?(?:控制|区分|隔离))",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -731,6 +741,16 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-04 17:18 明确指示：『有空位就给他』，REG-100 防打扰门禁）："
             "请直接在有空位的节点为其开通专属账号并交付，完成后调用 `sheepdog report` 报备；"
             "仅在全网现有节点全部满编（0 空位）需新购 VPS 时才附全量人员名单发起 `sheepdog ask`（没有发送）",
+        )
+    if _REGION_HARDCODE_OR_SUBFILTER_HOTFIX_ASK_RE.search(full_text) and (
+        "sub_filter" in full_text.lower() or not _CONFIG_SWITCH_ISOLATION_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对国内外共享前端/服务（如 app-tapnow）处理区域专属三方组件（如 CF Turnstile / 阿里云验证码 / Sentry DSN）时，"
+            "严禁提出『Nginx sub_filter 线上脏热修』或『无开关写死彻底禁掉/强制替换』"
+            "（主人纠偏：『这个修法你需要保证可以有个开关来控制 什么配置下只给国内的就行』，REG-101 防无开关硬编码与脏热修门禁）："
+            "必须设计可由环境变量/配置项控制的开关方案（明确什么配置下只对国内生效、不影响海外环境，且不采用 Nginx sub_filter 篡改静态产物）后再发起 ask（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

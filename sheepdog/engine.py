@@ -2878,12 +2878,27 @@ class Dispatcher:
             )
             for s in post_steps
         )
-        if require_bg_task and not has_bg:
+        has_owner_explicit = batch_idx is not None and any(
+            s.get("type") == "USER_INPUT" and s.get("source") == "USER_EXPLICIT"
+            for s in post_steps
+        )
+        if require_bg_task and not has_bg and not has_owner_explicit:
             return None, False
         return at, has_bg
 
+    def _has_owner_explicit_after_batch(self, t, batch: str) -> bool:
+        """检查当前批次送出后，主人是否在面板亲自输入过指令（USER_EXPLICIT）。"""
+        if not batch:
+            return False
+        path = self._record_file(t)
+        if path is None or not path.is_file():
+            return False
+        from . import hook
+        return bool(hook.owner_typed_after_batch(path, batch, topic_id=str(t["topic_id"] or "")))
+
     def _check_stopped_in_flight(self, t, batch: str, sent: datetime | None, now: datetime, adopted: bool) -> bool:
-        """7.64 / 7.107 / 1.1.3（REG-075 / REG-092）：会话在途因宿主退出/重登、Stop hook 放行停机、后台交互命令挂起（fullyIdle=false）
+        """7.64 / 7.107 / 1.1.3 / 1.1.12（REG-075 / REG-092 / REG-101）：会话在途因宿主退出/重登、Stop hook 放行停机、
+        后台交互命令挂起（fullyIdle=false）、主人在面板亲自输入指令（USER_EXPLICIT）后回合结束未交回执、
         或 SYSTEM_MESSAGE 落盘后宿主未启动 PLANNER_RESPONSE 停机、且无活跃羔羊时：
         静止满阈值自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
         if self.topic_host(t) != ANTIGRAVITY:
@@ -2902,6 +2917,7 @@ class Dispatcher:
         min_idle = 60
         has_bg_hang = False
         is_pf_blocked = False
+        owner_explicit_stopped = False
         if st.get("passed_at") or st.get("interrupted") is True:
             stopped_at = _parse(str(st.get("passed_at") or st.get("last_blocked_at") or ""))
         if stopped_at is None:
@@ -2916,11 +2932,23 @@ class Dispatcher:
                 stopped_at, has_bg_hang = self._transcript_planner_idle_at(
                     t, batch, resumed_at or sent, require_bg_task=False, allow_unawakened_system_msg=True
                 )
-            elif sent is not None and (now - sent).total_seconds() >= 180:
-                stopped_at, has_bg_hang = self._transcript_planner_idle_at(
+            elif sent is not None:
+                idle_at, bg_hang = self._transcript_planner_idle_at(
                     t, batch, sent, require_bg_task=True, allow_unawakened_system_msg=is_real_agentapi
                 )
-                min_idle = 90
+                if (
+                    idle_at is not None
+                    and not bg_hang
+                    and tid != BUS_TOPIC_ID
+                    and self.cfg.session.human_attach_minutes <= 0
+                    and self._has_owner_explicit_after_batch(t, batch)
+                ):
+                    stopped_at = idle_at
+                    owner_explicit_stopped = True
+                    min_idle = 60
+                elif (now - sent).total_seconds() >= 180 and idle_at is not None and bg_hang:
+                    stopped_at, has_bg_hang = idle_at, bg_hang
+                    min_idle = 90
         if stopped_at is None or (now - stopped_at).total_seconds() < min_idle:
             return False
         if already_resumed:
@@ -2936,6 +2964,11 @@ class Dispatcher:
             return True
         if is_pf_blocked:
             prompt = f"[sheepdog] 检测到刚才批次 `{batch}` 被宿主安全过滤器误拦或中断，请直接根据上下文继续完成并提交回执。"
+        elif owner_explicit_stopped:
+            prompt = (
+                f"[sheepdog] 检测到主人在面板直接下达了指令且当前回合已结束，批次 `{batch}` 尚未提交回执；"
+                "请严格遵照主人在面板的最新指令（若主人叫停则保持停手），仅补交一条当前状态的回执以释放队列锁。"
+            )
         else:
             bg_hint = "（检测到后台命令可能因等待交互输入挂起，请先用 manage_task kill 挂起任务并补加 --quiet）" if has_bg_hang else ""
             prompt = f"[sheepdog] 检测到刚才宿主重登/中断{bg_hint}，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
