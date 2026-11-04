@@ -405,7 +405,13 @@ def resolve_summary_and_body(
     has_delim = _MORE_SPLIT_RE.search(raw) is not None
     if (summary or "").strip():
         s = validate_summary(summary, for_reply=is_reply)
-        d = inline_det if has_delim and inline_det.strip() else raw
+        if has_delim and inline_det.strip():
+            if _norm_dedup_text(inline_sum) == _norm_dedup_text(s):
+                d = inline_det
+            else:
+                d = f"{inline_sum.strip()}\n\n{inline_det.strip()}" if inline_sum.strip() else inline_det
+        else:
+            d = raw
         if not d.strip():
             raise ValueError(f"more 折叠区原文为空。{SUMMARY_REQUIRED_GUIDE}")
         if hoist_at:

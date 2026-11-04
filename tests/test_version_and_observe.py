@@ -2797,6 +2797,99 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertNotIn("loop_feedback(1)", dig2["action_reasons"])
             self.assertEqual(dig2["d7_business_loops"]["feedback_runs"], [])
 
+    def test_reg105_sammy_parity_entrypoint_ask_guard_and_strict_loop_escalation_feedback(self):
+        from sheepdog import __version__, admin_web, loops, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.store import Store, now_iso
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 16))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            cfg.loops_dir_path = str(root / "loops")
+            cfg.loops_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+
+            # 1) Sammy / Sammi 请示南京生产 TKE 新建 Secret 的入口方案（提供现有跳板机入口或临时开单 IP 公网访问）时，触发 REG-105 拦截
+            title = "南京生产TKE写入Kimi生产Key方式"
+            bad_body = (
+                "Sammy 助理请示在腾讯云南京生产 TKE(cls-gnui5plk) tapnowprod 下新建 Secret agent-proxy-tokenhub-guangzhou-20261104(api_key) 的入口方案。\n"
+                "---more---\n"
+                "事情：Sammy 的 AI 助理 Sammi 转述 Sammy 与 Ziyi 需求，因 cls-gnui5plk 仅开启内网访问，Sammi 询问能否提供现有南京集群跳板机/TKE 入口，或同意其临时开启 cls-gnui5plk 公网访问。\n\n"
+                "选项：\n"
+                "A. 不开启 TKE 公网端口，由 tp_tapnow-prod-topology 提供现有内网跳板机入口协助 Sammi 写入\n"
+                "B. 同意授权 Sammi 临时开启 cls-gnui5plk 集群公网访问（仅放行单 IP 白名单），5 分钟内建好 Secret 后立即关闭"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_bad:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_release", title, bad_body)
+            self.assertIn("REG-105", str(ctx_bad.exception))
+
+            # 2) diagnose_override_reason 将『我们咋做你就给sammy咋做 sammy的权限至少要跟我一摸一样』归入 arch_or_config_posture（而非被 sammy 泛匹配到 peer_or_owner_delegate）
+            code, label = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · {title} [tp_release]\n{bad_body}",
+                "我们咋做你就给sammy咋做 sammy的权限至少要跟我一摸一样",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code, "arch_or_config_posture")
+            self.assertEqual(label, "技术姿势纠偏")
+
+            # 3) maybe_record_escalation_loop_feedback 仅将显式关联 Loop（--key loop-<id> 或命中 loop_items）的拍板记入 Loop，不误污染同会话普通私聊 ask；且对 [卡片回调] 前缀归一化防重复写 MEMORY.md
+            loops.init_loop(cfg, store, "prod-release-pilot", template="prod-release-pilot", topic_id="tp_release")
+            now_str = now_iso()
+            store.conn.execute(
+                "INSERT INTO loop_runs(run_id, loop_id, trigger_reason, autonomy, status, started_at, finished_at) VALUES(?,?,?,?,?,?,?)",
+                ("lrun_disp_105", "prod-release-pilot", "daemon_tick", "confirm", "dispatched", now_str, now_str),
+            )
+            store.conn.execute(
+                "INSERT INTO sends(idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("idem_non_loop_105", "ask", "tp_release", "om_test_non_loop_105", "kimi-k31-nanjing-secret", "KIMI-K31-NANJING-SECRET", "ask", now_str),
+            )
+            store.conn.execute(
+                "INSERT INTO sends(idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("idem_real_loop_105", "ask", "tp_release", "om_test_real_loop_105", "loop-prod-release-pilot", "LOOP-PROD-RELEASE-PILOT", "ask", now_str),
+            )
+            store.conn.commit()
+
+            # 普通非 Loop ask（key=kimi-k31-nanjing-secret）不写入 prod-release-pilot
+            matched_non_loop = loops.maybe_record_escalation_loop_feedback(
+                cfg, store, "om_test_non_loop_105", "tp_release", "[其他] 我们咋做你就给sammy咋做 sammy的权限至少要跟我一摸一样"
+            )
+            self.assertIsNone(matched_non_loop)
+
+            # 显式关联 Loop 的 ask 正常写入，且连续用『其他：...』与『[卡片回调] 其他：...』调用两次不在 MEMORY.md 产生重复行
+            matched_real = loops.maybe_record_escalation_loop_feedback(
+                cfg, store, "om_test_real_loop_105", "tp_release", "其他：延后10分钟发版"
+            )
+            loops.maybe_record_escalation_loop_feedback(
+                cfg, store, "om_test_real_loop_105", "tp_release", "[卡片回调] 其他：延后10分钟发版"
+            )
+            self.assertEqual(matched_real, "prod-release-pilot")
+            mem_txt = (cfg.loops_dir / "prod-release-pilot" / "MEMORY.md").read_text(encoding="utf-8")
+            self.assertEqual(mem_txt.count("延后10分钟发版"), 1)
+
+            # 4) resolve_summary_and_body 同时传入 --summary 且 body 内含 ---more--- 分隔『事情/选项 A/B』与『附录 SQL』时，保留 inline_sum 中的选项不丢失
+            from sheepdog.card import resolve_summary_and_body
+            from sheepdog.card_callback import parse_ask_options
+            edm_summary = "Elaine 申请在生产数据库 tapnow_edm 执行带事务与审计的 SQL，解除 15 个收件人屏蔽状态。建议选 A 批准执行。"
+            edm_body = (
+                "事情：Elaine申请在生产库执行SQL。\n\n"
+                "选项：\n"
+                "A. 同意：由专席在生产数据库安全执行该SQL\n"
+                "B. 暂缓或调整窗口\n\n"
+                "---more---\n"
+                "【待执行生产 SQL 脚本与安全保护】\n"
+                "- 目标数据库：生产 taplabs-453508 / tapnow_edm"
+            )
+            s_out, d_out, resolved_out = resolve_summary_and_body(edm_body, edm_summary, hoist_at=False)
+            self.assertIn("A. 同意：由专席在生产数据库安全执行该SQL", d_out)
+            self.assertIn("【待执行生产 SQL 脚本与安全保护】", d_out)
+            parsed_edm_opts = parse_ask_options(resolved_out)
+            self.assertEqual([o.key for o in parsed_edm_opts], ["A", "B"])
+
 
 if __name__ == "__main__":
     unittest.main()

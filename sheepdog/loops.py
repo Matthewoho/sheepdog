@@ -1154,6 +1154,7 @@ def record_loop_feedback(
     clean_fb = (feedback_text or "").strip()
     if not clean_fb:
         return
+    norm_fb = re.sub(r"^\[卡片回调\]\s*", "", clean_fb).strip() or clean_fb
     now_dt = datetime.now(timezone.utc).astimezone()
     if run_id:
         store.conn.execute(
@@ -1162,7 +1163,10 @@ def record_loop_feedback(
         )
     else:
         row = store.conn.execute(
-            "SELECT run_id FROM loop_runs WHERE loop_id = ? ORDER BY started_at DESC LIMIT 1",
+            """SELECT run_id FROM loop_runs
+               WHERE loop_id = ?
+               ORDER BY CASE WHEN status != 'empty' THEN 0 ELSE 1 END, started_at DESC
+               LIMIT 1""",
             (loop_id,),
         ).fetchone()
         if row:
@@ -1175,7 +1179,7 @@ def record_loop_feedback(
     if spec is not None and spec.memory_path is not None:
         _append_memory_note(
             spec.memory_path,
-            f"- [{now_dt.strftime('%Y-%m-%d %H:%M')}] 主人反馈纠偏: {clean_fb}",
+            f"- [{now_dt.strftime('%Y-%m-%d %H:%M')}] 主人反馈纠偏: {norm_fb}",
         )
 
 
@@ -1192,7 +1196,7 @@ def maybe_record_escalation_loop_feedback(
     topic_id: str,
     chosen_display: str,
 ) -> str | None:
-    """REG-103：当主人对关联 Loop 的拍板卡给出 [其他] 或纠偏/暂缓指令时，自动写入 loop_runs.human_feedback 与 MEMORY.md。"""
+    """REG-103 / REG-105：当主人对显式关联 Loop（--key loop-<id> 或命中 loop_items）的拍板卡给出 [其他] 或纠偏/暂缓指令时，自动写入 loop_runs.human_feedback 与 MEMORY.md。"""
     disp = (chosen_display or "").strip()
     if not disp or not _LOOP_FEEDBACK_OVERRIDE_RE.search(disp):
         return None
@@ -1214,16 +1218,6 @@ def maybe_record_escalation_loop_feedback(
                 ).fetchone()
                 if li_row and li_row["loop_id"]:
                     loop_id = str(li_row["loop_id"]).strip()
-    if not loop_id and topic_id:
-        for spec in discover_loops(cfg, store):
-            if spec.topic_id == topic_id:
-                r_run = store.conn.execute(
-                    "SELECT run_id FROM loop_runs WHERE loop_id = ? AND status = 'dispatched' ORDER BY started_at DESC LIMIT 1",
-                    (spec.id,),
-                ).fetchone()
-                if r_run:
-                    loop_id = spec.id
-                    break
     if not loop_id:
         return None
     record_loop_feedback(cfg, store, loop_id, disp)

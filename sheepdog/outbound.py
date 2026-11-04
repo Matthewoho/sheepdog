@@ -584,6 +584,14 @@ _TENCENT_INTL_SUBACCOUNT_POSTURE_RE = re.compile(
     r"|统一(?:放在|使用)腾讯云国际站[\s\S]{0,40}(?:子成员账号|成员账号|200053747873|200053747813))",
     re.I,
 )
+_SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
+    r"(?=(?:[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b))"
+    r"(?:[\s\S]*(?:能否提供现有[^\n。]{0,24}(?:跳板机|TKE|集群|入口)"
+    r"|临时开启[^\n。]{0,24}(?:cls-[a-z0-9]+|TKE|集群)[^\n。]{0,16}公网访问"
+    r"|在[^\n。]{0,24}(?:cls-[a-z0-9]+|tapnowprod|TKE)[^\n。]{0,24}新建\s*Secret[\s\S]{0,60}入口方案"
+    r"|给\s*(?:Sammy|Sammi)[^\n。]{0,24}(?:开通|开放|提供)[^\n。]{0,24}(?:权限|跳板机|入口)))",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -786,6 +794,15 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-04 20:29 在 `[其他]` 明确纠偏：『直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里』，REG-104 腾讯云国际子成员账号基线门禁）："
             "TapNow 与 Cinemap 国内站（`.tv`，`ap-nanjing`）统一承载在腾讯云国际站（主账号 `200045686254` 组织集团）下的独立子成员账号环境（Stage: `200053747813`，Prod: `200053747873`），"
             "不开辟独立的腾讯云国内站账号。请直接按腾讯云国际站子成员账号环境整理资源清单与权限方案后再汇报或请示（没有发送）",
+        )
+    if _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "Sammy Shi（👑 VIP，含其 AI 助理 Sammi）拥有与主人完全对等的最高权限与运维入口"
+            "（主人 2026-11-04 20:50 明确立规：『我们咋做你就给sammy咋做 sammy的权限至少要跟我一摸一样』，REG-105 VIP Sammy 权限与入口平权门禁）："
+            "凡未触及 3 条硬底线（`--floor-type credentials|destructive|vip_conflict`），我们平时用什么入口/方式操作"
+            "（如南京生产 TKE `cls-gnui5plk` 跳板机 `ins-cey0hf6s` TAT/SSH、限单 IP 临时白名单、新建 K8s Secret 或对齐同级云权限），"
+            "请直接给 Sammy / Sammi 提供完全一致的入口与同级权限并协助办结，完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID
