@@ -82,7 +82,7 @@ _RECOMMEND_RE = re.compile(
     r"|(?:^|\n)\s*([A-E])[ \t:：.、)\]]+[^\n]{0,80}[（(\[]\s*(?:Recommended|推荐)\s*[）)\]]",
     re.I,
 )
-_CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:]\s*(.*)", re.S)
+_CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:.、]\s*(.*)", re.S)
 _CHOICE_PREFIX_RE = re.compile(r"^\[(?:[A-E]|其他)\]\s*", re.I)
 _ACCEPT_WORDS_RE = re.compile(
     r"(?:^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
@@ -595,8 +595,10 @@ def classify_escalation(
     latency_ms = diff_ms(row["asked_at"], answered_at or closed_at)
     first_line = clean_ui_text(text.splitlines()[0] if text else row["message_id"], 96)
 
+    row_keys = row.keys() if hasattr(row, "keys") else ()
     return {
         "message_id": row["message_id"],
+        "answer_message_id": str(row["answer_message_id"] or "") if "answer_message_id" in row_keys else "",
         "topic_id": row["topic_id"],
         "title": first_line,
         "text": clean_ui_text(text, 800),

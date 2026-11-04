@@ -22,6 +22,12 @@ from . import SinkError, SinkTimeout
 AGENTAPI_TIMEOUT = 60
 
 _REQUIRED_ENV = ("ANTIGRAVITY_AGENTAPI_EXE", "ANTIGRAVITY_LS_ADDRESS", "ANTIGRAVITY_CSRF_TOKEN")
+_CALLER_SCOPED_ENV = (
+    "ANTIGRAVITY_PROJECT_ID",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_TRAJECTORY_ID",
+    "ANTIGRAVITY_SOURCE_METADATA",
+)
 ENV_CACHE_FILENAME = "antigravity_env.json"
 
 
@@ -153,8 +159,9 @@ class AgentApiSink:
         if not ok:
             raise SinkError(why)
         exe = os.environ["ANTIGRAVITY_AGENTAPI_EXE"]
+        cmd_env = {k: v for k, v in os.environ.items() if k not in _CALLER_SCOPED_ENV}
         try:
-            proc = subprocess.run([exe, "agentapi", *args], capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
+            proc = subprocess.run([exe, "agentapi", *args], env=cmd_env, capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
         except subprocess.TimeoutExpired as e:
             # 7.47 第 7 条：不再冲出 dispatch_once 中断整轮。send-message 超时可能其实送到了，由调用方按 SinkTimeout 处理
             raise SinkTimeout(f"agentapi {args[0] if args else ''} 超过 {AGENTAPI_TIMEOUT} 秒没返回（可能已经送到）") from e
@@ -168,8 +175,9 @@ class AgentApiSink:
                 and self._reload_saved_env(force=True)
             ):
                 exe = os.environ["ANTIGRAVITY_AGENTAPI_EXE"]
+                cmd_env = {k: v for k, v in os.environ.items() if k not in _CALLER_SCOPED_ENV}
                 try:
-                    proc = subprocess.run([exe, "agentapi", *args], capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
+                    proc = subprocess.run([exe, "agentapi", *args], env=cmd_env, capture_output=True, text=True, timeout=AGENTAPI_TIMEOUT)
                 except subprocess.TimeoutExpired as e:
                     raise SinkTimeout(f"agentapi {args[0] if args else ''} 超过 {AGENTAPI_TIMEOUT} 秒没返回（可能已经送到）") from e
                 out = proc.stdout.strip()

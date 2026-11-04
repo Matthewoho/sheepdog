@@ -2108,6 +2108,173 @@ class VersionAndObserveTest(unittest.TestCase):
             )
             self.assertEqual(code, "peer_or_owner_delegate")
 
+    def test_reg098_prompt_filter_auto_resume_and_caller_env_strip_and_evolve_dedup(self):
+        """1.1.9（REG-098）：
+        1. `AgentApiSink._call` 调用 `subprocess.run` 时自动剥离调用方窗口绑定的 `ANTIGRAVITY_PROJECT_ID` / `ANTIGRAVITY_CONVERSATION_ID` 等上下文变量，防止跨工作区投递报 `PermissionDenied: source project_id does not match target project_id`；
+        2. 宿主遭遇 Prompt Filter 拦截（`PLANNER_RESPONSE DONE` 含 `The prompt could not be submitted`，且宿主未触发 Stop hook 导致 `st == {}`）时，`Dispatcher._check_stopped_in_flight` 在静默满 15s 后无需依赖 `st` 自动发送干净续跑唤醒，且 `observe --self-heal` 同步写入 `hooks/stop/<topic>.json` 自愈标记；
+        3. `evolve.build_evolve_digest` 与 `evolve.run_evolve_tick` 自动过滤已处置的 `healed_override_escalation_ids` / `seen_override_ids` 与 `seen_failed_lamb_ids`，防止旧推翻项或旧超时羔羊在 65 分钟窗口内重复触发 `event_override` / `needs_action`。
+        """
+        from sheepdog import evolve
+        from sheepdog.config import SelfEvolveConfig
+        from sheepdog.sink.agentapi import AgentApiSink
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=tmp_path / "state",
+                self_evolve=SelfEvolveConfig(enabled=True, interval_minutes=60.0, cooldown_minutes=5.0, trigger_on_override=True),
+            )
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            # 1) AgentApiSink._call 剥离调用方 ANTIGRAVITY_PROJECT_ID 等环境变量
+            captured_env: dict[str, str] = {}
+
+            def _fake_run(cmd, **kwargs):
+                captured_env.update(kwargs.get("env") or {})
+                proc = mock.MagicMock()
+                proc.returncode = 0
+                proc.stdout = '{"response": {"sendMessage": {"ok": true}}}'
+                proc.stderr = ""
+                return proc
+
+            sink_api = AgentApiSink(state_dir=cfg.state_dir)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ANTIGRAVITY_AGENTAPI_EXE": "/bin/echo",
+                    "ANTIGRAVITY_LS_ADDRESS": "localhost:56342",
+                    "ANTIGRAVITY_CSRF_TOKEN": "tok",
+                    "ANTIGRAVITY_PROJECT_ID": "proj-caller-only",
+                    "ANTIGRAVITY_CONVERSATION_ID": "cid-caller-only",
+                },
+                clear=False,
+            ), mock.patch("sheepdog.sink.agentapi.subprocess.run", side_effect=_fake_run):
+                sink_api.send_message("cid-target", "hello")
+            self.assertNotIn("ANTIGRAVITY_PROJECT_ID", captured_env)
+            self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", captured_env)
+            self.assertEqual(captured_env.get("ANTIGRAVITY_LS_ADDRESS"), "localhost:56342")
+
+            # 2) Prompt Filter (PLANNER_RESPONSE DONE + 无 Stop hook 文件) 15s 自动续跑唤醒
+            ref_now = datetime(2026, 11, 4, 15, 45, 0, tzinfo=observe.TZ)
+            sent_dt = ref_now - timedelta(seconds=30)
+            sent_iso = observe.iso(sent_dt)
+            store.conn.execute(
+                """
+                INSERT INTO topics (topic_id, title, kind, conversation_id, host, state, pending_batch_id, dispatched_at, created_at, last_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("tp_pf_auto", "NAT排查", "dynamic", "cid-pf-auto", "antigravity", "running", "b-pf-1", sent_iso, sent_iso, sent_iso),
+            )
+            store.conn.commit()
+            t_pf = tmp_path / "brain" / "cid-pf-auto" / ".system_generated" / "logs" / "transcript.jsonl"
+            t_pf.parent.mkdir(parents=True, exist_ok=True)
+            t_pf.write_text(
+                json.dumps({
+                    "step_index": 488,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": observe.iso(ref_now - timedelta(seconds=29)),
+                    "content": "批次 `b-pf-1`",
+                })
+                + "\n"
+                + json.dumps({
+                    "step_index": 489,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": observe.iso(ref_now - timedelta(seconds=28)),
+                    "content": "The prompt could not be submitted. The prompt contains sensitive words that violate policy.",
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            dry_sink = DryRunSink()
+            dispatcher = Dispatcher(cfg, store, {"antigravity": dry_sink}, Roster(), SecurityConfig())
+            with mock.patch.object(dispatcher, "_record_file", return_value=t_pf), mock.patch.object(
+                dry_sink, "send_message", wraps=dry_sink.send_message
+            ) as mock_send_msg:
+                resumed = dispatcher._check_stopped_in_flight(
+                    store.get_topic("tp_pf_auto"), "b-pf-1", sent_dt, ref_now, True
+                )
+            self.assertTrue(resumed)
+            self.assertEqual(mock_send_msg.call_count, 1)
+            self.assertIn("安全过滤器误拦", mock_send_msg.call_args[0][1])
+
+            # 3) evolve.build_evolve_digest 过滤已结清的 healed_override_escalation_ids 与 seen_failed_lamb_ids
+            store.conn.execute(
+                """
+                INSERT INTO messages (message_id, chat_id, content, create_time, first_seen, last_seen, dispatch_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "om_old_ans_1",
+                    "oc_1",
+                    "[卡片回调] A：选A",
+                    observe.iso(ref_now - timedelta(minutes=25)),
+                    observe.iso(ref_now - timedelta(minutes=25)),
+                    observe.iso(ref_now - timedelta(minutes=25)),
+                    "acked",
+                ),
+            )
+            store.conn.execute(
+                """
+                INSERT INTO escalations (message_id, topic_id, chat_id, text, asked_at, closed_at, close_reason, answer_message_id, answered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "om_old_ovr_1",
+                    "tp_bus",
+                    "oc_1",
+                    "🐕 需要你定 · 测试 [tp_bus]\nA. 选A\nB. 选B\n我的建议：选 B",
+                    observe.iso(ref_now - timedelta(minutes=30)),
+                    observe.iso(ref_now - timedelta(minutes=25)),
+                    "answered",
+                    "om_old_ans_1",
+                    observe.iso(ref_now - timedelta(minutes=25)),
+                ),
+            )
+            store.conn.execute(
+                """
+                INSERT INTO lambs (lamb_id, parent_topic_id, kind, task_title, state, started_at, finished_at, result_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "lamb_old_timeout",
+                    "tp_pf_auto",
+                    "subagent",
+                    "旧超时羔羊",
+                    "timeout",
+                    observe.iso(ref_now - timedelta(minutes=40)),
+                    observe.iso(ref_now - timedelta(minutes=20)),
+                    "超时",
+                ),
+            )
+            store.conn.commit()
+            # 未标记 settled 前，应检出 1 条 overridden 与 1 条 failed_lambs
+            digest_before = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=ref_now)
+            self.assertEqual(len(digest_before["d3_decision_ledger"]["overridden_in_window"]), 1)
+            self.assertEqual(digest_before["d3_decision_ledger"]["overridden_in_window"][0]["answer_id"], "om_old_ans_1")
+            self.assertTrue(any(r.startswith("new_overrides(1)") for r in digest_before["action_reasons"]))
+            self.assertTrue(any(r.startswith("failed_lambs(1)") for r in digest_before["action_reasons"]))
+
+            # 标记 settled 后，应被过滤为空
+            store.set_meta("healed_override_escalation_ids", json.dumps(["om_old_ovr_1"]))
+            evolve.write_evolve_state(
+                store,
+                {
+                    "last_run_at": observe.iso(ref_now - timedelta(minutes=10)),
+                    "last_override_answer_id": "om_reclassified_accept",
+                    "seen_override_ids": ["om_old_ovr_1", "om_old_ans_1"],
+                    "seen_failed_lamb_ids": ["lamb_old_timeout"],
+                },
+            )
+            digest = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=ref_now)
+            self.assertEqual(digest["d3_decision_ledger"]["overridden_in_window"], [])
+            self.assertFalse(any(r.startswith("new_overrides") for r in digest["action_reasons"]), digest["action_reasons"])
+            self.assertFalse(any(r.startswith("failed_lambs") for r in digest["action_reasons"]), digest["action_reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

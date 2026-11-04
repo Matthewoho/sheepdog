@@ -150,6 +150,16 @@ def build_evolve_digest(
     window_start = now - timedelta(minutes=max(5.0, float(since_minutes)))
     window_iso = window_start.isoformat(timespec="seconds")
 
+    conn = store.conn
+    prev_evolve_st = read_evolve_state(store)
+    settled_ovr_ids: set[str] = set(str(x) for x in (prev_evolve_st.get("seen_override_ids") or []) if x)
+    try:
+        r_healed_ovr = conn.execute("SELECT value FROM meta WHERE key='healed_override_escalation_ids'").fetchone()
+        if r_healed_ovr and r_healed_ovr["value"]:
+            settled_ovr_ids.update(str(x) for x in json.loads(str(r_healed_ovr["value"])) if x)
+    except Exception:
+        pass
+
     # D1: 守护进程与 observe 告警
     obs_res = obs_mod.run_observe(
         cfg,
@@ -164,7 +174,6 @@ def build_evolve_digest(
     self_healed = list(obs_res.get("self_healed") or [])
 
     # D2: 路由统计、挂起批次与未结拍板项
-    conn = store.conn
     route_rows = conn.execute(
         "SELECT route, reason, COUNT(*) AS cnt FROM messages WHERE first_seen >= ? GROUP BY route, reason ORDER BY cnt DESC",
         (window_iso,),
@@ -196,7 +205,10 @@ def build_evolve_digest(
     latest_override_answer_id = ""
     for d in recent_decisions:
         if d.get("alignment") == "overridden":
-            ans_id = str(d.get("answer_message_id") or d.get("message_id") or "")
+            msg_id_str = str(d.get("message_id") or "")
+            ans_id = str(d.get("answer_message_id") or msg_id_str or "")
+            if msg_id_str in settled_ovr_ids or ans_id in settled_ovr_ids:
+                continue
             if ans_id and not latest_override_answer_id:
                 latest_override_answer_id = ans_id
             ans_at = _parse_iso(str(d.get("answered_at") or d.get("asked_at") or ""))
@@ -312,7 +324,11 @@ def build_evolve_digest(
     unpromoted = [c for c in autonomy_candidates if not c.get("promoted")]
     if unpromoted:
         action_reasons.append(f"autonomy_candidates({len(unpromoted)})")
-    failed_lambs = [lb for lb in recent_lambs if lb.get("state") in ("failed", "timeout")]
+    seen_failed_lamb_ids: set[str] = set(str(x) for x in (prev_evolve_st.get("seen_failed_lamb_ids") or []) if x)
+    failed_lambs = [
+        lb for lb in recent_lambs
+        if lb.get("state") in ("failed", "timeout") and str(lb.get("lamb_id") or "") not in seen_failed_lamb_ids
+    ]
     if failed_lambs:
         action_reasons.append(f"failed_lambs({len(failed_lambs)})")
 
@@ -510,6 +526,7 @@ def run_evolve_tick(
     elapsed_s = (now - last_run_at).total_seconds() if last_run_at is not None else float("inf")
 
     trigger_reason = ""
+    cand_digest: dict | None = None
     if force:
         trigger_reason = "manual_force"
     elif last_run_at is None or elapsed_s >= interval_s:
@@ -539,7 +556,8 @@ def run_evolve_tick(
                 )
                 prev["last_checked_escalation_at"] = str(row_e["ats"])
                 new_ov_id = str((cand_digest.get("d3_decision_ledger") or {}).get("latest_override_answer_id") or "")
-                if new_ov_id and new_ov_id != str(prev.get("last_override_answer_id") or ""):
+                seen_ovr_set = set(str(x) for x in (prev.get("seen_override_ids") or []) if x)
+                if new_ov_id and new_ov_id != str(prev.get("last_override_answer_id") or "") and new_ov_id not in seen_ovr_set:
                     trigger_reason = "event_override"
                 else:
                     write_evolve_state(store, prev)
@@ -549,7 +567,7 @@ def run_evolve_tick(
         return {"triggered": False, "reason": "within_interval", "elapsed_seconds": round(elapsed_s, 1)}
 
     ensure_evolve_topic(cfg, store)
-    digest = build_evolve_digest(
+    digest = cand_digest if cand_digest is not None else build_evolve_digest(
         cfg,
         store,
         since_minutes=max(65.0, float(cfg.self_evolve.interval_minutes) + 5.0),
@@ -603,7 +621,19 @@ def run_evolve_tick(
                     log.warning("向 known 自进化管家会话 %s 发送巡检摘要失败: %s", evolve_tid, e)
 
     d3 = digest.get("d3_decision_ledger") or {}
+    d5_lambs = (digest.get("d5_bus_and_lambs") or {}).get("recent_lambs") or []
     d6 = digest.get("d6_peer_feedback_inbox") or {}
+    seen_ovr_list = list(dict.fromkeys([
+        *(str(x) for x in (prev.get("seen_override_ids") or []) if x),
+        *(str(ov.get("message_id") or "") for ov in (d3.get("overridden_in_window") or []) if ov.get("message_id")),
+        *(str(ov.get("answer_id") or "") for ov in (d3.get("overridden_in_window") or []) if ov.get("answer_id")),
+        *([str(d3.get("latest_override_answer_id"))] if d3.get("latest_override_answer_id") else []),
+        *([str(prev.get("last_override_answer_id"))] if prev.get("last_override_answer_id") else []),
+    ]))[-100:]
+    seen_lamb_list = list(dict.fromkeys([
+        *(str(x) for x in (prev.get("seen_failed_lamb_ids") or []) if x),
+        *(str(lb.get("lamb_id") or "") for lb in d5_lambs if lb.get("state") in ("failed", "timeout") and lb.get("lamb_id")),
+    ]))[-100:]
     new_state = {
         "enabled": bool(cfg.self_evolve.enabled),
         "topic_id": evolve_tid,
@@ -618,6 +648,8 @@ def run_evolve_tick(
         "needs_action": bool(digest.get("needs_action")),
         "action_reasons": list(digest.get("action_reasons") or []),
         "last_override_answer_id": str(d3.get("latest_override_answer_id") or prev.get("last_override_answer_id") or ""),
+        "seen_override_ids": seen_ovr_list,
+        "seen_failed_lamb_ids": seen_lamb_list,
         "last_checked_escalation_at": now.isoformat(timespec="seconds"),
         "last_mail_id": max(int(d6.get("latest_mail_id") or 0), int(prev.get("last_mail_id") or 0)),
         "summary": {

@@ -855,6 +855,10 @@ def run_observe(
                             has_pf = any("The prompt could not be submitted" in str(s.get("content") or "") or "The prompt could not be submitted" in str(s.get("error") or "") for s in post_steps)
                             if has_pf:
                                 warn.append(f"宿主 Prompt Filter 拦截：{tid} 批次 {batch_id} 出现 'The prompt could not be submitted'")
+                                if self_heal and state_dir is not None and f"{tid}:{batch_id}" not in self_healed:
+                                    _write_self_heal_stop_marker(state_dir, tid, batch_id, ref_now)
+                                    self_healed.append(f"{tid}:{batch_id}")
+                                    info.append(f"已对 Prompt Filter 拦截会话 {tid} ({batch_id}) 写入 stop 自愈标记")
                             elif steps and not post_steps and running_lambs == 0:
                                 warn.append(f"投递黑洞：{tid} 批次 {batch_id} 已送出 {int(batch_age_s)}s，但宿主 transcript 无任何新 step")
 

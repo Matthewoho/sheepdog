@@ -2729,10 +2729,16 @@ class Dispatcher:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
 
     def _transcript_error_at(self, t, batch: str, sent: datetime | None) -> datetime | None:
-        """7.64：检查会话记录末尾是否在当前批次送出后停在 ERROR_MESSAGE（或 status=ERROR）。"""
+        """7.64 / 1.1.9（REG-098）：检查会话记录末尾是否在当前批次送出后停在 ERROR_MESSAGE（或 status=ERROR）
+        或宿主 Prompt Filter 拦截（'The prompt could not be submitted'）。"""
+        at, _ = self._transcript_error_or_prompt_filter_at(t, batch, sent)
+        return at
+
+    def _transcript_error_or_prompt_filter_at(self, t, batch: str, sent: datetime | None) -> tuple[datetime | None, bool]:
+        """返回 (stopped_at, is_prompt_filter)。当末尾 step 为 ERROR 或含 'The prompt could not be submitted' 时返回对应时间。"""
         path = self._record_file(t)
         if path is None or not path.is_file():
-            return None
+            return None, False
         try:
             with path.open("rb") as f:
                 size = f.seek(0, os.SEEK_END)
@@ -2740,24 +2746,28 @@ class Dispatcher:
                 f.seek(start)
                 data = f.read(size - start)
         except OSError:
-            return None
+            return None, False
         lines = [ln for ln in data.split(b"\n") if ln.strip()]
         if start > 0 and lines:
             lines = lines[1:]
         if not lines:
-            return None
+            return None, False
         try:
             last = json.loads(lines[-1])
         except ValueError:
-            return None
+            return None, False
         if not isinstance(last, dict):
-            return None
-        if last.get("type") != "ERROR_MESSAGE" and last.get("status") != "ERROR":
-            return None
+            return None, False
+        content_str = str(last.get("content") or "")
+        error_str = str(last.get("error") or "")
+        is_pf = "The prompt could not be submitted" in content_str or "The prompt could not be submitted" in error_str
+        is_err = last.get("type") == "ERROR_MESSAGE" or last.get("status") == "ERROR"
+        if not is_pf and not is_err:
+            return None, False
         at = _parse(str(last.get("created_at") or "")) or self._record_mtime(t)
-        if at is not None and sent is not None and at < sent:
-            return None
-        return at
+        if at is not None and sent is not None and at < sent - timedelta(seconds=2):
+            return None, False
+        return at, is_pf
 
     def _has_planner_response_since(self, t, since: datetime | None) -> bool:
         """检查会话 transcript 在 since 之后是否产生过至少一步 PLANNER_RESPONSE（REG-092）。"""
@@ -2891,10 +2901,16 @@ class Dispatcher:
         stopped_at = None
         min_idle = 60
         has_bg_hang = False
+        is_pf_blocked = False
         if st.get("passed_at") or st.get("interrupted") is True:
             stopped_at = _parse(str(st.get("passed_at") or st.get("last_blocked_at") or ""))
-        if stopped_at is None and st:
-            stopped_at = self._transcript_error_at(t, batch, sent)
+        if stopped_at is None:
+            err_at, is_pf = self._transcript_error_or_prompt_filter_at(t, batch, sent)
+            if err_at is not None and (st or is_pf):
+                stopped_at = err_at
+                is_pf_blocked = is_pf
+                if is_pf:
+                    min_idle = 15
         if stopped_at is None:
             if already_resumed:
                 stopped_at, has_bg_hang = self._transcript_planner_idle_at(
@@ -2918,8 +2934,11 @@ class Dispatcher:
                 self._fail(t, batch, RECEIPT_TIMEOUT, ATTN_RECEIPT_TIMEOUT)
             log.info("topic %s 批次 %s 自动续跑后再次停机满 60 秒未交回执，立即按超时解锁", tid, batch)
             return True
-        bg_hint = "（检测到后台命令可能因等待交互输入挂起，请先用 manage_task kill 挂起任务并补加 --quiet）" if has_bg_hang else ""
-        prompt = f"[sheepdog] 检测到刚才宿主重登/中断{bg_hint}，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
+        if is_pf_blocked:
+            prompt = f"[sheepdog] 检测到刚才批次 `{batch}` 被宿主安全过滤器误拦或中断，请直接根据上下文继续完成并提交回执。"
+        else:
+            bg_hint = "（检测到后台命令可能因等待交互输入挂起，请先用 manage_task kill 挂起任务并补加 --quiet）" if has_bg_hang else ""
+            prompt = f"[sheepdog] 检测到刚才宿主重登/中断{bg_hint}，批次 `{batch}` 尚未提交回执，请继续完成并提交回执。"
         try:
             self._send(t, prompt, batch)
         except SinkError as e:

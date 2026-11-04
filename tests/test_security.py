@@ -1657,9 +1657,18 @@ class GateTest(Base):
         2. 因腾讯云子账号 UnauthorizedOperation 请示主人登录控制台创建 API Key / 资源前，强制要求先核查本机 ~/.tccli/ 主账号凭据（如 tencent-cn.credential）；
         3. 主人在来源私聊/话题发『正在开会，稍后联系你。』『啥事你先总结一下我在开会』等忙碌延后语时，pending.detect 与 hit_of 严禁误标 possibly_handled = owner_spoke；
         4. 会话调用 sheepdog resolve 结案（或主人拍板）时，立即同步将关联的 waiting_owner 在办项收口（自动补项转 done、申报项转 doing），消除 60s 周期 _sync_duty 前交 receipt 误报『死球真空』。"""
+        from datetime import datetime, timedelta
         from sheepdog import decision_hub, duty, outbound, pending as pend
 
         self.cfg.topic_group.decision_hub = True
+        base_now = datetime.now().astimezone()
+        ts_ask_m = (base_now - timedelta(minutes=30)).isoformat(timespec="seconds")
+        ts_ask_ags = (base_now - timedelta(minutes=20)).isoformat(timespec="seconds")
+        ts_dup_ags = (base_now - timedelta(minutes=21)).isoformat(timespec="seconds")
+        ts_busy_1 = (base_now - timedelta(minutes=15)).isoformat(timespec="seconds")
+        ts_busy_2 = (base_now - timedelta(minutes=14)).isoformat(timespec="seconds")
+        ts_marked = (base_now - timedelta(minutes=13)).isoformat(timespec="seconds")
+        ts_owner_ok = (base_now - timedelta(minutes=5)).isoformat(timespec="seconds")
 
         # 1. 准备两条不同来源消息：om_test_about_meeting（开会对齐）与 om_test_about_ags（腾讯云 AGS Key）
         self.poll([
@@ -1679,7 +1688,7 @@ class GateTest(Base):
             key="T-42",
             about=["om_test_about_meeting"],
         )
-        self.store.add_escalation(res_m.message_id, "tp_alpha", "oc_test_owner", res_m.text, "2026-11-03T16:02:10+08:00")
+        self.store.add_escalation(res_m.message_id, "tp_alpha", "oc_test_owner", res_m.text, ts_ask_m)
 
         # (2) 腾讯云子账号 UnauthorizedOperation 请示主人登录控制台建 Key，未查本机 ~/.tccli/ -> 拦截
         with self.assertRaises(outbound.OutboundError) as ctx_tccli:
@@ -1718,7 +1727,7 @@ class GateTest(Base):
         self.assertNotEqual(res_ags1.message_id, res_m.message_id)
         self.assertFalse(res_ags1.patched_in_place)
         self.assertIn("今晚开会对齐", self.store.get_escalation(res_m.message_id)["text"])
-        self.store.add_escalation(res_ags1.message_id, "tp_alpha", "oc_test_owner", res_ags1.text, "2026-11-03T17:44:49+08:00")
+        self.store.add_escalation(res_ags1.message_id, "tp_alpha", "oc_test_owner", res_ags1.text, ts_ask_ags)
 
         # (1b) 同一会话随后换 --key tencent-ags-apikey 但针对同一 --about om_test_about_ags 重发同主题提问 -> 原地更新 res_ags1，不刷第 2 张卡！
         ags_body_v2 = (
@@ -1744,7 +1753,7 @@ class GateTest(Base):
 
         # (1c) 若历史存量中同一会话、同一 --about 存在两张同主题未决卡，主人拍板其中一张时自动结案另一张同源重复卡
         dup_mid = "om_test_ags_dup_legacy"
-        self.store.add_escalation(dup_mid, "tp_alpha", "oc_test_owner", "🐕 需要你定 · kc申请腾讯云AGS沙箱API Key [tp_alpha]\n旧卡", "2026-11-03T17:44:45+08:00")
+        self.store.add_escalation(dup_mid, "tp_alpha", "oc_test_owner", "🐕 需要你定 · kc申请腾讯云AGS沙箱API Key [tp_alpha]\n旧卡", ts_dup_ags)
         self.store.add_escalation_sources(dup_mid, "tp_alpha", [("om_test_about_ags", "oc_test_alpha_p2p")], pend.ORIGIN_ABOUT)
         decision_hub.sync_escalation_dual_cards(
             self.cfg,
@@ -1772,7 +1781,7 @@ class GateTest(Base):
                 sender_id=ME,
                 sender_name="Matthew",
                 content="正在开会，稍后联系你。",
-                create_time="2026-11-03T17:45:00+08:00",
+                create_time=ts_busy_1,
             ),
             "drop",
             "self",
@@ -1786,7 +1795,7 @@ class GateTest(Base):
                 sender_id=ME,
                 sender_name="Matthew",
                 content="啥事你先总结一下我在开会",
-                create_time="2026-11-03T17:45:10+08:00",
+                create_time=ts_busy_2,
             ),
             "drop",
             "self",
@@ -1795,7 +1804,7 @@ class GateTest(Base):
         esc_m = self.store.get_escalation(res_m.message_id)
         self.assertIsNone(pend.detect(self.cfg, self.store, esc_m))
         # 即便旧版已误标 possibly_handled_message_id = om_test_owner_busy_1，hit_of 与 verify_resolve_allowed 也会过滤掉该误标
-        self.store.mark_possibly_handled(res_m.message_id, "om_test_owner_busy_1", pend.PH_SPOKE, "2026-11-03T17:45:27+08:00")
+        self.store.mark_possibly_handled(res_m.message_id, "om_test_owner_busy_1", pend.PH_SPOKE, ts_marked)
         esc_m_marked = self.store.get_escalation(res_m.message_id)
         self.assertIsNone(pend.hit_of(self.cfg, self.store, esc_m_marked))
         with self.assertRaises(outbound.OutboundError):
@@ -1821,7 +1830,7 @@ class GateTest(Base):
                 sender_id=ME,
                 sender_name="Matthew",
                 content="同意今晚开会对齐测试方案",
-                create_time="2026-11-03T17:50:00+08:00",
+                create_time=ts_owner_ok,
             ),
             "dispatch",
             "owner_reply",
@@ -1984,6 +1993,7 @@ class GateTest(Base):
         4. 数据库内部 User 账号 / 只读账密（含尚未入 DBA 台账的新库）拦截绕过 DBA 向主人 ask（含在 tp_bus 总线发起），
            且测试环境 IAM 门禁不因正文附带『登记生产模板（测试与生产共用）』误判放行；
         5. _summarize_cli_lamb_log 过滤 gcloud 部署进度/proxy 提示行，并将截断的纯 JSON 属性碎片提炼为单行 JSON_TAIL(...)。"""
+        from datetime import datetime, timedelta
         from sheepdog import admin_web, decision_hub, engine, outbound
         from sheepdog.config import TopicGroupConfig
 
@@ -1994,8 +2004,12 @@ class GateTest(Base):
             decision_hub.META_DECISION_HUB,
             json.dumps({"root_message_id": "om_test_hub_root", "thread_id": "omt_test_hub_thr"}, ensure_ascii=False),
         )
-        ans_ts = "2026-11-03T20:13:19+08:00"
-        follow_ts = "2026-11-03T20:13:53+08:00"
+        base_now = datetime.now().astimezone()
+        ask_ts_resale = (base_now - timedelta(minutes=15)).isoformat(timespec="seconds")
+        open1_ts = (base_now - timedelta(minutes=25)).isoformat(timespec="seconds")
+        open2_ts = (base_now - timedelta(minutes=24)).isoformat(timespec="seconds")
+        ans_ts = (base_now - timedelta(minutes=12)).isoformat(timespec="seconds")
+        follow_ts = (base_now - timedelta(minutes=12) + timedelta(seconds=34)).isoformat(timespec="seconds")
         self.store.add_send(
             "ik_test_resale_ask",
             "ask",
@@ -2011,7 +2025,7 @@ class GateTest(Base):
             "tp_alpha",
             "oc_test_tg_hub",
             "🐕 需要你定 · Kai提请排期明日18点发版文本模型官方对齐 [tp_alpha]\n建议选 A：同意排期明天 18:00 窗口\n---more---\n选项：\nA. 同意排期明天 18:00 窗口\nB. 调整排期时间或有其他要求",
-            "2026-11-03T20:10:02+08:00",
+            ask_ts_resale,
         )
         cb_msg = msg(
             message_id="om_test_cb_resale_a",
@@ -2030,8 +2044,8 @@ class GateTest(Base):
         self.store.conn.commit()
 
         # 同时存在另外 2 张别的会话未决 ask，模拟 len(opens) != 1
-        self.store.add_escalation("om_test_other_open_1", "tp_bus", "oc_test_tg_hub", "提问1", "2026-11-03T20:00:00+08:00")
-        self.store.add_escalation("om_test_other_open_2", "tp_bus", "oc_test_tg_hub", "提问2", "2026-11-03T20:01:00+08:00")
+        self.store.add_escalation("om_test_other_open_1", "tp_bus", "oc_test_tg_hub", "提问1", open1_ts)
+        self.store.add_escalation("om_test_other_open_2", "tp_bus", "oc_test_tg_hub", "提问2", open2_ts)
 
         critique_msg = msg(
             message_id="om_test_hub_critique",
