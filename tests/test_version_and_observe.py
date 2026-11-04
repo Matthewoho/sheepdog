@@ -1961,6 +1961,58 @@ class VersionAndObserveTest(unittest.TestCase):
             )
             self.assertEqual(code, "peer_or_owner_delegate")
 
+    def test_reg096_nat_port_downsize_ask_requires_peak_per_vm_usage_and_diagnosis(self):
+        """REG-096: 请示调小 Cloud NAT minPortsPerVm 前必须核查并写明单实例最高端口使用数与影响评估 + 追问单实例峰值端口与影响归入 context_incomplete。"""
+        from sheepdog import admin_web, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(self_open_id="ou_owner", state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            # 1) 未写明单实例最高端口使用数就请示将 minPortsPerVm 调小为 256 -> 被拦截
+            with self.assertRaises(outbound.OutboundError) as cm:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_prod-nat-port-investigation",
+                    "生产东京Cloud NAT端口告警止血方案拍板",
+                    "生产东京 Cloud NAT 告警已排查清楚，当前实际丢包为 0。建议执行方案 A，将网关 minPortsPerVm 由 1024 调小为 256。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 调小网关 minPortsPerVm 至 256，保留 8 个已加白 IP 不变\n"
+                    "B. 确认阿里是否已把 50 个主池 IP 加白完毕并删除 Rule 101\n"
+                    "执行：gcloud compute routers nats update tap-prod-nat-gateway-tokyo --min-ports-per-vm=256",
+                )
+            self.assertIn("REG-096", str(cm.exception))
+
+            # 2) 写明了单实例最高端口使用数与动态端口分配上限 -> 正常放行
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                store,
+                "tp_prod-nat-port-investigation",
+                "生产东京Cloud NAT端口告警止血方案拍板",
+                "生产东京 Cloud NAT 告警已排查清楚，当前单实例最高端口使用数为 48 个（远低于 256，且已开启动态端口分配 maxPortsPerVm=65536），调小无任何业务影响。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 调小网关 minPortsPerVm 至 256，保留 8 个已加白 IP 不变\n"
+                "B. 确认阿里是否已把 50 个主池 IP 加白完毕并删除 Rule 101\n"
+                "执行：gcloud compute routers nats update tap-prod-nat-gateway-tokyo --min-ports-per-vm=256",
+            )
+
+            # 3) 主人反问「那会不会有什么影响呢 有办法看最高端口使用数的一个实例用了多少个端口吗」归入 context_incomplete
+            code, label = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · 生产东京Cloud NAT端口告警止血方案拍板 [tp_prod-nat-port-investigation]",
+                "那会不会有什么影响呢 有办法看最高端口使用数的一个实例用了多少个端口吗",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code, "context_incomplete")
+
 
 if __name__ == "__main__":
     unittest.main()

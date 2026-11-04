@@ -496,6 +496,16 @@ _PREMATURE_READONLY_INVESTIGATION_ASK_RE = re.compile(
     r"|A\s*[.、:：]\s*指定负责人\s*[（(][^\n）)]{0,24}直接告知负责人)",
     re.I,
 )
+_NAT_PORT_DOWNSIZE_ASK_RE = re.compile(
+    r"(?:minPortsPerVm|--min-ports-per-vm)[\s\S]{0,80}?(?:调小|下调|降为|改为\s*(?:64|128|256|512)|=\s*(?:64|128|256|512))",
+    re.I,
+)
+_NAT_PEAK_PER_VM_PORT_EVIDENCE_RE = re.compile(
+    r"(?:(?:单实例|单机|单个实例|per[\s_-]*vm|单\s*VM)[^\n。]{0,36}?(?:最高|峰值|最大|max)[^\n。]{0,24}?端口"
+    r"|(?:最高|峰值|最大)[^\n。]{0,20}?(?:端口使用数|已用端口)[^\n。]{0,24}?(?:实例|VM|机器)"
+    r"|port_usage|allocated_ports|used_ports)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -595,6 +605,13 @@ def check_ask_pre_flight_guard(
             "只读指标/实例/日志排查（Lane D）与转交专席核实属于 Agent 自治职责，严禁在尚未查清具体服务名（如『具体是哪个 gateway』）与实时指标前发 `sheepdog ask` 让主人拍板『A. 仅做只读指标与实例排查』"
             "（因未先只读核查而发 ask 等批，会导致对方等待后自行让其 Agent 操作，主人批复『他说他的agent操作了 你可以帮忙盯着点』）："
             "请立即直接 `sheepdog forward` 转交对应专席（或由当前专席直接执行只读核查），拿到真实服务名、当前实例数/配额与明确目标参数后，若确实需要执行生产变更，再由专席带齐实测数据发起一次精准 `sheepdog ask`（REG-094 防打扰门禁，没有发送）",
+        )
+    if _NAT_PORT_DOWNSIZE_ASK_RE.search(full_text) and not _NAT_PEAK_PER_VM_PORT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示调小/下调 Cloud NAT 网关 `minPortsPerVm`（`--min-ports-per-vm`）前，必须先通过 Cloud Monitoring 只读核查当前单实例（per-VM）最高端口使用数 / 已分配端口峰值及动态端口分配上限（`maxPortsPerVm`）"
+            "（主人反问：『那会不会有什么影响呢 有办法看最高端口使用数的一个实例用了多少个端口吗』）："
+            "请先查清当前单实例最高端口使用数（如 `nat/port_usage` / `allocated_ports` 单 VM 最大值）与调小后的实际影响评估并写入正文，严禁未附单实例峰值端口实测数据就发 ask（REG-096 防打扰门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return
