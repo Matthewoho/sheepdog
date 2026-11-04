@@ -2684,6 +2684,8 @@ class Dispatcher:
             self._watches_after_receipt(t["topic_id"], batch, receipt.get("anchors") or [])
             if anchors := self._receipt_anchors(t, receipt): fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
+            if status != "needs_decision":
+                self._auto_settle_open_escalations_on_owner_batch(t["topic_id"], batch)
             if status != "waiting":
                 _auto_close_topic_subagents(self.store, t["topic_id"])
             if status in ("handled", "done"):
@@ -4120,6 +4122,69 @@ class Dispatcher:
                 chosen_display=" ".join(plain_text(r["content"] or "").split())[:60] or "主人文字批复",
                 answered_at=r["create_time"] or now_iso())
 
+    def _auto_settle_open_escalations_on_owner_batch(self, topic_id: str, batch_id: str) -> list[str]:
+        """1.1.21（REG-110）：当某个会话名下有未关闭的「需要你定」提问，且主人在原业务群（或对该会话）直接下达了
+        owner_instruction / owner_reply 指令（如『@Mattheuu 你直接起 subagent review 完没问题直接合』），
+        会话收到并处理该批次后交回非 needs_decision 回执（handled / waiting / done）时，
+        自动用主人的这条群内指令将同会话对应的 open escalation 结案，并同步将话题群与拍板总台双卡片置绿，
+        避免主人已经在群里拍板指挥完，拍板总台还挂着未结案卡片迫使主人点『[其他] 我在群里回了呀』。"""
+        if not topic_id or not batch_id or not self.cfg.self_open_id:
+            return []
+        open_escs = [
+            e
+            for e in open_escalations(self.store, self.cfg.escalation.open_hours, topic_id)
+            if not e["closed_at"]
+        ]
+        if not open_escs:
+            return []
+        d = self.store.get_dispatch(batch_id)
+        mids = json.loads(d["message_ids"] or "[]") if d is not None and d["message_ids"] else []
+        if not mids:
+            return []
+        from . import pending as pend
+        owner_msgs = []
+        for mid in mids:
+            r = self.store.get_message(mid)
+            if r is None or r["sender_id"] != self.cfg.self_open_id or r["deleted"]:
+                continue
+            reason = (r["reason"] or "").strip()
+            if (reason in (OWNER_INSTRUCTION, OWNER_REPLY) or _has_owner_instruction_tag(r)) and not pend.is_owner_busy_or_defer_text(r["content"] or ""):
+                owner_msgs.append(r)
+        if not owner_msgs:
+            return []
+        settled: list[str] = []
+        for e in open_escs:
+            asked = _parse(e["asked_at"] or "")
+            src_chats = {
+                s["about_chat_id"]
+                for s in self.store.escalation_sources(e["message_id"])
+                if s["about_chat_id"]
+            }
+            matched_r = None
+            for r in reversed(owner_msgs):
+                c_dt = _parse(r["create_time"] or "")
+                f_dt = _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
+                dts = [x for x in (c_dt, f_dt) if x is not None]
+                r_dt = max(dts) if dts else None
+                if asked is not None and r_dt is not None and r_dt < asked - timedelta(seconds=90):
+                    continue
+                same_source_chat = not src_chats or (r["chat_id"] in src_chats)
+                recent_on_topic = asked is not None and r_dt is not None and (r_dt - asked) <= timedelta(minutes=30)
+                if same_source_chat or recent_on_topic:
+                    matched_r = r
+                    break
+            if matched_r is not None:
+                self._answer_escalation_row(e["message_id"], matched_r)
+                settled.append(e["message_id"])
+                log.info(
+                    "会话 %s 批次 %s 已按主人群内指令 %s 处理完毕，自动结案待定提问 %s",
+                    topic_id,
+                    batch_id,
+                    matched_r["message_id"],
+                    e["message_id"],
+                )
+        return settled
+
     def _complete_delivery(self, t, batch_id: str, signals: list, context: list, sent_at: str | None = None) -> dict:
         """批次已送达后的记账：标记消息、改会话状态、关闭被回答的「需要你定」、点确认表情。正常发送与崩溃恢复共用。"""
         ids = [r["message_id"] for r in signals]
@@ -4830,6 +4895,11 @@ class Dispatcher:
                         or cur_sum in ("{", "[")
                         or cur_sum.startswith('File "')
                         or bool(_SAVED_TMP_JSON_RE.match(cur_sum))
+                        or (
+                            sum(1 for ln in cur_sum.splitlines() if _ATTEMPT_POLL_PREFIX_RE.match(ln.strip())) >= 2
+                            and len({m.group(1) for ln in cur_sum.splitlines() if (m := _ATTEMPT_POLL_PREFIX_RE.match(ln.strip()))})
+                            < sum(1 for ln in cur_sum.splitlines() if _ATTEMPT_POLL_PREFIX_RE.match(ln.strip()))
+                        )
                         or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
@@ -6650,6 +6720,7 @@ _PY_EXCEPTION_LINE_RE = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Exit|Fault)\b\s*:|(?:STDERR:\s*)?(?:ERROR|FATAL)\s*:)"
 )
 _SAVED_TMP_JSON_RE = re.compile(r"^(?:Saved|Wrote)\s+(/tmp/[A-Za-z0-9_./-]+\.json)\s*$", re.I)
+_ATTEMPT_POLL_PREFIX_RE = re.compile(r"^\[(?:attempt|poll|try|round|step)\s*\d+(?:/\d+)?\]\s*(.+)$", re.I)
 _EDITED_PREFIX = "（已编辑）旧："
 _RECALLED_PREFIX = "（已撤回）原文："
 
@@ -6864,7 +6935,17 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
         ]
         if non_grep:
             meaningful = non_grep
-    tail_lines = (meaningful or non_empty)[-5:]
+    cand_lines = meaningful or non_empty
+    if len(cand_lines) >= 2:
+        deduped_cand: list[str] = []
+        for idx_c, ln in enumerate(cand_lines):
+            m_cur = _ATTEMPT_POLL_PREFIX_RE.match(ln)
+            m_nxt = _ATTEMPT_POLL_PREFIX_RE.match(cand_lines[idx_c + 1]) if idx_c + 1 < len(cand_lines) else None
+            if m_cur and m_nxt and m_cur.group(1).strip() == m_nxt.group(1).strip():
+                continue
+            deduped_cand.append(ln)
+        cand_lines = deduped_cand
+    tail_lines = cand_lines[-5:]
     if tail_lines and not all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
         non_json_frag = [ln for ln in tail_lines if not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)]
         if non_json_frag:

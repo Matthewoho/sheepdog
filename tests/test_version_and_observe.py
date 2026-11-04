@@ -3403,6 +3403,171 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(g0["sessions"][1]["lifecycle"], "standing")
             self.assertEqual(g0["sessions"][1]["last_active"], "2026-11-05T02:22:00+08:00")
 
+    def test_reg110_owner_group_instruction_auto_settles_open_escalation_and_vip_pr_followthrough_guard(self) -> None:
+        """REG-110 (v1.1.21):
+        1. pending._owner_followups 与 Dispatcher._auto_settle_open_escalations_on_owner_batch：
+           当会话名下存在未结案的「需要你定」提问，且主人在原业务群直接 @ 机器人下达 owner_instruction 指令（即使 reply_to 引用的是群内更早消息），
+           ① pending.detect 将其识别为 possibly_handled；
+           ② 会话处理完该批次交回非 needs_decision 回执（如 waiting/handled/done）时，_check_receipt 自动将该 open escalation 结案（answered）；
+        2. outbound.check_ask_pre_flight_guard 拦截把『谁来跟完我方在途 PR（A. 由我们跟到底 vs B. 由 Sammy 自己来跟合入与验证）』作为选择题抛给主人的甩锅 ask；
+        3. admin_web.diagnose_override_reason 将『我在群里回了呀』精准归入 stale_or_already_handled；
+        4. engine._summarize_cli_lamb_log 自动折叠连续相同内容的 `[attempt N]` / `[poll N]` 轮询行，仅保留最后一次尝试。
+        """
+        from sheepdog import admin_web, engine as eng, outbound, pending as pend
+        from sheepdog.config import Config
+        from sheepdog.roster import Roster
+        from sheepdog.security import SecurityConfig
+        from sheepdog.sink.agentapi import DryRunSink
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=state_dir,
+                config_path=state_dir / "config.toml",
+                sink="dryrun",
+            )
+            store = Store(cfg.db_path)
+            store.create_topic("tp_infra", "跨云迁移", "adopted", "迁移", "running")
+            store.update_topic(
+                "tp_infra",
+                conversation_id="cid_test_infra",
+                pending_batch_id="b20261105023601-infra",
+                dispatched_at="2026-11-05T02:36:01+08:00",
+            )
+            # 1) 业务群消息与 open escalation
+            store.conn.execute(
+                """
+                INSERT INTO messages (message_id, chat_id, chat_type, sender_id, content, create_time, first_seen, last_seen, route, reason, topic_id, dispatch_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "om_src_vip_q",
+                    "oc_group_1",
+                    "group",
+                    "ou_vip_sammy",
+                    "@Matthew .cnb.yml 这件事谁来跟完？",
+                    "2026-11-05T02:34:00+08:00",
+                    "2026-11-05T02:34:01+08:00",
+                    "2026-11-05T02:34:01+08:00",
+                    "dispatch",
+                    "mention",
+                    "tp_infra",
+                    "acked",
+                ),
+            )
+            store.add_escalation(
+                "om_esc_ask_1",
+                "tp_infra",
+                "oc_tg_1",
+                "🐕 需要你定 · 腾讯云迁移8个PR构建修复与合入收尾 [tp_infra]",
+                "2026-11-05T02:35:19+08:00",
+            )
+            store.add_escalation_sources(
+                "om_esc_ask_1",
+                "tp_infra",
+                [("om_src_vip_q", "oc_group_1")],
+                "explicit",
+            )
+            # 主人在原业务群直接 @ 机器人下达指令（reply_to 指向群内另一条旧消息 om_older_msg）
+            store.conn.execute(
+                """
+                INSERT INTO messages (message_id, chat_id, chat_type, sender_id, reply_to, content, create_time, first_seen, last_seen, route, reason, tags_json, topic_id, batch_id, dispatch_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "om_owner_group_inst",
+                    "oc_group_1",
+                    "group",
+                    "ou_test_owner",
+                    "om_older_msg",
+                    "@Mattheuu 你直接起 subagent review 完没问题直接合 合完看看有没有解决问题就行",
+                    "2026-11-05T02:35:00+08:00",
+                    "2026-11-05T02:36:01+08:00",
+                    "2026-11-05T02:36:01+08:00",
+                    "dispatch",
+                    "owner_instruction",
+                    json.dumps(["owner_instruction", "owner_at:quote"]),
+                    "tp_infra",
+                    "b20261105023601-infra",
+                    "delivered",
+                ),
+            )
+            store.record_dispatch("b20261105023601-infra", "tp_infra", ["om_owner_group_inst"])
+            store.conn.commit()
+
+            # 1a) pending.detect 识别到主人在原群下达的 owner_instruction
+            esc_row = store.get_escalation("om_esc_ask_1")
+            hit = pend.detect(cfg, store, esc_row)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit.reason, pend.PH_SPOKE)
+
+            # 1b) 会话交回 waiting 回执后，_check_receipt 自动将该 open escalation 结案
+            disp = eng.Dispatcher(cfg, store, {"antigravity": DryRunSink()}, Roster(), SecurityConfig())
+            rp = disp.receipt_path("tp_infra", "b20261105023601-infra")
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            rp.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "b20261105023601-infra",
+                        "topic_id": "tp_infra",
+                        "status": "waiting",
+                        "summary": "已按主人群内指令启动 subagent 审查并合入 8 个 PR",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            disp._check_receipt(store.get_topic("tp_infra"))
+            esc_after = store.get_escalation("om_esc_ask_1")
+            self.assertEqual(esc_after["close_reason"], "answered")
+            self.assertEqual(esc_after["answer_message_id"], "om_owner_group_inst")
+            self.assertIsNotNone(esc_after["closed_at"])
+
+            # 2) check_ask_pre_flight_guard 拦截把在途 PR 甩给 Sammy 自己合入的伪选择题
+            shirk_ask_text = (
+                "🐕 需要你定 · 腾讯云迁移8个PR构建修复与合入收尾 [tp_infra]\n"
+                "事情：Sammy 询问腾讯云国际迁移 8 个服务 PR 的 .cnb.yml 修复谁来跟完、几点前完成（我们此前已推送 6 个 PR 的 commit）。\n"
+                "选项：\n"
+                "A. 由我们（Infra与SRE团队）全权跟到底：今天12:00前完成全部8个PR构建修复与合入\n"
+                "B. 由Sammy自己来跟合入与验证：我们仅移交已修改的6个PR现状，后续合入由Sammy接手\n"
+                "我的建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_infra",
+                    "腾讯云迁移8个PR构建修复与合入收尾",
+                    shirk_ask_text,
+                )
+            self.assertIn("REG-110", str(ctx.exception))
+
+            # 3) diagnose_override_reason 识别『我在群里回了呀』为 stale_or_already_handled
+            cat, label = admin_web.diagnose_override_reason(shirk_ask_text, "我在群里回了呀", "OTHER", "A")
+            self.assertEqual(cat, "stale_or_already_handled")
+            self.assertEqual(label, "陈旧/已处理未重查")
+
+            # 4) _summarize_cli_lamb_log 折叠连续重复的 [attempt N] 轮询行
+            poll_log = (
+                "Triggering PR checks...\n"
+                "[attempt 2] pending tasks: ['fe-app-tapnow-pr-build']\n"
+                "[attempt 3] pending tasks: ['fe-app-tapnow-pr-build']\n"
+                "[attempt 4] pending tasks: ['fe-app-tapnow-pr-build']\n"
+                "[attempt 5] pending tasks: ['fe-app-tapnow-pr-build']\n"
+                "[attempt 6] pending tasks: ['fe-app-tapnow-pr-build']\n"
+            )
+            sum_txt, has_err = eng._summarize_cli_lamb_log(poll_log)
+            self.assertFalse(has_err)
+            self.assertEqual(
+                sum_txt.splitlines(),
+                [
+                    "Triggering PR checks...",
+                    "[attempt 6] pending tasks: ['fe-app-tapnow-pr-build']",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

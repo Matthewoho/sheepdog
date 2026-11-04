@@ -287,14 +287,22 @@ def _thread_root_id(store: Store, thread_id: str) -> str:
     return ""
 
 
-def _owner_followups(cfg, store: Store, srcs) -> list:
+def _owner_followups(cfg, store: Store, srcs, e=None) -> list:
     """主人本人在来源上的后续发言（还没按时间、代回筛）：私聊来源 → 这个私聊里主人的全部发言；群来源 → 回复 / 引用来源消息的、
     在来源消息所在话题里的（按来源消息的 thread_id 比：它本身在话题里，或者它就是话题开头那条、账本里已经补上了话题编号——
-    engine._learn_source_thread 在主人在群话题里说话时补）。找主人聊天里的不算。"""
+    engine._learn_source_thread 在主人在群话题里说话时补），或主人在该群对该会话下达的 owner_instruction / owner_reply。找主人聊天里的不算。"""
     me = cfg.self_open_id
     owner_chats = set(cfg.owner_side_chat_ids)
     out: dict[str, object] = {}
     p2p_chats: set[str] = set()
+    esc_tid = str(
+        (
+            e["topic_id"]
+            if e is not None and "topic_id" in e.keys()
+            else (srcs[0]["topic_id"] if srcs and "topic_id" in srcs[0].keys() else "")
+        )
+        or ""
+    ).strip()
     for s in srcs:
         chat = s["about_chat_id"]
         if not chat or chat in owner_chats:
@@ -308,10 +316,29 @@ def _owner_followups(cfg, store: Store, srcs) -> list:
         tid = (src["thread_id"] if src is not None else "") or ""
         rows = store.conn.execute(
             "SELECT * FROM messages WHERE sender_id=? AND chat_id=? AND COALESCE(deleted,0)=0 "
-            "AND (reply_to=? OR (? != '' AND thread_id=?))", (me, chat, mid, tid, tid)).fetchall()
+            "AND (reply_to=? OR (? != '' AND thread_id=?) "
+            "OR ((reason IN ('owner_instruction', 'owner_reply') OR COALESCE(tags_json, '') LIKE '%\"owner_instruction\"%') "
+            "AND (? = '' OR COALESCE(topic_id, '') = '' OR topic_id = ?)))",
+            (me, chat, mid, tid, tid, esc_tid, esc_tid),
+        ).fetchall()
         for r in rows:
             rtid = r["thread_id"] or ""
-            if r["reply_to"] == mid or (tid and rtid == tid):
+            r_reason = (r["reason"] if "reason" in r.keys() else "") or ""
+            r_tags = (r["tags_json"] if "tags_json" in r.keys() else "") or ""
+            r_topic = (r["topic_id"] if "topic_id" in r.keys() else "") or ""
+            is_direct_reply = r["reply_to"] == mid or (tid and rtid == tid)
+            is_group_owner_inst = (
+                r_reason in ("owner_instruction", "owner_reply") or '"owner_instruction"' in r_tags
+            ) and (not esc_tid or not r_topic or r_topic == esc_tid)
+            if is_direct_reply or is_group_owner_inst:
+                out[r["message_id"]] = r
+    if esc_tid:
+        for r in store.conn.execute(
+            "SELECT * FROM messages WHERE sender_id=? AND topic_id=? AND COALESCE(deleted,0)=0 "
+            "AND (reason IN ('owner_instruction', 'owner_reply') OR COALESCE(tags_json, '') LIKE '%\"owner_instruction\"%')",
+            (me, esc_tid),
+        ).fetchall():
+            if r["chat_id"] and r["chat_id"] not in owner_chats:
                 out[r["message_id"]] = r
     if p2p_chats:
         marks = ",".join("?" * len(p2p_chats))
@@ -381,10 +408,21 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
     about = [s["about_message_id"] for s in srcs] if srcs else []
     # 1. 主人本人后来说过话（7.38 第 3 条）：来源是私聊的，主人之后在这个私聊说话就算；来源是群的，只认主人回复 / 引用
     #    来源消息、或在来源消息所在话题里说的
-    if me and srcs:
+    if me and (srcs or (e is not None and "topic_id" in e.keys() and e["topic_id"])):
         best = None
-        for r in _owner_followups(cfg, store, srcs):
-            at = _parse(r["create_time"])
+        for r in _owner_followups(cfg, store, srcs, e):
+            c_dt = _parse(r["create_time"])
+            f_dt = _parse(r["first_seen"]) if "first_seen" in r.keys() else None
+            at = (
+                f_dt
+                if (
+                    c_dt is not None
+                    and f_dt is not None
+                    and c_dt <= asked < f_dt
+                    and (asked - c_dt).total_seconds() <= 90
+                )
+                else c_dt
+            )
             if (
                 at is None
                 or at <= asked

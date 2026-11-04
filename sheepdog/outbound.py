@@ -602,6 +602,11 @@ _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
     r"|给\s*(?:Sammy|Sammi)[^\n。]{0,24}(?:开通|开放|提供)[^\n。]{0,24}(?:权限|跳板机|入口)))",
     re.I,
 )
+_VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:谁来跟(?:完|进|到底)?|几点前完成|\.cnb\.yml|PR\s*构建修复))"
+    r"(?=[\s\S]*由\s*(?:Sammy(?:\s*Shi)?|Sammi|老胡|Andy\s*Hu)\s*自己来(?:跟|合入|做|处理|接手))",
+    re.I,
+)
 _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE = re.compile(
     r"(?=[\s\S]*(?:压测|全栈|生产|容量|扩容|升配)[^\n。]{0,24}(?:升配|扩容|容量|规格)[^\n。]{0,16}方案)"
     r"(?=[\s\S]*\b(?:PG|PostgreSQL)\b)"
@@ -840,6 +845,14 @@ def check_ask_pre_flight_guard(
             "凡未触及 3 条硬底线（`--floor-type credentials|destructive|vip_conflict`），我们平时用什么入口/方式操作"
             "（如南京生产 TKE `cls-gnui5plk` 跳板机 `ins-cey0hf6s` TAT/SSH、限单 IP 临时白名单、新建 K8s Secret 或对齐同级云权限），"
             "请直接给 Sammy / Sammi 提供完全一致的入口与同级权限并协助办结，完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（没有发送）",
+        )
+    if _VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对我方已修改/推送的 PR（如 `.cnb.yml` 构建修复等）或 VIP（Sammy / Sammi / 老胡）在群内询问『谁来跟完、几点前完成』的收尾工作，"
+            "严禁把『A. 由我们跟到底 vs B. 由 Sammy 自己来跟合入与验证』当作选择题发 `sheepdog ask` 打扰主人"
+            "（主人 2026-11-05 02:35 在群内直接指示：『你直接起 subagent review 完没问题直接合 合完看看有没有解决问题就行』，并在拍板卡批复『我在群里回了呀』，REG-110 我方在途 PR 闭环与禁甩锅 VIP 门禁）："
+            "自己经手的 PR 必须主动闭环跟到底！请直接派生 Subagent 完成 PR 审查、构建验证与合入，并在群内回复进展与明确完成时间，严禁发 `sheepdog ask` 询问要不要甩给 VIP 自己做（没有发送）",
         )
     if _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(full_text) and not _LARK_DOC_LINK_EVIDENCE_RE.search(full_text):
         raise OutboundError(
