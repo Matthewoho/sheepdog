@@ -40,8 +40,16 @@ def staged_files() -> list[str]:
     return [f for f in out.stdout.splitlines() if f]
 
 
+def all_tracked_files() -> list[str]:
+    out = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+    return [f for f in out.stdout.splitlines() if f]
+
+
 def main(argv: list[str]) -> int:
-    files = argv or staged_files()
+    if "--all" in argv:
+        files = all_tracked_files()
+    else:
+        files = argv or staged_files()
     terms = private_terms()
     bad = 0
     for f in files:

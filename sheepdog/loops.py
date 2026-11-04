@@ -1179,6 +1179,57 @@ def record_loop_feedback(
         )
 
 
+_LOOP_FEEDBACK_OVERRIDE_RE = re.compile(
+    r"(?:\[其他\]|其他[:：]|暂(?:时)?不(?:同步|播报|发)|取消|不对|不要|别发|先不)",
+    re.I,
+)
+
+
+def maybe_record_escalation_loop_feedback(
+    cfg: Config,
+    store: Store,
+    esc_mid: str,
+    topic_id: str,
+    chosen_display: str,
+) -> str | None:
+    """REG-103：当主人对关联 Loop 的拍板卡给出 [其他] 或纠偏/暂缓指令时，自动写入 loop_runs.human_feedback 与 MEMORY.md。"""
+    disp = (chosen_display or "").strip()
+    if not disp or not _LOOP_FEEDBACK_OVERRIDE_RE.search(disp):
+        return None
+    ensure_loop_tables(store)
+    loop_id = ""
+    if esc_mid:
+        s_row = store.conn.execute(
+            "SELECT key FROM sends WHERE message_id = ? LIMIT 1",
+            (esc_mid,),
+        ).fetchone()
+        if s_row and s_row["key"]:
+            k = str(s_row["key"]).strip()
+            if k.lower().startswith("loop-"):
+                loop_id = k[5:].strip()
+            else:
+                li_row = store.conn.execute(
+                    "SELECT loop_id FROM loop_items WHERE escalation_key = ? OR item_key = ? LIMIT 1",
+                    (k, k),
+                ).fetchone()
+                if li_row and li_row["loop_id"]:
+                    loop_id = str(li_row["loop_id"]).strip()
+    if not loop_id and topic_id:
+        for spec in discover_loops(cfg, store):
+            if spec.topic_id == topic_id:
+                r_run = store.conn.execute(
+                    "SELECT run_id FROM loop_runs WHERE loop_id = ? AND status = 'dispatched' ORDER BY started_at DESC LIMIT 1",
+                    (spec.id,),
+                ).fetchone()
+                if r_run:
+                    loop_id = spec.id
+                    break
+    if not loop_id:
+        return None
+    record_loop_feedback(cfg, store, loop_id, disp)
+    return loop_id
+
+
 # ======================= 零 Token 前置取料 (① Load) 与解析 =======================
 
 def _run_load_command(cmd: str, timeout_seconds: float = 15.0, cwd: Path | None = None) -> tuple[int, str, str]:

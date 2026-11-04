@@ -647,6 +647,11 @@ def sync_escalation_dual_cards(cfg, store, source, any_mid: str, *, chosen_displ
                                 except Exception as e: log.warning("同步同源重复提问绿卡失败（%s）: %s", smid, e)
     if tid:
         reconcile_closed_escalation_work(store, tid)
+    try:
+        from . import loops as _loops_mod
+        _loops_mod.maybe_record_escalation_loop_feedback(cfg, store, canon_mid, tid, chosen_display)
+    except Exception:
+        pass
     refresh_hub_root_card(cfg, store, source); return canon_mid
 
 settle_escalation_views = sync_escalation_dual_cards

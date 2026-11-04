@@ -564,6 +564,14 @@ _CONFIG_SWITCH_ISOLATION_EVIDENCE_RE = re.compile(
     r"(?:配置开关|环境变量开关|开关(?:来)?控制|feature\s*flag|什么配置下只给国内|按(?:环境|配置)(?:开关|变量)?(?:控制|区分|隔离))",
     re.I,
 )
+_BROADCAST_SYNC_ASK_RE = re.compile(
+    r"(?:日清播报|进度播报|战报播报|群内播报|每日进度[^\n]{0,20}播报|正式同步至群)",
+    re.I,
+)
+_SKIP_OR_CANCEL_SYNC_OPT_RE = re.compile(
+    r"(?:^[A-E][\.\、\:：\)\s]\s*[^\n]*(?:暂不同步|暂时不同步|取消(?:本次|今晚|今日)?播报|本次不(?:发|播报|同步)|不播报|不同步))",
+    re.I | re.M,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -751,6 +759,13 @@ def check_ask_pre_flight_guard(
             "严禁提出『Nginx sub_filter 线上脏热修』或『无开关写死彻底禁掉/强制替换』"
             "（主人纠偏：『这个修法你需要保证可以有个开关来控制 什么配置下只给国内的就行』，REG-101 防无开关硬编码与脏热修门禁）："
             "必须设计可由环境变量/配置项控制的开关方案（明确什么配置下只对国内生效、不影响海外环境，且不采用 Nginx sub_filter 篡改静态产物）后再发起 ask（没有发送）",
+        )
+    if _BROADCAST_SYNC_ASK_RE.search(full_text) and not _SKIP_OR_CANCEL_SYNC_OPT_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "就群内日清播报 / 进度播报 / 阶段战报发起 `sheepdog ask` 请示发布时，选项严禁只提供『同意发布 / 先做修改或补充内容』而缺少一键取消/暂不同步选项"
+            "（主人 2026-11-04 20:04 在 `[其他]` 批复：『暂时不同步了』，REG-103 播报类请示选项完备性门禁）："
+            "必须在选项中显式提供『暂不同步 / 取消本次播报（本次不发群）』的一键按钮选项，避免主人被迫手打『暂时不同步了』（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

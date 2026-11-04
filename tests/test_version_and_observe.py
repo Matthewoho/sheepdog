@@ -2666,6 +2666,73 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(len(residue["running_lambs"]), 1)
             self.assertEqual(residue["running_lambs"][0]["lamb_id"], "lamb_running_102")
 
+    def test_reg103_broadcast_sync_ask_requires_skip_option_and_loop_feedback_auto_wire(self):
+        from sheepdog import __version__, decision_hub, loops, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 14))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            cfg.loops_dir_path = str(root / "loops")
+            loop_dir = cfg.loops_dir / "infra-migration-daily-steward"
+            loop_dir.mkdir(parents=True, exist_ok=True)
+            (loop_dir / "LOOP.md").write_text(
+                "---\nid: infra-migration-daily-steward\ntitle: 迁移日清循环\ntopic_id: tp_infra-migration-ops\nautonomy: confirm\nenabled: true\n---\n",
+                encoding="utf-8",
+            )
+            store = Store(cfg.db_path)
+            store.upsert_topic("tp_infra-migration-ops", kind="custom", title="Infra", conversation_id="cid-inf", state="active")
+
+            # 1) 播报类 ask 缺少『暂不同步 / 取消本次播报』选项时，必须触发 REG-103 拦截
+            title = "20:00 跨云迁移日清播报拍板"
+            bad_body = (
+                "已整理好今晚 20:00 每日进度与阻塞卡点播报草案，请你审阅拍板后发进群。\n---more---\n"
+                "事情：已汇总 2026-11-04 晚 20:00 跨云迁移日清战报，请拍板发布。\n\n"
+                "选项：\n"
+                "A. 同意发布：以卡片形式正式同步至群「Infra 迁移改造」\n"
+                "B. 暂缓发布：先做修改或补充内容\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_bad:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_infra-migration-ops", title, bad_body)
+            self.assertIn("REG-103", str(ctx_bad.exception))
+
+            good_body = bad_body.replace(
+                "B. 暂缓发布：先做修改或补充内容",
+                "B. 暂缓发布：先做修改或补充内容\nC. 暂不同步：取消本次群内播报",
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_infra-migration-ops", title, good_body)
+
+            # 2) 当主人在关联 Loop 的拍板卡上给出『[其他] 暂时不同步了』时，sync_escalation_dual_cards 自动写入 loop_runs.human_feedback 与 MEMORY.md
+            loops.ensure_loop_tables(store)
+            store.conn.execute(
+                "INSERT INTO loop_runs(run_id, loop_id, trigger_reason, autonomy, status, started_at, finished_at) VALUES(?,?,?,?,?,?,?)",
+                ("lrun_test_103", "infra-migration-daily-steward", "daemon_tick", "confirm", "dispatched", "2026-11-04T20:02:57+08:00", "2026-11-04T20:02:57+08:00"),
+            )
+            full_esc_text = f"🐕 需要你定 · {title} [tp_infra-migration-ops]\n{good_body}"
+            store.conn.execute(
+                "INSERT INTO sends(idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("ik_103", "ask", "tp_infra-migration-ops", "om_esc_103", "loop-infra-migration-daily-steward", "LOOP-INFRA-MIGRATION-DAILY-STEWARD", full_esc_text, "2026-11-04T20:04:13+08:00"),
+            )
+            store.add_escalation("om_esc_103", "tp_infra-migration-ops", "oc_hub", full_esc_text, "2026-11-04T20:04:13+08:00")
+            decision_hub.sync_escalation_dual_cards(
+                cfg,
+                store,
+                None,
+                "om_esc_103",
+                chosen_display="[其他] 暂时不同步了",
+                topic_id="tp_infra-migration-ops",
+                answer_mid="sd_cb_103",
+            )
+            fb_row = store.conn.execute("SELECT human_feedback FROM loop_runs WHERE run_id='lrun_test_103'").fetchone()
+            self.assertEqual(fb_row["human_feedback"], "[其他] 暂时不同步了")
+            self.assertIn("暂时不同步了", (loop_dir / "MEMORY.md").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
