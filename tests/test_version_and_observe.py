@@ -2733,6 +2733,70 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(fb_row["human_feedback"], "[其他] 暂时不同步了")
             self.assertIn("暂时不同步了", (loop_dir / "MEMORY.md").read_text(encoding="utf-8"))
 
+    def test_reg104_cn_site_tencent_intl_subaccount_ask_guard_and_evolve_loop_feedback_dedup(self):
+        from sheepdog import __version__, admin_web, evolve, loops, outbound, parse_version_tuple
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 15))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            cfg.loops_dir_path = str(root / "loops")
+            cfg.loops_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+
+            # 1) 针对 .tv / Cinemap 中国站生产资源开辟，将『在腾讯云国内站账号下开辟 vs 先用国际站首发』作为二选一请示时，触发 REG-104 拦截
+            title = "Cinemap生产首发资源账号决策"
+            bad_body = (
+                "Kai提出Cinemap中国站11-05首发，需今晚定生产资源账号是用腾讯云国内站还是先用国际站单人首发。\n---more---\n"
+                "选项：\n"
+                "A. 按国内站开辟：在腾讯云国内站账号下开辟南京生产资源（需确认国内站企业实名与开通）。\n"
+                "B. 先用国际站首发：先用现有国际站南京成熟账号开独立资源，对外前再对齐国内站。\n\n"
+                "建议：若国内站账号权限已就绪建议 A，否则选 B 先跑通首发。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_bad:
+                outbound.check_ask_pre_flight_guard(cfg, store, "tp_kaifeng", title, bad_body)
+            self.assertIn("REG-104", str(ctx_bad.exception))
+
+            good_body = (
+                "Cinemap中国站11-05首发，已统一放在腾讯云国际站子成员账号（200053747873）环境，请确认规格。\n---more---\n"
+                "选项：\n"
+                "A. 同意在腾讯云国际站 Prod 子成员账号（200053747873）下开通 8C32G CVM 与 COS\n"
+                "B. 调整规格后再开通"
+            )
+            outbound.check_ask_pre_flight_guard(cfg, store, "tp_kaifeng", title, good_body)
+
+            # 2) diagnose_override_reason 将『直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里』归入 arch_or_config_posture
+            code, label = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · {title} [tp_kaifeng]\n{bad_body}",
+                "直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code, "arch_or_config_posture")
+            self.assertEqual(label, "技术姿势纠偏")
+
+            # 3) evolve.build_evolve_digest 过滤已记入 seen_feedback_run_ids 的 loop_runs.human_feedback，避免 65 分钟内重复报警
+            from sheepdog.store import now_iso
+            loops.ensure_loop_tables(store)
+            now_str = now_iso()
+            store.conn.execute(
+                "INSERT INTO loop_runs(run_id, loop_id, trigger_reason, autonomy, status, human_feedback, started_at, finished_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("lrun_seen_104", "infra-migration-daily-steward", "daemon_tick", "confirm", "dispatched", "[其他] 暂时不同步了", now_str, now_str),
+            )
+            store.conn.commit()
+            dig1 = evolve.build_evolve_digest(cfg, store)
+            self.assertIn("loop_feedback(1)", dig1["action_reasons"])
+
+            evolve.write_evolve_state(store, {"seen_feedback_run_ids": ["lrun_seen_104"]})
+            dig2 = evolve.build_evolve_digest(cfg, store)
+            self.assertNotIn("loop_feedback(1)", dig2["action_reasons"])
+            self.assertEqual(dig2["d7_business_loops"]["feedback_runs"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

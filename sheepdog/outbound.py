@@ -572,6 +572,18 @@ _SKIP_OR_CANCEL_SYNC_OPT_RE = re.compile(
     r"(?:^[A-E][\.\、\:：\)\s]\s*[^\n]*(?:暂不同步|暂时不同步|取消(?:本次|今晚|今日)?播报|本次不(?:发|播报|同步)|不播报|不同步))",
     re.I | re.M,
 )
+_CN_SITE_TENCENT_MAINLAND_VS_INTL_ASK_RE = re.compile(
+    r"(?:是用腾讯云国内站还是(?:先用)?国际站"
+    r"|在腾讯云国内站账号下开辟"
+    r"|对外前再对齐国内站"
+    r"|若国内站账号权限已就绪建议\s*[A-E])",
+    re.I,
+)
+_TENCENT_INTL_SUBACCOUNT_POSTURE_RE = re.compile(
+    r"(?:跟\s*tapnow\.tv\s*一样[\s\S]{0,40}腾讯云国际站[\s\S]{0,40}子成员账号"
+    r"|统一(?:放在|使用)腾讯云国际站[\s\S]{0,40}(?:子成员账号|成员账号|200053747873|200053747813))",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -766,6 +778,14 @@ def check_ask_pre_flight_guard(
             "就群内日清播报 / 进度播报 / 阶段战报发起 `sheepdog ask` 请示发布时，选项严禁只提供『同意发布 / 先做修改或补充内容』而缺少一键取消/暂不同步选项"
             "（主人 2026-11-04 20:04 在 `[其他]` 批复：『暂时不同步了』，REG-103 播报类请示选项完备性门禁）："
             "必须在选项中显式提供『暂不同步 / 取消本次播报（本次不发群）』的一键按钮选项，避免主人被迫手打『暂时不同步了』（没有发送）",
+        )
+    if _CN_SITE_TENCENT_MAINLAND_VS_INTL_ASK_RE.search(full_text) and not _TENCENT_INTL_SUBACCOUNT_POSTURE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对 `.tv` / Cinemap 中国站生产或预发资源开辟，严禁将『在腾讯云国内站账号开辟 vs 先用国际站临时过渡、对外前再对齐国内站』作为二选一请示抛给主人"
+            "（主人 2026-11-04 20:29 在 `[其他]` 明确纠偏：『直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里』，REG-104 腾讯云国际子成员账号基线门禁）："
+            "TapNow 与 Cinemap 国内站（`.tv`，`ap-nanjing`）统一承载在腾讯云国际站（主账号 `200045686254` 组织集团）下的独立子成员账号环境（Stage: `200053747813`，Prod: `200053747873`），"
+            "不开辟独立的腾讯云国内站账号。请直接按腾讯云国际站子成员账号环境整理资源清单与权限方案后再汇报或请示（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

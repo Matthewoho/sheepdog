@@ -369,6 +369,7 @@ def build_evolve_digest(
             for lp in (ov_loops.get("loops") or [])
             if (lp.get("state") or {}).get("paused")
         ]
+        seen_fb_run_ids: set[str] = set(str(x) for x in (prev_evolve_st.get("seen_feedback_run_ids") or []) if x)
         fb_rows = store.conn.execute(
             """SELECT run_id, loop_id, human_feedback, started_at
                FROM loop_runs
@@ -376,7 +377,7 @@ def build_evolve_digest(
                ORDER BY started_at DESC LIMIT 10""",
             (window_iso,),
         ).fetchall()
-        fb_list = [dict(r) for r in fb_rows]
+        fb_list = [dict(r) for r in fb_rows if str(r["run_id"] or "") not in seen_fb_run_ids]
         if paused_list:
             action_reasons.append(f"paused_loops({len(paused_list)})")
         if fb_list:
@@ -657,9 +658,14 @@ def run_evolve_tick(
         *([str(d3.get("latest_override_answer_id"))] if d3.get("latest_override_answer_id") else []),
         *([str(prev.get("last_override_answer_id"))] if prev.get("last_override_answer_id") else []),
     ]))[-100:]
+    d7_fbs = (digest.get("d7_business_loops") or {}).get("feedback_runs") or []
     seen_lamb_list = list(dict.fromkeys([
         *(str(x) for x in (prev.get("seen_failed_lamb_ids") or []) if x),
         *(str(lb.get("lamb_id") or "") for lb in d5_lambs if lb.get("state") in ("failed", "timeout") and lb.get("lamb_id")),
+    ]))[-100:]
+    seen_fb_list = list(dict.fromkeys([
+        *(str(x) for x in (prev.get("seen_feedback_run_ids") or []) if x),
+        *(str(fb.get("run_id") or "") for fb in d7_fbs if fb.get("run_id")),
     ]))[-100:]
     new_state = {
         "enabled": bool(cfg.self_evolve.enabled),
@@ -677,6 +683,7 @@ def run_evolve_tick(
         "last_override_answer_id": str(d3.get("latest_override_answer_id") or prev.get("last_override_answer_id") or ""),
         "seen_override_ids": seen_ovr_list,
         "seen_failed_lamb_ids": seen_lamb_list,
+        "seen_feedback_run_ids": seen_fb_list,
         "last_checked_escalation_at": now.isoformat(timespec="seconds"),
         "last_mail_id": max(int(d6.get("latest_mail_id") or 0), int(prev.get("last_mail_id") or 0)),
         "summary": {
