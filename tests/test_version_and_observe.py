@@ -1583,7 +1583,11 @@ class VersionAndObserveTest(unittest.TestCase):
                 def send_message(self, conv_id: str, prompt: str, **_kw):
                     sent_payloads.append((conv_id, prompt))
 
-            with mock.patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(root)}, clear=False):
+            now_b = datetime.fromisoformat("2026-11-04T08:07:02+08:00")
+            with (
+                mock.patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(root)}, clear=False),
+                mock.patch("sheepdog.engine._now", return_value=now_b),
+            ):
                 disp = Dispatcher(cfg, store, {"antigravity": FakeAgentApiSink()}, parse_roster({"session": []}))
                 t_row = store.get_topic(tid)
                 rows = store.pending_for_topic(tid)
@@ -3737,6 +3741,111 @@ class VersionAndObserveTest(unittest.TestCase):
                     "建议：选 A",
                 )
             self.assertIn("REG-112", str(ctx.exception))
+
+    def test_reg113_subagent_timeout_oscillation_guard_and_unawakened_owner_echo_self_heal(self):
+        """REG-113 (1.1.24):
+        1) Subagent lamb that timed out on 5-min GENERIC DONE mid-turn stall must NOT be revived by _scan_lambs
+           when task_act <= finished_at or now - task_act >= 5 min, and complete_lamb must deduplicate lamb_report
+           system messages so a single lamb_id never emits duplicate lamb_report batches.
+        2) When an idle Antigravity topic has 0 pending rows but has an unawakened owner_echoes (delivered without
+           producing any PLANNER_RESPONSE) and/or a duplicate missed lamb_report batch, both engine._auto_unstick_idle_antigravity
+           and observe --self-heal suppress the duplicate lamb_report and re-queue the owner echo to wake up the session.
+        """
+        from sheepdog.engine import complete_lamb
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(state_dir=Path(tmp))
+            db_path = cfg.db_path
+            st = Store(db_path)
+            st.create_topic("tp_demo", "Demo", "adopted", "duty", "active", "antigravity")
+            st.update_topic("tp_demo", conversation_id="cid-parent-113")
+            st.create_lamb("lamb_osc01", "tp_demo", "subagent", "sub-task", conversation_id="cid-sub-113")
+
+            # First complete_lamb emits 1 lamb_report and records report_msg_id
+            r1 = complete_lamb(st, "lamb_osc01", summary="first timeout", state="timeout")
+            self.assertTrue(r1["message_id"].startswith("sd_lamb_report_"))
+            lb_row = st.get_lamb("lamb_osc01")
+            self.assertEqual(lb_row["report_msg_id"], r1["message_id"])
+
+            # Even if reported_at and report_msg_id were wiped, complete_lamb checks existing lamb_report in messages
+            st.update_lamb("lamb_osc01", state="running", reported_at=None, report_msg_id=None)
+            r2 = complete_lamb(st, "lamb_osc01", summary="second timeout", state="timeout")
+            self.assertEqual(r2["message_id"], "")
+            rep_count = st.conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE topic_id='tp_demo' AND reason='lamb_report'"
+            ).fetchone()[0]
+            self.assertEqual(rep_count, 1)
+
+            # Set up an acked lamb_report + a duplicate missed lamb_report + an unawakened priority owner_echo
+            now_dt = datetime.now().astimezone()
+            old_iso = (now_dt - timedelta(minutes=25)).isoformat(timespec="seconds")
+            st.mark_batch([r1["message_id"]], "b_acked_lamb", "tp_demo", "acked")
+            dup_mid = st.add_system_message(
+                "tp_demo",
+                "lamb_report",
+                "duplicate report",
+                tags=["lamb:lamb_osc01", "lamb_state:timeout"],
+            )
+            st.record_dispatch("b_missed_dup", "tp_demo", [dup_mid], state="missed")
+            st.mark_batch([dup_mid], "b_missed_dup", "tp_demo", "missed")
+
+            cb_mid = "sd_card_cb_reg113_test001"
+            st.conn.execute(
+                "INSERT INTO messages(message_id, chat_id, sender_id, content, create_time, first_seen, last_seen, route, reason, topic_id, dispatch_state, batch_id, tags_json) "
+                "VALUES(?, 'oc_test', 'ou_owner', '[卡片回调] A：同意', ?, ?, ?, 'dispatch', 'owner_reply', 'tp_demo', 'acked', 'p_prio_113', '[]')",
+                (cb_mid, old_iso, old_iso, old_iso),
+            )
+            st.conn.execute(
+                "INSERT INTO owner_echoes(message_id, chat_id, kind, said_at, stage, topic_id, recorded_at, stage_at, delivered_at, batch_id, priority) "
+                "VALUES(?, 'oc_test', 'owner_reply', ?, 'delivered', 'tp_demo', ?, ?, ?, 'p_prio_113', 1)",
+                (cb_mid, old_iso, old_iso, old_iso, old_iso),
+            )
+            st.upsert_card("tp_demo", run_state="lost", detail="批次送出后不动", stuck_since=old_iso)
+            st.conn.commit()
+
+            # Run observe.run_observe(self_heal=True): should suppress duplicate missed lamb_report, re-queue cb_mid, and emit 0 warnings
+            rep = observe.run_observe(
+                cfg,
+                db_path=db_path,
+                now_dt=now_dt,
+                antigravity_brain_dir=Path(tmp) / "brain",
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertEqual(rep["warns"], [])
+            self.assertIn("tp_demo:owner_echo_requeue", rep["self_healed"])
+
+            msg_cb = st.get_message(cb_mid)
+            self.assertEqual(msg_cb["dispatch_state"], "pending")
+            msg_dup = st.get_message(dup_mid)
+            self.assertEqual(msg_dup["dispatch_state"], "acked")
+
+            # Subsequent observe within 30s (still pending) and at +5m (after re-delivery) both produce 0 warnings
+            rep2 = observe.run_observe(
+                cfg,
+                db_path=db_path,
+                now_dt=now_dt + timedelta(seconds=30),
+                antigravity_brain_dir=Path(tmp) / "brain",
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertEqual(rep2["warns"], [])
+
+            st.mark_batch([cb_mid], "b_redeliv_113", "tp_demo", "delivered")
+            st.echo_update(cb_mid, stage="delivered", stage_at=now_dt.isoformat(timespec="seconds"), batch_id="b_redeliv_113")
+            rep3 = observe.run_observe(
+                cfg,
+                db_path=db_path,
+                now_dt=now_dt + timedelta(minutes=5),
+                antigravity_brain_dir=Path(tmp) / "brain",
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertEqual(rep3["warns"], [])
+            st.close()
 
 
 if __name__ == "__main__":

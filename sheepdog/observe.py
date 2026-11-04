@@ -628,6 +628,16 @@ def run_observe(
                         f"例 {ex_row['topic_id']} {ex_row['message_id'][-8:]} ({int(ex_age)}s)"
                     )
 
+            requeued_echo_map: dict[str, str] = {}
+            if "meta" in tabs:
+                for mr_meta in c.execute(
+                    "SELECT key, value FROM meta WHERE key LIKE 'owner_echo_requeued:%'"
+                ).fetchall():
+                    mk = str(mr_meta["key"] or "")
+                    mv = str(mr_meta["value"] or "").strip()
+                    if mk.startswith("owner_echo_requeued:") and mv:
+                        requeued_echo_map[mk.removeprefix("owner_echo_requeued:")] = mv
+
             # 阶段 2: Priority SLA (90s)
             priority_msg_ids: set[str] = set()
             if "messages" in tabs:
@@ -647,7 +657,9 @@ def run_observe(
                 ).fetchall()
                 for r in prio_rows:
                     priority_msg_ids.add(r["message_id"])
-                    age_s = age_seconds(r["create_time"], ref_now)
+                    req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
+                    eff_create_ts = max(str(r["create_time"] or ""), req_ts) if req_ts else str(r["create_time"] or "")
+                    age_s = age_seconds(eff_create_ts, ref_now)
                     if age_s is not None and age_s >= 90:
                         warn.append(
                             f"主人指令/回复 pending 超 90s 未插话送达（Priority SLA）："
@@ -684,6 +696,9 @@ def run_observe(
                         q_ts = relay_ts_by_topic.get(tid_r) or str(r["last_seen"] or r["create_time"] or "")
                     else:
                         q_ts = str(r["create_time"] or "")
+                    req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
+                    if req_ts and req_ts > q_ts:
+                        q_ts = req_ts
                     age_s = age_seconds(q_ts, ref_now)
                     if age_s is None:
                         continue
@@ -791,15 +806,103 @@ def run_observe(
             # 阶段 4: Owner Echo SLA (15 分钟 = 900s)
             if "owner_echoes" in tabs:
                 opens = c.execute(
-                    "SELECT message_id, stage, topic_id, said_at FROM owner_echoes WHERE settled_at IS NULL"
+                    "SELECT message_id, stage, topic_id, said_at, delivered_at, stage_at, batch_id, relay_batch FROM owner_echoes WHERE settled_at IS NULL"
                 ).fetchall()
                 for r in opens:
-                    age_s = age_seconds(r["said_at"], ref_now)
+                    mid = str(r["message_id"] or "")
+                    tid = str(r["topic_id"] or "")
+                    requeue_key = f"owner_echo_requeued:{mid}"
+                    requeued_at = ""
+                    if "meta" in tabs and mid:
+                        meta_r = c.execute("SELECT value FROM meta WHERE key = ?", (requeue_key,)).fetchone()
+                        requeued_at = str((meta_r["value"] if meta_r else "") or "").strip()
+                    eff_since = max(str(r["said_at"] or ""), requeued_at) if requeued_at else str(r["said_at"] or "")
+                    age_s = age_seconds(eff_since, ref_now)
                     if age_s is not None and age_s >= 900:
-                        warn.append(
-                            f"主人说话回音超 15 分钟未结清（Owner Echo SLA）："
-                            f"{r['topic_id'] or '-'} {r['message_id'][-8:]} 已 {int(age_s // 60)} 分钟（stage={r['stage']}）"
-                        )
+                        healed_echo = False
+                        if self_heal and not requeued_at and tid and "topics" in tabs and "messages" in tabs:
+                            t_row = c.execute(
+                                "SELECT state, pending_batch_id FROM topics WHERE topic_id = ?",
+                                (tid,),
+                            ).fetchone()
+                            t_state = str((t_row["state"] if t_row else "") or "")
+                            t_pbid = str((t_row["pending_batch_id"] if t_row else "") or "").strip()
+                            if t_state in ("active", "blocked", "waiting_human") and not t_pbid and not str(r["relay_batch"] or "").strip():
+                                try:
+                                    now_s = iso(ref_now)
+                                    with sqlite3.connect(db, timeout=5.0) as wc:
+                                        wc.row_factory = sqlite3.Row
+                                        if "dispatches" in tabs:
+                                            for mr in wc.execute(
+                                                "SELECT batch_id FROM dispatches WHERE topic_id=? AND state='missed'",
+                                                (tid,),
+                                            ).fetchall():
+                                                m_msgs = wc.execute(
+                                                    "SELECT message_id, reason, tags_json FROM messages WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                                                    (mr["batch_id"], tid),
+                                                ).fetchall()
+                                                dup_mids = []
+                                                for mm in m_msgs:
+                                                    if str(mm["reason"] or "") == "lamb_report":
+                                                        try:
+                                                            m_tags = json.loads(mm["tags_json"] or "[]")
+                                                        except Exception:
+                                                            m_tags = []
+                                                        l_tag = next((tg for tg in m_tags if isinstance(tg, str) and tg.startswith("lamb:")), "")
+                                                        if l_tag and wc.execute(
+                                                            "SELECT 1 FROM messages WHERE topic_id=? AND reason='lamb_report' AND dispatch_state='acked' AND message_id!=? AND tags_json LIKE ? LIMIT 1",
+                                                            (tid, mm["message_id"], f'%"{l_tag}"%'),
+                                                        ).fetchone():
+                                                            dup_mids.append(mm["message_id"])
+                                                if dup_mids and len(dup_mids) == len(m_msgs):
+                                                    wc.execute(
+                                                        f"UPDATE messages SET dispatch_state='acked' WHERE topic_id=? AND message_id IN ({','.join('?' for _ in dup_mids)})",
+                                                        (tid, *dup_mids),
+                                                    )
+                                                    wc.execute(
+                                                        "UPDATE dispatches SET state='acked', error='observe自愈去重重复羔羊汇报' WHERE batch_id=?",
+                                                        (mr["batch_id"],),
+                                                    )
+                                        wc.execute(
+                                            "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id=? AND topic_id=?",
+                                            (mid, tid),
+                                        )
+                                        wc.execute(
+                                            "UPDATE owner_echoes SET stage='queued', stage_at=?, batch_id=NULL, delivered_at=NULL, relay_batch=NULL, relay_at=NULL, relay_status=NULL, relay_summary=NULL WHERE message_id=?",
+                                            (now_s, mid),
+                                        )
+                                        if "meta" in tabs:
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (requeue_key, now_s),
+                                            )
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (f"duty_reset:{tid}", now_s),
+                                            )
+                                        if "duty_cards" in tabs:
+                                            wc.execute(
+                                                "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, idle_since=?, updated_at=? WHERE topic_id=?",
+                                                (now_s, now_s, tid),
+                                            )
+                                        wc.commit()
+                                    if state_dir is not None:
+                                        try:
+                                            (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                        except OSError:
+                                            pass
+                                    self_healed.append(f"{tid}:owner_echo_requeue")
+                                    info.append(
+                                        f"已对 {tid} 自动重投未唤醒的主人回音消息 {mid[-8:]} 并解除看板死锁"
+                                    )
+                                    healed_echo = True
+                                except sqlite3.Error:
+                                    healed_echo = False
+                        if not healed_echo:
+                            warn.append(
+                                f"主人说话回音超 15 分钟未结清（Owner Echo SLA）："
+                                f"{r['topic_id'] or '-'} {r['message_id'][-8:]} 已 {int(age_s // 60)} 分钟（stage={r['stage']}）"
+                            )
                 for r in c.execute(
                     "SELECT message_id, batch_id, relay_batch, settled_at FROM owner_echoes "
                     "WHERE settled_by='relay' AND settled_at >= ? AND batch_id IS NOT NULL "

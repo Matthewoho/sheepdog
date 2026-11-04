@@ -3551,14 +3551,69 @@ class Dispatcher:
             if floor_dt is not None and sent <= floor_dt:
                 continue
             if not self._has_planner_response_since(t, sent):
+                missed_msgs = self.store.conn.execute(
+                    "SELECT message_id, reason, tags_json FROM messages WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                    (d["batch_id"], tid),
+                ).fetchall()
+                dup_mids: list[str] = []
+                requeue_mids: list[str] = []
+                for mr in missed_msgs:
+                    m_reason = str(mr["reason"] or "")
+                    m_tags = json.loads(mr["tags_json"] or "[]") if mr["tags_json"] else []
+                    lamb_tag = next((tg for tg in m_tags if isinstance(tg, str) and tg.startswith("lamb:")), "")
+                    if m_reason == "lamb_report" and lamb_tag:
+                        has_acked_same_lamb = self.store.conn.execute(
+                            "SELECT 1 FROM messages WHERE topic_id=? AND reason='lamb_report' AND dispatch_state='acked' AND message_id!=? AND tags_json LIKE ? LIMIT 1",
+                            (tid, mr["message_id"], f'%"{lamb_tag}"%'),
+                        ).fetchone()
+                        if has_acked_same_lamb:
+                            dup_mids.append(mr["message_id"])
+                            continue
+                    requeue_mids.append(mr["message_id"])
+                with self.store.tx() as c:
+                    if dup_mids:
+                        q_dup = ",".join("?" for _ in dup_mids)
+                        c.execute(
+                            f"UPDATE messages SET dispatch_state='acked' WHERE topic_id=? AND message_id IN ({q_dup})",
+                            (tid, *dup_mids),
+                        )
+                    if requeue_mids:
+                        q_req = ",".join("?" for _ in requeue_mids)
+                        c.execute(
+                            f"UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE topic_id=? AND message_id IN ({q_req})",
+                            (tid, *requeue_mids),
+                        )
+                if requeue_mids:
+                    self.store.set_dispatch_state(d["batch_id"], "redelivered", error="宿主未触发推理，随后续批次合并重投")
+                    requeued_batches.append(d["batch_id"])
+                elif dup_mids:
+                    self.store.set_dispatch_state(d["batch_id"], "acked", error="重复羔羊完工汇报已自动去重收口")
+        ts = now_iso()
+        for e in self.store.echo_open():
+            if e["topic_id"] != tid or e["stage"] != ECHO_DELIVERED or e["relay_batch"]:
+                continue
+            requeue_key = f"owner_echo_requeued:{e['message_id']}"
+            if self.store.get_meta(requeue_key):
+                continue
+            deliv_dt = _parse(e["delivered_at"] or e["stage_at"] or e["said_at"] or "")
+            if deliv_dt is None or deliv_dt.tzinfo is None or (now - deliv_dt) < timedelta(seconds=60):
+                continue
+            if not self._has_planner_response_since(t, deliv_dt):
+                self.store.set_meta(requeue_key, ts)
                 with self.store.tx() as c:
                     c.execute(
-                        "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
-                        (d["batch_id"], tid),
+                        "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id=? AND topic_id=?",
+                        (e["message_id"], tid),
                     )
-                self.store.set_dispatch_state(d["batch_id"], "redelivered", error="宿主未触发推理，随后续批次合并重投")
-                requeued_batches.append(d["batch_id"])
-        ts = now_iso()
+                self.store.echo_update(
+                    e["message_id"],
+                    stage=ECHO_QUEUED,
+                    stage_at=ts,
+                    batch_id=None,
+                    delivered_at=None,
+                    **ECHO_UNBOUND,
+                )
+                requeued_batches.append(e["batch_id"] or e["message_id"])
         self.store.set_meta(duty_reset_key(tid), ts)
         self.store.upsert_card(tid, run_state=duty.IDLE, detail="", stuck_since=None, idle_since=ts)
         new_rows = self.store.pending_for_topic(tid)
@@ -4868,7 +4923,12 @@ class Dispatcher:
                         continue
                     tp_sub = transcript_path(lb["conversation_id"])
                     task_act = _subagent_latest_task_log_mtime(tp_sub)
-                    if task_act is not None and (_now() - task_act) < timedelta(minutes=self.cfg.lamb.timeout_minutes):
+                    revive_window = min(timedelta(minutes=self.cfg.lamb.timeout_minutes), timedelta(minutes=5))
+                    if (
+                        task_act is not None
+                        and (fin_dt is None or task_act > fin_dt)
+                        and (_now() - task_act) < revive_window
+                    ):
                         self.store.update_lamb(
                             lb["lamb_id"],
                             state="running",
@@ -5771,6 +5831,11 @@ class Dispatcher:
         except Exception as e:
             log.warning("直投主脑来信出错: %s", e)
 
+        try:
+            self._recover_idle_stuck_topics(tids)
+        except Exception as e:
+            log.warning("空闲卡死会话解锁出错: %s", e)
+
         rows, groups = self._pending_groups(tids)
 
         result: dict = {"pending": len(rows), "sent": 0, "topics": {}}
@@ -5894,6 +5959,43 @@ class Dispatcher:
         log.info("已直投 %d 条跨工作区来信至主脑 %s (%s)", len(mids), duty.SHEEPDOG_BRAIN_TOPIC_ID, cid)
         return mids
 
+    def _recover_idle_stuck_topics(self, tids: list[str]) -> None:
+        """1.1.24（REG-113）：当可投递 Antigravity 会话当前无 pending 排队信号，但看板处于 STUCK（lost/stalled）
+        或存在送达后未触发任何 PLANNER_RESPONSE 的未结清 owner_echoes 时，主动执行一次解锁与未唤醒批次/回音重投，
+        破除『无新消息入队就不进 _dispatch_topic -> 永远不触发 _auto_unstick_idle_antigravity』死锁。"""
+        if getattr(self._sink(ANTIGRAVITY), "name", "") != "agentapi":
+            return
+        now = _now()
+        open_echoes_by_topic: dict[str, list] = {}
+        for e in self.store.echo_open():
+            if e["stage"] == ECHO_DELIVERED and not e["relay_batch"] and e["topic_id"]:
+                open_echoes_by_topic.setdefault(e["topic_id"], []).append(e)
+        for tid in tids:
+            t = self.store.get_topic(tid)
+            if (
+                t is None
+                or t["state"] != sm.ACTIVE
+                or t["pending_batch_id"]
+                or self.topic_host(t) != ANTIGRAVITY
+                or self._record_missing(t)
+            ):
+                continue
+            card = self.store.get_card(tid)
+            if self._owner_recent(self._owner_typed_at(t, card)):
+                continue
+            is_stuck = card is not None and card["run_state"] in duty.STUCK
+            has_unawakened_echo = False
+            for e in open_echoes_by_topic.get(tid, ()):
+                if self.store.get_meta(f"owner_echo_requeued:{e['message_id']}"):
+                    continue
+                deliv_dt = _parse(e["delivered_at"] or e["stage_at"] or e["said_at"] or "")
+                if deliv_dt is not None and deliv_dt.tzinfo is not None and (now - deliv_dt) >= timedelta(seconds=60):
+                    if not self._has_planner_response_since(t, deliv_dt):
+                        has_unawakened_echo = True
+                        break
+            if is_stuck or has_unawakened_echo:
+                self._auto_unstick_idle_antigravity(t, card, [])
+
     def _pending_groups(self, tids: list[str]) -> tuple[list, dict[str, list]]:
         """待推消息按会话分组：归属的会话不能投了退回总线；被安全规则 hold 又没放行的只能给总线。"""
         rows = self.store.pending_dispatch()
@@ -5924,6 +6026,10 @@ class Dispatcher:
             self._deliver_brain_mail()
         except Exception as e:
             log.warning("直投主脑来信出错: %s", e)
+        try:
+            self._recover_idle_stuck_topics(tids)
+        except Exception as e:
+            log.warning("空闲卡死会话解锁出错: %s", e)
         sending = {d["topic_id"] for d in self.store.dispatches_in_state("sending")}
         rows, groups = self._pending_groups(tids)
         result: dict = {"pending": len(rows), "sent": 0, "topics": {}}
@@ -7086,13 +7192,23 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
     final_state = state if state in ("done", "failed", "timeout") else "done"
     ts = now_iso()
     summary = (summary or "").strip() or (lb["result_summary"] or f"羔羊 {lid} 已结束（{final_state}）")
-    already_reported = bool(lb["reported_at"]) or bool(report_msg_id)
+    pt_id = lb["parent_topic_id"]
+    existing_rep = store.conn.execute(
+        "SELECT message_id FROM messages WHERE topic_id=? AND reason='lamb_report' AND tags_json LIKE ? ORDER BY create_time DESC LIMIT 1",
+        (pt_id, f'%"lamb:{lid}"%'),
+    ).fetchone()
+    existing_rep_mid = str(existing_rep["message_id"] or "") if existing_rep is not None else ""
+    already_reported = (
+        bool(lb["reported_at"])
+        or bool(report_msg_id)
+        or bool(lb["report_msg_id"])
+        or bool(existing_rep_mid)
+    )
     upd_fields = dict(state=final_state, finished_at=lb["finished_at"] or ts, last_act_at=ts,
                       result_summary=summary, reported_at=lb["reported_at"] or ts)
-    if report_msg_id:
-        upd_fields["report_msg_id"] = lb["report_msg_id"] or report_msg_id
+    if report_msg_id or existing_rep_mid:
+        upd_fields["report_msg_id"] = lb["report_msg_id"] or report_msg_id or existing_rep_mid
     store.update_lamb(lid, **upd_fields)
-    pt_id = lb["parent_topic_id"]
     close_why = "羔羊已由母羊销毁" if report_msg_id == "killed_by_parent" else "羔羊已完成"
     for wk_id in filter(None, {lid, (lb["conversation_id"] or "").strip()}):
         nk = duty.norm_key(f"lamb:{wk_id}")
@@ -7114,6 +7230,7 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
         text = (f"【系统提示 · 羔羊完工汇报】\n🐑 羔羊 `{lid}`（[{lb['kind']}] {lb['task_title']}）已结束，状态：`{final_state}`。\n"
                 f"结果摘要：{summary}{log_hint}")
         mid = store.add_system_message(pt_id, "lamb_report", text, tags=[f"lamb:{lid}", f"lamb_state:{final_state}"])
+        store.update_lamb(lid, report_msg_id=mid)
     touch_wakeup(store)
     return {"lamb_id": lid, "parent_topic_id": pt_id, "state": final_state, "summary": summary, "message_id": mid}
 
