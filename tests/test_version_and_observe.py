@@ -3568,6 +3568,83 @@ class VersionAndObserveTest(unittest.TestCase):
                 ],
             )
 
+    def test_reg111_upgrade_notice_plain_chinese_commit_body_and_semver_regressions_extract(self):
+        """1.1.22（REG-111）：
+        1. `version_watch.summarize_upgrade_changes` 优先从 Commit Body（`git log --format=%B`）中提取显式的『更新了什么 / 解决了什么问题』，并经 `_plain_chinese_upgrade_text` 自动剥离内部函数名（如 `pending._owner_followups`、`_auto_settle_open_escalations_on_owner_batch`）、正则常量（`_VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE`）与 `REG-XXX` 编号，转为面向主人的中文大白话；
+        2. 当 Commit Body 未写结构化摘要时，`REGRESSIONS.md` diff 解析同时支持两段式（`7.93`）与三段式（`1.1.21`）版本号，并自动将『症状；现通过...改进根治：修法』拆入『解决了什么问题』与『更新了什么』且清洗代码黑话；
+        3. 当既无 Commit Body 中文说明又无 `REGRESSIONS.md` 变更、仅有纯英文 Conventional Commit 标题时，严禁把 `feat(pending,engine): ...` 原样塞进飞书升级完成通知卡片。
+        """
+        from sheepdog import version_watch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "sheepdog").mkdir(parents=True, exist_ok=True)
+            (repo / "tests").mkdir(parents=True, exist_ok=True)
+
+            def git(*args: str) -> str:
+                cmd = ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args]
+                return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+
+            git("init", "-q")
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.1.20"\n', encoding="utf-8")
+            (repo / "tests" / "REGRESSIONS.md").write_text(
+                "# 回归\n\n| 规格 | 症状 | 守它的测试 |\n| --- | --- | --- |\n| 1.1.20 | 旧症状 | `t0` |\n",
+                encoding="utf-8",
+            )
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: v1.1.20")
+            sha_1120 = git("rev-parse", "HEAD")
+
+            # 场景 A：三段式版本号 1.1.21 + 英文 Commit 标题 + Commit Body 含代码函数名
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.1.21"\n', encoding="utf-8")
+            git("add", "-A")
+            commit_msg_1121 = (
+                "feat(pending,engine,outbound): auto-settle open escalations on owner group instruction (v1.1.21, REG-110)\n\n"
+                "- 📋 更新了什么：1) pending._owner_followups 识别主人在原业务群下达的 owner_instruction / owner_reply 指令，且 engine._check_receipt 新增 _auto_settle_open_escalations_on_owner_batch 自动结案同会话未关闭的 escalation；2) outbound.check_ask_pre_flight_guard 新增 _VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE 门禁拦截甩锅 ask；3) diagnose_override_reason 将『我在群里回了呀』归入 stale_or_already_handled（REG-110）\n"
+                "- 🎯 解决了什么问题：根治主人在业务群直接 @ 机器人拍板后，拍板总台卡片仍悬空未关、迫使主人再点『我在群里回了呀』的问题\n"
+            )
+            git("commit", "-q", "-m", commit_msg_1121)
+            sha_1121 = git("rev-parse", "HEAD")
+
+            summary_a = version_watch.summarize_upgrade_changes(repo, from_sha=sha_1120, to_sha=sha_1121)
+            self.assertIn("📋 **更新了什么**", summary_a)
+            self.assertIn("🎯 **解决了什么问题**", summary_a)
+            self.assertIn("群内 @ 指令或回复", summary_a)
+            self.assertIn("「陈旧/已处理未重查」", summary_a)
+            self.assertNotIn("feat(pending,engine,outbound)", summary_a)
+            self.assertNotIn("_owner_followups", summary_a)
+            self.assertNotIn("_auto_settle_open_escalations_on_owner_batch", summary_a)
+            self.assertNotIn("_VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE", summary_a)
+            self.assertNotIn("stale_or_already_handled", summary_a)
+            self.assertNotIn("REG-110", summary_a)
+
+            # 场景 B：Commit Body 无显式说明，但 REGRESSIONS.md 新增 1.1.22 三段式表格行（含『症状；现通过...根治：修法』）
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.1.22"\n', encoding="utf-8")
+            (repo / "tests" / "REGRESSIONS.md").write_text(
+                "# 回归\n\n| 规格 | 症状 | 守它的测试 |\n| --- | --- | --- |\n| 1.1.20 | 旧症状 | `t0` |\n"
+                "| 1.1.22 | 升级通知直接打印英文 git commit 标题与函数名导致主人看不懂；现通过三项改进根治：① `version_watch.summarize_upgrade_changes` 优先提取提交正文说明并做中文大白话清洗；② 支持三段式版本号提取（REG-111） | `t111` |\n",
+                encoding="utf-8",
+            )
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat(version_watch): plain Chinese upgrade summary (v1.1.22, REG-111)")
+            sha_1122 = git("rev-parse", "HEAD")
+
+            summary_b = version_watch.summarize_upgrade_changes(repo, from_sha=sha_1121, to_sha=sha_1122)
+            self.assertIn("📋 **更新了什么**：① 优先提取提交正文说明并做中文大白话清洗", summary_b)
+            self.assertIn("🎯 **解决了什么问题**：升级通知直接打印英文 git commit 标题与函数名导致主人看不懂", summary_b)
+            self.assertNotIn("summarize_upgrade_changes", summary_b)
+            self.assertNotIn("feat(version_watch)", summary_b)
+            self.assertNotIn("REG-111", summary_b)
+
+            # 场景 C：既无 Commit Body 说明又无 REGRESSIONS.md 变更，仅有纯英文 Commit 标题时，兜底绝不直出英文标题
+            (repo / "sheepdog" / "__init__.py").write_text('__version__ = "1.1.23"\n', encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "fix(engine): prevent duplicate dispatch lock under race condition")
+            sha_1123 = git("rev-parse", "HEAD")
+            summary_c = version_watch.summarize_upgrade_changes(repo, from_sha=sha_1122, to_sha=sha_1123)
+            self.assertIn("完成本轮代码改进与问题修复", summary_c)
+            self.assertNotIn("fix(engine):", summary_c)
+
 
 if __name__ == "__main__":
     unittest.main()

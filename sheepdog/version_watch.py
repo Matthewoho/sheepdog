@@ -383,45 +383,187 @@ def pull_repo_for_channel(root: Path, channel: str = "stable", timeout: float = 
     return (r.returncode == 0), out, ("" if r.returncode == 0 else (out or f"returncode={r.returncode}"))
 
 
+_UPGRADE_BUCKET_CN = {
+    "stale_or_already_handled": "「陈旧/已处理未重查」",
+    "context_incomplete": "「上下文/现状未查清」",
+    "arch_or_config_posture": "「架构/配置姿势纠偏」",
+    "peer_or_owner_delegate": "「转交他人/专席」",
+    "option_or_schedule_redirect": "「选项/排期调整」",
+}
+
+_UPGRADE_TERM_CN = (
+    (r"(?<![A-Za-z0-9_])`?owner_instruction`?\s*[/、与和]\s*`?owner_reply`?\s*(?:指令)?(?![A-Za-z0-9_])", "群内 @ 指令或回复"),
+    (r"(?<![A-Za-z0-9_])`?owner_instruction`?\s*(?:指令)?(?![A-Za-z0-9_])", "主人群内指令"),
+    (r"(?<![A-Za-z0-9_])`?owner_reply`?(?![A-Za-z0-9_])", "主人回复"),
+    (r"(?<![A-Za-z0-9_])`?needs_decision`?\s*回执", "「待拍板」回执"),
+    (r"(?<![A-Za-z0-9_])`?needs_decision`?(?![A-Za-z0-9_])", "「待拍板」"),
+    (r"(?<![A-Za-z0-9_])`?waiting`?\s*回执", "「等待中」回执"),
+    (r"waiting/handled/done", "执行中或已完成"),
+    (r"(?<![A-Za-z0-9_])`?open\s+escalations?`?(?![A-Za-z0-9_])", "未关闭的待拍板提问"),
+    (r"(?<![A-Za-z0-9_])`?escalations?`?(?![A-Za-z0-9_])", "待拍板提问"),
+    (r"(?<![A-Za-z0-9_])`?event_override`?(?![A-Za-z0-9_])", "拍板纠偏"),
+    (r"(?<![A-Za-z0-9_])`?sheepdog\s+ask`?(?![A-Za-z0-9_])", "拍板请示"),
+    (r"(?<![A-Za-z0-9_])`?sheepdog\s+report`?(?![A-Za-z0-9_])", "结果汇报"),
+    (r"(?<![A-Za-z0-9_.])`?ask`?(?![A-Za-z0-9_])", "请示"),
+    (r"(?<![A-Za-z0-9_])`?(?:topics\.)?last_active`?(?![A-Za-z0-9_])", "最后活跃时间"),
+    (r"(?<![A-Za-z0-9_])`?dispatched_at`?(?![A-Za-z0-9_])", "派单时间"),
+    (r"(?<![A-Za-z0-9_])`?duty_cards`?(?![A-Za-z0-9_])", "当班状态卡"),
+    (r"(?<![A-Za-z0-9_])`?bus_core`?(?![A-Za-z0-9_])", "顶层中枢分组"),
+    (r"(?<![A-Za-z0-9_])`?dynamic_oneshot`?(?![A-Za-z0-9_])", "一次性会话分组"),
+    (r"(?<![A-Za-z0-9_])`?reply_to`?(?![A-Za-z0-9_])", "引用消息"),
+    (r"(?<![A-Za-z0-9_])`?summary`?(?![A-Za-z0-9_])", "摘要"),
+    (r"(?<![A-Za-z0-9_])`?standing`?\s*常设会话", "常驻会话"),
+    (r"(?<![A-Za-z0-9_])`?standing`?(?![A-Za-z0-9_])", "常驻"),
+)
+
+_UPGRADE_PY_SYM = (
+    r"(?<![A-Za-z0-9_.-])(?:"
+    r"`?(?:sheepdog\.)?(?:engine|pending|outbound|admin_web|evolve|observe|store|router|card|card_callback|decision_hub|loops|version_watch|cli|duty|hook|actions|config|feishu_ws|topics)\.[A-Za-z0-9_.]+`?"
+    r"|`?[A-Z][A-Za-z0-9_]*\.[a-z_][A-Za-z0-9_.]*`?"
+    r"|`?_[A-Za-z0-9_.]+`?"
+    r"|`?(?!tp_)[a-z][a-z0-9]*_[a-z0-9_]+(?:\([^)]*\))?`?"
+    r"|`?[A-Z][A-Z0-9]*_[A-Z0-9_]+`?"
+    r")(?![A-Za-z0-9_.-])"
+)
+
+
+def _plain_chinese_upgrade_text(text: str) -> str:
+    """1.1.22（REG-111）：将含代码黑话（函数名、模块路径、正则常量、REG 编号）的升级说明提纯为面向主人的中文大白话。"""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    for k, v in _UPGRADE_BUCKET_CN.items():
+        s = re.sub(rf"(?<![A-Za-z0-9_])`?{re.escape(k)}`?(?![A-Za-z0-9_])", v, s)
+    for pat, repl in _UPGRADE_TERM_CN:
+        s = re.sub(pat, repl, s)
+    s = re.sub(r"\s*[（(]\s*(?:v?[0-9]+(?:\.[0-9]+){1,2}\s*[,，\s]\s*)?REG-\d+\s*[）)]", "", s)
+    s = re.sub(r"\bREG-\d+\b", "", s)
+    s = re.sub(r"\s*[（(]\s*`?(?:om|lamb)_[A-Za-z0-9_]+`?(?:\s*[/、与和]\s*`?(?:om|lamb)_[A-Za-z0-9_]+`?)*\s*[）)]", "", s)
+    s = re.sub(r"在\s*`?om_[A-Za-z0-9_]+`?\s*", "", s)
+    s = re.sub(rf"(?:{_UPGRADE_PY_SYM}\s*)?新增\s+{_UPGRADE_PY_SYM}(?:\s*(?:[$]\\times[$]|×|与|和)\s*{_UPGRADE_PY_SYM})*\s*门禁", "新增发前门禁", s)
+    s = re.sub(rf"(?:{_UPGRADE_PY_SYM}\s*)?新增\s+{_UPGRADE_PY_SYM}\s*[，,]\s*", "", s)
+    s = re.sub(rf"(?:{_UPGRADE_PY_SYM}\s*)?新增\s+{_UPGRADE_PY_SYM}\s*", "", s)
+    s = re.sub(r"`[^`]*(?:==|!=|<=|>=|\bNone\b|\bTrue\b|\bFalse\b|='[a-z_]+')[^`]*`", "", s)
+    s = re.sub(rf"{_UPGRADE_PY_SYM}(?:\s*(?:与|和|及|、|/)\s*{_UPGRADE_PY_SYM})*\s*", "", s)
+    s = re.sub(r"[（(]\s*[）)]", "", s)
+    s = re.sub(r"因\s*(?:要求\s*)?且\s*", "因", s)
+    s = re.sub(r"[，,]\s*且\s*", "，", s)
+    s = re.sub(r"(?:^|(?<=[；;：:①②③④⑤⑥\s]))且\s*", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" ；;，,")
+    return s
+
+
+def _extract_commit_body_notes(body_text: str) -> tuple[list[str], list[str]]:
+    """从 git log --format=%B 提交正文中提取显式编写的『更新了什么』与『解决了什么问题』行。"""
+    updated: list[str] = []
+    solved: list[str] = []
+    for raw_ln in (body_text or "").splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        mu = re.match(r"^(?:[-*•]\s*)?(?:📋\s*)?\*{0,2}更新了什么\*{0,2}\s*[：:]\s*(.+)$", ln)
+        if mu:
+            cleaned = _plain_chinese_upgrade_text(mu.group(1))
+            if cleaned and cleaned not in updated:
+                updated.append(cleaned)
+            continue
+        ms = re.match(r"^(?:[-*•]\s*)?(?:🎯\s*)?\*{0,2}解决了什么问题\*{0,2}\s*[：:]\s*(.+)$", ln)
+        if ms:
+            cleaned = _plain_chinese_upgrade_text(ms.group(1))
+            if cleaned and cleaned not in solved:
+                solved.append(cleaned)
+    return updated, solved
+
+
+def _plain_chinese_commit_fallback(commit_line: str) -> str:
+    """当既无 Commit Body 中文说明又无 REGRESSIONS.md 匹配时，把英文 git subject 转为大白话，严禁原样吐出 feat(...): 英文行。"""
+    s = (commit_line or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"^([0-9a-f]{7,40})\s+(.*)$", s)
+    sha = m.group(1)[:7] if m else ""
+    subj = (m.group(2) if m else s).strip()
+    subj_no_prefix = re.sub(r"^[a-z]+(?:\([^)]*\))?!?:\s*", "", subj, flags=re.IGNORECASE).strip()
+    subj_no_reg = re.sub(r"\s*[（(]\s*(?:v?[0-9]+(?:\.[0-9]+){1,2}\s*[,，\s]\s*)?REG-\d+\s*[）)]\s*$", "", subj_no_reg := subj_no_prefix).strip()
+    if re.search(r"[\u4e00-\u9fff]", subj_no_reg):
+        cleaned = _plain_chinese_upgrade_text(subj_no_reg)
+        return f"{cleaned}（{sha}）" if sha else cleaned
+    return f"完成本轮代码改进与问题修复（提交 {sha}）" if sha else "完成本轮代码改进与问题修复"
+
+
 def summarize_upgrade_changes(root: Path, from_sha: str = "", to_sha: str = "", explicit_notes: str = "") -> str:
-    """7.93（REG-061）：提炼本次升级『更新了什么』与『解决了什么问题』摘要，供升级完成通知展示。"""
+    """7.93（REG-061）/ 1.1.22（REG-111）：提炼本次升级『更新了什么』与『解决了什么问题』中文大白话摘要，供升级完成通知展示。"""
     notes = (explicit_notes or "").strip()
     if notes:
+        u_notes, s_notes = _extract_commit_body_notes(notes)
+        if u_notes or s_notes:
+            out_lines: list[str] = []
+            if u_notes:
+                out_lines.append(f"- 📋 **更新了什么**：{'；'.join(u_notes[:3])}")
+            if s_notes:
+                out_lines.append(f"- 🎯 **解决了什么问题**：{'；'.join(s_notes[:3])}")
+            return "\n".join(out_lines)
         if "更新了什么" in notes or "解决了什么问题" in notes:
             return notes
-        parts = [p.strip() for p in re.split(r"[\n；;]+", notes) if p.strip()]
+        parts = [_plain_chinese_upgrade_text(p) for p in re.split(r"[\n；;]+", notes) if p.strip()]
+        parts = [p for p in parts if p]
         if len(parts) >= 2:
             return f"- 📋 **更新了什么**：{parts[0]}\n- 🎯 **解决了什么问题**：{'；'.join(parts[1:])}"
-        return f"- 📋 **更新了什么 / 解决了什么问题**：{notes}"
+        cleaned_single = parts[0] if parts else notes
+        return f"- 📋 **更新了什么 / 解决了什么问题**：{cleaned_single}"
 
     if not (root / ".git").exists():
         return ""
     rng = f"{from_sha}..{to_sha}" if (from_sha and to_sha and from_sha != to_sha) else "HEAD~1..HEAD"
     updated_items: list[str] = []
     solved_items: list[str] = []
-    r_diff = _git_run(["git", "-C", str(root), "diff", "--unified=0", rng, "--", "tests/REGRESSIONS.md"], timeout=5.0)
-    if r_diff is not None and r_diff.returncode == 0 and (r_diff.stdout or "").strip():
-        for raw_ln in r_diff.stdout.splitlines():
-            if not raw_ln.startswith("+") or raw_ln.startswith("+++"):
-                continue
-            ln = raw_ln[1:].strip()
-            if mh := re.match(r"^##\s+([0-9]+\.[0-9]+\s+.+)$", ln):
-                item = mh.group(1).strip()
-                if item not in updated_items:
-                    updated_items.append(item)
-            elif mr := re.match(r"^\|\s*([0-9]+\.[0-9]+)\s*\|\s*([^|]+?)\s*\|", ln):
-                spec_no, symptom = mr.group(1).strip(), mr.group(2).strip()
-                if symptom and symptom not in ("症状", "---"):
-                    entry = f"[{spec_no}] {symptom}"
-                    if entry not in solved_items:
-                        solved_items.append(entry)
+
+    # 1) 优先从 git commit 正文（%B）提取显式编写的「更新了什么 / 解决了什么问题」并做大白话清洗
+    r_body = _git_run(["git", "-C", str(root), "log", "--no-merges", "-n", "5", "--format=%B", rng], timeout=5.0)
+    if (r_body is None or r_body.returncode != 0 or not (r_body.stdout or "").strip()) and to_sha:
+        r_body = _git_run(["git", "-C", str(root), "log", "-n", "1", "--format=%B", to_sha], timeout=5.0)
+    if r_body is not None and r_body.returncode == 0 and (r_body.stdout or "").strip():
+        u_body, s_body = _extract_commit_body_notes(r_body.stdout)
+        updated_items.extend(u_body)
+        solved_items.extend(s_body)
+
+    # 2) 从 tests/REGRESSIONS.md 差异提取（同时支持 7.93 两段式与 1.1.22 三段式版本号，并自动拆分「症状；现通过...根治：修法」）
+    if not updated_items or not solved_items:
+        r_diff = _git_run(["git", "-C", str(root), "diff", "--unified=0", rng, "--", "tests/REGRESSIONS.md"], timeout=5.0)
+        if r_diff is not None and r_diff.returncode == 0 and (r_diff.stdout or "").strip():
+            for raw_ln in r_diff.stdout.splitlines():
+                if not raw_ln.startswith("+") or raw_ln.startswith("+++"):
+                    continue
+                ln = raw_ln[1:].strip()
+                if mh := re.match(r"^##\s+([0-9]+(?:\.[0-9]+){1,2}\s+.+)$", ln):
+                    item = _plain_chinese_upgrade_text(mh.group(1).strip())
+                    if item and item not in updated_items:
+                        updated_items.append(item)
+                elif mr := re.match(r"^\|\s*([0-9]+(?:\.[0-9]+){1,2})\s*\|\s*([^|]+?)\s*\|", ln):
+                    spec_no, col2 = mr.group(1).strip(), mr.group(2).strip()
+                    if not col2 or col2 in ("症状", "---"):
+                        continue
+                    split_parts = re.split(r"(?:[；。]\s*)?现通过[^：:]{0,16}[：:]\s*", col2, maxsplit=1)
+                    if len(split_parts) == 2:
+                        sym_clean = _plain_chinese_upgrade_text(split_parts[0])
+                        fix_clean = _plain_chinese_upgrade_text(split_parts[1])
+                        if fix_clean and fix_clean not in updated_items:
+                            updated_items.append(fix_clean)
+                        if sym_clean and sym_clean not in solved_items:
+                            solved_items.append(sym_clean)
+                    else:
+                        sym_clean = _plain_chinese_upgrade_text(col2)
+                        entry = f"[{spec_no}] {sym_clean}" if spec_no.count(".") == 1 else sym_clean
+                        if entry and entry not in solved_items:
+                            solved_items.append(entry)
 
     commits: list[str] = []
     r_log = _git_run(["git", "-C", str(root), "log", "--no-merges", "-n", "5", "--format=%h %s", rng], timeout=5.0)
     if (r_log is None or r_log.returncode != 0 or not (r_log.stdout or "").strip()) and to_sha:
         r_log = _git_run(["git", "-C", str(root), "log", "-n", "1", "--format=%h %s", to_sha], timeout=5.0)
     if r_log is not None and r_log.returncode == 0 and (r_log.stdout or "").strip():
-        commits = [c.strip() for c in r_log.stdout.splitlines() if c.strip()]
+        commits = [_plain_chinese_commit_fallback(c.strip()) for c in r_log.stdout.splitlines() if c.strip()]
+        commits = [c for c in commits if c]
 
     lines: list[str] = []
     if updated_items:
@@ -430,10 +572,8 @@ def summarize_upgrade_changes(root: Path, from_sha: str = "", to_sha: str = "", 
         lines.append(f"- 📋 **更新了什么**：{'；'.join(commits[:3])}")
     if solved_items:
         lines.append(f"- 🎯 **解决了什么问题**：{'；'.join(solved_items[:3])}")
-    elif commits and updated_items:
-        lines.append(f"- 🎯 **提交记录**：{'；'.join(commits[:3])}")
     elif commits:
-        lines.append(f"- 🎯 **解决了什么问题**：同步提交 {'；'.join(commits[:3])} 中的修复与改进")
+        lines.append(f"- 🎯 **解决了什么问题**：{'；'.join(commits[:3])}")
     return "\n".join(lines)
 
 
