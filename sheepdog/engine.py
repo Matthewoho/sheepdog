@@ -2759,12 +2759,50 @@ class Dispatcher:
             return None
         return at
 
+    def _has_planner_response_since(self, t, since: datetime | None) -> bool:
+        """检查会话 transcript 在 since 之后是否产生过至少一步 PLANNER_RESPONSE（REG-092）。"""
+        if since is None:
+            return False
+        path = self._record_file(t)
+        if path is None or not path.is_file():
+            return False
+        try:
+            with path.open("rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                start = max(0, size - 256 * 1024)
+                f.seek(start)
+                data = f.read(size - start)
+        except OSError:
+            return False
+        lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        if start > 0 and lines:
+            lines = lines[1:]
+        threshold = since - timedelta(seconds=2)
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "PLANNER_RESPONSE":
+                continue
+            st_dt = _parse(str(obj.get("created_at") or ""))
+            if st_dt is not None and st_dt >= threshold:
+                return True
+        return False
+
     def _transcript_planner_idle_at(
-        self, t, batch: str, sent: datetime | None, *, require_bg_task: bool = True
+        self,
+        t,
+        batch: str,
+        sent: datetime | None,
+        *,
+        require_bg_task: bool = True,
+        allow_unawakened_system_msg: bool = False,
     ) -> tuple[datetime | None, bool]:
-        """7.107（REG-075）：检查会话记录末尾是否在当前批次送出后停在已完成且无工具调用的 PLANNER_RESPONSE DONE。
-        返回 (stopped_at, has_bg_task)。当 require_bg_task=True（首轮因后台命令挂起导致 fullyIdle=false 未写 passed_at）时，
-        要求批次送出后存在 RUNNING 的 GENERIC 后台任务步骤；当 require_bg_task=False（已 auto_resumed 后再次停机）时直接返回末尾时间。"""
+        """7.107 / 1.1.3（REG-075 / REG-092）：检查会话记录末尾是否在当前批次送出后停在：
+        1) 已完成且无工具调用的 PLANNER_RESPONSE DONE；或
+        2) allow_unawakened_system_msg=True 时，批次 SYSTEM_MESSAGE / USER_INPUT 已写入 transcript 但宿主未启动任何 PLANNER_RESPONSE。
+        返回 (stopped_at, has_bg_task)。"""
         path = self._record_file(t)
         if path is None or not path.is_file():
             return None, False
@@ -2790,14 +2828,16 @@ class Dispatcher:
         if not steps:
             return None, False
         last = steps[-1]
-        if (
-            last.get("type") != "PLANNER_RESPONSE"
-            or str(last.get("status") or "").upper() != "DONE"
-            or bool(last.get("tool_calls"))
+        last_type = str(last.get("type") or "")
+        last_done = str(last.get("status") or "").upper() == "DONE" and not bool(last.get("tool_calls"))
+        if not last_done or last_type not in (
+            ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT")
+            if allow_unawakened_system_msg
+            else ("PLANNER_RESPONSE",)
         ):
             return None, False
         at = _parse(str(last.get("created_at") or "")) or self._record_mtime(t)
-        if at is None or (sent is not None and at < sent):
+        if at is None or (sent is not None and at < sent - timedelta(seconds=2)):
             return None, False
         batch_idx = None
         if batch:
@@ -2807,6 +2847,13 @@ class Dispatcher:
                 if s.get("type") in ("SYSTEM_MESSAGE", "USER_INPUT") and needle in str(s.get("content") or ""):
                     batch_idx = i
                     break
+        if last_type in ("SYSTEM_MESSAGE", "USER_INPUT"):
+            if batch_idx is None:
+                return None, False
+            tail_after_batch = steps[batch_idx + 1 :]
+            if any(s.get("type") == "PLANNER_RESPONSE" for s in tail_after_batch):
+                return None, False
+            return at, False
         post_steps = steps[batch_idx + 1:] if batch_idx is not None else [
             s for s in steps
             if sent is None or ((st_dt := _parse(str(s.get("created_at") or ""))) is not None and st_dt >= sent)
@@ -2826,7 +2873,8 @@ class Dispatcher:
         return at, has_bg
 
     def _check_stopped_in_flight(self, t, batch: str, sent: datetime | None, now: datetime, adopted: bool) -> bool:
-        """7.64 / 7.107（REG-075）：会话在途因宿主退出/重登、Stop hook 放行停机或后台交互命令挂起（fullyIdle=false）停机、且无活跃羔羊时：
+        """7.64 / 7.107 / 1.1.3（REG-075 / REG-092）：会话在途因宿主退出/重登、Stop hook 放行停机、后台交互命令挂起（fullyIdle=false）
+        或 SYSTEM_MESSAGE 落盘后宿主未启动 PLANNER_RESPONSE 停机、且无活跃羔羊时：
         静止满阈值自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
         if self.topic_host(t) != ANTIGRAVITY:
             return False
@@ -2839,6 +2887,7 @@ class Dispatcher:
         meta_key = f"auto_resumed:{batch}"
         already_resumed = bool(st.get("auto_resumed") or self.store.get_meta(meta_key))
         resumed_at = _parse(str(st.get("auto_resumed_at") or self.store.get_meta(meta_key) or ""))
+        is_real_agentapi = getattr(self._sink(ANTIGRAVITY), "name", "") == "agentapi"
         stopped_at = None
         min_idle = 60
         has_bg_hang = False
@@ -2849,11 +2898,11 @@ class Dispatcher:
         if stopped_at is None:
             if already_resumed:
                 stopped_at, has_bg_hang = self._transcript_planner_idle_at(
-                    t, batch, resumed_at or sent, require_bg_task=False
+                    t, batch, resumed_at or sent, require_bg_task=False, allow_unawakened_system_msg=True
                 )
             elif sent is not None and (now - sent).total_seconds() >= 180:
                 stopped_at, has_bg_hang = self._transcript_planner_idle_at(
-                    t, batch, sent, require_bg_task=True
+                    t, batch, sent, require_bg_task=True, allow_unawakened_system_msg=is_real_agentapi
                 )
                 min_idle = 90
         if stopped_at is None or (now - stopped_at).total_seconds() < min_idle:
@@ -3409,6 +3458,48 @@ class Dispatcher:
         log.info("topic %s 僵尸容器 %s 已自动换壳 -> %s (%s)", t["topic_id"], old_cid, new_cid, why)
         return self.store.get_topic(t["topic_id"])
 
+    def _auto_unstick_idle_antigravity(self, t, card, rows: list) -> tuple[list, object]:
+        """1.1.3（REG-092）：当真实 Antigravity 会话已处于可投递态（pending_batch_id 为空，无在跑批次）且记录文件存在，
+        但因上一批 SYSTEM_MESSAGE 落盘后宿主瞬时未触发推理而在回执超时后被标为 missed + 看板 STUCK（lost/stalled）时，
+        自动将未触发任何 PLANNER_RESPONSE 的 missed 批次重新并入待推队列，并重置看板 STUCK 锁，消除「不发新消息永远不动 <-> 不动永远不发新消息」死锁。"""
+        tid = t["topic_id"]
+        prev_label = duty.RUN_LABEL.get(card["run_state"] if card else "", "卡住")
+        last_act = _parse(card["last_act_at"] or "") if card is not None else None
+        reset_dt = _parse(self.store.get_meta(duty_reset_key(tid)))
+        floor = [x for x in (last_act, reset_dt) if x is not None]
+        floor_dt = max(floor) if floor else None
+        now = _now()
+        requeued_batches: list[str] = []
+        for d in self.store.recent_dispatches(tid):
+            if d["state"] != "missed":
+                continue
+            sent = _parse(d["sent_at"])
+            if sent is None or sent.tzinfo is None or now - sent > timedelta(hours=24):
+                continue
+            if floor_dt is not None and sent <= floor_dt:
+                continue
+            if not self._has_planner_response_since(t, sent):
+                with self.store.tx() as c:
+                    c.execute(
+                        "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                        (d["batch_id"], tid),
+                    )
+                self.store.set_dispatch_state(d["batch_id"], "redelivered", error="宿主未触发推理，随后续批次合并重投")
+                requeued_batches.append(d["batch_id"])
+        ts = now_iso()
+        self.store.set_meta(duty_reset_key(tid), ts)
+        self.store.upsert_card(tid, run_state=duty.IDLE, detail="", stuck_since=None, idle_since=ts)
+        new_rows = self.store.pending_for_topic(tid)
+        new_card = self.store.get_card(tid)
+        log.info(
+            "topic %s 在可投递态下自动解除看板 %s 死锁（合并重投未唤醒批次=%s，当前待推 %d 条）",
+            tid,
+            prev_label,
+            requeued_batches or "无",
+            len(new_rows),
+        )
+        return new_rows, new_card
+
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
@@ -3424,6 +3515,16 @@ class Dispatcher:
             res["waiting_spawn"] = True
             return res
         card = self.store.get_card(t["topic_id"])
+        if (
+            card is not None
+            and card["run_state"] in duty.STUCK
+            and t["state"] != sm.FAILED
+            and self.topic_host(t) == ANTIGRAVITY
+            and getattr(self._sink(ANTIGRAVITY), "name", "") == "agentapi"
+            and not self._record_missing(t)
+        ):
+            rows, card = self._auto_unstick_idle_antigravity(t, card, rows)
+            res["pending"] = len(rows)
         if card is not None and card["run_state"] in duty.STUCK and t["state"] != sm.FAILED:
             why = f"羊群看板判为{duty.RUN_LABEL[card['run_state']]}（{card['detail']}）"
             log.info("topic %s 排队：%s，%d 条信号", t["topic_id"], why, len(rows))

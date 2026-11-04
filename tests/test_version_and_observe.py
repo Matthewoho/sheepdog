@@ -1454,6 +1454,186 @@ class VersionAndObserveTest(unittest.TestCase):
                 "选项：\nA. 同意由专席按合规口径配置并回读\nB. 暂不开通\n建议：选 A。\n回复：打 A / B",
             )
 
+    def test_reg092_unawakened_system_message_and_duty_stuck_queue_self_heal(self):
+        """REG-092 (v1.1.3):
+        1) 宿主写入 SYSTEM_MESSAGE 后未启动 PLANNER_RESPONSE（post_steps=[SYSTEM_MESSAGE]）：
+           - observe L3 探针 2 检出 SYSTEM_MESSAGE 静默并写入 stop 自愈标记；
+           - Dispatcher._check_stopped_in_flight (name='agentapi') 在 >=180s 时识别未唤醒 SYSTEM_MESSAGE 并自动发断点续跑唤醒；
+        2) 当上一批因宿主未触发推理而超时标为 missed 且看板标为 lost、话题已回 active（pending_batch_id=None）时，
+           新到达的 pending 消息不会因看板 lost 永久死锁：
+           - observe --self-heal 阶段 3 自动将未触发推理的 missed 批次消息重回 pending、写入 duty_reset 并重置 duty_cards 为 idle；
+           - Dispatcher._dispatch_topic (name='agentapi') 同样自动解除可投递态下的看板 STUCK 死锁并合并补投。
+        """
+        from sheepdog import duty
+        from sheepdog.engine import Dispatcher
+        from sheepdog.models import Message
+        from sheepdog.roster import parse_roster
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_owner", state_dir=state_dir)
+            cfg.source.enabled = False
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            cid = "55c0efa0-266f-4caf-b0fb-5f05085f7c49"
+            tid = "tp_infra-migration-ops"
+            t_log = brain_dir / cid / ".system_generated" / "logs" / "transcript.jsonl"
+            t_log.parent.mkdir(parents=True, exist_ok=True)
+
+            # Part A: running 态下 SYSTEM_MESSAGE 落盘但无 PLANNER_RESPONSE -> observe L3 探针 2 检出并写 stop 自愈标记
+            store.upsert_topic(
+                tid,
+                title="项目·Infra迁移改造",
+                kind="dynamic",
+                conversation_id=cid,
+                state="running",
+                pending_batch_id="b20261104055452-infra-migration-ops",
+                dispatched_at="2026-11-04T05:54:52+08:00",
+            )
+            steps_a = [
+                {
+                    "step_index": 3262,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-03T21:31:52Z",
+                    "content": "上一轮已完成",
+                },
+                {
+                    "step_index": 3263,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": "2026-11-03T21:54:52Z",
+                    "content": "[sheepdog] 新信号批次 `b20261104055452-infra-migration-ops`（topic `tp_infra-migration-ops`，共 1 条）",
+                },
+            ]
+            t_log.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in steps_a) + "\n", encoding="utf-8")
+
+            now_a = datetime.fromisoformat("2026-11-04T06:00:00+08:00")
+            obs_a = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_a,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertIn(f"{tid}:b20261104055452-infra-migration-ops", obs_a["self_healed"])
+            self.assertTrue(any("SYSTEM_MESSAGE 已 DONE 静默" in w for w in obs_a["warns"]))
+
+            # Part B: 批次已超时变为 missed，会话回到 active (pending_batch_id=None)，看板标为 lost，新消息到达 pending 超 5m
+            m_missed = Message(
+                message_id="om_missed_0554",
+                chat_id="oc_infra",
+                chat_name="Infra 迁移改造",
+                chat_type="group",
+                sender_id="ou_ziyi",
+                sender_name="Ziyi Zhang",
+                sender_type="user",
+                content="@Matthew Hong 05:54 联调进度",
+                msg_type="text",
+                create_time="2026-11-04T05:54:00+08:00",
+            )
+            m_pending = Message(
+                message_id="om_pending_0728",
+                chat_id="oc_infra",
+                chat_name="Infra 迁移改造",
+                chat_type="group",
+                sender_id="ou_ziyi",
+                sender_name="Ziyi Zhang",
+                sender_type="user",
+                content="@Matthew Hong 07:28 收尾验证",
+                msg_type="text",
+                create_time="2026-11-04T07:28:00+08:00",
+            )
+            store.upsert_message(m_missed, "dispatch", "at_me", ["owner:infra-migration-ops"], tid)
+            store.upsert_message(m_pending, "dispatch", "at_me", ["owner:infra-migration-ops"], tid)
+            store.record_dispatch("b20261104055452-infra-migration-ops", tid, ["om_missed_0554"], state="sent")
+            with store.tx() as c:
+                c.execute(
+                    "UPDATE dispatches SET sent_at='2026-11-04T05:54:52+08:00', state='missed', error='回执超时（adopted 不重投）' WHERE batch_id='b20261104055452-infra-migration-ops'"
+                )
+                c.execute(
+                    "UPDATE messages SET dispatch_state='missed', batch_id='b20261104055452-infra-migration-ops' WHERE message_id='om_missed_0554'"
+                )
+            store.update_topic(tid, state="active", pending_batch_id=None, dispatched_at="2026-11-04T05:54:52+08:00")
+            store.upsert_card(
+                tid,
+                run_state=duty.LOST,
+                detail="批次 05:54 送出后会话记录 134 分钟完全不动",
+                last_act_at="2026-11-04T05:31:52+08:00",
+                stuck_since="2026-11-04T05:54:52+08:00",
+                queued=1,
+                no_record=0,
+            )
+
+            # 1) 测试 Dispatcher._dispatch_topic (sink.name='agentapi') 直接自动解除失联死锁并合并重投 om_missed_0554 + om_pending_0728
+            sent_payloads: list[tuple[str, str]] = []
+
+            class FakeAgentApiSink:
+                name = "agentapi"
+                host = "antigravity"
+
+                def send_message(self, conv_id: str, prompt: str, **_kw):
+                    sent_payloads.append((conv_id, prompt))
+
+            with mock.patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(root)}, clear=False):
+                disp = Dispatcher(cfg, store, {"antigravity": FakeAgentApiSink()}, parse_roster({"session": []}))
+                t_row = store.get_topic(tid)
+                rows = store.pending_for_topic(tid)
+                self.assertEqual([r["message_id"] for r in rows], ["om_pending_0728"])
+                res_d = disp._dispatch_topic(t_row, rows)
+                self.assertEqual(res_d["sent"], 2)
+                self.assertEqual(len(sent_payloads), 1)
+                self.assertIn("om_missed_0554", sent_payloads[0][1])
+                self.assertIn("om_pending_0728", sent_payloads[0][1])
+                self.assertEqual(store.get_dispatch("b20261104055452-infra-migration-ops")["state"], "redelivered")
+
+            # 2) 同样状态还原后测试 observe.run_observe(self_heal=True) 阶段 3 自动自愈解锁
+            with store.tx() as c:
+                c.execute(
+                    "UPDATE dispatches SET state='missed', error='回执超时（adopted 不重投）' WHERE batch_id='b20261104055452-infra-migration-ops'"
+                )
+                c.execute(
+                    "UPDATE messages SET dispatch_state='missed', batch_id='b20261104055452-infra-migration-ops' WHERE message_id='om_missed_0554'"
+                )
+                c.execute(
+                    "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id='om_pending_0728'"
+                )
+            store.update_topic(tid, state="active", pending_batch_id=None, dispatched_at="2026-11-04T05:54:52+08:00")
+            store.upsert_card(
+                tid,
+                run_state=duty.LOST,
+                detail="批次 05:54 送出后会话记录 134 分钟完全不动",
+                last_act_at="2026-11-04T05:31:52+08:00",
+                stuck_since="2026-11-04T05:54:52+08:00",
+                queued=1,
+                no_record=0,
+            )
+            now_b = datetime.fromisoformat("2026-11-04T08:07:02+08:00")
+            obs_b = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_b,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertIn(f"{tid}:duty_stuck_queue_unblock", obs_b["self_healed"])
+            self.assertFalse(any("Queue Head-of-Line SLA" in w for w in obs_b["warns"]))
+            self.assertEqual(store.get_card(tid)["run_state"], duty.IDLE)
+            self.assertEqual(
+                [r["message_id"] for r in store.pending_for_topic(tid)],
+                ["om_missed_0554", "om_pending_0728"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

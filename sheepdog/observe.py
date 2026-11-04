@@ -658,7 +658,7 @@ def run_observe(
                     if max_age_s >= 300:
                         t_row = (
                             c.execute(
-                                "SELECT state, pending_batch_id, dispatched_at FROM topics WHERE topic_id = ?",
+                                "SELECT state, pending_batch_id, dispatched_at, conversation_id, host FROM topics WHERE topic_id = ?",
                                 (tid,),
                             ).fetchone()
                             if "topics" in tabs
@@ -666,10 +666,87 @@ def run_observe(
                         )
                         pending_batch = (t_row["pending_batch_id"] if t_row else None) or "无"
                         topic_state = (t_row["state"] if t_row else None) or "unknown"
-                        warn.append(
-                            f"消息排队超 5 分钟（Queue Head-of-Line SLA 队头阻塞）：{tid} {len(ages)} 条 "
-                            f"最久 {int(max_age_s // 60)} 分钟（阻塞批次={pending_batch} state={topic_state}）"
+                        card_row = (
+                            c.execute(
+                                "SELECT run_state, detail, last_act_at, no_record FROM duty_cards WHERE topic_id = ?",
+                                (tid,),
+                            ).fetchone()
+                            if "duty_cards" in tabs
+                            else None
                         )
+                        healed_hol = False
+                        if (
+                            self_heal
+                            and pending_batch == "无"
+                            and topic_state in ("active", "blocked", "waiting_human")
+                            and card_row is not None
+                            and card_row["run_state"] in ("lost", "stalled")
+                            and not int(card_row["no_record"] or 0)
+                        ):
+                            try:
+                                t_cid = str((t_row["conversation_id"] if t_row else "") or "").strip()
+                                t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir)) if t_cid else []
+                                last_act_str = str(card_row["last_act_at"] or "")
+                                requeued_bids: list[str] = []
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.row_factory = sqlite3.Row
+                                    if "dispatches" in tabs:
+                                        missed_rows = wc.execute(
+                                            "SELECT batch_id, sent_at FROM dispatches WHERE topic_id = ? AND state = 'missed' ORDER BY sent_at DESC LIMIT 10",
+                                            (tid,),
+                                        ).fetchall()
+                                        for mr in missed_rows:
+                                            m_sent = str(mr["sent_at"] or "")
+                                            if last_act_str and m_sent <= last_act_str:
+                                                continue
+                                            m_dt = parse_iso(m_sent)
+                                            has_planner = False
+                                            if m_dt is not None and t_steps:
+                                                thr = m_dt - timedelta(seconds=2)
+                                                has_planner = any(
+                                                    s.get("type") == "PLANNER_RESPONSE"
+                                                    and (st_dt := parse_iso(str(s.get("created_at") or ""))) is not None
+                                                    and st_dt >= thr
+                                                    for s in t_steps
+                                                )
+                                            if not has_planner:
+                                                wc.execute(
+                                                    "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                                                    (mr["batch_id"], tid),
+                                                )
+                                                wc.execute(
+                                                    "UPDATE dispatches SET state='redelivered', error='observe自愈合并重投' WHERE batch_id=?",
+                                                    (mr["batch_id"],),
+                                                )
+                                                requeued_bids.append(mr["batch_id"])
+                                    now_s = iso(ref_now)
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"duty_reset:{tid}", now_s),
+                                        )
+                                    wc.execute(
+                                        "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, idle_since=?, updated_at=? WHERE topic_id=?",
+                                        (now_s, now_s, tid),
+                                    )
+                                    wc.commit()
+                                if state_dir is not None:
+                                    try:
+                                        (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                    except OSError:
+                                        pass
+                                self_healed.append(f"{tid}:duty_stuck_queue_unblock")
+                                info.append(
+                                    f"已对 {tid} 解除看板 {card_row['run_state']} 队头死锁并唤醒投递（合并重投未唤醒批次={requeued_bids or '无'}）"
+                                )
+                                healed_hol = True
+                            except sqlite3.Error:
+                                healed_hol = False
+                        if not healed_hol:
+                            warn.append(
+                                f"消息排队超 5 分钟（Queue Head-of-Line SLA 队头阻塞）：{tid} {len(ages)} 条 "
+                                f"最久 {int(max_age_s // 60)} 分钟（阻塞批次={pending_batch} state={topic_state}）"
+                            )
 
             # 阶段 4: Owner Echo SLA (15 分钟 = 900s)
             if "owner_echoes" in tabs:
@@ -758,10 +835,18 @@ def run_observe(
                                     pass
                             if not has_receipt:
                                 last_step = post_steps[-1]
-                                if last_step.get("type") == "PLANNER_RESPONSE" and last_step.get("status") == "DONE" and not last_step.get("tool_calls"):
+                                last_type = str(last_step.get("type") or "")
+                                if (
+                                    last_type in ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT")
+                                    and last_step.get("status") == "DONE"
+                                    and not last_step.get("tool_calls")
+                                ):
                                     silent_s = age_seconds(str(last_step.get("created_at") or ""), ref_now)
                                     if silent_s is not None and silent_s >= 90:
-                                        warn.append(f"假 running 僵尸锁：{tid} 批次 {batch_id} 已跑 {int(batch_age_s // 60)} 分钟，transcript 最后一步 PLANNER_RESPONSE 已 DONE 静默 {int(silent_s)}s 但未交回执")
+                                        warn.append(
+                                            f"假 running 僵尸锁：{tid} 批次 {batch_id} 已跑 {int(batch_age_s // 60)} 分钟，"
+                                            f"transcript 最后一步 {last_type} 已 DONE 静默 {int(silent_s)}s 但未交回执"
+                                        )
                                         if self_heal and state_dir is not None:
                                             _write_self_heal_stop_marker(state_dir, tid, batch_id, ref_now)
                                             self_healed.append(f"{tid}:{batch_id}")
