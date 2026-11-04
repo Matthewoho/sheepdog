@@ -3232,6 +3232,113 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertNotIn("2026-10-07.jsonl:", rg_sum)
             self.assertIn("HTTP Error 403: Forbidden", rg_sum)
 
+    def test_reg108_edgeone_subaccount_guard_traceback_and_saved_json_lamb_and_evolve_mail_dedup(self):
+        """REG-108（1.1.19）：
+        1) check_ask_pre_flight_guard 拦截未注明目标腾讯云子成员账号 ID（如 200053747873 / 200053747813）的 EdgeOne 加速域名配置 ask；
+        2) diagnose_override_reason 将『哪个子成员环境』归入 context_incomplete（缺环境/调用链反问）；
+        3) _summarize_cli_lamb_log 对 Python Traceback 折叠剥离中间 File "..." 帧直接保留最终异常行，并对 Saved /tmp/xxx.json 提取顶层 JSON 摘要；
+        4) evolve.build_evolve_digest D6 过滤已回执（acked）且 id <= last_mail_id 的同行留言，避免 65 分钟窗口内重复刷屏。
+        """
+        from datetime import datetime, timedelta, timezone
+        from sheepdog import admin_web, engine, evolve, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=state_dir,
+                config_path=state_dir / "config.toml",
+                sink="dryrun",
+            )
+            store = Store(cfg.db_path)
+
+            # 1) 未写明腾讯云子成员账号 ID 的 EdgeOne 加速域名请示被拦截
+            eo_ask_title = "Kai 申请在生产 EdgeOne 配置 cinemap.tapnow.tv 加速域名"
+            eo_ask_body_missing_sub = (
+                "事情：Kai 申请在生产 EdgeOne（tapnow.tv 站点）新增加速域名 cinemap.tapnow.tv，绑定泛域名证书、回源至生产独立 CLB。\n"
+                "选项：\nA. 同意配置：在生产 EdgeOne 创建 cinemap.tapnow.tv 加速域名并交付 CNAME\nB. 暂缓配置\n"
+                "建议：选 A\n执行：专席 tp_kaifeng"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_eo:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_kaifeng",
+                    eo_ask_title,
+                    eo_ask_body_missing_sub,
+                )
+            self.assertIn("REG-108", str(ctx_eo.exception))
+
+            # 写明子成员账号 200053747873 后正常放行
+            eo_ask_body_with_sub = (
+                "事情：EdgeOne 目标站点 tapnow.tv 位于腾讯云国际站生产子成员账号 200053747873（Zone: zone-3wzk608w22ku），回源至生产 CLB。\n"
+                "选项：\nA. 同意在生产子账号 200053747873 配置 cinemap.tapnow.tv 加速域名\nB. 暂缓配置\n"
+                "建议：选 A\n执行：专席 tp_kaifeng"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                store,
+                "tp_kaifeng",
+                eo_ask_title,
+                eo_ask_body_with_sub,
+            )
+
+            # 2) diagnose_override_reason 将『哪个子成员环境』归入 context_incomplete
+            c_sub, l_sub = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · {eo_ask_title} [tp_kaifeng]\n{eo_ask_body_missing_sub}",
+                "哪个子成员环境",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_sub, l_sub), ("context_incomplete", "缺环境/调用链反问"))
+
+            # 3a) _summarize_cli_lamb_log 剥离 Python Traceback 中间 File "..." 帧，直出末尾异常
+            tb_log = (
+                '  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 1389, in https_open\n'
+                '    return self.do_open(http.client.HTTPSConnection, req,\n'
+                '  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 1349, in do_open\n'
+                '    raise URLError(err)\n'
+                'urllib.error.URLError: <urlopen error EOF occurred in violation of protocol (_ssl.c:1129)>\n'
+            )
+            tb_sum, tb_err = engine._summarize_cli_lamb_log(tb_log)
+            self.assertTrue(tb_err)
+            self.assertNotIn('File "/Library/', tb_sum)
+            self.assertIn("urllib.error.URLError: <urlopen error EOF occurred in violation of protocol", tb_sum)
+
+            # 3b) _summarize_cli_lamb_log 对 Saved /tmp/..._out.json 自动附加顶层 JSON 摘要
+            tmp_json = Path("/tmp/test_reg108_lamb_saved_out.json")
+            try:
+                tmp_json.write_text('{"ok": true, "domain": "app.tapnow.tv", "certs": [1, 2]}', encoding="utf-8")
+                saved_sum, saved_err = engine._summarize_cli_lamb_log(f"Saved {tmp_json.as_posix()}\n")
+                self.assertFalse(saved_err)
+                self.assertIn("-> JSON(", saved_sum)
+                self.assertIn("domain=app.tapnow.tv", saved_sum)
+            finally:
+                tmp_json.unlink(missing_ok=True)
+
+            # 4) evolve.build_evolve_digest D6 过滤已回执（acked）且 id <= last_mail_id 的同行留言
+            now_dt = datetime(2026, 11, 5, 1, 45, 0, tzinfo=timezone(timedelta(hours=8)))
+            store.conn.execute(
+                "INSERT INTO messages (message_id, chat_id, sender_id, sender_name, sender_type, content, msg_type, create_time, first_seen, last_seen, route, reason, topic_id, dispatch_state) "
+                "VALUES ('sd_mail_reg108_1', '__system__', 'tp_auth', 'tp_auth', 'system', 'mail body', 'text', '2026-11-05T00:51:13+08:00', '2026-11-05T00:51:13+08:00', '2026-11-05T00:51:13+08:00', 'dispatch', 'duty_mail', 'tp_sheepdog', 'acked')"
+            )
+            store.conn.execute(
+                "INSERT INTO mailbox (id, from_topic, to_topic, key, body, message_id, created_at) "
+                "VALUES (2342, 'tp_auth', 'tp_sheepdog', 'vercel-mail', '邮箱来的消息暂时不管', 'sd_mail_reg108_1', '2026-11-05T00:51:13+08:00')"
+            )
+            store.conn.commit()
+            # 首次未记录 last_mail_id 时可见
+            dig1 = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=now_dt)
+            self.assertEqual(len(dig1["d6_peer_feedback_inbox"]["peer_mails"]), 1)
+            # 记录 last_mail_id=2342 且已 acked 后不再重复出现在 peer_mails
+            evolve.write_evolve_state(store, {"last_mail_id": 2342})
+            dig2 = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=now_dt)
+            self.assertEqual(len(dig2["d6_peer_feedback_inbox"]["peer_mails"]), 0)
+            self.assertEqual(dig2["d6_peer_feedback_inbox"]["latest_mail_id"], 2342)
+
 
 if __name__ == "__main__":
     unittest.main()

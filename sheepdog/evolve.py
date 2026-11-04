@@ -313,6 +313,7 @@ def build_evolve_digest(
     evolve_tid = cfg.self_evolve.topic_id
     peer_mails = []
     latest_mail_id = 0
+    last_seen_mail_id = int(prev_evolve_st.get("last_mail_id") or 0)
     if store.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mailbox'").fetchone():
         for mr in conn.execute(
             """
@@ -328,6 +329,9 @@ def build_evolve_digest(
             mid_int = int(mr["id"])
             if mid_int > latest_mail_id:
                 latest_mail_id = mid_int
+            is_unread = (mr["dispatch_state"] != "acked")
+            if not is_unread and mid_int <= last_seen_mail_id:
+                continue
             peer_mails.append(
                 {
                     "id": mid_int,
@@ -335,7 +339,7 @@ def build_evolve_digest(
                     "to_topic": mr["to_topic"],
                     "body": (mr["body"] or "")[:300],
                     "created_at": mr["created_at"],
-                    "unread": (mr["dispatch_state"] != "acked"),
+                    "unread": is_unread,
                 }
             )
 

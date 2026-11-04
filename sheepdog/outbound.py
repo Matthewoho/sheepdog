@@ -584,6 +584,16 @@ _TENCENT_INTL_SUBACCOUNT_POSTURE_RE = re.compile(
     r"|统一(?:放在|使用)腾讯云国际站[\s\S]{0,40}(?:子成员账号|成员账号|200053747873|200053747813))",
     re.I,
 )
+_TENCENT_EDGEONE_RESOURCE_CHANGE_ASK_RE = re.compile(
+    r"(?:(?:在|于)?(?:生产|预发|Stage|Prod)?\s*EdgeOne[^\n。]{0,36}(?:新增|创建|配置|修改|绑定)[^\n。]{0,36}(?:加速域名|域名|站点|回源)"
+    r"|EdgeOne\s*[（(]?\s*tapnow\.tv\s*站点[）)]?\s*(?:新增|创建|配置)"
+    r"|配置\s+[a-z0-9.-]+\.tapnow\.tv\s+加速域名)",
+    re.I,
+)
+_TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE = re.compile(
+    r"(?:\b2000\d{8}\b|(?:子成员账号|成员子账号|子账号|主账号)\s*(?:[:：]?\s*)?(?:2000\d{8}|tapnow-(?:prod|stage)))",
+    re.I,
+)
 _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
     r"(?=(?:[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b))"
     r"(?:[\s\S]*(?:能否提供现有[^\n。]{0,24}(?:跳板机|TKE|集群|入口)"
@@ -814,6 +824,13 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-04 20:29 在 `[其他]` 明确纠偏：『直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里』，REG-104 腾讯云国际子成员账号基线门禁）："
             "TapNow 与 Cinemap 国内站（`.tv`，`ap-nanjing`）统一承载在腾讯云国际站（主账号 `200045686254` 组织集团）下的独立子成员账号环境（Stage: `200053747813`，Prod: `200053747873`），"
             "不开辟独立的腾讯云国内站账号。请直接按腾讯云国际站子成员账号环境整理资源清单与权限方案后再汇报或请示（没有发送）",
+        )
+    if _TENCENT_EDGEONE_RESOURCE_CHANGE_ASK_RE.search(full_text) and not _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示在 EdgeOne（如 `tapnow.tv` 站点 / `*.tapnow.tv` 加速域名）新增、配置或修改加速域名与回源 CLB 前，必须在正文中显式写明目标所在的腾讯云『子成员账号 ID / UIN』（如生产子账号 `200053747873`、Stage 子账号 `200053747813` 或主账号 `200045686254`）及对应 Zone ID / CLB IP"
+            "（主人 2026-11-05 01:40 在 `[其他]` 反问：『哪个子成员环境』，REG-108 腾讯云子成员账号环境显式标注门禁）："
+            "请先核实并在正文中明确标注目标 EdgeOne 站点与回源 CLB 所属的子成员账号 ID（如 `生产子账号 200053747873`）后再发起 `sheepdog ask`（没有发送）",
         )
     if _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE.search(full_text):
         raise OutboundError(

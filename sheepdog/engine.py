@@ -4828,6 +4828,8 @@ class Dispatcher:
                         _GREP_MATCH_LINE_RE.search(cur_sum)
                         or _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(cur_sum)
                         or cur_sum in ("{", "[")
+                        or cur_sum.startswith('File "')
+                        or bool(_SAVED_TMP_JSON_RE.match(cur_sum))
                         or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
@@ -6618,6 +6620,10 @@ _YAML_FRAGMENT_LINE_RE = re.compile(
     r"^(?:-\s+\S.*|(?!STDERR:|ERROR:|WARNING:|FAIL:)[A-Za-z_][A-Za-z0-9_.-]*:(?:\s+.*)?)$"
 )
 _JSON_OBJECT_KEY_LINE_RE = re.compile(r'^"([^"]+)"\s*:\s*\{\s*$')
+_PY_EXCEPTION_LINE_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Exit|Fault)\b\s*:|(?:STDERR:\s*)?(?:ERROR|FATAL)\s*:)"
+)
+_SAVED_TMP_JSON_RE = re.compile(r"^(?:Saved|Wrote)\s+(/tmp/[A-Za-z0-9_./-]+\.json)\s*$", re.I)
 _EDITED_PREFIX = "（已编辑）旧："
 _RECALLED_PREFIX = "（已撤回）原文："
 
@@ -6851,6 +6857,33 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             return f"JSON_TAIL(sections={len(obj_keys)}, last={obj_keys[-1]}{tail_kv})", has_err
         if kv_pairs:
             return f"JSON_TAIL({', '.join(kv_pairs[-4:])})", has_err
+    if has_err and any(ln.startswith(('File "', "Traceback")) for ln in tail_lines):
+        exc_indices = [i for i, ln in enumerate(tail_lines) if _PY_EXCEPTION_LINE_RE.match(ln)]
+        if exc_indices:
+            first_tb = next((i for i, ln in enumerate(tail_lines) if ln.startswith(('File "', "Traceback"))), 0)
+            last_exc = exc_indices[-1]
+            tail_lines = [*tail_lines[:first_tb], *tail_lines[last_exc:]]
+    if not has_err and tail_lines and (m_saved := _SAVED_TMP_JSON_RE.match(tail_lines[-1])):
+        try:
+            p_json = Path(m_saved.group(1))
+            if p_json.is_file() and p_json.stat().st_size <= 262144:
+                saved_obj = json.loads(p_json.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(saved_obj, dict) and saved_obj:
+                    saved_parts: list[str] = []
+                    for k, v in list(saved_obj.items())[:6]:
+                        if isinstance(v, str):
+                            vc = " ".join(v.split())
+                            saved_parts.append(f"{k}={vc[:47] + '...' if len(vc) > 50 else vc}")
+                        elif isinstance(v, (int, float, bool)) or v is None:
+                            saved_parts.append(f"{k}={v}")
+                        elif isinstance(v, list):
+                            saved_parts.append(f"{k}=[{len(v)} items]")
+                        elif isinstance(v, dict):
+                            saved_parts.append(f"{k}={{{len(v)} keys}}")
+                    if saved_parts:
+                        tail_lines = [*tail_lines[:-1], f"{tail_lines[-1]} -> JSON({', '.join(saved_parts)})"]
+        except Exception:
+            pass
     capped_tail = [ln[:237] + "..." if len(ln) > 240 else ln for ln in tail_lines]
     return "\n".join(capped_tail), has_err
 
