@@ -478,10 +478,31 @@ def run_observe(
             except Exception:
                 ic_meta = {}
         if ic_meta.get("mode") == "native_ws":
-            if ic_meta.get("state") in ("running", "starting", "reconnecting"):
+            ws_state = str(ic_meta.get("state") or "")
+            ws_err = str(ic_meta.get("last_error") or "")
+            ws_err_low = ws_err.lower()
+            ws_transient = any(
+                k in ws_err_low
+                for k in ("timed out", "timeout", "eof", "handshake", "reset", "closed", "zombie", "unreachable", "refused", "no such host")
+            )
+            ws_last_ok_ts = str(ic_meta.get("last_pong_at") or ic_meta.get("ready_at") or ic_meta.get("started_at") or "")
+            ws_ok_age_m = age_min(ws_last_ok_ts, ref_now) if ws_last_ok_ts else None
+            if ws_state in ("running", "starting"):
                 info.append(f"原生 WebSocket 常驻在线（conn={ic_meta.get('conn_id') or '-'}，重启 {ic_meta.get('restarts', 0)} 次）")
+            elif (ws_state == "reconnecting" or (ws_state == "down" and ws_transient)) and (
+                ws_ok_age_m is not None and ws_ok_age_m < 10.0
+            ):
+                info.append(
+                    f"原生 WebSocket 瞬时断线重连中（已 {ws_ok_age_m:.1f} 分钟，重启 {ic_meta.get('restarts', 0)} 次，最近：{ws_err[:60]}）"
+                )
+                if self_heal and state_dir is not None:
+                    try:
+                        (state_dir / ".wakeup").write_text("native_ws_wakeup\n", encoding="utf-8")
+                        self_healed.append("native_ws:wakeup_poll")
+                    except OSError:
+                        pass
             else:
-                warn.append(f"原生 WebSocket 异常：state={ic_meta.get('state')} err={str(ic_meta.get('last_error', ''))[:80]}")
+                warn.append(f"原生 WebSocket 异常：state={ws_state} err={ws_err[:80]}")
         elif not consumer_procs:
             warn.append("lark-cli event consume 没在跑")
 

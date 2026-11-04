@@ -1634,6 +1634,112 @@ class VersionAndObserveTest(unittest.TestCase):
                 ["om_missed_0554", "om_pending_0728"],
             )
 
+    def test_reg093_native_ws_transient_handshake_reconnect_grace_and_endpoint_cache(self):
+        """REG-093: 原生 WebSocket 瞬时 TLS/握手超时进入 reconnecting + 5 分钟 endpoint 缓存保留 + observe 10 分钟宽限期自愈唤醒与超时告警区分。"""
+        from sheepdog.source import feishu_ws
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_owner", state_dir=state_dir)
+            cfg.source.enabled = False
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+            ps_only_run = "24169 Wed Nov  4 00:56:02 2026 /opt/homebrew/bin/sheepdog run\n"
+            now_dt = datetime.fromisoformat("2026-11-04T09:07:13+08:00")
+
+            # 1) 瞬时 TLS 握手超时（距上次 pong 仅 3.9 分钟 < 10 分钟）：归入 info + self_heal 写入 .wakeup，不报 warn
+            store.set_meta(
+                "identity_consumer",
+                json.dumps(
+                    {
+                        "mode": "native_ws",
+                        "state": "down",
+                        "pid": 24169,
+                        "started_at": "2026-11-04T08:26:34+08:00",
+                        "ready_at": "2026-11-04T08:26:36+08:00",
+                        "last_pong_at": "2026-11-04T09:03:21+08:00",
+                        "restarts": 12,
+                        "last_error": "_ssl.c:993: The handshake operation timed out",
+                        "conn_id": "7704106114829324048",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            obs_grace = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_dt,
+                check_processes=True,
+                check_log=False,
+                ps_output=ps_only_run,
+                self_heal=True,
+            )
+            self.assertFalse(any("原生 WebSocket 异常" in w for w in obs_grace["warns"]))
+            self.assertTrue(any("原生 WebSocket 瞬时断线重连中" in i for i in obs_grace["infos"]))
+            self.assertIn("native_ws:wakeup_poll", obs_grace["self_healed"])
+            self.assertTrue((cfg.state_dir / ".wakeup").exists())
+
+            # 2) 持续失联 >= 10 分钟（距上次 pong 15 分钟）：必须照常报 warn
+            store.set_meta(
+                "identity_consumer",
+                json.dumps(
+                    {
+                        "mode": "native_ws",
+                        "state": "reconnecting",
+                        "pid": 24169,
+                        "started_at": "2026-11-04T08:26:34+08:00",
+                        "ready_at": "2026-11-04T08:26:36+08:00",
+                        "last_pong_at": "2026-11-04T08:50:00+08:00",
+                        "restarts": 40,
+                        "last_error": "_ssl.c:993: The handshake operation timed out",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            obs_prolonged = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_dt,
+                check_processes=True,
+                check_log=False,
+                ps_output=ps_only_run,
+                self_heal=True,
+            )
+            self.assertTrue(any("原生 WebSocket 异常" in w for w in obs_prolonged["warns"]))
+
+            # 3) FeishuNativeWSClient._serve_once 在 endpoint_fetcher 连续抖动 2 次时仍可复用 300s 内的 _last_ep
+            clock_val = [100.0]
+            fetch_n = [0]
+
+            def flaky_fetcher(*_a):
+                fetch_n[0] += 1
+                if fetch_n[0] == 1:
+                    return {"url": "wss://example.invalid/ws/v2?service_id=1&device_id=c1", "client_config": {}}
+                raise TimeoutError("_ssl.c:993: The handshake operation timed out")
+
+            ws_cli = feishu_ws.FeishuNativeWSClient(
+                credentials={"app_id": "cli_a", "app_secret": "sec_a"},
+                on_event=lambda _e: None,
+                endpoint_fetcher=flaky_fetcher,
+                clock=lambda: clock_val[0],
+            )
+            ws_cli._state["ready_at"] = "2026-11-04T08:26:36+08:00"
+            with mock.patch.object(
+                feishu_ws,
+                "_RawWebSocket",
+                side_effect=TimeoutError("_ssl.c:993: The handshake operation timed out"),
+            ):
+                with self.assertRaises(TimeoutError):
+                    ws_cli._serve_once()
+                self.assertIsNotNone(ws_cli._last_ep)
+                clock_val[0] = 120.0
+                with self.assertRaises(TimeoutError):
+                    ws_cli._serve_once()
+                # 第二次抖动后 _last_ep 仍未在 300s 窗口内被清空
+                self.assertIsNotNone(ws_cli._last_ep)
+
 
 if __name__ == "__main__":
     unittest.main()

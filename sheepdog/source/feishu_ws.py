@@ -212,7 +212,7 @@ def normalize_ws_event_payload(raw_obj: dict, frame_headers: dict[str, str] | No
     return None
 
 def fetch_ws_endpoint(app_id: str, app_secret: str, domain: str = "https://open.larksuite.com",
-                      timeout: float = 10.0, opener=urllib.request.urlopen) -> dict:
+                      timeout: float = 5.0, opener=urllib.request.urlopen) -> dict:
     url, body = f"{domain.rstrip('/')}/callback/ws/endpoint", json.dumps({"AppID": app_id, "AppSecret": app_secret}).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "locale": "zh"}, method="POST")
     with opener(req, timeout=timeout) as resp:
@@ -331,7 +331,7 @@ class FeishuNativeWSClient:
         self.ping_interval, self.pong_timeout, self.backoff, self.backoff_max = float(ping_interval), float(pong_timeout), float(backoff), float(backoff_max)
         self.toast_text, self.endpoint_fetcher, self.clock = toast_text, endpoint_fetcher, clock
         self._stop_evt, self._reconnect_evt, self._thread, self._ws = threading.Event(), threading.Event(), None, None
-        self._seq, self._connected_in_round, self._multipart, self._last_ep = 0, False, {}, None
+        self._seq, self._connected_in_round, self._multipart, self._last_ep, self._last_ep_mono = 0, False, {}, None, 0.0
         self._state = {
             "mode": "native_ws", "state": "stopped", "pid": os.getpid(), "started_at": "", "ready_at": "",
             "last_event_at": "", "last_ping_at": "", "last_pong_at": "", "last_pong_mono": 0.0,
@@ -374,7 +374,15 @@ class FeishuNativeWSClient:
             self._reconnect_evt.clear()
             try: self._serve_once()
             except Exception as e:
-                self._state.update(state="down", last_error=str(e)[:240], last_exit=f"{_now_iso()} {e}"[:240])
+                err_s = str(e)[:240]
+                err_l = err_s.lower()
+                has_ever_connected = bool(self._state.get("ready_at") or self._state.get("last_pong_at"))
+                is_transient = any(
+                    k in err_l
+                    for k in ("timed out", "timeout", "eof", "handshake", "reset", "closed", "zombie", "unreachable", "refused", "no such host")
+                )
+                next_st = "reconnecting" if (not self._stop_evt.is_set() and has_ever_connected and is_transient) else "down"
+                self._state.update(state=next_st, last_error=err_s, last_exit=f"{_now_iso()} {e}"[:240])
                 self._notify_state()
             if self._stop_evt.is_set(): break
             if self._connected_in_round:
@@ -388,9 +396,12 @@ class FeishuNativeWSClient:
             no_args = code is not None and not (code.co_flags & 0x04) and (code.co_argcount - (1 if hasattr(self.endpoint_fetcher, "__self__") else 0)) == 0
             ep = self._last_ep = self.endpoint_fetcher() if no_args else self.endpoint_fetcher(
                 self.credentials.get("app_id", ""), self.credentials.get("app_secret", ""), self.credentials.get("domain", "https://open.larksuite.com"))
+            self._last_ep_mono = self.clock()
         except Exception:
-            if self._last_ep is None: raise
-            ep, self._last_ep = self._last_ep, None
+            if self._last_ep is None or (self._last_ep_mono > 0.0 and (self.clock() - self._last_ep_mono) > 300.0):
+                self._last_ep = None
+                raise
+            ep = self._last_ep
         ws_url, read_to = ep["url"] if isinstance(ep, dict) else getattr(ep, "url", str(ep)), max(0.02, min(1.0, self.ping_interval / 2.0, self.pong_timeout / 2.0))
         ws = _RawWebSocket(ws_url, connect_timeout=max(1.0, self.pong_timeout), read_timeout=read_to)
         self._ws, self._connected_in_round, now_m = ws, True, self.clock()
