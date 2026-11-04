@@ -75,7 +75,10 @@ _PENDING_DECISION_RE = re.compile(
     re.I,
 )
 _NONE_DECISION_RE = re.compile(
-    r"^\s*(?:[`*_~>-]*\s*)*(?:无|没有|暂无|无需|目前无|目前没有|暂时没有|0\s*项|none\b)", re.I
+    r"^\s*(?:[`*_~>•+-]*\s*)*(?:(?:当前|目前|暂时|本轮|眼下|此刻)?(?:暂)?(?:无|没有|无需)|0\s*(?:项|条|件)|none\b)", re.I
+)
+_SIBLING_SECTION_RE = re.compile(
+    r"^\s*(?:[-*•+]|\d+[.)、]|#{1,4})?\s*(?:\*\*|__)?(?:接下来|下一步|后续|已沉淀|未沉淀|进度|总览|上次以来)", re.I
 )
 _ASK_CMD_RE = re.compile(r"\bsheepdog\s+ask\b")
 
@@ -216,7 +219,18 @@ def _unsent_ask_turn(path: Path, tail: int = TRANSCRIPT_TAIL_BYTES) -> tuple[str
     planners = [d for d in tail_steps if d.get("type") == "PLANNER_RESPONSE"]
     if not planners or not (m := _PENDING_DECISION_RE.search(str(planners[-1].get("content") or ""))):
         return None
-    body = f"{m.group(1) or ''}\n{m.group(2) or ''}".strip()
+    inline = (m.group(1) or "").strip()
+    if inline and _NONE_DECISION_RE.match(inline):
+        return None
+    block_lines: list[str] = []
+    for ln in (m.group(2) or "").splitlines():
+        if _SIBLING_SECTION_RE.match(ln):
+            break
+        block_lines.append(ln)
+    block = "\n".join(block_lines).strip()
+    if not inline and block and _NONE_DECISION_RE.match(block.splitlines()[0]):
+        return None
+    body = f"{inline}\n{block}".strip()
     return (f"ask:{anchor_step}", re.sub(r"\s+", " ", body)[:80]) if body and not _NONE_DECISION_RE.match(body) else None
 
 

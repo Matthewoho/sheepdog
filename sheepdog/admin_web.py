@@ -134,7 +134,7 @@ def diagnose_override_reason(
     ):
         return ("arch_or_config_posture", "技术姿势纠偏")
     if re.search(
-        r"(?:已经处理了|过时间了|太久了|他有权限了|我已经回了|还要吗)",
+        r"(?:已经处理了|过时间了|太久了|他有权限了|我已经回了|还要吗|(?:他的|自己)\s*agent\s*操作了|帮忙盯着点)",
         s,
         re.I,
     ):

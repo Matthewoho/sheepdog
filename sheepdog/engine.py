@@ -4670,7 +4670,14 @@ class Dispatcher:
                         or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
-                            and any(p in cur_sum for p in ("Traceback", "RuntimeError:", "raise RuntimeError", "~~~~", "execute_dag_lane"))
+                            and (
+                                any(p in cur_sum for p in ("Traceback", "RuntimeError:", "raise RuntimeError", "~~~~", "execute_dag_lane", 'echo "Production Cloud Build'))
+                                or any(
+                                    _YAML_FRAGMENT_LINE_RE.match(ln.strip())
+                                    for ln in cur_sum.splitlines()
+                                    if not ln.strip().startswith("JSON(")
+                                )
+                            )
                         )
                         or (
                             lb["state"] == "failed"
@@ -6420,6 +6427,9 @@ _JSON_PROP_FRAGMENT_LINE_RE = re.compile(
     r'^"[^"]+"\s*:\s*(?:\{\s*\}?|\[\s*\]?|[-0-9.]+|true|false|null|"[^"]*")\s*,?\s*$',
     re.I,
 )
+_YAML_FRAGMENT_LINE_RE = re.compile(
+    r"^(?:-\s+\S.*|(?!STDERR:|ERROR:|WARNING:|FAIL:)[A-Za-z_][A-Za-z0-9_.-]*:(?:\s+.*)?)$"
+)
 _JSON_OBJECT_KEY_LINE_RE = re.compile(r'^"([^"]+)"\s*:\s*\{\s*$')
 _EDITED_PREFIX = "（已编辑）旧："
 _RECALLED_PREFIX = "（已撤回）原文："
@@ -6493,13 +6503,17 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                         or ("RequestId" in obj and "Error" not in obj)
                     ):
                         has_err = False
-                    raw_prefix = [
-                        ln.strip() for ln in stripped[:idx].splitlines()
-                        if ln.strip()
-                        and not re.match(r"^[{}\[\],;:\s]+$", ln.strip())
-                        and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln.strip())
-                        and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln.strip())
-                    ] if idx != -1 else []
+                    pre_non_empty = [ln.strip() for ln in stripped[:idx].splitlines() if ln.strip()] if idx != -1 else []
+                    if pre_non_empty and _YAML_FRAGMENT_LINE_RE.match(pre_non_empty[-1]):
+                        raw_prefix = []
+                    else:
+                        raw_prefix = [
+                            ln for ln in pre_non_empty
+                            if not re.match(r"^[{}\[\],;:\s]+$", ln)
+                            and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)
+                            and not _YAML_FRAGMENT_LINE_RE.match(ln)
+                            and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+                        ]
                     if not has_err:
                         tb_idx = next((i for i, ln in enumerate(raw_prefix) if ln.startswith("Traceback")), None)
                         if tb_idx is not None:

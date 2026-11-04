@@ -489,6 +489,11 @@ _STAGE_SUBACCOUNT_ADMIN_OPTION_RE = re.compile(
     r"(?:AdministratorAccess|QcloudAdministratorAccess|\badmin\b\s*权限|配\s*admin)",
     re.I,
 )
+_PREMATURE_READONLY_INVESTIGATION_ASK_RE = re.compile(
+    r"(?:A\s*[.、:：]\s*(?:仅做|先做|先进行|先由专席)?只读[^\n]{0,24}(?:排查|核实|核查|检查)"
+    r"|建议选\s*A[^\n]{0,20}先(?:由专席)?只读(?:核实|排查|核查)具体是哪个)",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -581,6 +586,13 @@ def check_ask_pre_flight_guard(
             "在物理隔离的腾讯云 Stage 独立成员账号（200053747813）为内部研发同学开通联调/部署权限时，首选建议应直接授予该 Stage 成员子账号的 `AdministratorAccess`（admin 权限，严格隔离主账号与生产）"
             "（主人 2026-11-04 03:05:29 明确改判：『给他在stage配admin』）："
             "请在选项 A 中直接提供或建议在 Stage 独立成员账号（200053747813）授予 `AdministratorAccess`（admin），避免在已隔离的 Stage 子账号里抠碎片最小策略导致联调反复卡壳（REG-090 防打扰门禁，没有发送）",
+        )
+    if _PREMATURE_READONLY_INVESTIGATION_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "只读指标/实例/日志排查（Lane D）与转交专席核实属于 Agent 自治职责，严禁在尚未查清具体服务名（如『具体是哪个 gateway』）与实时指标前发 `sheepdog ask` 让主人拍板『A. 仅做只读指标与实例排查』"
+            "（因未先只读核查而发 ask 等批，会导致对方等待后自行让其 Agent 操作，主人批复『他说他的agent操作了 你可以帮忙盯着点』）："
+            "请立即直接 `sheepdog forward` 转交对应专席（或由当前专席直接执行只读核查），拿到真实服务名、当前实例数/配额与明确目标参数后，若确实需要执行生产变更，再由专席带齐实测数据发起一次精准 `sheepdog ask`（REG-094 防打扰门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return

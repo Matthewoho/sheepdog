@@ -1740,6 +1740,119 @@ class VersionAndObserveTest(unittest.TestCase):
                 # 第二次抖动后 _last_ep 仍未在 300s 窗口内被清空
                 self.assertIsNotNone(ws_cli._last_ep)
 
+    def test_reg094_stop_hook_none_decision_and_cli_lamb_yaml_tail_filter(self):
+        """1.1.5（REG-094）：
+        1. Stop hook `_unsent_ask_turn` 对 `- **等你定的事**：当前无。` 后紧跟同级列表 `- **接下来自动跟进的事**：...` 不误拦，
+           而对真正列了待拍板项但未调 `sheepdog ask` 的回复仍准确拦截并截断在同级后续章节前；
+        2. `_summarize_cli_lamb_log` 与 `_scan_lambs` 在 CLI 羔羊末尾含结构化 JSON 时自动过滤前置 `gcloud builds triggers import` 输出的 YAML 列表项（`- build` / `- deploy` / `- prod`）与键值行，避免 `JSON(...)` 被挤到第 3 行。
+        """
+        from sheepdog import engine, hook
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            t_none = root / "transcript_none.jsonl"
+            steps_none = [
+                {
+                    "step_index": 1,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "content": "[sheepdog] 新信号批次 `b20261104141100-release`",
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "content": (
+                        "### 二、待定事项与接下来做什么\n\n"
+                        "- **等你定的事**：当前无。\n"
+                        "- **接下来自动跟进的事**：\n"
+                        "  1. **`202611030051`（Kai Feng `chat-service` 语音网关后续放量 & 审批单流转）**：等待观察 2 小时。\n"
+                    ),
+                },
+            ]
+            t_none.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in steps_none) + "\n", encoding="utf-8")
+            self.assertIsNone(hook._unsent_ask_turn(t_none))
+
+            t_real = root / "transcript_real.jsonl"
+            steps_real = [
+                {
+                    "step_index": 10,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "content": "[sheepdog] 新信号批次 `b20261104141100-release`",
+                },
+                {
+                    "step_index": 11,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "content": (
+                        "### 二、待定事项与接下来做什么\n\n"
+                        "- **等你定的事**：\n"
+                        "  - A：将生产 Trigger 中的 cloud-sdk:slim 替换为 cloud-sdk\n"
+                        "- **接下来自动跟进的事**：\n"
+                        "  1. 等待 Sammy 审批通过\n"
+                    ),
+                },
+            ]
+            t_real.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in steps_real) + "\n", encoding="utf-8")
+            unsent = hook._unsent_ask_turn(t_real)
+            self.assertIsNotNone(unsent)
+            self.assertEqual(unsent[0], "ask:10")
+            self.assertIn("cloud-sdk:slim", unsent[1])
+            self.assertNotIn("接下来自动跟进的事", unsent[1])
+
+            yaml_json_log = (
+                "repositoryEventConfig:\n"
+                "  push:\n"
+                "    tag: ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{7}$\n"
+                "serviceAccount: projects/taplabs-453508/serviceAccounts/cloud-build-prod@taplabs-453508.iam.gserviceaccount.com\n"
+                "substitutions:\n"
+                "  _DEPLOY_PROJECT_ID: taplabs-453508\n"
+                "  _TRAFFIC_MODE: all\n"
+                "  _VERSION_DESCRIPTION: ''\n"
+                "tags:\n"
+                "- build\n"
+                "- deploy\n"
+                "- prod\n"
+                '{"ok": false, "new_build_id": "4dabd043-0c29-4f06-90a3-5a69b6ff719b", "patched_all_triggers_count": 74}\n'
+            )
+            s_out, has_err = engine._summarize_cli_lamb_log(yaml_json_log)
+            self.assertTrue(has_err)
+            self.assertTrue(s_out.startswith("JSON(ok=False, new_build_id=4dabd043-0c29-4f06-90a3-5a69b6ff719b"))
+            self.assertNotIn("- deploy", s_out)
+            self.assertNotIn("- prod", s_out)
+
+            # 3) 未先做只读核查就发起「A. 仅做只读指标与实例排查」的空手 ask 被 check_ask_pre_flight_guard 拦截（REG-094）
+            from sheepdog import admin_web, outbound
+            from sheepdog.config import Config
+            from sheepdog.store import Store
+
+            cfg = Config(self_open_id="ou_owner", state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            with self.assertRaises(outbound.OutboundError) as cm:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_bus",
+                    "Leon 申请生产 gateway 扩容核实",
+                    "Leon Liang 私聊反馈生产 gateway 实例数打满请求扩容。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 仅做只读指标与实例排查（执行：新开专席 tp_prod-gateway-investigation）\n"
+                    "B. 同意核实后受控扩容（执行：新开专席 tp_prod-gateway-investigation）\n"
+                    "建议：建议选 A 先由专席只读核实具体是哪个 gateway，确认需要后再由你拍板扩容。",
+                )
+            self.assertIn("REG-094", str(cm.exception))
+            code, label = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · Leon 申请生产 gateway 扩容核实 [tp_bus]",
+                "他说他的agent操作了 你可以帮忙盯着点",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code, "stale_or_already_handled")
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
