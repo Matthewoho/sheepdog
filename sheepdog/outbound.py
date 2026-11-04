@@ -603,6 +603,15 @@ _LARK_DOC_LINK_EVIDENCE_RE = re.compile(
     r"(?:(?:larksuite\.com|feishu\.cn)/(?:docx|docs|wiki)/[A-Za-z0-9]+|飞书(?:云)?文档|Lark\s*文档)",
     re.I,
 )
+_MAIL_ASSISTANT_ONLY_ACCESS_ASK_RE = re.compile(
+    r"(?:(?:邮件助手|Mail\s*Assistant|飞书邮箱|邮箱)(?:收到|推送|转来|发来)[^\n。]{0,36}(?:访问|权限|Access\s*Request|申请|请求)"
+    r"|\[Access\s*Request\][^\n]{0,80}requested\s+access\s+to)",
+    re.I,
+)
+_FEISHU_DIRECT_REQUEST_EVIDENCE_RE = re.compile(
+    r"(?:当事人在飞书|本人(?:已)?在飞书|在飞书(?:私聊|群内|主动)(?:找过来|提出|确认|催办)|飞书消息\s*`?om_[A-Za-z0-9]+)",
+    re.I,
+)
 _UNVERIFIED_TICKET_PROMISE_RE = re.compile(
     r"(?:正在跟进(?:腾讯云|阿里云|GCP|AWS|云厂商|官方|该)?[^\n。；]{0,24}工单"
     r"|(?:目前已|已经|已)提(?:工)?单咨询(?:腾讯云|阿里云|GCP|AWS|云厂商)?[^\n。；]{0,16}(?:架构师|客服|技术支持|售后)?"
@@ -822,6 +831,13 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-04 21:29 在 `[其他]` 明确要求：『给我完整的方案吧 用lark文档 我要仔细看看』，REG-106 多组件容量方案必附飞书文档门禁）："
             "请先将完整的全栈容量对比、连接数/IOPS/内存水位测算、各组件目标规格与回缩预案整理成飞书云文档（Lark Docx）并授权主人可访问，"
             "在 `sheepdog ask` 正文中附上飞书文档链接（`https://.../docx/...`）后再发起请示（没有发送）",
+        )
+    if _MAIL_ASSISTANT_ONLY_ACCESS_ASK_RE.search(full_text) and not _FEISHU_DIRECT_REQUEST_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "严禁针对仅由邮件助手（Mail Assistant / 飞书邮箱）推送的自动权限或预览访问申请邮件（如 Vercel Access Request 等）且当事人未在飞书主动找过来的情况发起 `sheepdog ask`"
+            "（主人 2026-11-05 00:50 在 `[其他]` 明确立规：『邮箱来的消息吗 暂时不管』，REG-107 邮件助手自动权限申请静默门禁）："
+            "凡仅从邮箱/邮件助手收到的自动申请通知、申请人未在飞书私聊或群内主动提出诉求的，请直接静默归档并交 `handled` 回执，严禁发 `sheepdog ask` 打扰主人或主动私聊当事人（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

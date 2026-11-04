@@ -3446,20 +3446,38 @@ class Dispatcher:
 
     def _group_peer_status(self, t) -> str:
         gid = (t["group_id"] if "group_id" in t.keys() else "") or ""
-        if not gid:
-            return ""
-        g_topics = self.store.get_group_topics(gid)
-        all_watches = self.store.open_watches()
-        p_counts = {gt["topic_id"]: self.store.count_pending_messages_for_topic(gt["topic_id"]) for gt in g_topics}
-        p_work = {gt["topic_id"]: self.store.open_work(gt["topic_id"]) for gt in g_topics}
-        p_watches = {gt["topic_id"]: [w for w in all_watches if w["topic_id"] == gt["topic_id"]] for gt in g_topics}
-        snap = self.store.group_context_snapshot(gid, t["topic_id"])
-        try:
-            out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches, snapshot=snap)
-        except TypeError:
-            out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches)
-        if out and snap and not any(s in out for s in snap):
-            out = "\n".join([*out.splitlines(), *[f"  - {s}" for s in snap]][:10])
+        out = ""
+        if gid:
+            g_topics = self.store.get_group_topics(gid)
+            all_watches = self.store.open_watches()
+            p_counts = {gt["topic_id"]: self.store.count_pending_messages_for_topic(gt["topic_id"]) for gt in g_topics}
+            p_work = {gt["topic_id"]: self.store.open_work(gt["topic_id"]) for gt in g_topics}
+            p_watches = {gt["topic_id"]: [w for w in all_watches if w["topic_id"] == gt["topic_id"]] for gt in g_topics}
+            snap = self.store.group_context_snapshot(gid, t["topic_id"])
+            try:
+                out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches, snapshot=snap)
+            except TypeError:
+                out = render_group_peer_status(t["topic_id"], g_topics, p_counts, p_work, p_watches)
+            if out and snap and not any(s in out for s in snap):
+                out = "\n".join([*out.splitlines(), *[f"  - {s}" for s in snap]][:10])
+        own_lambs = self.store.get_active_lambs(t["topic_id"])
+        if own_lambs:
+            lamb_lines = [
+                "## 🐑 当前在途羔羊（禁止在母羊主线程重复跑同款重活或 tail 轮询子代理日志）"
+            ]
+            for lb in own_lambs[:5]:
+                lid = lb["lamb_id"]
+                kind = lb["kind"] or "subagent"
+                cid = (lb["conversation_id"] or "").strip()
+                title = (lb["task_title"] or "").strip() or lid
+                cid_note = f", cid=`{cid}`" if cid else ""
+                lamb_lines.append(f"- `{lid}` ({kind}{cid_note})：{title}")
+            lamb_lines.append(
+                "> 💡 若本批消息是同一任务的补充线索，请用 `send_message` 转发给在途 subagent（或等待其自动回流 `[lamb:...]`），"
+                f"并在 30 秒内交 `waiting` 回执（`--anchors lamb:{own_lambs[0]['lamb_id']}`）释放批次锁，严禁在母羊主线程重复执行耗时命令或轮询 `transcript.jsonl`！"
+            )
+            lamb_block = "\n".join(lamb_lines)
+            out = f"{out}\n\n{lamb_block}" if out else lamb_block
         return out
 
     def _is_zombie_antigravity(self, t, from_uncertain: bool = False) -> bool:
@@ -3552,11 +3570,73 @@ class Dispatcher:
         )
         return new_rows, new_card
 
+    def _maybe_nudge_hol_queue_pressure(self, t, rows: list, res: dict) -> bool:
+        """1.1.18（REG-107）：当 Antigravity 会话持锁运行当前批次满 3 分钟（180s），且队列中已有后续新信号排队满 3 分钟
+        （在 5 分钟 Queue Head-of-Line SLA 告警触发前），向运行中的母羊发送一次背压提醒（每批次最多一次），
+        督促其立即把慢排查/尾随日志下放给异步羔羊并交 waiting 回执释放队列锁。"""
+        if t["state"] != sm.RUNNING or self._priority_blocked(t):
+            return False
+        tid, bid = t["topic_id"], (t["pending_batch_id"] or "").strip()
+        if not bid or tid == BUS_TOPIC_ID:
+            return False
+        nudge_key = f"hol_pressure_nudge:{bid}"
+        if self.store.get_meta(nudge_key):
+            return False
+        now = _now()
+        disp_dt = _parse(t["dispatched_at"] or "")
+        if disp_dt is None or disp_dt.tzinfo is None or (now - disp_dt) < timedelta(seconds=180):
+            return False
+        signals = [r for r in rows if not _is_pure_owner_context(r)]
+        if not signals:
+            return False
+        max_wait_s = 0.0
+        for r in signals:
+            tags_raw = str(r["tags_json"] or "") if "tags_json" in r.keys() else ""
+            is_fwd = '"forwarded"' in tags_raw or '"forwarded_from:' in tags_raw
+            q_ts = str((r["last_seen"] if is_fwd and "last_seen" in r.keys() else None) or r["create_time"] or "")
+            q_dt = _parse(q_ts)
+            if q_dt is None or q_dt.tzinfo is None:
+                continue
+            eff_since = max(disp_dt, q_dt)
+            wait_s = (now - eff_since).total_seconds()
+            if wait_s > max_wait_s:
+                max_wait_s = wait_s
+        if max_wait_s < 180:
+            return False
+        cli = self.cfg.cli_command
+        own_lambs = self.store.get_active_lambs(tid)
+        anchor_ex = f"lamb:{own_lambs[0]['lamb_id']}" if own_lambs else "lamb:<id>"
+        lamb_hint = (
+            f"（当前已有在途羔羊 `{own_lambs[0]['lamb_id']}`：{own_lambs[0]['task_title']}，请勿在母羊主线程重复跑同款命令或 `tail` 轮询其日志，直接挂 `--anchors {anchor_ex}`）"
+            if own_lambs
+            else "（用 `invoke_subagent` 或 `sheepdog lamb-spawn` 派生异步羔羊，并挂 `--anchors lamb:<id>`）"
+        )
+        run_mins = max(3, int((now - disp_dt).total_seconds() // 60))
+        wait_mins = max(3, int(max_wait_s // 60))
+        msg_text = (
+            f"⏱️ [sheepdog 队列背压提醒 · 非新批次] 你手上的批次 `{bid}` 已运行 {run_mins} 分钟，"
+            f"后面已有 {len(signals)} 条新消息在队列里等了 {wait_mins} 分钟（即将触发 5 分钟 Queue Head-of-Line SLA 队头阻塞告警）。\n"
+            f"请立即停止在母羊主线程内串行执行慢命令或 `tail` 轮询子代理日志！若剩余排查/构建耗时 > 30 秒，请立即下放给羔羊{lamb_hint}，"
+            f"并在当前回合先交 `waiting` 回执释放批次锁，让排队消息先进来：\n"
+            f"`{cli} receipt --topic {tid} --batch {bid} --status waiting --anchors {anchor_ex} --summary \"已转交异步羔羊跟进，释放队列锁处理后续新消息\"`"
+        )
+        self.store.set_meta(nudge_key, now_iso())
+        try:
+            self._send(t, msg_text)
+        except SinkError as e:
+            log.warning("topic %s: 发送队列背压提醒失败（%s）", tid, e)
+            return False
+        res["hol_nudged"] = bid
+        log.info("topic %s: 批次 %s 运行 %d 分钟阻塞 %d 条新信号满 %d 分钟，已发在途队列背压提醒", tid, bid, run_mins, len(signals), wait_mins)
+        return True
+
     def _dispatch_topic(self, t, rows) -> dict:
         res = {"pending": len(rows), "sent": 0, "state": t["state"]}
         if not self._deliverable(t):
             if t["state"] == sm.RUNNING and self.cfg.session.owner_priority and (urgent := self._priority_rows(rows)):
                 return self._dispatch_priority(t, urgent, res)
+            if t["state"] == sm.RUNNING:
+                self._maybe_nudge_hol_queue_pressure(t, rows, res)
             log.info("topic %s 状态 %s，%d 条信号排队中", t["topic_id"], t["state"], len(rows))
             return res
         if self._is_zombie_antigravity(t):
@@ -6521,7 +6601,10 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
     return lid
 
 
-_GREP_MATCH_LINE_RE = re.compile(r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+:\d+:", re.M)
+_GREP_MATCH_LINE_RE = re.compile(
+    r"^(?:/|\./|~/|[A-Za-z0-9_.-]+/)[^:\n]+(?::\d+:|\.(?:jsonl|json|md|py|toml|ya?ml|txt|log|sh):)",
+    re.M,
+)
 _INTERMEDIATE_POLL_LINE_RE = re.compile(r"\bpoll\s+\d+\s*:.*\bstatus=(?:WORKING|QUEUED|PENDING)\b", re.I)
 _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
     r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b)",
@@ -6731,6 +6814,13 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             except Exception:
                 pass
     meaningful = [ln for ln in non_empty if not re.match(r"^[{}\[\],;:\s]+$", ln)]
+    non_grep_all = [
+        ln for ln in meaningful
+        if not _GREP_MATCH_LINE_RE.match(ln)
+        and not ('"WaitMsBeforeAsync"' in ln and '"toolSummary"' in ln)
+    ]
+    if non_grep_all:
+        meaningful = non_grep_all
     if not has_err:
         non_grep = [
             ln for ln in meaningful
@@ -6761,7 +6851,8 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
             return f"JSON_TAIL(sections={len(obj_keys)}, last={obj_keys[-1]}{tail_kv})", has_err
         if kv_pairs:
             return f"JSON_TAIL({', '.join(kv_pairs[-4:])})", has_err
-    return "\n".join(tail_lines), has_err
+    capped_tail = [ln[:237] + "..." if len(ln) > 240 else ln for ln in tail_lines]
+    return "\n".join(capped_tail), has_err
 
 
 def _terminate_lamb_process(lb: dict) -> bool:

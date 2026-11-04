@@ -3023,6 +3023,215 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertNotEqual(trunc_sum.strip(), "{")
             self.assertIn("kubectl get pods", trunc_sum)
 
+    def test_reg107_active_lamb_prompt_injection_and_hol_queue_pressure_nudge(self) -> None:
+        """REG-107: 独立母羊会话（group_id 为空）名下存在 running 羔羊时，新批次提示词必须自动注入『## 🐑 当前在途羔羊』防主线程重复跑同款重活或 tail 轮询；且当母羊持锁运行满 3 分钟阻塞后续新消息满 3 分钟时，自动发送每批次最多一次的在途队列背压提醒。"""
+        from datetime import timedelta
+        from unittest.mock import patch
+        from sheepdog import engine, observe
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.roster import parse_roster
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_test_owner", state_dir=state_dir, config_path=state_dir / "config.toml")
+            cfg.playbook_dir = str(Path(__file__).resolve().parent / "fixtures" / "playbook")
+            cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            roster = parse_roster(
+                {
+                    "session": [
+                        {
+                            "key": "infra-migration-ops",
+                            "mode": "managed",
+                            "conversation_id": "conv_test_infra_107",
+                            "title": "跨云迁移值守",
+                            "duty": "负责跨云迁移改造排障",
+                            "chats": [{"chat_id": "oc_test_infra_107", "name": "Infra 迁移群", "all_messages": True}],
+                        }
+                    ]
+                }
+            )
+            sent_to_sink: list[tuple[str, str]] = []
+
+            class _FakeSink:
+                name = "agentapi"
+
+                def send_message(self, conversation_id: str, text: str, batch_id: str = "") -> None:
+                    sent_to_sink.append((conversation_id, text))
+
+                def transcript_contains(self, conversation_id: str, needle: str) -> bool:
+                    return True
+
+            disp = engine.Dispatcher(cfg, store, _FakeSink(), roster=roster)
+            store.upsert_topic(
+                "tp_infra-migration-ops",
+                kind="standing",
+                title="跨云迁移值守",
+                conversation_id="conv_test_infra_107",
+                state="active",
+                onboarded_at="2026-11-05T00:00:00+08:00",
+                rules_hash=disp.rules_hash(store.get_topic("tp_infra-migration-ops") or {"topic_id": "tp_infra-migration-ops", "kind": "standing", "title": "跨云迁移值守", "duty": "负责跨云迁移改造排障", "authority": "", "self_polling": "", "retire_self_polling": 0, "group_id": ""}),
+            )
+            # 1) 母羊已派生在途 subagent 羔羊 lamb_f8a8ad1b 且处于可投递态（state=active, group_id=''）
+            store.create_lamb(
+                "lamb_f8a8ad1b",
+                "tp_infra-migration-ops",
+                kind="subagent",
+                task_title="排查Ethan反馈历史记录加载失败根因",
+                conversation_id="2370527a-b554-4a41-87ae-9e2194e2f3e3",
+                state="running",
+                started_at="2026-11-05T00:21:29+08:00",
+                last_act_at="2026-11-05T00:24:00+08:00",
+            )
+            m1 = Message(
+                message_id="om_test_ethan_followup_107",
+                chat_id="oc_test_infra_107",
+                chat_name="Infra 迁移群",
+                chat_type="group",
+                sender_id="ou_test_ethan",
+                sender_name="Ethan Wen",
+                sender_type="user",
+                content="看起来都和文件上传下载有关",
+                msg_type="text",
+                create_time="2026-11-05T00:24:45+08:00",
+            )
+            store.upsert_message(m1, "dispatch", "roster_chat_all", [], "tp_infra-migration-ops", "pending")
+            t0 = datetime.fromisoformat("2026-11-05T00:24:45+08:00")
+            with patch("sheepdog.engine._now", return_value=t0), patch("sheepdog.engine.now_iso", return_value=t0.isoformat()):
+                disp.dispatch_once()
+            self.assertEqual(len(sent_to_sink), 1)
+            batch_prompt_txt = sent_to_sink[-1][1]
+            self.assertIn("## 🐑 当前在途羔羊", batch_prompt_txt)
+            self.assertIn("lamb_f8a8ad1b", batch_prompt_txt)
+            self.assertIn("2370527a-b554-4a41-87ae-9e2194e2f3e3", batch_prompt_txt)
+            self.assertIn("--anchors lamb:lamb_f8a8ad1b", batch_prompt_txt)
+
+            # 2) 母羊持锁运行当前批次满 4 分钟，且队列中有新消息（Andy Xiao 在 00:30:00 发来）已排队 4 分钟（>= 180s）：
+            #    _dispatch_topic 自动发送一次在途队列背压提醒（每批次最多一次）
+            t_cur = store.get_topic("tp_infra-migration-ops")
+            blocking_bid = t_cur["pending_batch_id"]
+            self.assertTrue(blocking_bid)
+            m2 = Message(
+                message_id="om_test_andy_queued_107",
+                chat_id="oc_test_infra_107",
+                chat_name="Infra 迁移群",
+                chat_type="group",
+                sender_id="ou_test_andy",
+                sender_name="Andy Xiao",
+                sender_type="user",
+                content="国内环境是不是还没有配置 google login 相关的配置？",
+                msg_type="text",
+                create_time="2026-11-05T00:30:00+08:00",
+            )
+            store.upsert_message(m2, "dispatch", "roster_chat_all", [], "tp_infra-migration-ops", "pending")
+
+            # 在 00:31:00（排队仅 60s < 180s）时不触发背压提醒
+            t_early = datetime.fromisoformat("2026-11-05T00:31:00+08:00")
+            with patch("sheepdog.engine._now", return_value=t_early), patch("sheepdog.engine.now_iso", return_value=t_early.isoformat()):
+                res_early = disp.dispatch_once()
+            self.assertEqual(len(sent_to_sink), 1)
+            self.assertNotIn("hol_nudged", res_early["topics"]["tp_infra-migration-ops"])
+
+            # 在 00:34:00（批次已跑 9m15s，m2 已排队 4m >= 180s）时触发一次在途队列背压提醒
+            t_late = datetime.fromisoformat("2026-11-05T00:34:00+08:00")
+            with patch("sheepdog.engine._now", return_value=t_late), patch("sheepdog.engine.now_iso", return_value=t_late.isoformat()):
+                res_nudge = disp.dispatch_once()
+            self.assertEqual(len(sent_to_sink), 2)
+            self.assertEqual(res_nudge["topics"]["tp_infra-migration-ops"].get("hol_nudged"), blocking_bid)
+            nudge_txt = sent_to_sink[-1][1]
+            self.assertIn("[sheepdog 队列背压提醒 · 非新批次]", nudge_txt)
+            self.assertIn(blocking_bid, nudge_txt)
+            self.assertIn("--status waiting --anchors lamb:lamb_f8a8ad1b", nudge_txt)
+
+            # 同一批次再次 tick 不重复发送
+            t_later = t_late + timedelta(minutes=1)
+            with patch("sheepdog.engine._now", return_value=t_later), patch("sheepdog.engine.now_iso", return_value=t_later.isoformat()):
+                disp.dispatch_once()
+            self.assertEqual(len(sent_to_sink), 2)
+
+            # 3) observe(self_heal=True) 在 Queue Head-of-Line SLA 满 5 分钟且 state=running 时自动写入 .wakeup
+            obs_res = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=datetime.fromisoformat("2026-11-05T00:36:00+08:00"),
+                self_heal=True,
+                check_processes=False,
+                check_log=False,
+            )
+            self.assertTrue(any("Queue Head-of-Line SLA" in w for w in obs_res["warns"]))
+            self.assertTrue((state_dir / ".wakeup").exists())
+
+            # 4) Mail Assistant 邮件通知（含收件人 matthewhong-8968）路由至 INBOX (bot_p2p) 而非误触 bot_p2p_keyword
+            from sheepdog import admin_web, outbound, router
+            from sheepdog.config import RoutingConfig
+
+            rcfg = RoutingConfig(keywords=["Matthew", "紧急"])
+            rctx = router.RouteContext("ou_test_owner")
+            mail_msg = Message(
+                message_id="om_test_mail_assistant_107",
+                chat_id="oc_test_mail_p2p",
+                chat_name="",
+                chat_type="p2p",
+                sender_id="cli_test_mail_assistant_107",
+                sender_name="Mail Assistant",
+                sender_type="app",
+                content='<card title="[Access Request] finderhugo-6325 requested access to tapnow-test-pr-9117-test-1.vercel.app">Access request Hello, matthewhong-8968. finder.hugo@gmail.com wants access</card>',
+                msg_type="interactive",
+                create_time="2026-11-05T00:39:00+08:00",
+            )
+            r_dec = router.route(mail_msg, rctx, rcfg)
+            self.assertEqual(r_dec.route, router.INBOX)
+            self.assertEqual(r_dec.reason, "bot_p2p")
+
+            # 5) check_ask_pre_flight_guard 拦截仅由邮件助手推送且当事人未在飞书主动找过来的自动权限申请 ask
+            mail_ask_body = (
+                "事情：邮件助手收到 Vercel 访问申请：内部同事 Hugo Xie 请求访问测试环境前端 PR 预览地址 tapnow-test-pr-9117-test-1.vercel.app。\n"
+                "选项：\nA. 批准访问并通知他\nB. 暂不批准\n"
+                "建议：选 A\n执行：tp_auth"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_mail:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_auth",
+                    "Hugo Xie 申请 Vercel 测试预览访问",
+                    mail_ask_body,
+                )
+            self.assertIn("REG-107", str(ctx_mail.exception))
+
+            # 若当事人在飞书主动提出诉求（附飞书消息说明）则正常放行
+            feishu_ask_body = mail_ask_body + "\n补充：当事人已在飞书私聊主动找过来（飞书消息 `om_test_feishu_req_107`）请求协助开通。"
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                store,
+                "tp_auth",
+                "Hugo Xie 申请 Vercel 测试预览访问",
+                feishu_ask_body,
+            )
+
+            # 6) diagnose_override_reason 将『邮箱来的消息吗 暂时不管』归入 stale_or_already_handled
+            c_mail, l_mail = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · Hugo Xie 申请 Vercel 测试预览访问 [tp_auth]\n{mail_ask_body}",
+                "邮箱来的消息吗 暂时不管",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_mail, l_mail), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            # 7) _summarize_cli_lamb_log 过滤无行号的 rg .jsonl/.md 匹配行（即便末尾含 error）
+            rg_err_log = (
+                "/tmp/test_workspace/80_Context/atoms/2026-10-07.jsonl:{\"confidence\": \"high\", \"id\": \"atom_b2639ecbc2e5\"}\n"
+                "=== [3] Check Vercel API with User-Agent ===\n"
+                "Teams: {\"error\": \"HTTP Error 403: Forbidden\"}\n"
+            )
+            rg_sum, rg_has_err = engine._summarize_cli_lamb_log(rg_err_log)
+            self.assertTrue(rg_has_err)
+            self.assertNotIn("2026-10-07.jsonl:", rg_sum)
+            self.assertIn("HTTP Error 403: Forbidden", rg_sum)
+
 
 if __name__ == "__main__":
     unittest.main()

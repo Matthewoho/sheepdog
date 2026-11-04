@@ -74,6 +74,15 @@ def message_bodies(content: str) -> list[str]:
     return out
 
 
+def _is_mail_assistant_p2p(msg: Message) -> bool:
+    if not msg.is_bot_sender:
+        return False
+    sname = (msg.sender_name or "").strip().lower()
+    if sname in ("mail assistant", "邮件助手", "lark mail", "飞书邮箱"):
+        return True
+    return "applink.larksuite.com/client/mail/card/" in (msg.content or "")
+
+
 def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 1. 自己发的
     if ctx.self_open_id and msg.sender_id == ctx.self_open_id:
@@ -97,7 +106,7 @@ def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
     # 3. 私聊
     if msg.is_p2p:
         if msg.is_bot_sender and not cfg.dispatch_bot_p2p:
-            if kw:
+            if kw and not _is_mail_assistant_p2p(msg):
                 return RouteDecision(DISPATCH, "bot_p2p_keyword", [f"keyword:{kw}"])
             return RouteDecision(INBOX, "bot_p2p")
         return RouteDecision(DISPATCH, "p2p")

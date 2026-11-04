@@ -778,6 +778,11 @@ def run_observe(
                             except sqlite3.Error:
                                 healed_hol = False
                         if not healed_hol:
+                            if self_heal and topic_state == "running" and pending_batch != "无" and state_dir is not None:
+                                try:
+                                    (state_dir / ".wakeup").write_text(iso(ref_now), encoding="utf-8")
+                                except OSError:
+                                    pass
                             warn.append(
                                 f"消息排队超 5 分钟（Queue Head-of-Line SLA 队头阻塞）：{tid} {len(ages)} 条 "
                                 f"最久 {int(max_age_s // 60)} 分钟（阻塞批次={pending_batch} state={topic_state}）"
