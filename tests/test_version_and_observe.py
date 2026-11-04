@@ -2013,6 +2013,101 @@ class VersionAndObserveTest(unittest.TestCase):
             )
             self.assertEqual(code, "context_incomplete")
 
+    def test_reg097_bus_proxy_specialist_ask_guard_and_subagent_stall_and_json_lamb(self):
+        """REG-097: 拦截 tp_bus 替专席越俎代庖发 ask + Subagent 工具返回后模型回合静默卡住 5m 收尾提取 + CLI 羔羊顶层 JSON dict 免被内部字符串 Error 误判失败 + 下午6点弄识别为带参采纳。"""
+        from sheepdog import admin_web, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(self_open_id="ou_owner", state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            self.addCleanup(store.close)
+
+            # 1) tp_bus 在拍板卡中将执行/核查委派给专席 tp_prod-gateway-monitor -> 被 REG-097 门禁拦截并提示改用 forward
+            with self.assertRaises(outbound.OutboundError) as cm:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    store,
+                    "tp_bus",
+                    "Leon 申请删除生产 Cloud Run agent-gateway 旧修订",
+                    "Leon 在群里申请删除生产网关两个 0 流量旧修订来快速释放 256 个实例。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 同意删除旧修订（执行：tp_prod-gateway-monitor，核对 0% 流量无 tag 后执行并回读）\n"
+                    "B. 不主动删除，等待自然清空（执行：tp_prod-gateway-monitor，盯守确认自然清空）\n"
+                    "建议：建议选 B（等待自然清空）。",
+                )
+            self.assertIn("REG-097", str(cm.exception))
+            self.assertIn("tp_prod-gateway-monitor", str(cm.exception))
+
+            # 2) tp_bus 因转交被拒绝或询问开启 Codex 会话 -> 正常放行
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                store,
+                "tp_bus",
+                "转交 tp_release 被拒绝请示",
+                "总线转交专席 tp_release 时被拒绝（会话处于 closed 状态）。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 恢复名册并重投（执行：tp_release）\n"
+                "B. 直接在飞书审批",
+            )
+
+            # 3) CLI 羔羊输出顶层合法 JSON dict（无顶层 error/ok=False），但内部探测字段含多行 JS 与 SyntaxError 字符串 -> has_err 为 False，且多行字符串被折叠截断
+            raw_json_log = json.dumps(
+                {
+                    "fake_secret_oracle": "file:///tmp/[eval1]:1\nimport https from 'node:https';\nSyntaxError: Invalid or unexpected token\n    at compileSourceTextModule",
+                    "prod_logs_count": 38,
+                    "files_checked": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            summary_str, has_err = engine._summarize_cli_lamb_log(raw_json_log)
+            self.assertFalse(has_err, summary_str)
+            self.assertIn("prod_logs_count=38", summary_str)
+            self.assertNotIn("\n", summary_str)
+
+            # 4) Subagent transcript 最后一步为 GENERIC DONE，且包含前序 Command output -> _harvest_subagent_stall_state 提取成功
+            tp_file = root / "subagent_transcript.jsonl"
+            tp_file.write_text(
+                json.dumps(
+                    {
+                        "step_index": 131,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "content": "Created At: 2026-11-04T15:17:40+08:00\nCompleted At: 2026-11-04T15:17:44+08:00\nCommand exited with code 0.\n\nCommand output:\n24h Max Allocated Ports: 1024\n24h Max Open Connections: 51",
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "step_index": 133,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "content": "Created At: 2026-11-04T15:17:55+08:00\nCompleted At: 2026-11-04T15:17:55+08:00\nCreated file.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            is_stalled, harvested = engine._harvest_subagent_stall_state(tp_file)
+            self.assertTrue(is_stalled)
+            self.assertIn("24h Max Open Connections: 51", harvested)
+
+            # 5) 主人回复「[卡片回调] 其他：下午6点弄 弄完要定时观察」-> _ACCEPT_WORDS_RE 匹配为带参采纳
+            self.assertIsNotNone(admin_web._ACCEPT_WORDS_RE.search("下午6点弄 弄完要定时观察"))
+            code, _ = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · Leon 申请删除生产 Cloud Run 旧修订 [tp_bus]\nA. 同意（执行：tp_prod-gateway-monitor）",
+                "同意删除旧修订",
+                "A",
+                "B",
+            )
+            self.assertEqual(code, "peer_or_owner_delegate")
+
 
 if __name__ == "__main__":
     unittest.main()

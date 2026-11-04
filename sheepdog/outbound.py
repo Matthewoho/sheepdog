@@ -506,6 +506,14 @@ _NAT_PEAK_PER_VM_PORT_EVIDENCE_RE = re.compile(
     r"|port_usage|allocated_ports|used_ports)",
     re.I,
 )
+_BUS_PROXY_SPECIALIST_ASK_RE = re.compile(
+    r"(?:执行\s*[：:]\s*(?:新开专席\s*)?|由.{0,8}专席\s*[（(]?|建议由\s*)(tp_(?!bus\b)[a-z0-9_-]+)",
+    re.I,
+)
+_BUS_CODEX_OR_BLOCKED_FORWARD_ASK_RE = re.compile(
+    r"(?:\bcodex\b|转交[^\n。]{0,24}(?:被拒绝|失败|报错|失联|已收掉|closed))",
+    re.I,
+)
 
 
 def check_ask_pre_flight_guard(
@@ -612,6 +620,19 @@ def check_ask_pre_flight_guard(
             "请示调小/下调 Cloud NAT 网关 `minPortsPerVm`（`--min-ports-per-vm`）前，必须先通过 Cloud Monitoring 只读核查当前单实例（per-VM）最高端口使用数 / 已分配端口峰值及动态端口分配上限（`maxPortsPerVm`）"
             "（主人反问：『那会不会有什么影响呢 有办法看最高端口使用数的一个实例用了多少个端口吗』）："
             "请先查清当前单实例最高端口使用数（如 `nat/port_usage` / `allocated_ports` 单 VM 最大值）与调小后的实际影响评估并写入正文，严禁未附单实例峰值端口实测数据就发 ask（REG-096 防打扰门禁，没有发送）",
+        )
+    if (
+        topic_id == BUS_TOPIC_ID
+        and (m_spec := _BUS_PROXY_SPECIALIST_ASK_RE.search(full_text))
+        and not _BUS_CODEX_OR_BLOCKED_FORWARD_ASK_RE.search(full_text)
+    ):
+        spec_tid = m_spec.group(1)
+        raise OutboundError(
+            EXIT_INVALID,
+            f"总线（tp_bus）严禁在未做现场只读核查的情况下替专席（{spec_tid}）越俎代庖发『需要你定』拍板卡"
+            "（因总线无 gcloud/代码/库表只读权限，代发卡片既缺实时现场核实导致盲猜建议被推翻，又让卡片回调多绕一跳）："
+            f"请立即改用 `sheepdog forward --topic {spec_tid} --message-ids <原消息ID>`（若该专席尚未创建则先 `sheepdog new-session`）直接转交专席，"
+            f"由 `{spec_tid}` 完成现场只读核查（如核实 0% 流量无 tag 旧修订实例、IAM vs 数据库账密等）后直接向主人发卡请示（REG-097 防总线越权代问门禁，没有发送）",
         )
     if topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
         return

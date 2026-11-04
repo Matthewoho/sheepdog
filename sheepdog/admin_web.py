@@ -86,7 +86,8 @@ _CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:]\s*
 _CHOICE_PREFIX_RE = re.compile(r"^\[(?:[A-E]|其他)\]\s*", re.I)
 _ACCEPT_WORDS_RE = re.compile(
     r"(?:^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
-    r"|直接配|直接弄|帮我弄|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理|18点(?:执行|再动)"
+    r"|直接配|直接弄|帮我弄|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理"
+    r"|(?:18\s*点|(?:下午|晚上|今晚)\s*6\s*点)\s*(?:弄|执行|再动|操作|改|调|发|切)"
     r"|(?:我(?:已经|直接|自己|刚)?(?:撤回|删掉|删除|处理|弄好|发过|改好|搞定)了?|已(?:直接)?撤回)"
     r"|\bwsurl\s*[:=]|\bkey\s*[:=].*\bsecret\s*[:=])",
     re.I,
@@ -117,6 +118,9 @@ def diagnose_override_reason(
         r"(?:3x-ui|laohu|老胡|nicky|sammy|ziyi|kaichi|发版人|谁负责|问问那个人|让他找|去找|找\s*\S+\s*(?:沟通|确认|问|反馈)|帮忙看看|新开专席|转交专席|由专席(?:只读)?排查)",
         s,
         re.I,
+    ) or (
+        "[tp_bus]" in (text or "")
+        and re.search(r"(?:执行\s*[：:]\s*(?:新开专席\s*)?|由.{0,8}专席\s*[（(]?|建议由\s*)tp_(?!bus\b)[a-z0-9_-]+", text or "", re.I)
     ):
         return ("peer_or_owner_delegate", "未先找专席或Owner")
     if re.search(

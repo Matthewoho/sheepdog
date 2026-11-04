@@ -4748,17 +4748,37 @@ class Dispatcher:
                         log.info("topic %s: 从母羊近期 transcript 自动补绑 subagent conversation_id %s -> %s (%s)",
                                  tid, cid, lid, lb["task_title"])
             last_dt = _parse(lb["last_act_at"] or "") or _parse(lb["started_at"] or "")
+            is_mid_turn_generic_stall = False
+            harvested_tool_out = ""
             if lb["conversation_id"]:
                 tp = transcript_path(lb["conversation_id"])
                 act = last_activity_at(ANTIGRAVITY, tp) if tp.exists() else None
                 if act is not None and (last_dt is None or act > last_dt):
                     last_dt = act
                     self.store.update_lamb(lid, last_act_at=act.astimezone().isoformat(timespec="seconds"))
-            if last_dt is not None and now - last_dt >= timeout_delta:
-                summary = lb["result_summary"] or f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时"
+                if tp.exists() and last_dt is not None and now - last_dt >= timedelta(minutes=5):
+                    is_mid_turn_generic_stall, harvested_tool_out = _harvest_subagent_stall_state(tp)
+            mid_turn_stall_delta = min(timeout_delta, timedelta(minutes=5))
+            if last_dt is not None and (
+                now - last_dt >= timeout_delta
+                or (lb["conversation_id"] and is_mid_turn_generic_stall and now - last_dt >= mid_turn_stall_delta)
+            ):
+                if lb["result_summary"]:
+                    summary = lb["result_summary"]
+                elif is_mid_turn_generic_stall and now - last_dt < timeout_delta:
+                    summary = (
+                        f"羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟（已自动提取最近工具输出）：{harvested_tool_out}"
+                        if harvested_tool_out
+                        else "羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟，已超时收尾"
+                    )
+                else:
+                    summary = (
+                        f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时（最近输出：{harvested_tool_out}）"
+                        if harvested_tool_out
+                        else f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时"
+                    )
                 complete_lamb(self.store, lid, summary=summary, state="timeout")
-                log.warning("羔羊 %s（母羊 %s）超过 %d 分钟无心跳，已标为 timeout 并唤醒母羊",
-                            lid, tid, self.cfg.lamb.timeout_minutes)
+                log.warning("羔羊 %s（母羊 %s）超过阈值无心跳，已标为 timeout 并唤醒母羊", lid, tid)
         reported: list[str] = []
         for lb in self.store.get_unreported_finished_lambs():
             complete_lamb(self.store, lb["lamb_id"], summary=lb["result_summary"] or "", state=lb["state"])
@@ -6453,6 +6473,50 @@ def _unwrap_edited_content(text: str) -> tuple[str, str]:
     return s, s
 
 
+def _harvest_subagent_stall_state(tp: Path) -> tuple[bool, str]:
+    """REG-097：检查 subagent 羔羊 transcript 尾部是否在工具返回（GENERIC DONE）后模型回合静默卡死，并提取最近的工具输出摘要。"""
+    if not tp.exists():
+        return False, ""
+    try:
+        size = tp.stat().st_size
+        start = max(0, size - 65536)
+        with tp.open("rb") as f:
+            if start > 0:
+                f.seek(start)
+                f.readline()
+            raw = f.read()
+    except OSError:
+        return False, ""
+    steps: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            if isinstance(d, dict):
+                steps.append(d)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    if not steps:
+        return False, ""
+    last_step = steps[-1]
+    is_generic_done = bool(
+        str(last_step.get("type") or "") == "GENERIC"
+        and str(last_step.get("status") or "") == "DONE"
+    )
+    harvested = ""
+    for st in reversed(steps[-8:]):
+        if str(st.get("type") or "") == "GENERIC":
+            c = str(st.get("content") or "")
+            if "Command output:" in c:
+                out_part = c.split("Command output:", 1)[1].strip()
+                if out_part:
+                    harvested = " ".join(out_part.split())[:240]
+                    break
+    return is_generic_done, harvested
+
+
 def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
     """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
     优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片。"""
@@ -6495,15 +6559,23 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                 obj = json.loads(cand)
                 if isinstance(obj, dict):
                     st_val = str(obj.get("status") or "").strip()
-                    if obj.get("ok") is False or st_val.lower() in ("failed", "error", "failure", "timeout", "cancelled") or obj.get("error") or obj.get("Error"):
+                    pre_non_empty = [ln.strip() for ln in stripped[:idx].splitlines() if ln.strip()] if idx != -1 else []
+                    if (
+                        obj.get("ok") is False
+                        or st_val.lower() in ("failed", "error", "failure", "timeout", "cancelled")
+                        or obj.get("error")
+                        or obj.get("Error")
+                        or obj.get("err")
+                        or obj.get("traceback")
+                    ):
                         has_err = True
                     elif (
                         obj.get("ok") is True
                         or st_val.upper() in ("SUCCESS", "OK", "DONE", "HANDLED")
                         or ("RequestId" in obj and "Error" not in obj)
+                        or not any(k in "\n".join(pre_non_empty[-15:]) for k in ("Traceback", "Fatal", "ERROR:"))
                     ):
                         has_err = False
-                    pre_non_empty = [ln.strip() for ln in stripped[:idx].splitlines() if ln.strip()] if idx != -1 else []
                     if pre_non_empty and _YAML_FRAGMENT_LINE_RE.match(pre_non_empty[-1]):
                         raw_prefix = []
                     else:
@@ -6536,7 +6608,12 @@ def _summarize_cli_lamb_log(raw_text: str) -> tuple[str, bool]:
                     compact_parts: list[str] = []
                     for k in ordered_keys:
                         v = obj[k]
-                        if isinstance(v, (str, int, float, bool)) or v is None:
+                        if isinstance(v, str):
+                            v_clean = " ".join(v.split())
+                            if len(v_clean) > 80:
+                                v_clean = v_clean[:77] + "..."
+                            compact_parts.append(f"{k}={v_clean}")
+                        elif isinstance(v, (int, float, bool)) or v is None:
                             compact_parts.append(f"{k}={v}")
                         elif isinstance(v, list):
                             compact_parts.append(f"{k}=[{len(v)} items]")
