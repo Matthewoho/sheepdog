@@ -238,9 +238,14 @@ def build_evolve_digest(
     slow_rows = conn.execute(
         """
         SELECT batch_id, topic_id, state, sent_at, acked_at,
-               ROUND((julianday(COALESCE(acked_at, ?)) - julianday(sent_at)) * 86400.0, 1) AS dur_s
+               ROUND((julianday(CASE
+                   WHEN acked_at IS NOT NULL AND acked_at != '' THEN acked_at
+                   WHEN state IN ('sent', 'sending', 'uncertain') THEN ?
+                   ELSE sent_at
+               END) - julianday(sent_at)) * 86400.0, 1) AS dur_s
         FROM dispatches
         WHERE sent_at >= ?
+          AND state NOT IN ('context', 'priority', 'redelivered')
         ORDER BY dur_s DESC
         LIMIT 10
         """,
@@ -270,19 +275,39 @@ def build_evolve_digest(
         """,
         (window_iso,),
     ).fetchall()
-    recent_lambs = [
-        {
-            "lamb_id": r["lamb_id"],
-            "parent_topic_id": r["parent_topic_id"],
-            "kind": r["kind"],
-            "task_title": r["task_title"],
-            "state": r["state"],
-            "started_at": r["started_at"],
-            "finished_at": r["finished_at"],
-            "result_summary": (r["result_summary"] or "")[:160],
-        }
-        for r in lamb_rows
-    ]
+    recent_lambs = []
+    for r in lamb_rows:
+        st_val = str(r["state"] or "")
+        p_tid = str(r["parent_topic_id"] or "")
+        fin_at = str(r["finished_at"] or "")
+        recovered_by_parent = False
+        if st_val == "failed" and p_tid and fin_at:
+            has_newer_done_lamb = conn.execute(
+                "SELECT 1 FROM lambs WHERE parent_topic_id = ? AND state = 'done' AND started_at >= ? LIMIT 1",
+                (p_tid, fin_at),
+            ).fetchone() is not None
+            has_post_ack = conn.execute(
+                "SELECT 1 FROM dispatches WHERE topic_id = ? AND state IN ('acked', 'acked_late') AND acked_at IS NOT NULL AND acked_at >= ? LIMIT 1",
+                (p_tid, fin_at),
+            ).fetchone() is not None
+            has_open_fail = conn.execute(
+                "SELECT 1 FROM dispatches WHERE topic_id = ? AND state IN ('failed', 'missed') AND sent_at >= ? LIMIT 1",
+                (p_tid, fin_at),
+            ).fetchone() is not None
+            recovered_by_parent = bool(has_newer_done_lamb or (has_post_ack and not has_open_fail))
+        recent_lambs.append(
+            {
+                "lamb_id": r["lamb_id"],
+                "parent_topic_id": r["parent_topic_id"],
+                "kind": r["kind"],
+                "task_title": r["task_title"],
+                "state": r["state"],
+                "started_at": r["started_at"],
+                "finished_at": r["finished_at"],
+                "result_summary": (r["result_summary"] or "")[:160],
+                "recovered_by_parent": recovered_by_parent,
+            }
+        )
 
     # D6: 跨会话同行反馈收件箱（发往 tp_sheepdog 的留言或待处理系统消息）
     evolve_tid = cfg.self_evolve.topic_id
@@ -327,7 +352,9 @@ def build_evolve_digest(
     seen_failed_lamb_ids: set[str] = set(str(x) for x in (prev_evolve_st.get("seen_failed_lamb_ids") or []) if x)
     failed_lambs = [
         lb for lb in recent_lambs
-        if lb.get("state") in ("failed", "timeout") and str(lb.get("lamb_id") or "") not in seen_failed_lamb_ids
+        if lb.get("state") in ("failed", "timeout")
+        and not lb.get("recovered_by_parent")
+        and str(lb.get("lamb_id") or "") not in seen_failed_lamb_ids
     ]
     if failed_lambs:
         action_reasons.append(f"failed_lambs({len(failed_lambs)})")

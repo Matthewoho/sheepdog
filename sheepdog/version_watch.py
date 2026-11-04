@@ -513,6 +513,68 @@ def _resolve_rollback_info(store, root: Path, prev_ver: str, prev_sha: str, prev
     return {}
 
 
+def _collect_rollback_window_residue(store, since_iso: str) -> dict:
+    """盘点新版本在岗窗口 [t_swap, t_rollback] 内残留的在途子任务（lambs）、在途批次（dispatches）与已产生的外发副作用（sends）。"""
+    res: dict = {
+        "since_at": since_iso or "",
+        "running_lambs": [],
+        "in_flight_dispatches": [],
+        "completed_dispatches_count": 0,
+        "outbound_sends_count": 0,
+    }
+    if store is None or not getattr(store, "conn", None):
+        return res
+    conn = store.conn
+    tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    try:
+        if "lambs" in tabs:
+            if since_iso:
+                rows = conn.execute(
+                    "SELECT lamb_id, parent_topic_id, kind, task_title FROM lambs WHERE state='running' AND started_at >= ? ORDER BY started_at DESC LIMIT 10",
+                    (since_iso,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT lamb_id, parent_topic_id, kind, task_title FROM lambs WHERE state='running' ORDER BY started_at DESC LIMIT 10"
+                ).fetchall()
+            res["running_lambs"] = [
+                {
+                    "lamb_id": r["lamb_id"],
+                    "parent_topic_id": r["parent_topic_id"],
+                    "kind": r["kind"],
+                    "task_title": r["task_title"],
+                }
+                for r in rows
+            ]
+        if "dispatches" in tabs:
+            if since_iso:
+                inf = conn.execute(
+                    "SELECT batch_id, topic_id, state FROM dispatches WHERE state IN ('sent','sending','uncertain') AND sent_at >= ? ORDER BY sent_at DESC LIMIT 10",
+                    (since_iso,),
+                ).fetchall()
+                res["completed_dispatches_count"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM dispatches WHERE state IN ('acked','acked_late') AND sent_at >= ?",
+                        (since_iso,),
+                    ).fetchone()[0]
+                )
+            else:
+                inf = conn.execute(
+                    "SELECT batch_id, topic_id, state FROM dispatches WHERE state IN ('sent','sending','uncertain') ORDER BY sent_at DESC LIMIT 10"
+                ).fetchall()
+            res["in_flight_dispatches"] = [
+                {"batch_id": r["batch_id"], "topic_id": r["topic_id"], "state": r["state"]}
+                for r in inf
+            ]
+        if "sends" in tabs and since_iso:
+            res["outbound_sends_count"] = int(
+                conn.execute("SELECT COUNT(*) FROM sends WHERE sent_at >= ?", (since_iso,)).fetchone()[0]
+            )
+    except Exception:
+        pass
+    return res
+
+
 def execute_upgrade(
     dispatcher, *, reply_to: str = "", command: str = "", no_pull: bool = False,
     channel: str = "stable", rollback: bool = False, target_sha: str = "",
@@ -532,23 +594,41 @@ def execute_upgrade(
     is_rollback = bool(rollback or channel == "rollback")
     if is_rollback:
         rb_target = (target_sha or "").strip()
-        if not rb_target and dispatcher.store is not None:
+        since_iso = ""
+        if dispatcher.store is not None:
             saved = _safe_json(dispatcher.store.get_meta("version_rollback_target"))
             if isinstance(saved, dict):
-                rb_target = str(saved.get("git_sha") or "").strip()
+                if not rb_target:
+                    rb_target = str(saved.get("git_sha") or "").strip()
+                since_iso = str(saved.get("saved_at") or "").strip()
         if not rb_target:
             rb_target = "HEAD~1"
         rolled_ok, rb_out, rb_err = rollback_repo_to_target(root, rb_target, timeout=15.0)
         disk_after = version_info(root, prefer_disk_version=True)
+        residue = _collect_rollback_window_residue(dispatcher.store, since_iso)
+        res_parts: list[str] = []
+        if residue["running_lambs"]:
+            lb_names = "、".join(f"`{x['lamb_id']}`({x['parent_topic_id']})" for x in residue["running_lambs"][:5])
+            res_parts.append(f"在途羔羊 `{len(residue['running_lambs'])}` 只（{lb_names}）")
+        if residue["in_flight_dispatches"]:
+            dp_names = "、".join(f"`{x['batch_id']}`({x['topic_id']})" for x in residue["in_flight_dispatches"][:5])
+            res_parts.append(f"在途批次 `{len(residue['in_flight_dispatches'])}` 个（{dp_names}）")
+        if not res_parts:
+            res_parts.append("在途残留 `0` 项")
+        if residue["completed_dispatches_count"] or residue["outbound_sends_count"]:
+            res_parts.append(
+                f"期间已结案批次 `{residue['completed_dispatches_count']}` 个 / 外发消息 `{residue['outbound_sends_count']}` 条"
+            )
+        residue_line = f"\n🔍 期间状态与在途盘点：{'；'.join(res_parts)}。"
         if rolled_ok:
             dispatcher.restart_requested = True
-            body = f"⏪ 已从 **{mem_disp}** 回滚至 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程使其立即生效。"
+            body = f"⏪ 已从 **{mem_disp}** 回滚至 **{disk_after['display']}**（PID {pid}），正在原地重启常驻进程使其立即生效。{residue_line}"
         else:
             dispatcher.restart_requested = False
-            body = f"⚠️ 回滚失败（{rb_err}），当前仍为 **{disk_after['display']}**（PID {pid}）。"
+            body = f"⚠️ 回滚失败（{rb_err}），当前仍为 **{disk_after['display']}**（PID {pid}）。{residue_line}"
         dispatcher._notify_owner(f"🐕 汇报 · 升级完成 [{BUS_TOPIC_ID}]\n{body}", "升级完成", BUS_TOPIC_ID, reply_to=reply_to)
         log.info("已执行 rollback 动作（%s -> %s，ok=%s，target=%s，command=%r）", mem_disp, disk_after["display"], rolled_ok, rb_target, command)
-        return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": "rollback", "rollback": True, "rolled_back": rolled_ok, "rollback_output": rb_out, "rollback_failed_reason": rb_err, "restart_requested": bool(rolled_ok)}
+        return {"from": mem_disp, "to": disk_after["display"], "version": disk_after["version"], "git_sha": disk_after["git_sha"], "channel": "rollback", "rollback": True, "rolled_back": rolled_ok, "rollback_output": rb_out, "rollback_failed_reason": rb_err, "window_residue": residue, "restart_requested": bool(rolled_ok)}
 
     pulled, pull_output, pull_failed_reason = False, "", ""
     if not no_pull and (root / ".git").exists():

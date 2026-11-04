@@ -1201,9 +1201,13 @@ class Store:
     def dispatches_in_state(self, state: str) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM dispatches WHERE state=? ORDER BY sent_at", (state,)).fetchall()
 
-    def set_dispatch_state(self, batch_id: str, state: str, error: str | None = None) -> None:
+    def set_dispatch_state(self, batch_id: str, state: str, error: str | None = None, acked_at: str | None = None) -> None:
+        ts = acked_at or (now_iso() if state in ("acked", "acked_late") else None)
         with self.tx() as c:
-            c.execute("UPDATE dispatches SET state=?, error=COALESCE(?, error) WHERE batch_id=?", (state, error, batch_id))
+            c.execute(
+                "UPDATE dispatches SET state=?, error=COALESCE(?, error), acked_at=COALESCE(?, acked_at) WHERE batch_id=?",
+                (state, error, ts, batch_id),
+            )
 
     def timed_out_dispatches(self, topic_id: str, error_prefix: str) -> list[sqlite3.Row]:
         """这个会话判过回执超时的批次（failed / missed，error 以 error_prefix 开头），按发送时间排。"""
@@ -1276,6 +1280,12 @@ class Store:
             bid = (r["relay_batch"] or "").strip()
             if bid in missing and bid not in updates:
                 updates[bid] = r["relay_at"]
+        for r in self.conn.execute(
+            "SELECT batch_id, sent_at FROM dispatches WHERE state IN ('acked','acked_late') AND (acked_at IS NULL OR acked_at='') AND error LIKE 'forwarded:%' AND sent_at IS NOT NULL AND sent_at != ''"
+        ):
+            bid = (r["batch_id"] or "").strip()
+            if bid in missing and bid not in updates:
+                updates[bid] = r["sent_at"]
         if not updates:
             return 0
         with self.tx() as c:

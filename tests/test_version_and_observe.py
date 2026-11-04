@@ -2593,6 +2593,79 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("主人在面板直接下达了指令", mock_send.call_args[0][1])
             self.assertIn("若主人叫停则保持停手", mock_send.call_args[0][1])
 
+    def test_reg102_evolve_parent_recovered_lamb_and_forwarded_dispatch_acked_at_and_rollback_residue(self):
+        from sheepdog import __version__, evolve, parse_version_tuple, version_watch
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 13))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(cfg.db_path)
+            store.upsert_topic("tp_release", kind="custom", title="Release Bot", conversation_id="cid-rel", state="active")
+            store.upsert_topic("tp_bus", kind="known", title="Bus", conversation_id="cid-bus", state="active")
+            store.upsert_topic("tp_infra", kind="custom", title="Infra", conversation_id="cid-inf", state="active")
+
+            ref_now = datetime(2026, 11, 4, 19, 12, 0, tzinfo=observe.TZ)
+            t_context = (ref_now - timedelta(minutes=50)).isoformat(timespec="seconds")
+            t_fwd = (ref_now - timedelta(minutes=45)).isoformat(timespec="seconds")
+            t_lamb_fail = (ref_now - timedelta(minutes=3)).isoformat(timespec="seconds")
+            t_lamb_done = (ref_now - timedelta(minutes=1)).isoformat(timespec="seconds")
+
+            # 1) set_dispatch_state(..., 'acked') 自动写入 acked_at；context 批次与已转发批次不应在 evolve D4 误算为超时慢批次
+            store.conn.execute(
+                "INSERT INTO dispatches(batch_id, topic_id, message_ids, sent_at, state, acked_at) VALUES(?,?,?,?,?,?)",
+                ("b-ctx-102", "tp_infra", "[]", t_context, "context", None),
+            )
+            store.conn.execute(
+                "INSERT INTO dispatches(batch_id, topic_id, message_ids, sent_at, state, acked_at) VALUES(?,?,?,?,?,?)",
+                ("b-fwd-102", "tp_bus", "[]", t_fwd, "sent", None),
+            )
+            store.conn.commit()
+            store.set_dispatch_state("b-fwd-102", "acked", error="forwarded:tp_release")
+            fwd_row = store.get_dispatch("b-fwd-102")
+            self.assertIsNotNone(fwd_row["acked_at"])
+            store.conn.execute(
+                "UPDATE dispatches SET acked_at=? WHERE batch_id='b-fwd-102'",
+                ((ref_now - timedelta(minutes=44, seconds=50)).isoformat(timespec="seconds"),),
+            )
+            store.conn.commit()
+
+            # 2) 母羊已在失败羔羊后拉起新羔羊成功完成（或已 ack 后续批次）时，不应再触发 failed_lambs 告警
+            store.conn.execute(
+                "INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, state, started_at, finished_at, result_summary) VALUES(?,?,?,?,?,?,?,?)",
+                ("lamb_fail_102", "tp_release", "cli", "核查构建v1", "failed", (ref_now - timedelta(minutes=4)).isoformat(timespec="seconds"), t_lamb_fail, "JSONDecodeError"),
+            )
+            store.conn.execute(
+                "INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, state, started_at, finished_at, result_summary) VALUES(?,?,?,?,?,?,?,?)",
+                ("lamb_done_102", "tp_release", "cli", "核查构建v2", "done", t_lamb_done, ref_now.isoformat(timespec="seconds"), "OK"),
+            )
+            store.conn.commit()
+
+            digest = evolve.build_evolve_digest(cfg, store, since_minutes=65.0, now_dt=ref_now)
+            slow_ids = [x["batch_id"] for x in digest["d4_latency_and_slow_dispatches"]["slow_dispatches"]]
+            self.assertNotIn("b-ctx-102", slow_ids)
+            self.assertNotIn("b-fwd-102", slow_ids)
+            self.assertNotIn("failed_lambs(1)", digest["action_reasons"])
+            rec_map = {lb["lamb_id"]: lb.get("recovered_by_parent") for lb in digest["d5_bus_and_lambs"]["recent_lambs"]}
+            self.assertTrue(rec_map.get("lamb_fail_102"))
+
+            # 3) 回滚窗口状态残留盘点（_collect_rollback_window_residue）：显式列出 [t_swap, t_rollback] 期间在途羔羊与批次
+            store.conn.execute(
+                "INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, state, started_at) VALUES(?,?,?,?,?,?)",
+                ("lamb_running_102", "tp_infra", "subagent", "压测HPA扩缩容核查", "running", (ref_now - timedelta(seconds=30)).isoformat(timespec="seconds")),
+            )
+            store.conn.commit()
+            residue = version_watch._collect_rollback_window_residue(
+                store, (ref_now - timedelta(minutes=10)).isoformat(timespec="seconds")
+            )
+            self.assertEqual(len(residue["running_lambs"]), 1)
+            self.assertEqual(residue["running_lambs"][0]["lamb_id"], "lamb_running_102")
+
 
 if __name__ == "__main__":
     unittest.main()
