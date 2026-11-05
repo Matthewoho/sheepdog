@@ -3531,16 +3531,15 @@ class Dispatcher:
         return self.store.get_topic(t["topic_id"])
 
     def _auto_unstick_idle_antigravity(self, t, card, rows: list) -> tuple[list, object]:
-        """1.1.3（REG-092）：当真实 Antigravity 会话已处于可投递态（pending_batch_id 为空，无在跑批次）且记录文件存在，
-        但因上一批 SYSTEM_MESSAGE 落盘后宿主瞬时未触发推理而在回执超时后被标为 missed + 看板 STUCK（lost/stalled）时，
+        """1.1.3（REG-092）/ 1.1.25（REG-114）：当真实 Antigravity 会话已处于可投递态（pending_batch_id 为空，无在跑批次）且记录文件存在，
+        但因上一批 SYSTEM_MESSAGE 落盘后宿主瞬时未触发推理而在回执超时后被标为 missed + 看板 STUCK（lost/stalled）或因 duty_reset 被重置为 IDLE 时，
         自动将未触发任何 PLANNER_RESPONSE 的 missed 批次重新并入待推队列，并重置看板 STUCK 锁，消除「不发新消息永远不动 <-> 不动永远不发新消息」死锁。"""
         tid = t["topic_id"]
         prev_label = duty.RUN_LABEL.get(card["run_state"] if card else "", "卡住")
         last_act = _parse(card["last_act_at"] or "") if card is not None else None
-        reset_dt = _parse(self.store.get_meta(duty_reset_key(tid)))
-        floor = [x for x in (last_act, reset_dt) if x is not None]
-        floor_dt = max(floor) if floor else None
+        floor_dt = last_act
         now = _now()
+        ts = now_iso()
         requeued_batches: list[str] = []
         for d in self.store.recent_dispatches(tid):
             if d["state"] != "missed":
@@ -3550,6 +3549,11 @@ class Dispatcher:
                 continue
             if floor_dt is not None and sent <= floor_dt:
                 continue
+            if not rows:
+                if now - sent < timedelta(seconds=180):
+                    continue
+                if self.store.get_meta(f"missed_batch_requeued:{d['batch_id']}"):
+                    continue
             if not self._has_planner_response_since(t, sent):
                 missed_msgs = self.store.conn.execute(
                     "SELECT message_id, reason, tags_json FROM messages WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
@@ -3584,11 +3588,12 @@ class Dispatcher:
                             (tid, *requeue_mids),
                         )
                 if requeue_mids:
+                    if not rows:
+                        self.store.set_meta(f"missed_batch_requeued:{d['batch_id']}", ts)
                     self.store.set_dispatch_state(d["batch_id"], "redelivered", error="宿主未触发推理，随后续批次合并重投")
                     requeued_batches.append(d["batch_id"])
                 elif dup_mids:
                     self.store.set_dispatch_state(d["batch_id"], "acked", error="重复羔羊完工汇报已自动去重收口")
-        ts = now_iso()
         for e in self.store.echo_open():
             if e["topic_id"] != tid or e["stage"] != ECHO_DELIVERED or e["relay_batch"]:
                 continue
@@ -3660,8 +3665,13 @@ class Dispatcher:
                 max_wait_s = wait_s
         if max_wait_s < 180:
             return False
-        cli = self.cfg.cli_command
+        card = self.store.get_card(tid)
+        if card is not None and card["run_state"] in duty.STUCK:
+            return False
         own_lambs = self.store.get_active_lambs(tid)
+        if not own_lambs and not self._has_planner_response_since(t, disp_dt):
+            return False
+        cli = self.cfg.cli_command
         anchor_ex = f"lamb:{own_lambs[0]['lamb_id']}" if own_lambs else "lamb:<id>"
         lamb_hint = (
             f"（当前已有在途羔羊 `{own_lambs[0]['lamb_id']}`：{own_lambs[0]['task_title']}，请勿在母羊主线程重复跑同款命令或 `tail` 轮询其日志，直接挂 `--anchors {anchor_ex}`）"
@@ -3705,12 +3715,14 @@ class Dispatcher:
             return res
         card = self.store.get_card(t["topic_id"])
         if (
-            card is not None
-            and card["run_state"] in duty.STUCK
-            and t["state"] != sm.FAILED
+            t["state"] != sm.FAILED
             and self.topic_host(t) == ANTIGRAVITY
             and getattr(self._sink(ANTIGRAVITY), "name", "") == "agentapi"
             and not self._record_missing(t)
+            and (
+                (card is not None and card["run_state"] in duty.STUCK)
+                or any(d["state"] == "missed" for d in self.store.recent_dispatches(t["topic_id"]))
+            )
         ):
             rows, card = self._auto_unstick_idle_antigravity(t, card, rows)
             res["pending"] = len(rows)
@@ -4845,6 +4857,7 @@ class Dispatcher:
                     if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip():
                         complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错", state="failed", report_msg_id="subagent_spawn_error")
         for ret in subagent_returns_in(host, d):
+            from . import guard as _g_sub
             cands = (
                 [lb for lb in self.store.get_active_lambs(tid) if (lb["conversation_id"] or "").strip() == ret.conversation_id]
                 or [
@@ -4852,7 +4865,13 @@ class Dispatcher:
                     if (lb["conversation_id"] or "").strip() == ret.conversation_id
                     and (
                         lb["state"] == "timeout"
-                        or (lb["state"] == "done" and str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# ")))
+                        or (
+                            lb["state"] == "done"
+                            and (
+                                str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
+                                or bool(_g_sub._SUBAGENT_META_LINE_RE.match(str(lb["result_summary"] or "").replace("`", "").strip()))
+                            )
+                        )
                     )
                 ]
             )
@@ -4871,7 +4890,7 @@ class Dispatcher:
                 log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lb["lamb_id"], cid)
 
     def _scan_lambs(self) -> list[str]:
-        """7.63 / 7.106：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案，并自愈存量占位/grep 摘要。"""
+        """7.63 / 7.106 / 1.1.25（REG-114）：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案，并自愈存量占位/grep/元信息摘要。"""
         from . import guard as _g
         if b"pre-tool hook" not in _g._NEEDLES[LAMB_DISCOVERY]:
             _g._NEEDLES[LAMB_DISCOVERY] = (*_g._NEEDLES[LAMB_DISCOVERY], b"pre-tool hook", b"Encountered error", b'"ERROR"')
@@ -4889,7 +4908,10 @@ class Dispatcher:
                 if lb["state"] == "done"
                 and lb["kind"] in ("subagent", "native_subagent")
                 and (lb["conversation_id"] or "").strip()
-                and str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
+                and (
+                    str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
+                    or bool(_g._SUBAGENT_META_LINE_RE.match(str(lb["result_summary"] or "").replace("`", "").strip()))
+                )
             ]
             if need_sub_heal and (tp_file := self._record_file(t)) is not None and tp_file.exists():
                 scan_jsonl(
@@ -4899,9 +4921,12 @@ class Dispatcher:
                 )
                 for lb in need_sub_heal:
                     after_lb = self.store.get_lamb(lb["lamb_id"])
-                    if after_lb and str(after_lb["result_summary"] or "").strip().startswith(("[lamb:", "# ")):
+                    if after_lb and (
+                        str(after_lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
+                        or bool(_g._SUBAGENT_META_LINE_RE.match(str(after_lb["result_summary"] or "").replace("`", "").strip()))
+                    ):
                         fallback_sum = str(after_lb["result_summary"] or "").strip().lstrip("#").strip()
-                        if fallback_sum.startswith("[lamb:"):
+                        if fallback_sum.startswith("[lamb:") or _g._SUBAGENT_META_LINE_RE.match(fallback_sum.replace("`", "").strip()):
                             fallback_sum = after_lb["task_title"] or f"羔羊 {lb['lamb_id']} 已完成"
                         self.store.update_lamb(lb["lamb_id"], result_summary=fallback_sum)
             for lb in topic_lambs:
@@ -4986,6 +5011,13 @@ class Dispatcher:
                             ln.rstrip().endswith((" {", " [")) and not ln.lstrip().startswith(("{", "["))
                             for ln in cur_sum.splitlines()
                         )
+                        or any(
+                            _EMPTY_TRAILING_STDERR_LABEL_RE.match(ln.strip())
+                            for ln in cur_sum.splitlines()
+                        )
+                        or "Reply, forward, and other actions:" in cur_sum
+                        or "羊群看板 ·" in cur_sum
+                        or bool(re.search(r"^-\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}\s+Reply,\s+forward", cur_sum, re.M))
                     ):
                         try:
                             lp = Path(lb["log_path"])
@@ -5993,7 +6025,23 @@ class Dispatcher:
                     if not self._has_planner_response_since(t, deliv_dt):
                         has_unawakened_echo = True
                         break
-            if is_stuck or has_unawakened_echo:
+            has_unawakened_missed = False
+            if not is_stuck and not has_unawakened_echo:
+                last_act_dt = _parse(card["last_act_at"] or "") if card is not None else None
+                for d in self.store.recent_dispatches(tid):
+                    if d["state"] != "missed":
+                        continue
+                    sent_dt = _parse(d["sent_at"] or "")
+                    if sent_dt is None or sent_dt.tzinfo is None or (now - sent_dt) < timedelta(seconds=180):
+                        continue
+                    if last_act_dt is not None and sent_dt <= last_act_dt:
+                        continue
+                    if self.store.get_meta(f"missed_batch_requeued:{d['batch_id']}"):
+                        continue
+                    if not self._has_planner_response_since(t, sent_dt):
+                        has_unawakened_missed = True
+                        break
+            if is_stuck or has_unawakened_echo or has_unawakened_missed:
                 self._auto_unstick_idle_antigravity(t, card, [])
 
     def _pending_groups(self, tids: list[str]) -> tuple[list, dict[str, list]]:
@@ -6953,14 +7001,39 @@ _CLI_PASS_BANNER_RE = re.compile(
 _REDIRECTED_TMP_LOG_RE = re.compile(
     r">\s*['\"]?(/(?:private/)?tmp/[A-Za-z0-9_./-]+\.(?:log|txt|out|err))['\"]?"
 )
+_EMPTY_TRAILING_STDERR_LABEL_RE = re.compile(
+    r"^(?:\[?(?:DAG[_ ])?STD(?:ERR|OUT)\]?|DAG\s+stderr|STDERR|STDOUT)\s*:\s*$",
+    re.I,
+)
+_CLI_BOARD_TAIL_HDR_RE = re.compile(
+    r"^(?:===\s+.*\bboard\s+===|羊群看板\s*·)",
+    re.I,
+)
 
 
 def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, bool]:
-    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）/ REG-106：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
-    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行及截断 JSON 碎片（含孤立开闭括号）。"""
+    """7.101（REG-069）/ 7.106（REG-074）/ 7.107（REG-075）/ 7.117（REG-085）/ 7.118（REG-086）/ REG-106 / REG-114：从 CLI 羔羊日志提取有意义的尾行或末尾 JSON 摘要，
+    优先保留关键状态字段（ok/status/id/build_id/lane_id/service），并过滤尾部 grep/rg 路径匹配行噪音、已恢复 JSON 前的中间 Traceback 行、中间轮询 status=WORKING 行、gcloud 进度/代理提示行、空 stderr 标签行、末尾连带打印的羊群看板及截断 JSON 碎片。"""
     if not raw_text:
         return "", False
-    non_empty = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    raw_lines = raw_text.splitlines()
+    board_cut_idx = next(
+        (
+            i for i, ln in enumerate(raw_lines)
+            if _CLI_BOARD_TAIL_HDR_RE.match(ln.strip())
+            and any(prev.strip() for prev in raw_lines[:i])
+        ),
+        None,
+    )
+    if board_cut_idx is not None:
+        raw_lines = raw_lines[:board_cut_idx]
+    while raw_lines and (not raw_lines[-1].strip() or _EMPTY_TRAILING_STDERR_LABEL_RE.match(raw_lines[-1].strip())):
+        raw_lines.pop()
+    raw_text = "\n".join(raw_lines)
+    non_empty = [
+        ln.strip() for ln in raw_lines
+        if ln.strip() and not _EMPTY_TRAILING_STDERR_LABEL_RE.match(ln.strip())
+    ]
     if not non_empty:
         return "", False
     recent_window = "\n".join(non_empty[-30:])
@@ -7013,6 +7086,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                             and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)
                             and not _YAML_FRAGMENT_LINE_RE.match(ln)
                             and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+                            and not _EMPTY_TRAILING_STDERR_LABEL_RE.match(ln)
                         ]
                     if not has_err:
                         tb_idx = next((i for i, ln in enumerate(raw_prefix) if ln.startswith("Traceback")), None)

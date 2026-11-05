@@ -602,14 +602,22 @@ def recent_subagent_cids_since(host: str, path: Path | None, since_iso: str, par
 _LAMB_TAG_RE = re.compile(r"\[lamb:[A-Za-z0-9_.-]+\]", re.I)
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
 _MD_LIST_PREFIX_RE = re.compile(r"^(?:>\s*)*(?:[-*+]\s+|\d+[.)、]\s+)+")
-_SUBAGENT_GREETING_RE = re.compile(r"^母羊您好[，,：:\s]*")
+_SUBAGENT_GREETING_RE = re.compile(
+    r"^(?:母羊(?:（[^）]*）|\([^)]*\))?(?:您好|你好)[，,：:\s]*(?:(?:后台)?羔羊\s*`?lamb_[0-9a-f]{8}`?\s*)?(?:任务执行完毕[，,：:\s]*)?"
+    r"|羔羊任务执行完毕[，,：:\s]*(?:以下为[^：:]*[：:])?\s*)",
+    re.I,
+)
 _SUBAGENT_LEADIN_SUFFIX_RE = re.compile(
-    r"[，,；;]?\s*(?:结论与证据如下|核心结论与证据如下|结论如下|汇总大盘如下|汇总如下|详情如下|具体如下)[：:]?\s*$"
+    r"[，,；;]?\s*(?:核心结论与证据如下|结论与证据如下|核心结论如下|结论如下|汇总大盘如下|汇总如下|详情如下|具体如下)[：:]?\s*$"
+)
+_SUBAGENT_META_LINE_RE = re.compile(
+    r"^(?:任务单号|任务编号|羔羊编号|子代理编号|lamb_id|派发母羊|所属母羊|母羊会话|执行角色|执行羔羊|核验时间|汇报时间|完成时间|执行时间|授权凭证|日志路径|工作目录)\s*[：:]",
+    re.I,
 )
 
 
 def _summarize_subagent_return(raw_text: str, limit: int = 120) -> str:
-    """7.106（REG-074）：从子代理回传 Markdown 中提取实质结论摘要，剥离 [lamb:...] 路由标签、Markdown 标题与导语寒暄。"""
+    """7.106（REG-074）/ 1.1.25（REG-114）：从子代理回传 Markdown 中提取实质结论摘要，剥离 [lamb:...] 路由标签、Markdown 标题、元信息行与导语寒暄。"""
     cleaned_raw = _LAMB_TAG_RE.sub("", raw_text or "").strip()
     if not cleaned_raw:
         return ""
@@ -623,7 +631,7 @@ def _summarize_subagent_return(raw_text: str, limit: int = 120) -> str:
             continue
         if in_code_block or not s:
             continue
-        if re.match(r"^[-*_]{3,}$", s) or (s.startswith("|") and s.endswith("|")):
+        if re.match(r"^[-*_]{3,}$", s) or s.startswith("|") or s.startswith("<truncated "):
             continue
         if (m_h := _MD_HEADING_RE.match(s)) is not None:
             h_txt = m_h.group(1).replace("**", "").replace("__", "").strip()
@@ -631,6 +639,8 @@ def _summarize_subagent_return(raw_text: str, limit: int = 120) -> str:
                 headings.append(h_txt)
             continue
         b = _MD_LIST_PREFIX_RE.sub("", s).replace("**", "").replace("__", "").strip()
+        if _SUBAGENT_META_LINE_RE.match(b.replace("`", "").strip()):
+            continue
         b = _SUBAGENT_GREETING_RE.sub("", b).strip()
         b = _SUBAGENT_LEADIN_SUFFIX_RE.sub("", b).strip()
         if b:

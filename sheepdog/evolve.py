@@ -281,7 +281,7 @@ def build_evolve_digest(
         p_tid = str(r["parent_topic_id"] or "")
         fin_at = str(r["finished_at"] or "")
         recovered_by_parent = False
-        if st_val == "failed" and p_tid and fin_at:
+        if st_val in ("failed", "timeout") and p_tid and fin_at:
             has_newer_done_lamb = conn.execute(
                 "SELECT 1 FROM lambs WHERE parent_topic_id = ? AND state IN ('done', 'running') AND started_at >= ? LIMIT 1",
                 (p_tid, fin_at),

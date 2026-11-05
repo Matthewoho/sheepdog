@@ -3847,6 +3847,148 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(rep3["warns"], [])
             st.close()
 
+    def test_reg114_evolve_timeout_lamb_recovery_subagent_meta_strip_cli_board_stderr_and_missed_unstick(self):
+        """REG-114 (v1.1.25):
+        1) evolve.build_evolve_digest D5 marks timeout lambs as recovered_by_parent=True when the parent session subsequently acks its batch without open failures;
+        2) guard._summarize_subagent_return & engine._scan_lambs strip Markdown report metadata bullets (任务单号/派发母羊/执行角色/核验时间) and truncated table rows;
+        3) engine._summarize_cli_lamb_log & _scan_lambs strip trailing empty [DAG_STDERR]: / DAG stderr: labels and trailing sheepdog board dumps;
+        4) engine._auto_unstick_idle_antigravity & _recover_idle_stuck_topics re-queue unawakened missed batches even after _check_stopped_in_flight sets duty_reset:<tid>.
+        """
+        from sheepdog import evolve, guard, engine as eng_mod
+        from sheepdog.engine import Dispatcher, _summarize_cli_lamb_log
+        from sheepdog.roster import Roster, RosterSession
+
+        # 1) Subagent return summary strips metadata bullets and truncated table rows
+        raw_sub_md = (
+            "[lamb:lamb_9844f0ae]\n"
+            "# 羔羊独立盲审报告：T1 只读云上快照对账与 Gate 2 零未知漂移验算\n\n"
+            "- **任务单号**：`lamb_9844f0ae`\n"
+            "- **派发母羊**：`tp_tapnow-prod-topology`\n"
+            "- **执行角色**：`Meru-Verify Subagent`\n"
+            "- **核验时间**：2026-11-05 11:25 CST\n\n"
+            "| 核验项 | 状态 |\n"
+            "| :--- | :--- |\n"
+            "| `tapnow.tv` 站点归属 <truncated 9784 bytes>\n\n"
+            "母羊（`tp_tapnow-prod-topology`）您好，后台羔羊 `lamb_9844f0ae` 任务执行完毕，核心结论如下：\n"
+            "Gate 2 零未知漂移验算 100% 通过，生产子账号 200053747873 下无任何漂移。\n"
+        )
+        sub_sum = guard._summarize_subagent_return(raw_sub_md)
+        self.assertNotIn("任务单号", sub_sum)
+        self.assertNotIn("lamb_9844f0ae", sub_sum)
+        self.assertIn("Gate 2 零未知漂移验算 100% 通过", sub_sum)
+
+        # 2) CLI lamb log summary strips trailing empty [DAG_STDERR]: / DAG stderr: and trailing sheepdog board dumps
+        raw_cli_stderr = (
+            "[DAG_STDOUT]:\n"
+            "{\n"
+            '  "ok": true,\n'
+            '  "lane_id": "lane-a-regular",\n'
+            '  "service": "tapnow-bff",\n'
+            '  "status": "SUCCESS"\n'
+            "}\n\n"
+            "[DAG_STDERR]:\n"
+        )
+        cli_sum1, cli_err1 = _summarize_cli_lamb_log(raw_cli_stderr)
+        self.assertFalse(cli_err1)
+        self.assertIn("JSON(ok=True, status=SUCCESS, lane_id=lane-a-regular, service=tapnow-bff)", cli_sum1)
+        self.assertNotIn("[DAG_STDERR]:", cli_sum1)
+
+        raw_cli_board = (
+            "=== 1. Approval Instance Details ===\n"
+            "Status: APPROVED\n"
+            "Service: fe-app-tapnow (v2.18.0)\n"
+            "=== tp_sammy-shi board ===\n"
+            "羊群看板 · 1 个会话\n"
+            "- 2026-11-05T09:27:29+08:00 Reply, forward, and other actions: 12 items\n"
+        )
+        cli_sum2, cli_err2 = _summarize_cli_lamb_log(raw_cli_board)
+        self.assertFalse(cli_err2)
+        self.assertIn("Service: fe-app-tapnow (v2.18.0)", cli_sum2)
+        self.assertNotIn("Reply, forward, and other actions", cli_sum2)
+        self.assertNotIn("羊群看板", cli_sum2)
+
+        # 3) Evolve D5 timeout lamb recovery + _recover_idle_stuck_topics unsticking missed batch after duty_reset
+        from datetime import timezone
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sheepdog.sqlite3"
+            st = Store(db_path)
+            now_dt = datetime(2026, 11, 5, 11, 40, 0, tzinfo=timezone(timedelta(hours=8)))
+            t0_iso = (now_dt - timedelta(minutes=25)).isoformat(timespec="seconds")
+            t_fin_iso = (now_dt - timedelta(minutes=20)).isoformat(timespec="seconds")
+            t_ack_iso = (now_dt - timedelta(minutes=5)).isoformat(timespec="seconds")
+
+            st.upsert_topic("tp_kaifeng", title="Kai Feng", state="active", conversation_id="cid_kf", host="antigravity")
+            st.conn.execute(
+                """INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, state, started_at, last_act_at, finished_at, result_summary)
+                   VALUES('lamb_33b04ccc', 'tp_kaifeng', 'subagent', 'Cinemap Stage build', 'timeout', ?, ?, ?, '羔羊在工具返回后静默中断超 5 分钟')""",
+                (t0_iso, t0_iso, t_fin_iso),
+            )
+            st.record_dispatch("b_kf_after", "tp_kaifeng", ["om_kf_1"])
+            st.conn.execute(
+                "UPDATE dispatches SET state='acked', sent_at=?, acked_at=? WHERE batch_id='b_kf_after'",
+                (t_fin_iso, t_ack_iso),
+            )
+            st.conn.commit()
+
+            cfg = Config(state_dir=Path(tmp))
+            with mock.patch("sheepdog.observe.run_observe", return_value={"warns": [], "infos": [], "self_healed": []}):
+                dig = evolve.build_evolve_digest(cfg, st, since_minutes=60, now_dt=now_dt)
+            self.assertNotIn("failed_lambs(1)", dig["action_reasons"])
+            kf_lamb = next(lb for lb in dig["d5_bus_and_lambs"]["recent_lambs"] if lb["lamb_id"] == "lamb_33b04ccc")
+            self.assertTrue(kf_lamb["recovered_by_parent"])
+
+            # 4) Standalone recovery of unawakened missed batch when duty_reset:<tid> > sent_at and card is IDLE
+            brain_dir = Path(tmp) / "brain"
+            cid_af = "3bd5503a-152b-4ff3-b76e-1a8f04d91e9f"
+            tp_dir = brain_dir / cid_af / ".system_generated" / "logs"
+            tp_dir.mkdir(parents=True, exist_ok=True)
+            tp_file = tp_dir / "transcript.jsonl"
+            prev_act_iso = (now_dt - timedelta(minutes=30)).isoformat(timespec="seconds")
+            missed_sent_iso = (now_dt - timedelta(minutes=10)).isoformat(timespec="seconds")
+            reset_iso = (now_dt - timedelta(minutes=8)).isoformat(timespec="seconds")
+            tp_file.write_text(
+                json.dumps({"type": "PLANNER_RESPONSE", "created_at": prev_act_iso, "content": "prev ok"}) + "\n"
+                + json.dumps({"type": "USER_INPUT", "created_at": missed_sent_iso, "content": "batch b_missed_af"}) + "\n",
+                encoding="utf-8",
+            )
+            st.upsert_topic("tp_agent-first", title="Agent First", kind="adopted", state="active",
+                            conversation_id=cid_af, host="antigravity", onboarded_at=prev_act_iso)
+            st.upsert_card("tp_agent-first", run_state="idle", last_act_at=prev_act_iso, idle_since=reset_iso)
+            st.set_meta("duty_reset:tp_agent-first", reset_iso)
+
+            colleague_mid = "om_colleague_msg_114"
+            st.conn.execute(
+                """INSERT INTO messages(message_id, chat_id, chat_type, sender_id, sender_name, create_time, msg_type, content,
+                   route, reason, topic_id, dispatch_state, batch_id, first_seen, last_seen, tags_json)
+                   VALUES(?, 'oc_af', 'group', 'ou_kf', 'Kai Feng', ?, 'text', '请看下这个报错',
+                   'dispatch', 'group_Roster', 'tp_agent-first', 'missed', 'b_missed_af', ?, ?, '[]')""",
+                (colleague_mid, missed_sent_iso, missed_sent_iso, missed_sent_iso),
+            )
+            st.record_dispatch("b_missed_af", "tp_agent-first", [colleague_mid])
+            st.conn.execute(
+                "UPDATE dispatches SET state='missed', sent_at=? WHERE batch_id='b_missed_af'",
+                (missed_sent_iso,),
+            )
+            st.conn.commit()
+
+            roster = Roster(
+                sessions=[RosterSession(key="agent-first", mode="managed", title="Agent First", duty="test", chats=[])],
+            )
+
+            class _FakeAgentApiSink:
+                name = "agentapi"
+
+            disp = Dispatcher(cfg, st, _FakeAgentApiSink(), roster=roster)
+            with mock.patch.object(eng_mod, "transcript_path", side_effect=lambda c: brain_dir / c / ".system_generated" / "logs" / "transcript.jsonl"), \
+                 mock.patch.object(eng_mod, "_now", return_value=now_dt):
+                disp._recover_idle_stuck_topics(["tp_agent-first"])
+
+            msg_af = st.get_message(colleague_mid)
+            self.assertEqual(msg_af["dispatch_state"], "pending")
+            d_af = st.get_dispatch("b_missed_af")
+            self.assertEqual(d_af["state"], "redelivered")
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
