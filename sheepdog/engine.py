@@ -2704,7 +2704,7 @@ class Dispatcher:
             return  # 命令行宿主这一轮还在后台跑（或等重试）：跑完由 _finish_run 收尾，不按回执超时算
         sent = _parse(t["dispatched_at"])
         now = _now()
-        if duty.fresh_active_lambs(self.store, t["topic_id"], now, self.cfg.lamb.timeout_minutes):
+        if duty.fresh_active_lambs(self.store, t["topic_id"], now, self.cfg.lamb.timeout_minutes, min_started_at=sent):
             return
         if self._check_stopped_in_flight(t, batch, sent, now, adopted):
             return
@@ -2917,7 +2917,7 @@ class Dispatcher:
         静止满阈值自动发一次断点续跑唤醒；若已自动唤醒过一次后再次放行停机满 60 秒，立即按超时解锁。"""
         if self.topic_host(t) != ANTIGRAVITY:
             return False
-        if self.store.get_active_lambs(t["topic_id"]):
+        if duty.fresh_active_lambs(self.store, t["topic_id"], now, self.cfg.lamb.timeout_minutes, min_started_at=sent):
             return False
         from . import hook
         tid = t["topic_id"]
@@ -2963,6 +2963,14 @@ class Dispatcher:
                 elif (now - sent).total_seconds() >= 180 and idle_at is not None and bg_hang:
                     stopped_at, has_bg_hang = idle_at, bg_hang
                     min_idle = 90
+                elif (
+                    idle_at is not None
+                    and not bg_hang
+                    and is_real_agentapi
+                    and not self._has_owner_explicit_after_batch(t, batch)
+                ):
+                    stopped_at = idle_at
+                    min_idle = 60
         if stopped_at is None or (now - stopped_at).total_seconds() < min_idle:
             return False
         if already_resumed:

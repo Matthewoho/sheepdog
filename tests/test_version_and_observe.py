@@ -4761,6 +4761,140 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(label_repo, "技术姿势纠偏")
             st.close()
 
+    def test_reg120_vip_high_perm_e2e_ask_guard_and_unawakened_sysmsg_and_prebatch_lamb_unlock(self):
+        """REG-120 (1.1.31):
+        1) When VIP (Lao Hu / Sammy) requests cloud subaccount / CAM / TKE kubeconfig permissions, check_ask_pre_flight_guard
+           (even when floor_type='credential' is passed) rejects asks that recommend 'A. 不外发生产云 AK/SK 与集群 kubeconfig，由专席直接代建...仅交付只读 SDK Key'
+           or only offer single-namespace restricted permissions; recommending high-permission end-to-end autonomy passes;
+           and diagnose_override_reason classifies 'laohu 的权限要高 你要让他尽可能端到端完成' as ('arch_or_config_posture', '技术姿势纠偏').
+        2) In Engine._check_stopped_in_flight, when an Antigravity batch lands as SYSTEM_MESSAGE DONE with zero PLANNER_RESPONSE
+           for >= 60s on real agentapi, it triggers auto-resume immediately instead of dropping through if/elif branches.
+        3) In duty.fresh_active_lambs(..., min_started_at=sent), a background lamb spawned in an earlier batch (started_at < sent - 5s)
+           does NOT block _check_stopped_in_flight or _check_receipt for a newly dispatched batch, while a lamb spawned in the
+           current batch (started_at >= sent - 5s) continues to pause receipt timeout.
+        """
+        from datetime import timezone
+        from sheepdog import admin_web, config, duty, engine, outbound, session as sm, store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = Path(tmp)
+            cfg = config.Config(state_dir=tpath)
+            st = store.Store(cfg.db_path)
+
+            # 1) VIP low-permission / proxy deployment recommendation rejected even with floor_type="credential"
+            bad_vip_ask_body = (
+                "因外发生产云账号 AK/SK 与生产 TKE 集群管理员 kubeconfig 触及凭据外发硬底线，特请示办理方式（建议选 A）：\n"
+                "A. 不外发生产云 AK/SK 与集群 kubeconfig，由 tp_laohu 直接在 200053747873 为其开通 TencentDB PG 新库 growthbook、在 cls-gnui5plk 部署 GrowthBook，仅交付后台登录账号与只读 SDK Key\n"
+                "B. 为老胡创建 200053747873 专用受限 CAM 子账号（仅限新建 DB 与 cls-gnui5plk 下 growthbook 单命名空间权限）并签发受限 kubeconfig 供其部署\n"
+                "C. 暂缓在生产集群部署 GrowthBook，先在 Stage 环境 (200053747755) 部署验证\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_vip:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_laohu",
+                    "老胡申请腾讯云国际 Prod 子账号 (200053747873) 权限与南京 TKE kubeconfig 部署 GrowthBook",
+                    bad_vip_ask_body,
+                    key="fe-1864-growthbook-prod-credentials",
+                    floor="外发生产云账号 AK/SK 与生产集群 kubeconfig 凭据",
+                    floor_type="credential",
+                )
+            self.assertIn("REG-120", str(cm_vip.exception))
+
+            good_vip_ask_body = (
+                "因外发生产云账号 AK/SK 与生产 TKE 集群 kubeconfig 触及凭据外发硬底线，特请示办理方式（建议选 A）：\n"
+                "A. 为老胡开通 200053747873 高权限 CAM 子账号（AdministratorAccess）并签发 cls-gnui5plk 完整管理员 kubeconfig，支持其端到端自主完成 GrowthBook 部署与验证\n"
+                "B. 由专席代为部署 GrowthBook 并仅交付后台账号\n"
+                "建议：选 A"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_laohu",
+                "老胡申请腾讯云国际 Prod 子账号 (200053747873) 权限与南京 TKE kubeconfig 部署 GrowthBook",
+                good_vip_ask_body,
+                key="fe-1864-growthbook-prod-credentials",
+                floor="外发生产云账号 AK/SK 与生产集群 kubeconfig 凭据",
+                floor_type="credential",
+            )
+
+            code_vip, label_vip = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · 老胡申请腾讯云国际 Prod 子账号权限 [tp_laohu]\n{bad_vip_ask_body}",
+                "laohu 的权限要高  你要让他尽可能端到端完成",
+            )
+            self.assertEqual(code_vip, "arch_or_config_posture")
+            self.assertEqual(label_vip, "技术姿势纠偏")
+
+            # 2) Unawakened SYSTEM_MESSAGE DONE after >= 60s + pre-batch background lamb does not block auto-resume
+            now_dt = datetime.now().astimezone()
+            sent_dt = now_dt - timedelta(seconds=95)
+            old_lamb_dt = now_dt - timedelta(minutes=45)
+            cur_lamb_dt = now_dt - timedelta(seconds=30)
+
+            st.create_topic("tp_kaifeng", "Kai Feng", "adopted", "duty", sm.RUNNING, "antigravity")
+            st.update_topic(
+                "tp_kaifeng",
+                conversation_id="cid-kaifeng-120",
+                pending_batch_id="b20261105194335-kaifeng",
+                dispatched_at=sent_dt.isoformat(timespec="seconds"),
+            )
+            # Pre-batch lamb started 45 minutes ago (before sent_dt)
+            st.create_lamb("lamb_old120", "tp_kaifeng", "subagent", "Old CNB Upload", conversation_id="cid-sub-old120")
+            st.update_lamb(
+                "lamb_old120",
+                state="running",
+                started_at=old_lamb_dt.isoformat(timespec="seconds"),
+                last_act_at=now_dt.isoformat(timespec="seconds"),
+            )
+            # Without min_started_at, fresh_active_lambs includes lamb_old120; with min_started_at=sent_dt, it excludes lamb_old120
+            self.assertEqual(len(duty.fresh_active_lambs(st, "tp_kaifeng", now_dt, 20)), 1)
+            self.assertEqual(len(duty.fresh_active_lambs(st, "tp_kaifeng", now_dt, 20, min_started_at=sent_dt)), 0)
+
+            # Write transcript with SYSTEM_MESSAGE DONE for b20261105194335-kaifeng and zero PLANNER_RESPONSE
+            rec_file = tpath / "transcript_kaifeng.jsonl"
+            rec_file.write_text(
+                json.dumps(
+                    {
+                        "step_index": 10,
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "created_at": sent_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "content": "批次 `b20261105194335-kaifeng` 请处理并交回执",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            sent_prompts = []
+
+            class DummyAgentApiSink:
+                name = "agentapi"
+
+            eng = engine.Dispatcher(cfg, st, {"antigravity": DummyAgentApiSink()})
+            eng._record_file = lambda t_row: rec_file
+            eng._send = lambda t_row, prompt, batch: sent_prompts.append((t_row["topic_id"], batch, prompt))
+
+            t_row = st.get_topic("tp_kaifeng")
+            resumed = eng._check_stopped_in_flight(t_row, "b20261105194335-kaifeng", sent_dt, now_dt, True)
+            self.assertTrue(resumed)
+            self.assertEqual(len(sent_prompts), 1)
+            self.assertIn("b20261105194335-kaifeng", sent_prompts[0][2])
+
+            # 3) If a lamb was spawned in the CURRENT batch (started_at >= sent_dt - 5s), fresh_active_lambs blocks _check_stopped_in_flight
+            st.create_lamb("lamb_cur120", "tp_kaifeng", "subagent", "Current Batch Task", conversation_id="cid-sub-cur120")
+            st.update_lamb(
+                "lamb_cur120",
+                state="running",
+                started_at=cur_lamb_dt.isoformat(timespec="seconds"),
+                last_act_at=now_dt.isoformat(timespec="seconds"),
+            )
+            self.assertEqual(len(duty.fresh_active_lambs(st, "tp_kaifeng", now_dt, 20, min_started_at=sent_dt)), 1)
+            self.assertFalse(eng._check_stopped_in_flight(t_row, "b20261105194335-kaifeng", sent_dt, now_dt, True))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

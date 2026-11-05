@@ -757,6 +757,16 @@ _RAW_STDOUT_IN_ASK_OPTION_RE = re.compile(
     r"|deployment\s+\"[^\"]+\"\s+successfully\s+rolled\s+out)",
     re.I,
 )
+_VIP_LOW_PERM_OR_PROXY_INSTEAD_OF_E2E_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:老胡|laohu|Andy\s*Hu|Sammy(?:\s*Shi)?|Sammi)[^\n。；]{0,36}申请[^\n。；]{0,60}(?:子账号|CAM|权限|kubeconfig|TKE|集群))"
+    r"(?=[\s\S]*(?:不外发[^\n。；]*(?:AK/SK|凭据|密钥|kubeconfig|权限)[^\n。；]*由[^\n。；]*(?:直接|代建|代跑|部署)[\s\S]{0,260}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?A"
+    r"|仅限[^\n。；]{0,40}单命名空间权限))",
+    re.I,
+)
+_VIP_HIGH_PERM_E2E_RECOMMEND_RE = re.compile(
+    r"A\s*[\.、:：)\]]\s*[^\n]*(?:高权限|管理员|AdministratorAccess|全量|完整权限|端到端)[\s\S]{0,360}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?A\b",
+    re.I,
+)
 
 
 def check_unverified_ticket_promise_guard(text: str) -> None:
@@ -842,6 +852,14 @@ def check_ask_pre_flight_guard(
                     "即使你建议选 A（拒绝直接开放个人写权限、由 SRE 代跑），也必须在选项 B 或 C 中显式提供一个『同意授权开通所申请权限（配齐前置快照/水位注意事项）』的正向按钮选项，"
                     "让主人能一键拍板（没有发送）。",
                 )
+    if _VIP_LOW_PERM_OR_PROXY_INSTEAD_OF_E2E_ASK_RE.search(full_text) and not _VIP_HIGH_PERM_E2E_RECOMMEND_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "VIP（老胡 / Andy Hu、Sammy Shi）申请云账号 / CAM 子账号 / TKE `kubeconfig` 等高权限以推进业务部署时，"
+            "严禁把『A. 不外发云凭据/kubeconfig，由专席直接代建并仅交付后台只读 Key』作为首选建议，或仅提供单命名空间受限窄权限"
+            "（主人 2026-11-05 19:39 在 `tp_laohu` 卡片 `[其他]` 明确纠偏：『laohu 的权限要高 你要让他尽可能端到端完成』，REG-120 VIP 高权限端到端闭环门禁）："
+            "请将『为老胡/VIP 开通高权限（如高权限 CAM 子账号与完整集群 kubeconfig），支持其端到端自主完成部署与验证』作为首选建议（建议选 A）后再发起 `sheepdog ask`（没有发送）",
+        )
     if floor or floor_type:
         return
     if _SYMBOLIC_RELEASE_SCHEDULE_ASK_RE.search(full_text) and not _GENUINE_SCHEDULE_CONFLICT_RE.search(full_text):

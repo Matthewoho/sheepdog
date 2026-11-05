@@ -807,15 +807,21 @@ def action_label(run_state: str) -> str:
 
 
 def fresh_active_lambs(store: Store, topic_id: str, now: datetime | None = None,
-                       timeout_minutes: float = 20) -> list[dict]:
-    """母羊名下 state='running' 且最近一次心跳未超时的活跃羔羊（7.63）。"""
+                       timeout_minutes: float = 20,
+                       min_started_at: datetime | None = None) -> list[dict]:
+    """母羊名下 state='running' 且最近一次心跳未超时的活跃羔羊（7.63 / 1.1.31 REG-120）。
+    若传入 min_started_at，则仅统计在当前批次派发后（started_at >= min_started_at - 5s）拉起的本批次羔羊，
+    防止上一批次已交 waiting 回执遗留的长耗时后台羔羊阻塞后续新批次的唤醒与回执超时。"""
     if not hasattr(store, "get_active_lambs"):
         return []
     now = now or datetime.now().astimezone()
     active = store.get_active_lambs(topic_id)
     out: list[dict] = []
     for lb in active:
-        dts = [x for x in (_dt(lb.get("started_at") or ""), _dt(lb.get("last_act_at") or "")) if x is not None]
+        st_dt = _dt(lb.get("started_at") or "")
+        if min_started_at is not None and st_dt is not None and st_dt < min_started_at - timedelta(seconds=5):
+            continue
+        dts = [x for x in (st_dt, _dt(lb.get("last_act_at") or "")) if x is not None]
         ref = max(dts) if dts else None
         if ref is None or (now - ref) <= timedelta(minutes=timeout_minutes):
             out.append(lb)
