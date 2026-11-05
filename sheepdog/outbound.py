@@ -594,6 +594,25 @@ _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE = re.compile(
     r"(?:\b2000\d{8}\b|(?:子成员账号|成员子账号|子账号|主账号)\s*(?:[:：]?\s*)?(?:2000\d{8}|tapnow-(?:prod|stage)))",
     re.I,
 )
+_TENCENT_MAINLAND_FALLBACK_ON_LIMIT_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:境内主账号|国内腾讯云|100048360698|境内账号)[^\n。]{0,40}(?:建|创建|新建|开辟|申请)[^\n。]{0,30}(?:子账号|账号|凭据|密钥|TMS|IMS|内容安全))"
+    r"(?=[\s\S]*(?:UnsupportedRegion|地域不支持|国际账号[^\n。]{0,24}(?:不支持|报错|受限)|TMS|IMS|内容安全))",
+    re.I,
+)
+_URGENCY_AND_TENCENT_CONTACT_EVIDENCE_RE = re.compile(
+    r"(?=[\s\S]*(?:已(?:向|跟|与)?[^\n。]{0,16}确认[^\n。]{0,16}(?:着急|急需|紧急)|先问(?:一下)?[^\n。]{0,16}(?:是否)?着急|询问[^\n。]{0,16}是否着急))"
+    r"(?=[\s\S]*(?:问一下腾讯云|咨询腾讯云|联系腾讯云|找腾讯云(?:的人|接口人|架构师|客服)?))",
+    re.I,
+)
+_NEW_DOMESTIC_DOMAIN_ASK_RE = re.compile(
+    r"(?:(?:是否)?(?:新增|新建|开通|配置|给一个)[^\n。]{0,20}国内(?:跳转|直连|可达)?域名"
+    r"|(?:新增|新建|开通)[^\n。]{0,20}\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.tapnow\.media\b[^\n。]{0,20}(?:国内|直连|跳转))",
+    re.I,
+)
+_DOMESTIC_DOMAIN_AUDIENCE_EVIDENCE_RE = re.compile(
+    r"(?:给谁访问|访问(?:受众|对象|群体|人群)|受众(?:群体|对象|是谁)|目标(?:受众|访问群体|用户群体)|已(?:向|跟)[^\n。]{0,16}确认[^\n。]{0,20}(?:给.*访问|访问对象|受众))",
+    re.I,
+)
 _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
     r"(?=(?:[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b))"
     r"(?:[\s\S]*(?:能否提供现有[^\n。]{0,24}(?:跳板机|TKE|集群|入口)"
@@ -853,6 +872,21 @@ def check_ask_pre_flight_guard(
             "请示在 EdgeOne（如 `tapnow.tv` 站点 / `*.tapnow.tv` 加速域名）新增、配置或修改加速域名与回源 CLB 前，必须在正文中显式写明目标所在的腾讯云『子成员账号 ID / UIN』（如生产子账号 `200053747873`、Stage 子账号 `200053747813` 或主账号 `200045686254`）及对应 Zone ID / CLB IP"
             "（主人 2026-11-05 01:40 在 `[其他]` 反问：『哪个子成员环境』，REG-108 腾讯云子成员账号环境显式标注门禁）："
             "请先核实并在正文中明确标注目标 EdgeOne 站点与回源 CLB 所属的子成员账号 ID（如 `生产子账号 200053747873`）后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _TENCENT_MAINLAND_FALLBACK_ON_LIMIT_ASK_RE.search(full_text) and not _URGENCY_AND_TENCENT_CONTACT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "因腾讯云国际站子账号调接口报 `UnsupportedRegion` / 地域或功能受限（如 TMS/IMS 内容安全）而请示回退到『境内主账号（100048360698）/ 国内腾讯云』新建子账号前，"
+            "必须先向需求方确认『这件事是否着急（现有本地词表/兜底是否够用）』，并在方案中提供『不着急则先联系/问一下腾讯云的人（开通国际站权限或支持地域）』的收束选项"
+            "（主人 2026-11-05 12:38 在 `[其他]` 纠偏：『问一下这个着急吗 不着急的话我可以先问一下腾讯云的人』，REG-115 防遇限盲目回退国内腾讯云主账号门禁）："
+            "请先向需求方询问是否着急，并在正文中写明需求方关于紧急度的明确答复及咨询腾讯云接口人的选项后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _NEW_DOMESTIC_DOMAIN_ASK_RE.search(full_text) and not _DOMESTIC_DOMAIN_AUDIENCE_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示新增/开通『国内直连/跳转域名』（如 `edm.tapnow.media` 等）前，必须先向申请人核实并在正文中写明『该国内域名具体是给谁访问的（目标访问受众是谁：真实国内 C 端客户、海外客户还是内部运营不挂梯子测试）』"
+            "（主人 2026-11-05 12:40 在 `[其他]` 反问：『问一下国内域名是给谁访问的』，REG-115 新增国内域名必核访问受众门禁）："
+            "请先向申请人问清该国内域名的真实访问受众（`给谁访问 / 访问受众`）并写入正文后再发起 `sheepdog ask`（没有发送）",
         )
     if _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE.search(full_text):
         raise OutboundError(

@@ -2718,6 +2718,8 @@ class Dispatcher:
             ) is not None:
                 self._dispatch_topic(new_t, self.store.pending_for_topic(t["topic_id"]))
                 return
+            if self._maybe_auto_redeliver_unverified_sys_batch(t, batch):
+                return
             self.store.set_dispatch_state(batch, "uncertain", error="agentapi 返回成功，但会话记录里找不到这个批次")
             self.store.mark_batch_state(batch, "uncertain")
             self.store.update_topic(t["topic_id"], state=sm.ACTIVE, pending_batch_id=None)
@@ -4344,8 +4346,38 @@ class Dispatcher:
                     self.store.update_topic(t["topic_id"], dispatched_at=now.isoformat(timespec="seconds"))
                 log.info("uncertain 批次 %s（%s）在会话记录里核到了，补记为已送达", d["batch_id"], d["topic_id"])
                 continue
+            if not self._record_active_since(t, sent) and self._maybe_auto_redeliver_unverified_sys_batch(t, d["batch_id"]):
+                continue
             if now - sent >= timedelta(minutes=UNCERTAIN_NOTICE_MINUTES):
                 self._uncertain_notice(t, d, sent)
+
+    def _maybe_auto_redeliver_unverified_sys_batch(self, t, batch_id: str) -> bool:
+        """1.1.26（REG-115）：当纯内部幂等系统通知批次（如 sd_lamb_report_* 羔羊完工汇报、sd_watch_* 等待提醒、
+        sd_patrol_* 定时巡检、sd_tell_* 跨会话留言）在送出后未落入会话记录（transcript.jsonl 无该批次且无新动作）时，
+        若直接打入 uncertain 不重发，会导致母羊永远收不到羔羊失败/完工通知而悬空。对纯系统通知批次自动退回待推一次。"""
+        d = self.store.get_dispatch(batch_id)
+        if d is None:
+            return False
+        mids = [str(x) for x in json.loads(d["message_ids"] or "[]") if x]
+        if not mids or not all(
+            m.startswith(("sd_lamb_report_", "sd_watch_", "sd_patrol_", "sd_tell_")) for m in mids
+        ):
+            return False
+        once_key = f"auto_redelivered_sys_uncertain:{batch_id}"
+        if self.store.get_meta(once_key):
+            return False
+        self.store.set_meta(once_key, now_iso())
+        self.store.set_dispatch_state(batch_id, "redelivered", error="auto_redeliver_unverified_sys_batch")
+        with self.store.tx() as c:
+            q = ",".join("?" * len(mids))
+            c.execute(
+                f"UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id IN ({q}) AND batch_id=?",
+                [*mids, batch_id],
+            )
+        if t["pending_batch_id"] == batch_id or t["state"] == sm.RUNNING:
+            self.store.update_topic(t["topic_id"], state=sm.ACTIVE, pending_batch_id=None)
+        log.info("纯系统通知批次 %s（%s）未落入会话记录，已自动退回待推重投: %s", batch_id, t["topic_id"], mids)
+        return True
 
     def _uncertain_notice(self, t, d, sent: datetime) -> None:
         key = uncertain_notice_key(d["batch_id"])
@@ -4979,7 +5011,7 @@ class Dispatcher:
                         or _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(cur_sum)
                         or cur_sum in ("{", "[")
                         or cur_sum.startswith('File "')
-                        or bool(_SAVED_TMP_JSON_RE.match(cur_sum))
+                        or (bool(_SAVED_TMP_JSON_RE.match(cur_sum)) and "-> JSON(" not in cur_sum)
                         or (
                             sum(1 for ln in cur_sum.splitlines() if _ATTEMPT_POLL_PREFIX_RE.match(ln.strip())) >= 2
                             and len({m.group(1) for ln in cur_sum.splitlines() if (m := _ATTEMPT_POLL_PREFIX_RE.match(ln.strip()))})
@@ -6885,7 +6917,11 @@ _GREP_MATCH_LINE_RE = re.compile(
 )
 _INTERMEDIATE_POLL_LINE_RE = re.compile(r"\bpoll\s+\d+\s*:.*\bstatus=(?:WORKING|QUEUED|PENDING)\b", re.I)
 _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
-    r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b)",
+    r"^(?:Deploying\.*|Setting IAM Policy\.*done|Creating Revision\.*done|Routing traffic\.*done|"
+    r"Provisioning resources\.*done|Starting execution\.*done|Running execution\.*done|"
+    r"To execute this job,\s*use:|gcloud\s+run\s+jobs\s+(?:execute|executions\s+describe)\b|"
+    r"View details about this execution by running:|Or visit https://console\.cloud\.google\.com/|"
+    r"Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b)",
     re.I | re.M,
 )
 _JSON_PROP_FRAGMENT_LINE_RE = re.compile(
@@ -6899,7 +6935,7 @@ _JSON_OBJECT_KEY_LINE_RE = re.compile(r'^"([^"]+)"\s*:\s*\{\s*$')
 _PY_EXCEPTION_LINE_RE = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Exit|Fault)\b\s*:|(?:STDERR:\s*)?(?:ERROR|FATAL)\s*:)"
 )
-_SAVED_TMP_JSON_RE = re.compile(r"^(?:Saved|Wrote)\s+(/tmp/[A-Za-z0-9_./-]+\.json)\s*$", re.I)
+_SAVED_TMP_JSON_RE = re.compile(r"^(?:Saved|Wrote)\s+(/(?:private/)?tmp/[A-Za-z0-9_./-]+\.json)\b", re.I)
 _ATTEMPT_POLL_PREFIX_RE = re.compile(r"^\[(?:attempt|poll|try|round|step)\s*\d+(?:/\d+)?\]\s*(.+)$", re.I)
 _EDITED_PREFIX = "（已编辑）旧："
 _RECALLED_PREFIX = "（已撤回）原文："
@@ -7129,6 +7165,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
     non_grep_all = [
         ln for ln in meaningful
         if not _GREP_MATCH_LINE_RE.match(ln)
+        and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
         and not ('"WaitMsBeforeAsync"' in ln and '"toolSummary"' in ln)
     ]
     if non_grep_all:
@@ -7202,7 +7239,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                     tail_lines.append(f"-> {root_err}")
         except Exception:
             pass
-    if not has_err and tail_lines and (m_saved := _SAVED_TMP_JSON_RE.match(tail_lines[-1])):
+    if not has_err and tail_lines and (m_saved := _SAVED_TMP_JSON_RE.match(tail_lines[-1])) and "-> JSON(" not in tail_lines[-1]:
         try:
             p_json = Path(m_saved.group(1))
             if p_json.is_file() and p_json.stat().st_size <= 262144:

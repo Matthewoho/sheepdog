@@ -3989,6 +3989,147 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(d_af["state"], "redelivered")
             st.close()
 
+    def test_reg115_mainland_fallback_and_domestic_domain_audience_guards_and_sys_batch_redeliver(self):
+        """1.1.26（REG-115）：
+        1) check_ask_pre_flight_guard 拦截遇地域受限盲目请示回退境内主账号新建子账号（要求先问是否着急并提供咨询腾讯云选项）与新增国内域名未写明给谁访问；
+        2) diagnose_override_reason 精准将『问一下这个着急吗 不着急的话我可以先问一下腾讯云的人』『问一下国内域名是给谁访问的』归入 context_incomplete；
+        3) _recheck_uncertain 对未落入 transcript 的纯内部系统通知批次（sd_lamb_report_*）自动退回 pending 重投；
+        4) _summarize_cli_lamb_log 支持带后缀的 Saved /tmp/...json 自动追加 JSON(...) 并过滤 gcloud run jobs 提示行。
+        """
+        from datetime import timezone
+        from sheepdog import admin_web, engine as eng_mod, outbound
+        from sheepdog.engine import Dispatcher, _summarize_cli_lamb_log
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sheepdog.sqlite3"
+            st = Store(db_path)
+            cfg = Config(state_dir=Path(tmp))
+
+            # 1a) Mainland fallback without urgency & Tencent contact -> blocked
+            with self.assertRaises(outbound.OutboundError) as ctx1:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "请定国内腾讯云建TMS/IMS审核子账号",
+                    "国际账号调广州报 UnsupportedRegion，必须在境内主账号 100048360698 下建专有审核子账号。\n"
+                    "选项：\nA. 批准在境内主账号 100048360698 创建子账号\nB. 暂缓创建，继续用本地词表\n建议：选 A",
+                )
+            self.assertIn("REG-115", str(ctx1.exception))
+
+            # With urgency confirmed + Tencent contact option -> allowed
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kaifeng",
+                "请定国内腾讯云建TMS/IMS审核子账号",
+                "已向 Kai 确认是否着急（不急需今晚切云端），国际账号调广州报 UnsupportedRegion，若必须在境内主账号 100048360698 下建子账号请拍板。\n"
+                "选项：\nA. 先联系并问一下腾讯云的人开通国际站权限或支持地域\nB. 批准在境内主账号 100048360698 创建子账号\n建议：选 A",
+            )
+
+            # 1b) New domestic domain without target audience -> blocked
+            with self.assertRaises(outbound.OutboundError) as ctx2:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_edm-open-tracking",
+                    "是否新增国内跳转域名 edm.tapnow.media",
+                    "Elaine 实测国内直连打不开 edm.tapnow.ai，申请新增国内直连域名 edm.tapnow.media。\n"
+                    "选项：\nA. 同意新增 edm.tapnow.media\nB. 暂不建新域名\n建议：选 A",
+                )
+            self.assertIn("REG-115", str(ctx2.exception))
+
+            # With target audience explicitly documented -> allowed
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_edm-open-tracking",
+                "是否新增国内跳转域名 edm.tapnow.media",
+                "已向 Elaine 确认该国内域名是给谁访问的（目标访问受众为国内站真实 C 端订阅客户）。\n"
+                "选项：\nA. 同意新增 edm.tapnow.media\nB. 暂不建新域名\n建议：选 A",
+            )
+
+            # 2) diagnose_override_reason classification
+            code1, label1 = admin_web.diagnose_override_reason(
+                "请定国内腾讯云建TMS/IMS审核子账号",
+                "问一下这个着急吗  不着急的话我可以先问一下腾讯云的人",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual(code1, "context_incomplete")
+            self.assertEqual(label1, "缺环境/调用链反问")
+
+            code2, label2 = admin_web.diagnose_override_reason(
+                "是否新增国内跳转域名 edm.tapnow.media",
+                "问一下国内域名是给谁访问的",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual(code2, "context_incomplete")
+            self.assertEqual(label2, "缺环境/调用链反问")
+
+            # 3) _recheck_uncertain auto-redelivers unverified internal system batch (sd_lamb_report_*)
+            now_dt = datetime(2026, 11, 5, 12, 50, 0, tzinfo=timezone(timedelta(hours=8)))
+            sent_iso = (now_dt - timedelta(minutes=5)).isoformat(timespec="seconds")
+            prev_iso = (now_dt - timedelta(minutes=10)).isoformat(timespec="seconds")
+            brain_dir = Path(tmp) / "brain"
+            cid_edm = "83f03a49-990b-4b53-bb85-52952e0bb85f"
+            tp_dir = brain_dir / cid_edm / ".system_generated" / "logs"
+            tp_dir.mkdir(parents=True, exist_ok=True)
+            (tp_dir / "transcript.jsonl").write_text(
+                json.dumps({"type": "PLANNER_RESPONSE", "created_at": prev_iso, "content": "done"}) + "\n",
+                encoding="utf-8",
+            )
+            st.upsert_topic("tp_edm", title="EDM", kind="dynamic", state="active", conversation_id=cid_edm, host="antigravity")
+            lamb_msg_id = "sd_lamb_report_test115"
+            st.conn.execute(
+                """INSERT INTO messages(message_id, chat_id, chat_type, sender_id, sender_name, create_time, msg_type, content,
+                   route, reason, topic_id, dispatch_state, batch_id, first_seen, last_seen, tags_json)
+                   VALUES(?, 'oc_sys', 'p2p', 'sys', 'sheepdog', ?, 'text', '羔羊失败汇报',
+                   'dispatch', 'lamb_report', 'tp_edm', 'uncertain', 'b_unc_lamb115', ?, ?, '[]')""",
+                (lamb_msg_id, sent_iso, sent_iso, sent_iso),
+            )
+            st.record_dispatch("b_unc_lamb115", "tp_edm", [lamb_msg_id], state="uncertain")
+            st.conn.execute("UPDATE dispatches SET sent_at=? WHERE batch_id='b_unc_lamb115'", (sent_iso,))
+            st.conn.commit()
+
+            class _FakeSink:
+                name = "agentapi"
+
+            disp = Dispatcher(cfg, st, _FakeSink())
+            with mock.patch.object(eng_mod, "transcript_path", side_effect=lambda c: brain_dir / c / ".system_generated" / "logs" / "transcript.jsonl"), \
+                 mock.patch.object(eng_mod, "_now", return_value=now_dt):
+                disp._recheck_uncertain()
+
+            self.assertEqual(st.get_dispatch("b_unc_lamb115")["state"], "redelivered")
+            self.assertEqual(st.get_message(lamb_msg_id)["dispatch_state"], "pending")
+
+            # 4) _summarize_cli_lamb_log handles Saved /tmp/...json with trailing metadata and strips gcloud run jobs hints
+            tmp_json = Path("/tmp/test_reg115_diag.json")
+            try:
+                tmp_json.write_text(json.dumps({"ok": True, "locked_by": "job_0068"}), encoding="utf-8")
+                s_sum, s_err = _summarize_cli_lamb_log(f"Saved {tmp_json}, code len: 4521 asc_logs: 34\n")
+                self.assertFalse(s_err)
+                self.assertIn("-> JSON(ok=True, locked_by=job_0068)", s_sum)
+            finally:
+                tmp_json.unlink(missing_ok=True)
+
+            err_log = (
+                "Execution [tapnow-edm-migrate-7x2g5] has successfully completed.\n"
+                "View details about this execution by running:\n"
+                "gcloud run jobs executions describe tapnow-edm-migrate-7x2g5\n"
+                "Or visit https://console.cloud.google.com/run/jobs/executions/details/asia-northeast1/tapnow-edm-migrate-7x2g5\n"
+                "[5/6] Updating URL Map tap-prod-global-elb-2...\n"
+                "Traceback (most recent call last):\n"
+                '  File "<string>", line 2, in <module>\n'
+                "ModuleNotFoundError: No module named 'yaml'\n"
+            )
+            e_sum, e_err = _summarize_cli_lamb_log(err_log)
+            self.assertTrue(e_err)
+            self.assertNotIn("Or visit https://console.cloud.google.com", e_sum)
+            self.assertIn("ModuleNotFoundError: No module named 'yaml'", e_sum)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
