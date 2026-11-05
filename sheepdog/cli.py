@@ -2752,6 +2752,9 @@ def cmd_lamb(args) -> int:
         cmd_str = _normalize_lamb_spawn_cmd(raw_cmd_str)
         raw_lid = (args.lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
         lid = raw_lid if raw_lid.startswith("lamb_") else f"lamb_{raw_lid}"
+        if not re.fullmatch(r"lamb_[A-Za-z0-9_-]{1,64}", lid) or ".." in lid:
+            print(f"lamb spawn 被拒绝: 非法 lamb_id: {raw_lid!r}", file=sys.stderr)
+            return 2
         cfg.lambs_dir.mkdir(parents=True, exist_ok=True)
         log_path = cfg.lambs_dir / f"{lid}.log"
         env = {**os.environ, "SHEEPDOG_LAMB_ID": lid}

@@ -189,6 +189,9 @@ def owner_inputs(transcript: Path, max_age_hours: float, now: datetime | None = 
                 continue
             if not isinstance(d, dict) or d.get("type") != "USER_INPUT":
                 continue
+            src = d.get("source")
+            if src and src != "USER_EXPLICIT":
+                continue
             step = d.get("step_index", i)
             if step == 0 or i == 0:
                 continue
@@ -198,12 +201,33 @@ def owner_inputs(transcript: Path, max_age_hours: float, now: datetime | None = 
             content = d.get("content")
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
+            from .prompts import is_sheepdog_prompt
+            if is_sheepdog_prompt(content):
+                continue
             found = _USER_REQUEST.findall(content)
             out.append(_norm(" ".join(found)) if found else _norm(content))
     return out
 
 
-def quote_verified(quote: str, transcript: Path, max_age_hours: float, now: datetime | None = None) -> bool:
-    """空白归一后，quote 是否是回看期内某条主人输入的子串。"""
+def quote_matches_text(quote: str, text: str) -> bool:
+    """REG-125：校验 quote 是否有效匹配主人原话 text。
+    - 完全相等（如单字回复 '行' / 'A'）直接匹配；
+    - 子串匹配时，拒绝单字符（如 '的' / 'a'）或少于 4 个字符的纯 ASCII 短词（'ok'/'yes'/'no' 除外）在长句中发生单字符碰撞绕过。
+    """
     q = _norm(quote)
-    return bool(q) and any(q in said for said in owner_inputs(transcript, max_age_hours, now))
+    s = _norm(text)
+    if not q or not s:
+        return False
+    if q == s:
+        return True
+    if len(q) < 2:
+        return False
+    if q.isascii() and len(q) < 4 and q.lower() not in ("ok", "yes", "no"):
+        return False
+    return q in s
+
+
+def quote_verified(quote: str, transcript: Path, max_age_hours: float, now: datetime | None = None) -> bool:
+    """空白归一后，quote 是否匹配回看期内某条主人输入（防单字子串碰撞与非 USER_EXPLICIT 注入，REG-125）。"""
+    q = _norm(quote)
+    return bool(q) and any(quote_matches_text(q, said) for said in owner_inputs(transcript, max_age_hours, now))

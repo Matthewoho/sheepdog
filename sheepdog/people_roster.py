@@ -9,7 +9,9 @@ from pathlib import Path
 
 DEFAULT_DB_PATH = Path.home() / ".local/state/sheepdog/sheepdog.sqlite3"
 DEFAULT_CONFIG_PATH = Path.home() / ".config/sheepdog/config.toml"
-DEFAULT_VAULT_PEOPLE_DIR = Path.home() / "Work/MatthewNote/50_People"
+DEFAULT_VAULT_PEOPLE_DIR = Path(
+    os.environ.get("SHEEPDOG_VAULT_PEOPLE_DIR") or str(Path.home() / ".config/sheepdog/people")
+)
 
 _SCHEMA_SQL = "CREATE TABLE IF NOT EXISTS people_roster (person_key TEXT PRIMARY KEY, open_id TEXT DEFAULT '', feishu_name TEXT DEFAULT '', preferred_name TEXT NOT NULL, aliases_json TEXT NOT NULL DEFAULT '[]', p2p_chat_id TEXT DEFAULT '', role_hint TEXT DEFAULT '', updated_at TEXT NOT NULL);"
 _MAC_SAFE_RE = re.compile(r"(?<![A-Za-z0-9_])(?<!桌面端 )(?<!桌面端)(?<!泽楷\()(?<!泽楷（)Mac(?![A-Za-z0-9_])(?!\s*(?:桌面端|平台|端|版|安装包|设备|OS|Book|mini|Universal|客户端|电脑))")
@@ -68,29 +70,79 @@ class _SeedCatalog(tuple):
 
 
 _SEED_TS = "2026-10-23T00:00:00Z"
-def _oid(h: str) -> str: return f"ou_{h}" if h else ""
-def _cid(h: str) -> str: return f"oc_{h}" if h else ""
+
+
+def _seed_oid(key: str) -> str:
+    return f"ou_test_seed_{key}" if key else ""
+
+
+def _seed_cid(key: str) -> str:
+    return f"oc_test_seed_{key}" if key else ""
+
 
 BUILTIN_ROSTER_SEEDS = _SeedCatalog((
-    PersonRecord("matthew_hong", _oid("f7c171b535ffd721db458ffd534d2a12"), "Matthew Hong", "Matthew", ("matthew", "matthew hong", "洪印峰", "主人", "owner", "owner(matthew)"), _cid("d37c081a78de29275f4b73e52416f64a"), "owner:本人", _SEED_TS),
+    PersonRecord("matthew_hong", _seed_oid("matthew_hong"), "Matthew Hong", "Matthew", ("matthew", "matthew hong", "洪印峰", "主人", "owner", "owner(matthew)"), _seed_cid("matthew_hong"), "owner:本人", _SEED_TS),
     PersonRecord("zekai", "", "Mac", "泽楷", ("泽楷", "mac", "zekai", "ze kai"), "", "colleague:泽楷(Mac)", _SEED_TS),
-    PersonRecord("max_luo", _oid("e45c90b45531d4288ec4dd642fa7e3d8"), "Max Luo", "Max", ("max", "max luo", "bymax"), _cid("9cd9d1a06e8384fd9d36bf3b1cb33c64"), "colleague:Business Intelligence(Max Luo)", _SEED_TS),
-    PersonRecord("wenbo_wang", _oid("3585a5081a0edb21d13c4f3dc3c704b1"), "Wenbo Wang", "文博", ("文博", "王文博", "wenbo", "wenbo wang", "tp_wenbo", "tp_wenbo-ops"), _cid("9f0ce7e2be7d427ab966fbff0063a7df"), "colleague:EPS与企业购研发", _SEED_TS),
-    PersonRecord("andy_hu", _oid("2fab46a4e76db7dcc4f8e85846a8407e"), "Andy Hu", "老胡", ("老胡", "胡总", "andy hu", "lao hu", "laohu", "andy", "tp_laohu", "tp_laohu#2"), _cid("f2ccaa3846c06797402607e228d683c4"), "vip:客户端与业务工程负责人", _SEED_TS),
-    PersonRecord("sherwin_cao", _oid("6c0affda4f537b5d1118d578c30d280c"), "Sherwin Cao", "曹总", ("曹总", "老曹", "sherwin", "sherwin cao"), _cid("365275538e822e89f6b88d0303ac9c86"), "vip:曹总(Sherwin Cao)", _SEED_TS),
-    PersonRecord("jianglei_li", _oid("3002b9346540646c1e01062285a7c77d"), "Jianglei Li", "姜磊", ("姜磊", "李姜磊", "jianglei", "jianglei li", "tp_jianglei"), _cid("e560a839df07268b62eb0637807c8f5b"), "colleague:模型与计费业务负责人", _SEED_TS),
-    PersonRecord("kai_feng", _oid("5797d399248c9cf8d3888a12c1c589a1"), "Kai Feng", "Kai", ("kai", "kai feng", "楷", "凯哥", "阿楷", "tp_kaifeng"), _cid("819e6fec88e604ec99335ab805e389cc"), "colleague:大促与后端研发", _SEED_TS),
-    PersonRecord("jerry_chu", _oid("35ba3fe4f666308b6f39b9dd8c92b433"), "Jerry Chu", "Jerry", ("jerry", "jerry chu", "jerry.c"), _cid("b7a43bf09550d4e51b44504c740f9faf"), "colleague:Business Intelligence", _SEED_TS),
-    PersonRecord("sammy_shi", _oid("5b3511d971c1840b39146abbc675565a"), "Sammy Shi", "Sammy", ("sammy", "sammy shi", "tp_sammy", "tp_sammy-shi", "tp_sammy-collab"), _cid("2206ffc78dffa571d872757010106a8a"), "vip:TapNow工程负责人", _SEED_TS),
-    PersonRecord("ren_ryan", _oid("0a68a357f7badcf71abfa5e21e66ad5e"), "Ren Ryan", "Ryan", ("ryan", "ren ryan"), _cid("510205350e43fedbf8171b1001d808ef"), "vip:管理层", _SEED_TS),
-    PersonRecord("jessie", _oid("942ce0ba2af328043e4371e27c1a6524"), "Jessie", "Jessie", ("jessie", "tp_jessie"), _cid("73fef55ff01a46f6dd96475b42075042"), "vip:管理层", _SEED_TS),
+    PersonRecord("max_luo", _seed_oid("max_luo"), "Max Luo", "Max", ("max", "max luo", "bymax"), _seed_cid("max_luo"), "colleague:Business Intelligence(Max Luo)", _SEED_TS),
+    PersonRecord("wenbo_wang", _seed_oid("wenbo_wang"), "Wenbo Wang", "文博", ("文博", "王文博", "wenbo", "wenbo wang", "tp_wenbo", "tp_wenbo-ops"), _seed_cid("wenbo_wang"), "colleague:企业购研发", _SEED_TS),
+    PersonRecord("andy_hu", _seed_oid("andy_hu"), "Andy Hu", "老胡", ("老胡", "胡总", "andy hu", "lao hu", "laohu", "andy", "tp_laohu", "tp_laohu#2"), _seed_cid("andy_hu"), "vip:客户端与业务工程负责人", _SEED_TS),
+    PersonRecord("sherwin_cao", _seed_oid("sherwin_cao"), "Sherwin Cao", "曹总", ("曹总", "老曹", "sherwin", "sherwin cao"), _seed_cid("sherwin_cao"), "vip:曹总(Sherwin Cao)", _SEED_TS),
+    PersonRecord("jianglei_li", _seed_oid("jianglei_li"), "Jianglei Li", "姜磊", ("姜磊", "李姜磊", "jianglei", "jianglei li", "tp_jianglei"), _seed_cid("jianglei_li"), "colleague:模型与计费业务负责人", _SEED_TS),
+    PersonRecord("kai_feng", _seed_oid("kai_feng"), "Kai Feng", "Kai", ("kai", "kai feng", "楷", "凯哥", "阿楷", "tp_kaifeng"), _seed_cid("kai_feng"), "colleague:大促与后端研发", _SEED_TS),
+    PersonRecord("jerry_chu", _seed_oid("jerry_chu"), "Jerry Chu", "Jerry", ("jerry", "jerry chu", "jerry.c"), _seed_cid("jerry_chu"), "colleague:Business Intelligence", _SEED_TS),
+    PersonRecord("sammy_shi", _seed_oid("sammy_shi"), "Sammy Shi", "Sammy", ("sammy", "sammy shi", "tp_sammy", "tp_sammy-shi", "tp_sammy-collab"), _seed_cid("sammy_shi"), "vip:工程负责人", _SEED_TS),
+    PersonRecord("ren_ryan", _seed_oid("ren_ryan"), "Ren Ryan", "Ryan", ("ryan", "ren ryan"), _seed_cid("ren_ryan"), "vip:管理层", _SEED_TS),
+    PersonRecord("jessie", _seed_oid("jessie"), "Jessie", "Jessie", ("jessie", "tp_jessie"), _seed_cid("jessie"), "vip:管理层", _SEED_TS),
     PersonRecord("john_hu", "", "John Hu", "John Hu", ("john hu", "john"), "", "colleague:前端研发(John Hu)", _SEED_TS),
-    PersonRecord("ethan_wen", _oid("7ba08fca72bd4112d9aa4b2edcea6803"), "Ethan Wen", "Ethan", ("ethan wen", "ethan"), _cid("efd811a110be857481bb396f4fdbeda8"), "colleague:Ethan Wen", _SEED_TS),
-    PersonRecord("kc_chen", _oid("5c596bcaa5e1c9ef8a2c036acd7d3674"), "KC Chen", "KC", ("kc", "kc chen"), _cid("e94fe9a390754c59d2060350c6a5cde5"), "colleague:KC Chen", _SEED_TS),
-    PersonRecord("felix_fang", _oid("0f762741f29f082e2955095f24d2d41c"), "Felix Fang", "Felix", ("felix fang", "felix"), _cid("499e4cd782c1e9338b10348b0c97455c"), "colleague:Felix Fang", _SEED_TS),
-    PersonRecord("zhenxin_zhu", _oid("7d7f7ef995fc1cf4fa903b41bdbc8c30"), "Zhenxin Zhu", "Zhenxin", ("zhenxin zhu", "zhenxin"), _cid("8843599a44f15565d6cba7bfb3e54efd"), "colleague:Zhenxin Zhu", _SEED_TS),
-    PersonRecord("nicky_ye", _oid("914f825baddc6794381bf5884f260968"), "Nicky Ye", "Nicky", ("nicky ye", "nicky"), _cid("861bcd911c850db698e6f6917185dd05"), "colleague:Nicky Ye", _SEED_TS),
+    PersonRecord("ethan_wen", _seed_oid("ethan_wen"), "Ethan Wen", "Ethan", ("ethan wen", "ethan"), _seed_cid("ethan_wen"), "colleague:Ethan Wen", _SEED_TS),
+    PersonRecord("kc_chen", _seed_oid("kc_chen"), "KC Chen", "KC", ("kc", "kc chen"), _seed_cid("kc_chen"), "colleague:KC Chen", _SEED_TS),
+    PersonRecord("felix_fang", _seed_oid("felix_fang"), "Felix Fang", "Felix", ("felix fang", "felix"), _seed_cid("felix_fang"), "colleague:Felix Fang", _SEED_TS),
+    PersonRecord("zhenxin_zhu", _seed_oid("zhenxin_zhu"), "Zhenxin Zhu", "Zhenxin", ("zhenxin zhu", "zhenxin"), _seed_cid("zhenxin_zhu"), "colleague:Zhenxin Zhu", _SEED_TS),
+    PersonRecord("nicky_ye", _seed_oid("nicky_ye"), "Nicky Ye", "Nicky", ("nicky ye", "nicky"), _seed_cid("nicky_ye"), "colleague:Nicky Ye", _SEED_TS),
 ))
+
+
+def _effective_roster_seeds(db_path: Path | str | None = None) -> _SeedCatalog:
+    """读取内置种子；若目标为本机默认状态库且存在 ~/.config/sheepdog/people_seeds.json，则合并本机真实 open_id/chat_id 覆盖。"""
+    is_default_db = db_path is None and not os.environ.get("SHEEPDOG_STATE_DIR")
+    if not is_default_db and db_path is not None:
+        try:
+            is_default_db = Path(db_path).expanduser().resolve() == DEFAULT_DB_PATH.resolve()
+        except OSError:
+            is_default_db = False
+    if not is_default_db:
+        return BUILTIN_ROSTER_SEEDS
+    cfg_base = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config"))
+    local_file = cfg_base / "sheepdog" / "people_seeds.json"
+    if not local_file.is_file():
+        return BUILTIN_ROSTER_SEEDS
+    try:
+        raw_data = json.loads(local_file.read_text(encoding="utf-8"))
+        if isinstance(raw_data, list):
+            by_key = {str(it.get("person_key") or ""): it for it in raw_data if isinstance(it, dict) and it.get("person_key")}
+        elif isinstance(raw_data, dict):
+            by_key = {str(k): v for k, v in raw_data.items() if isinstance(v, dict)}
+        else:
+            return BUILTIN_ROSTER_SEEDS
+        merged_records = []
+        for s in BUILTIN_ROSTER_SEEDS:
+            ov = by_key.get(s.person_key)
+            if not ov:
+                merged_records.append(s)
+                continue
+            merged_records.append(PersonRecord(
+                s.person_key,
+                str(ov.get("open_id") or s.open_id),
+                str(ov.get("feishu_name") or s.feishu_name),
+                str(ov.get("preferred_name") or s.preferred_name),
+                tuple(str(x) for x in (ov.get("aliases") or s.aliases) if str(x).strip()),
+                str(ov.get("p2p_chat_id") or s.p2p_chat_id),
+                str(ov.get("role_hint") or s.role_hint),
+                str(ov.get("updated_at") or s.updated_at),
+            ))
+        return _SeedCatalog(tuple(merged_records))
+    except Exception:
+        return BUILTIN_ROSTER_SEEDS
 
 
 def _now_iso() -> str: return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -132,10 +184,11 @@ def _row_to_record(row: sqlite3.Row) -> PersonRecord:
 
 def ensure_people_roster_seeded(db_path=None, *, vault_people_dir=None, roster_toml_path=None) -> list[PersonRecord]:
     now = _now_iso()
+    seeds = _effective_roster_seeds(db_path)
     with _connect(db_path) as conn:
         existing = {r["person_key"]: _row_to_record(r) for r in conn.execute("SELECT * FROM people_roster").fetchall()}
         by_open_id = {r.open_id: r.person_key for r in existing.values() if r.open_id}
-        for seed in BUILTIN_ROSTER_SEEDS:
+        for seed in seeds:
             key = seed.person_key
             other_seed_terms = _other_seed_terms(key)
             cur = existing.get(key)
@@ -148,8 +201,8 @@ def ensure_people_roster_seeded(db_path=None, *, vault_people_dir=None, roster_t
             else:
                 clean_aliases = [a for a in cur.aliases if a.strip().lower() not in other_seed_terms]
                 merged = _merge_aliases(clean_aliases, seed.aliases)
-                oid = "" if (key == "zekai" and cur.open_id == BUILTIN_ROSTER_SEEDS["max_luo"].open_id) else (cur.open_id or seed.open_id)
-                cid = "" if (key == "zekai" and cur.p2p_chat_id == BUILTIN_ROSTER_SEEDS["max_luo"].p2p_chat_id) else (cur.p2p_chat_id or seed.p2p_chat_id)
+                oid = "" if (key == "zekai" and cur.open_id == seeds["max_luo"].open_id) else (cur.open_id or seed.open_id)
+                cid = "" if (key == "zekai" and cur.p2p_chat_id == seeds["max_luo"].p2p_chat_id) else (cur.p2p_chat_id or seed.p2p_chat_id)
                 if cur.open_id and not oid: by_open_id.pop(cur.open_id, None)
                 if oid: by_open_id[oid] = key
                 rh = seed.role_hint if (not cur.role_hint or cur.role_hint in {"colleague", "colleague:p2p", f"colleague:{seed.feishu_name}"}) else cur.role_hint

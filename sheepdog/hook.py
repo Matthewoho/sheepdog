@@ -97,15 +97,27 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
+_SAFE_TOPIC_ID_RE = re.compile(r"^[A-Za-z0-9_.#-]{1,64}$")
+
+
+def _validate_topic_id(topic_id: str) -> str:
+    s = (topic_id or "").strip()
+    if not s or not _SAFE_TOPIC_ID_RE.match(s) or ".." in s:
+        raise ValueError(f"非法 topic_id: {topic_id!r}")
+    return s
+
+
 def count_path(cfg: Config, topic_id: str) -> Path:
-    return cfg.state_dir.joinpath(*STOP_COUNT_DIR, f"{topic_id}.json")
+    safe_tid = _validate_topic_id(topic_id)
+    return cfg.state_dir.joinpath(*STOP_COUNT_DIR, f"{safe_tid}.json")
 
 
 def clear_stop_state(state_dir: Path, topic_id: str) -> None:
     """7.64：清掉这个会话的 Stop hook 状态文件（回执已交或人工复位时调用）。"""
     try:
-        Path(state_dir).joinpath(*STOP_COUNT_DIR, f"{topic_id}.json").unlink(missing_ok=True)
-    except OSError:
+        safe_tid = _validate_topic_id(topic_id)
+        Path(state_dir).joinpath(*STOP_COUNT_DIR, f"{safe_tid}.json").unlink(missing_ok=True)
+    except (OSError, ValueError):
         pass
 
 

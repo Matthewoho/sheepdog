@@ -31,7 +31,7 @@ from .prompts import (DEFAULT_COMPACTION_NOTE, DEFAULT_PATROL_PROMPT, QUOTE_LABE
                       retirement_prompt, roster_table, rules_update_message, standing_rules_bus,
                       standing_rules_managed, watch_message, priority_prompt)
 from .roster import _KEY_RE, MANAGED, Roster, RosterChat, RosterSession, parse_patrol_hours
-from .security import HOLD, NONE, SecurityConfig, quote_verified
+from .security import HOLD, NONE, SecurityConfig, quote_matches_text, quote_verified
 from .router import DISPATCH, DROP, INBOX, SELF, RouteContext, RouteDecision, message_bodies, route, route_within_group
 from .sink import RunResult, Sink, SinkError, SinkTimeout
 from .source import Source
@@ -5171,13 +5171,24 @@ class Dispatcher:
 
                     def handle(off: int, d: dict, tid=tid, host=thost, cid=cid) -> None:
                         for c in commands_in(host, d, off):
-                            pat = first_match(c.text, patterns)
-                            if pat and (skip := first_match(c.text, ignores)):
-                                log.info("会话 %s 的命令命中 %s，但也命中忽略规则 %s，不报", tid, pat, skip)
-                                continue
+                            segments = [seg.strip() for seg in re.split(r"(?:&&|\|\||[;|\n])+", c.text) if seg.strip()] or [c.text]
+                            hit_pat = None
+                            for seg in segments:
+                                seg_pat = first_match(seg, patterns)
+                                if seg_pat:
+                                    if first_match(seg, ignores):
+                                        continue
+                                    hit_pat = seg_pat
+                                    break
+                            if hit_pat is None:
+                                full_pat = first_match(c.text, patterns)
+                                if full_pat and (skip := first_match(c.text, ignores)):
+                                    log.info("会话 %s 的命令命中 %s，但也命中忽略规则 %s，不报", tid, full_pat, skip)
+                                    continue
+                                hit_pat = full_pat
                             shown = redact(c.text)
-                            if pat and self.store.add_audit_hit(tid, cid, c.step, shown, pat, c.at):
-                                log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, pat, shown)
+                            if hit_pat and self.store.add_audit_hit(tid, cid, c.step, shown, hit_pat, c.at):
+                                log.warning("会话 %s 跑了危险命令（命中 %s）：%s", tid, hit_pat, shown)
 
                     is_lamb = str(target_t["topic_id"]).startswith(f"{tid}:lamb:")
                     self._follow(target_t, AUDIT, handle, backfill=LAST_ACTIVITY_TAIL if is_lamb else 0)
@@ -6557,7 +6568,7 @@ def owner_quote_verifier(store: Store, max_age_hours: float, self_open_id: str):
             ts = _parse(r["create_time"] or "")
             if ts is None or ts.tzinfo is None or ts < cutoff:
                 continue
-            if any(q in " ".join(b.split()) for b in message_bodies(r["content"] or "")):
+            if any(quote_matches_text(q, " ".join(b.split())) for b in message_bodies(r["content"] or "")):
                 return QUOTE_LABEL_IM
         return ""
     return verify
@@ -6864,7 +6875,7 @@ def auto_settle_open_escalations_on_owner_batch(
         return []
     open_escs = [
         e
-        for e in open_escalations(store, cfg.escalation.open_hours, topic_id)
+        for e in store.open_escalations(topic_id)
         if not e["closed_at"]
     ]
     if not open_escs:
@@ -7052,6 +7063,8 @@ def register_lamb(store: Store, parent_topic_id: str, task_title: str, kind: str
     lid = (lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"
     if not lid.startswith("lamb_"):
         lid = "lamb_" + lid
+    if not re.fullmatch(r"lamb_[A-Za-z0-9_-]{1,64}", lid) or ".." in lid:
+        raise ValueError(f"非法 lamb_id: {lamb_id!r}")
     title = (task_title or "").strip() or lid
     store.create_lamb(lid, parent_topic_id, kind=kind, task_title=title, conversation_id=cid, pid=pid, state="running", log_path=log_path)
     return lid
@@ -7381,6 +7394,23 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
             first_tb = next((i for i, ln in enumerate(tail_lines) if ln.startswith(('File "', "Traceback"))), 0)
             last_exc = exc_indices[-1]
             tail_lines = [*tail_lines[:first_tb], *tail_lines[last_exc:]]
+    def _safe_tmp_file(raw_path: str) -> Path | None:
+        if not raw_path or ".." in raw_path:
+            return None
+        p = Path(raw_path)
+        if p.is_symlink():
+            return None
+        try:
+            resolved = p.resolve(strict=True)
+            allowed_roots = {Path("/tmp").resolve(), Path("/private/tmp").resolve()}
+            if resolved.parent not in allowed_roots or not resolved.is_file():
+                return None
+            if resolved.stat().st_size > 262144:
+                return None
+            return resolved
+        except Exception:
+            return None
+
     if (
         has_err
         and _depth == 0
@@ -7389,8 +7419,8 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
         and (m_redir := _REDIRECTED_TMP_LOG_RE.search("\n".join(tail_lines)))
     ):
         try:
-            p_redir = Path(m_redir.group(1))
-            if p_redir.is_file() and p_redir.stat().st_size <= 262144:
+            p_redir = _safe_tmp_file(m_redir.group(1))
+            if p_redir is not None:
                 redir_sum, _ = _summarize_cli_lamb_log(
                     p_redir.read_text(encoding="utf-8", errors="replace"),
                     _depth=1,
@@ -7403,8 +7433,8 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
             pass
     if not has_err and tail_lines and (m_saved := _SAVED_TMP_JSON_RE.match(tail_lines[-1])) and "-> JSON(" not in tail_lines[-1]:
         try:
-            p_json = Path(m_saved.group(1))
-            if p_json.is_file() and p_json.stat().st_size <= 262144:
+            p_json = _safe_tmp_file(m_saved.group(1))
+            if p_json is not None:
                 saved_obj = json.loads(p_json.read_text(encoding="utf-8", errors="replace"))
                 if isinstance(saved_obj, dict) and saved_obj:
                     saved_parts: list[str] = []

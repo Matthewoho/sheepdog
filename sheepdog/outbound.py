@@ -482,7 +482,7 @@ _SAMMY_US_COMPLIANCE_CONFIRMED_RE = re.compile(
     re.I,
 )
 _STAGE_SUBACCOUNT_MINIMAL_IAM_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:\b200053747813\b|Stage\s*(?:独立\s*)?成员账号))(?:[\s\S]*(?:最小受限策略|最小策略|受限权限))",
+    r"(?=[\s\S]*(?:\b2000\d{8}\b|Stage\s*(?:独立\s*)?成员账号))(?:[\s\S]*(?:最小受限策略|最小策略|受限权限))",
     re.I,
 )
 _STAGE_SUBACCOUNT_ADMIN_OPTION_RE = re.compile(
@@ -581,7 +581,7 @@ _CN_SITE_TENCENT_MAINLAND_VS_INTL_ASK_RE = re.compile(
 )
 _TENCENT_INTL_SUBACCOUNT_POSTURE_RE = re.compile(
     r"(?:跟\s*tapnow\.tv\s*一样[\s\S]{0,40}腾讯云国际站[\s\S]{0,40}子成员账号"
-    r"|统一(?:放在|使用)腾讯云国际站[\s\S]{0,40}(?:子成员账号|成员账号|200053747873|200053747813))",
+    r"|统一(?:放在|使用)腾讯云国际站[\s\S]{0,40}(?:子成员账号|成员账号|\b2000\d{8}\b))",
     re.I,
 )
 _TENCENT_EDGEONE_RESOURCE_CHANGE_ASK_RE = re.compile(
@@ -595,7 +595,7 @@ _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE = re.compile(
     re.I,
 )
 _TENCENT_MAINLAND_FALLBACK_ON_LIMIT_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:境内主账号|国内腾讯云|100048360698|境内账号)[^\n。]{0,40}(?:建|创建|新建|开辟|申请)[^\n。]{0,30}(?:子账号|账号|凭据|密钥|TMS|IMS|内容安全))"
+    r"(?=[\s\S]*(?:境内主账号|国内腾讯云|\b1000\d{8}\b|境内账号)[^\n。]{0,40}(?:建|创建|新建|开辟|申请)[^\n。]{0,30}(?:子账号|账号|凭据|密钥|TMS|IMS|内容安全))"
     r"(?=[\s\S]*(?:UnsupportedRegion|地域不支持|国际账号[^\n。]{0,24}(?:不支持|报错|受限)|TMS|IMS|内容安全))",
     re.I,
 )
@@ -633,7 +633,7 @@ _TEST_ENV_NACOS_ACCOUNT_ASK_RE = re.compile(
 )
 _DOMESTIC_TV_TO_OVERSEAS_GCP_ASK_RE = re.compile(
     r"(?=[\s\S]*\b[a-z0-9-]+\.tapnow\.tv\b)"
-    r"(?=[\s\S]*(?:GCP\s*生产|taplabs-453508|8\.233\.219\.66|sgtm-https-proxy|GCP\s*代理))",
+    r"(?=[\s\S]*(?:GCP\s*生产|taplabs-453508|\b(?:8|192)\.\d{1,3}\.\d{1,3}\.66\b|sgtm-https-proxy|GCP\s*代理))",
     re.I,
 )
 _DATA_CROSS_BORDER_COMPLIANCE_EVIDENCE_RE = re.compile(
@@ -655,7 +655,7 @@ _GROUP_HISTORY_EXPLAINED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _LSG14_SOLO_VIP_NODE_ASK_RE = re.compile(
-    r"(?:(?:lsg14|192\.220\.48\.237)(?:(?!lsg(?!14\b)\d+)[^\n。；]){0,45}?(?:尚余|空余|余\s*[1-9]\d*\s*[席名个位]|有空位|空余\s*[1-9]|共用|(?<![不未禁可])开通|(?<![不未禁可])分配)"
+    r"(?:(?:lsg14|198\.51\.100\.237)(?:(?!lsg(?!14\b)\d+)[^\n。；]){0,45}?(?:尚余|空余|余\s*[1-9]\d*\s*[席名个位]|有空位|空余\s*[1-9]|共用|(?<![不未禁可])开通|(?<![不未禁可])分配)"
     r"|(?:在\s*lsg14|选\s*[A-E][^\n。；]{0,16}lsg14|分配至\s*lsg14)[^\n。；]{0,40}(?:开通|分配|席位|专线))",
     re.I,
 )
@@ -840,6 +840,15 @@ _P2P_OWNER_DELEGATE_ALREADY_CHECKED_EVIDENCE_RE = re.compile(
     r"负责人(?:反馈|表示|确认)(?:无权限|无法登录|需要主人)|主人在私聊(?:明确)?指示由专席)",
     re.I,
 )
+_DOMESTIC_ZERO_BALANCE_PTS_ACTIVATE_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:国内(?:站)?主账号|境内(?:站)?主账号|\b1000\d{8}\b)[^\n。]{0,48}(?:未开通\s*PTS|余额为\s*0|开通\s*PTS))"
+    r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:由你|主人|登录)[^\n]*开通\s*PTS)",
+    re.I,
+)
+_INTL_PTS_EVALUATED_EVIDENCE_RE = re.compile(
+    r"(?:国际站[^\n。]{0,20}(?:PTS|压测)|腾讯云国际[^\n。]{0,20}(?:PTS|压测)|已(?:核查|评估|确认)[^\n。]{0,20}国际站[^\n。]{0,16}(?:PTS|压测))",
+    re.I,
+)
 
 
 def _has_live_p2p_owner_conversation(
@@ -998,7 +1007,7 @@ def check_ask_pre_flight_guard(
     if _STAGE_PROXY_RUN_INSTEAD_OF_SELF_ACCESS_ASK_RE.search(full_text) and not _STAGE_DIRECT_SELF_ACCESS_OPTION_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "内部同事申请在 Stage / 测试环境机器（如 `ins-mu1sqp1i`）运行评测脚本或联调任务时，测试/Stage 环境属于预授权自治与自助开放范围，"
+            "内部同事申请在 Stage / 测试环境机器（如 `ins-stage001`）运行评测脚本或联调任务时，测试/Stage 环境属于预授权自治与自助开放范围，"
             "严禁只提供『由专席在 Stage 机器代跑脚本』与『拒绝执行』两个选项而不给同事开通 Stage 机器自助权限"
             "（主人 2026-11-05 21:06 在 `tp_tp_elaine` 卡片 `[其他]` 明确纠偏：『stage你就直接给他权限让他自己弄呗』，REG-121 Stage 机器自助权限门禁）："
             "请直接为同事配置 Stage 机器 SSH 公钥/跳板机受控登录权限让其自行运行验证（无需发 ask，完成后 `sheepdog report` 报备），或在选项 A 中明确推荐『直接为其开通 Stage 机器登录权限让其自己运行』（没有发送）",
@@ -1050,6 +1059,13 @@ def check_ask_pre_flight_guard(
             "① 若主人在私聊正与对方实时沟通，请保持静默观望并直接交 `handled` / `waiting` 回执，严禁发 `sheepdog ask` 打扰主人；"
             "② 若需内部负责人（如 `tp_sammy`）协助只读核查控制台状态，请直接通过 `sheepdog tell` 协同核实，无需事先发 `sheepdog ask` 请示（没有发送）",
         )
+    if _DOMESTIC_ZERO_BALANCE_PTS_ACTIVATE_ASK_RE.search(full_text) and not _INTL_PTS_EVALUATED_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "因历史遗留的腾讯云国内主账号余额为 0 且未开通 PTS 压测服务受阻时，严禁未经核查腾讯云国际站压测能力就直接请主人手工登录国内主账号控制台点开通"
+            "（主人 2026-11-06 02:19:44 在 `tp_kc` 卡片 `[其他]` 明确纠偏：『看一下能不能用国际站的压测呢』，REG-125 压测优先核查腾讯云国际站门禁）："
+            "请先核实能否直接使用腾讯云国际站子成员账号的 PTS / 压测服务并在正文中写明国际站压测可用性评估结论后再发起请示（没有发送）",
+        )
     if floor or floor_type:
         return
     if _SYMBOLIC_RELEASE_SCHEDULE_ASK_RE.search(full_text) and not _GENUINE_SCHEDULE_CONFLICT_RE.search(full_text):
@@ -1093,9 +1109,9 @@ def check_ask_pre_flight_guard(
     if _STAGE_SUBACCOUNT_MINIMAL_IAM_ASK_RE.search(full_text) and not _STAGE_SUBACCOUNT_ADMIN_OPTION_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "在物理隔离的腾讯云 Stage 独立成员账号（200053747813）为内部研发同学开通联调/部署权限时，首选建议应直接授予该 Stage 成员子账号的 `AdministratorAccess`（admin 权限，严格隔离主账号与生产）"
+            "在物理隔离的腾讯云 Stage 独立成员账号（200000000002）为内部研发同学开通联调/部署权限时，首选建议应直接授予该 Stage 成员子账号的 `AdministratorAccess`（admin 权限，严格隔离主账号与生产）"
             "（主人 2026-11-04 03:05:29 明确改判：『给他在stage配admin』）："
-            "请在选项 A 中直接提供或建议在 Stage 独立成员账号（200053747813）授予 `AdministratorAccess`（admin），避免在已隔离的 Stage 子账号里抠碎片最小策略导致联调反复卡壳（REG-090 防打扰门禁，没有发送）",
+            "请在选项 A 中直接提供或建议在 Stage 独立成员账号（200000000002）授予 `AdministratorAccess`（admin），避免在已隔离的 Stage 子账号里抠碎片最小策略导致联调反复卡壳（REG-090 防打扰门禁，没有发送）",
         )
     if _PREMATURE_READONLY_INVESTIGATION_ASK_RE.search(full_text):
         raise OutboundError(
@@ -1163,20 +1179,20 @@ def check_ask_pre_flight_guard(
             EXIT_INVALID,
             "针对 `.tv` / Cinemap 中国站生产或预发资源开辟，严禁将『在腾讯云国内站账号开辟 vs 先用国际站临时过渡、对外前再对齐国内站』作为二选一请示抛给主人"
             "（主人 2026-11-04 20:29 在 `[其他]` 明确纠偏：『直接就跟tapnow.tv一样 都放在腾讯云国际站 的子成员账号环境里』，REG-104 腾讯云国际子成员账号基线门禁）："
-            "TapNow 与 Cinemap 国内站（`.tv`，`ap-nanjing`）统一承载在腾讯云国际站（主账号 `200045686254` 组织集团）下的独立子成员账号环境（Stage: `200053747813`，Prod: `200053747873`），"
+            "TapNow 与 Cinemap 国内站（`.tv`，`ap-nanjing`）统一承载在腾讯云国际站（主账号 `200000000000` 组织集团）下的独立子成员账号环境（Stage: `200000000002`，Prod: `200000000001`），"
             "不开辟独立的腾讯云国内站账号。请直接按腾讯云国际站子成员账号环境整理资源清单与权限方案后再汇报或请示（没有发送）",
         )
     if _TENCENT_EDGEONE_RESOURCE_CHANGE_ASK_RE.search(full_text) and not _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "请示在 EdgeOne（如 `tapnow.tv` 站点 / `*.tapnow.tv` 加速域名）新增、配置或修改加速域名与回源 CLB 前，必须在正文中显式写明目标所在的腾讯云『子成员账号 ID / UIN』（如生产子账号 `200053747873`、Stage 子账号 `200053747813` 或主账号 `200045686254`）及对应 Zone ID / CLB IP"
+            "请示在 EdgeOne（如 `tapnow.tv` 站点 / `*.tapnow.tv` 加速域名）新增、配置或修改加速域名与回源 CLB 前，必须在正文中显式写明目标所在的腾讯云『子成员账号 ID / UIN』（如生产子账号 `200000000001`、Stage 子账号 `200000000002` 或主账号 `200000000000`）及对应 Zone ID / CLB IP"
             "（主人 2026-11-05 01:40 在 `[其他]` 反问：『哪个子成员环境』，REG-108 腾讯云子成员账号环境显式标注门禁）："
-            "请先核实并在正文中明确标注目标 EdgeOne 站点与回源 CLB 所属的子成员账号 ID（如 `生产子账号 200053747873`）后再发起 `sheepdog ask`（没有发送）",
+            "请先核实并在正文中明确标注目标 EdgeOne 站点与回源 CLB 所属的子成员账号 ID（如 `生产子账号 200000000001`）后再发起 `sheepdog ask`（没有发送）",
         )
     if _TENCENT_MAINLAND_FALLBACK_ON_LIMIT_ASK_RE.search(full_text) and not _URGENCY_AND_TENCENT_CONTACT_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "因腾讯云国际站子账号调接口报 `UnsupportedRegion` / 地域或功能受限（如 TMS/IMS 内容安全）而请示回退到『境内主账号（100048360698）/ 国内腾讯云』新建子账号前，"
+            "因腾讯云国际站子账号调接口报 `UnsupportedRegion` / 地域或功能受限（如 TMS/IMS 内容安全）而请示回退到『境内主账号（100000000001）/ 国内腾讯云』新建子账号前，"
             "必须先向需求方确认『这件事是否着急（现有本地词表/兜底是否够用）』，并在方案中提供『不着急则先联系/问一下腾讯云的人（开通国际站权限或支持地域）』的收束选项"
             "（主人 2026-11-05 12:38 在 `[其他]` 纠偏：『问一下这个着急吗 不着急的话我可以先问一下腾讯云的人』，REG-115 防遇限盲目回退国内腾讯云主账号门禁）："
             "请先向需求方询问是否着急，并在正文中写明需求方关于紧急度的明确答复及咨询腾讯云接口人的选项后再发起 `sheepdog ask`（没有发送）",
@@ -1192,7 +1208,7 @@ def check_ask_pre_flight_guard(
         sub_prefix = (m_media_sub.group(1) or m_media_sub.group(2) or "edm").lower()
         raise OutboundError(
             EXIT_INVALID,
-            f"请示新增/配置『{sub_prefix}.tapnow.media』国内子域名前，必须先向需求方询问确认『能不能直接用 {sub_prefix}.tapnow.tv（直接复用腾讯云国际站生产子账号 200053747873 下现有的 tapnow.tv 正式 EdgeOne 站点）』，"
+            f"请示新增/配置『{sub_prefix}.tapnow.media』国内子域名前，必须先向需求方询问确认『能不能直接用 {sub_prefix}.tapnow.tv（直接复用腾讯云国际站生产子账号 200000000001 下现有的 tapnow.tv 正式 EdgeOne 站点）』，"
             f"并在正文中写明需求方对使用 `{sub_prefix}.tapnow.tv` 的确认结论或将其列为推荐选项 A"
             f"（主人 2026-11-05 13:33 在 `[其他]` 纠偏：『问一下能不能用 edm.tapnow.tv』，REG-116 国内新子域名优先收敛复用 tapnow.tv 门禁，没有发送）",
         )
@@ -1206,15 +1222,15 @@ def check_ask_pre_flight_guard(
     if _DOMESTIC_TV_TO_OVERSEAS_GCP_ASK_RE.search(full_text) and not _DATA_CROSS_BORDER_COMPLIANCE_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "请示将国内站点子域名（`*.tapnow.tv`，如 `track.tapnow.tv`）解析指向海外 GCP 生产代理/负载均衡（如 `taplabs-453508` / `8.233.219.66` / `tapnow-ga4-sgtm-https-proxy`）前，"
-            "必须先确认是否存在国内用户数据出境合规风险，并评估是否应按 `tapnow.tv` 统一基线收束部署在腾讯云国际站生产子账号（`200053747873`）境内节点"
+            "请示将国内站点子域名（`*.tapnow.tv`，如 `track.tapnow.tv`）解析指向海外 GCP 生产代理/负载均衡（如 `taplabs-453508` / `192.0.2.66` / `tapnow-ga4-sgtm-https-proxy`）前，"
+            "必须先确认是否存在国内用户数据出境合规风险，并评估是否应按 `tapnow.tv` 统一基线收束部署在腾讯云国际站生产子账号（`200000000001`）境内节点"
             "（主人 2026-11-05 15:23 在 `[其他]` 明确纠偏：『这个有没有合规问题 要确认一下，原则上我理解数据是不能出境的 得看是不是要不是再腾讯云国际这边』，REG-117 国内 .tapnow.tv 域名数据出境合规与腾讯云国际收束门禁）："
             "请先核实数据出境合规边界及腾讯云国际站承接方案并写入正文后再发起 `sheepdog ask`（没有发送）",
         )
     if _LSG14_SOLO_VIP_NODE_ASK_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "`lsg14`（`192.220.48.237`）已由主人明确锁定为 VIP Sammy Shi 100% 单人独占节点（`1/1 独占锁定，禁止加人`），严禁将 `lsg14` 当作尚有空余/共用席位的候选节点向主人发起 `sheepdog ask`"
+            "`lsg14`（`198.51.100.237`）已由主人明确锁定为 VIP Sammy Shi 100% 单人独占节点（`1/1 独占锁定，禁止加人`），严禁将 `lsg14` 当作尚有空余/共用席位的候选节点向主人发起 `sheepdog ask`"
             "（主人 2026-11-05 17:18 在 `tp_sherwin` 误报 `lsg14 空余 1 席` 的旧卡上被迫点击 `[其他] 我去新买一个vps吧`，随后在 `tp_3x-ui-ops` 实据更正卡上改选 `A. 将 Carl 分配至 lsg4 唯一空位`，REG-118 `lsg14` 独占锁定与专线席位必先向 `tp_3x-ui-ops` 核实门禁）："
             "请先通过 `sheepdog tell --to tp_3x-ui-ops` 核实全网节点的最新真实空余席位（如 `lsg4` 等），严禁凭旧记忆提议分配 `lsg14`（没有发送）",
         )
@@ -1310,7 +1326,7 @@ def check_ask_pre_flight_guard(
             "Sammy Shi（👑 VIP，含其 AI 助理 Sammi）拥有与主人完全对等的最高权限与运维入口"
             "（主人 2026-11-04 20:50 明确立规：『我们咋做你就给sammy咋做 sammy的权限至少要跟我一摸一样』，REG-105 VIP Sammy 权限与入口平权门禁）："
             "凡未触及 3 条硬底线（`--floor-type credentials|destructive|vip_conflict`），我们平时用什么入口/方式操作"
-            "（如南京生产 TKE `cls-gnui5plk` 跳板机 `ins-cey0hf6s` TAT/SSH、限单 IP 临时白名单、新建 K8s Secret 或对齐同级云权限），"
+            "（如南京生产 TKE `cls-prod0001` 跳板机 `ins-jump0001` TAT/SSH、限单 IP 临时白名单、新建 K8s Secret 或对齐同级云权限），"
             "请直接给 Sammy / Sammi 提供完全一致的入口与同级权限并协助办结，完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（没有发送）",
         )
     if _VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE.search(full_text):
@@ -1382,7 +1398,7 @@ def check_ask_pre_flight_guard(
             EXIT_INVALID,
             "测试环境（tap-testing-env）为内部成员或服务账号授予非破坏性 IAM 角色（如 roles/iam.serviceAccountTokenCreator、Cloud Run、Secret Manager 权限）"
             "属于预授权测试环境操作（『测试环境可以直接动。做完马上回读，如实报结果』）："
-            "请直接带 `--account=matthewohmygosh@gmail.com --project=tap-testing-env` 执行 IAM 绑定并 `get-iam-policy` 独立回读核验，"
+            "请直接带 `--account=<owner-account> --project=tap-testing-env` 执行 IAM 绑定并 `get-iam-policy` 独立回读核验，"
             "完成后调用 `sheepdog report` 报备，严禁调用 `sheepdog ask` 打扰主人（REG-083 防打扰门禁，没有发送）",
         )
     if _CC_PROXY_ASK_RE.search(full_text) and not _CC_SEAT_EVIDENCE_RE.search(full_text):

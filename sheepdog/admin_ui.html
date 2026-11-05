@@ -506,7 +506,7 @@
       background: var(--surface);
     }
 
-    .meru-center-topbar {
+    .sd-center-topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -1057,7 +1057,7 @@
       overflow: hidden;
     }
 
-    .meru-stage-tabbar {
+    .sd-stage-tabbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -1074,7 +1074,7 @@
       overflow-x: auto;
       flex: 1;
     }
-    .meru-stage-tab {
+    .sd-stage-tab {
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -1089,17 +1089,17 @@
       cursor: pointer;
       white-space: nowrap;
     }
-    .meru-stage-tab:hover {
+    .sd-stage-tab:hover {
       background: var(--hover);
       color: var(--text);
     }
-    .meru-stage-tab.active {
+    .sd-stage-tab.active {
       background: var(--raised);
       border-color: var(--border);
       color: var(--text);
       font-weight: 600;
     }
-    .meru-stage-tab-close {
+    .sd-stage-tab-close {
       width: 16px;
       height: 16px;
       border-radius: 4px;
@@ -1111,11 +1111,11 @@
       justify-content: center;
       cursor: pointer;
     }
-    .meru-stage-tab-close:hover {
+    .sd-stage-tab-close:hover {
       background: var(--border);
       color: var(--text);
     }
-    .meru-stage-tab-close svg {
+    .sd-stage-tab-close svg {
       width: 11px;
       height: 11px;
       stroke: currentColor;
@@ -1433,7 +1433,7 @@
         border: none;
         height: 100vh;
       }
-      .meru-center-topbar {
+      .sd-center-topbar {
         padding: 0 16px;
       }
       .center-content-scroll {
@@ -1524,7 +1524,7 @@
     <div class="sheet-frame" id="sheet-frame">
       <!-- Center Workspace -->
       <main class="center-stage">
-        <header class="meru-center-topbar">
+        <header class="sd-center-topbar">
           <div class="topbar-left-anchor">
             <button class="icon-btn mobile-menu-trigger" id="btn-mobile-nav" title="展开导航栏" aria-label="展开导航栏">
               <svg viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
@@ -1580,7 +1580,7 @@
 
       <!-- Right Stage (Closable Tabs + agy app 100% Full-Height Left-Right Split) -->
       <aside class="right-stage" id="right-stage">
-        <div class="meru-stage-tabbar">
+        <div class="sd-stage-tabbar">
           <div class="stage-tabs-list" id="stage-tabs-list"></div>
           <button class="icon-btn" id="btn-add-stage-tab" title="恢复全部舞台标签" aria-label="恢复舞台标签">
             <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -1681,10 +1681,8 @@
       if (!isoStr) return "-";
       const s = String(isoStr);
       const tIdx = s.indexOf("T");
-      if (tIdx >= 0 && s.length >= tIdx + 9) {
-        return s.slice(tIdx + 1, tIdx + 9);
-      }
-      return s.slice(0, 19);
+      const out = (tIdx >= 0 && s.length >= tIdx + 9) ? s.slice(tIdx + 1, tIdx + 9) : s.slice(0, 19);
+      return escapeHtml(out);
     }
 
     function escapeHtml(str) {
@@ -2544,9 +2542,9 @@
       }
 
       tabList.innerHTML = STATE.stageTabs.map((t) => `
-        <div class="meru-stage-tab ${t.id === STATE.activeStageTab ? "active" : ""}" data-stage-tab="${t.id}">
+        <div class="sd-stage-tab ${t.id === STATE.activeStageTab ? "active" : ""}" data-stage-tab="${t.id}">
           <span>${escapeHtml(t.title)}</span>
-          <button class="meru-stage-tab-close" data-close-tab="${t.id}" title="关闭标签页" aria-label="关闭标签页">
+          <button class="sd-stage-tab-close" data-close-tab="${t.id}" title="关闭标签页" aria-label="关闭标签页">
             ${renderLinearIconSvg("close")}
           </button>
         </div>
@@ -2554,7 +2552,7 @@
 
       tabList.querySelectorAll("[data-stage-tab]").forEach((tab) => {
         tab.addEventListener("click", (e) => {
-          if (e.target.closest(".meru-stage-tab-close")) return;
+          if (e.target.closest(".sd-stage-tab-close")) return;
           STATE.activeStageTab = tab.getAttribute("data-stage-tab");
           renderRightStage();
         });

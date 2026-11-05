@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -669,6 +670,11 @@ class Store:
     def __init__(self, path: Path | str):
         self.path = path
         self.conn = sqlite3.connect(str(path))
+        try:
+            if str(path) != ":memory:":
+                os.chmod(str(path), 0o600)
+        except OSError:
+            pass
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._migrate()

@@ -258,11 +258,32 @@ def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool 
                 print(f"      缺测试：{t}（{why}）")
         for g in reg.get("no_guard", []):
             print(f"  （登记里写「缺」、没有守卫的：{g}）")
+        priv_script = work / "src1" / "scripts" / "check_private_data.py"
+        priv_ok = True
+        if priv_script.is_file():
+            exported_files = [
+                str(p.relative_to(work / "src1"))
+                for p in (work / "src1").rglob("*")
+                if p.is_file()
+            ]
+            priv_proc = subprocess.run(
+                [python, str(priv_script), *exported_files],
+                cwd=work / "src1",
+                capture_output=True,
+                text=True,
+            )
+            priv_ok = priv_proc.returncode == 0
+            if priv_ok:
+                print(f"  隐私与保密红线扫描 ✓ {len(exported_files)} 个导出文件零敏感信息泄漏")
+            else:
+                print("  隐私与保密红线扫描 ✗ 发现敏感信息或保密词：")
+                for ln in (priv_proc.stdout + priv_proc.stderr).splitlines()[:25]:
+                    print(f"      {ln}")
         counts = {r["tests"] for r in results}
         same = len(counts) == 1
         if not same:
             print(f"  ✗ 3 次的测试数不一样：{[r['tests'] for r in results]}")
-        green = all(r["ok"] for r in results) and len(results) == runs and same and reg["ok"]
+        green = all(r["ok"] for r in results) and len(results) == runs and same and reg["ok"] and priv_ok
         if not green:
             for i, r in enumerate(results, 1):
                 if not r["ok"] and r.get("stderr_tail") and not r["red"]:

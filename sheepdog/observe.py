@@ -167,14 +167,25 @@ def _fingerprint_warns(warns: list[str]) -> str:
     return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:16]
 
 
+_BUS_SHELL_OR_QUOTED_CMD_BYPASS_RE = re.compile(
+    r"(?:\b(?:bash|sh|zsh|python3?(?:\.\d+)?)\s+-(?:[a-zA-Z]*c)\b"
+    r"|\$\([^)]*(?:gcloud|kubectl|tccli|aliyun|terraform|helm|docker|curl|ssh|scp|git\s+(?:clone|pull|push|commit|checkout))\b"
+    r"|['\"](?:gcloud|kubectl|tccli|aliyun|terraform|helm|docker|curl|ssh|scp)\b)",
+    re.I,
+)
+
+
 def _is_bus_forbidden_command(cmd_str: str) -> bool:
     """判断 tp_bus 执行的 run_command 是否越权：
-    1. 先剥离单双引号内的字符串字面量（如 --note "..." / --text "..."），避免转发备注提及 gcloud 等词被误判；
-    2. 拆分子命令段，若子命令段是合法的 sheepdog 自身 CLI 调用则直接放行；
-    3. 对非 sheepdog 子命令段的去引号文本匹配 _BUS_FORBIDDEN_CMD_RE。
+    1. 拦截通过 bash -c "..."、$(...) 命令替换或给命令名加引号（如 "gcloud"）绕过去引号检测（REG-125）；
+    2. 先剥离单双引号内的字符串字面量（如 --note "..." / --text "..."），避免转发备注提及 gcloud 等词被误判；
+    3. 拆分子命令段，若子命令段是合法的 sheepdog 自身 CLI 调用则放行（但禁止 tp_bus 借 sheepdog lamb spawn --cmd 间接跑越权命令）；
+    4. 对非 sheepdog 子命令段的去引号文本匹配 _BUS_FORBIDDEN_CMD_RE。
     """
     if not cmd_str:
         return False
+    if _BUS_SHELL_OR_QUOTED_CMD_BYPASS_RE.search(cmd_str) and _BUS_FORBIDDEN_CMD_RE.search(cmd_str):
+        return True
     unquoted = _QUOTED_STR_RE.sub('""', cmd_str)
     for seg in re.split(r"(?:&&|\|\||[;|\n])+", unquoted):
         seg_s = seg.strip()
@@ -183,6 +194,8 @@ def _is_bus_forbidden_command(cmd_str: str) -> bool:
         m = _SHEEPDOG_CMD_SEGMENT_RE.match(seg_s)
         if m is not None:
             subcmd = (m.group("subcmd") or "").strip()
+            if subcmd == "lamb" and _BUS_FORBIDDEN_CMD_RE.search(cmd_str):
+                return True
             if not subcmd or subcmd.startswith("-") or subcmd in _SHEEPDOG_SUBCMDS:
                 continue
         if _BUS_FORBIDDEN_CMD_RE.search(seg_s):

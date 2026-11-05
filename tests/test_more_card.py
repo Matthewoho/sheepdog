@@ -276,7 +276,7 @@ class MoreCardTest(ThreadsBase):
             ("URL", "详情见 https://example.com/pr/42 ，已验证通过。"),
             ("文件路径", "已修改 sheepdog/card.py 并跑通单测。"),
             ("飞书内部 ID", "已在群 oc_test_group_123456 同步结论。"),
-            ("飞书裸 om/ou ID", "消息 om_x100b62a41a73f0a 由 ou_f7c171b535ffd721 发起。"),
+            ("飞书裸 om/ou ID", "消息 om_0000000000000001 由 ou_0000000000000001 发起。"),
             ("反引号代码", "已部署 `model-manager-decision-service` 到测试环境。"),
             ("Markdown 编号分点列表", "结论如下：\n1. 独立创建新服务\n2. 不混入旧模型服务"),
             ("CJK紧贴revision", "刚上线00005-5vc版本"),
@@ -318,7 +318,7 @@ class MoreCardTest(ThreadsBase):
         self._assert_reply_full_width_more(
             card_of(self.lark.sent("+messages-reply")[-1])["body"]["elements"], good_matthew, LONG_DETAIL
         )
-        plain_words = "<at id=ou_f7c171b535ffd721>Ren Ryan</at> 收到 feedback，我们在 cafe 聊过 deadbeef 和 decade 方案，20261022 前搞定。"
+        plain_words = "<at id=ou_0000000000000001>Ren Ryan</at> 收到 feedback，我们在 cafe 聊过 deadbeef 和 decade 方案，20261022 前搞定。"
         rc_pw, out_pw, err_pw = self.cli("reply-card", "--summary", plain_words, "--text", LONG_DETAIL)
         self.assertEqual(rc_pw, 0, err_pw)
 
@@ -336,7 +336,7 @@ class MoreCardTest(ThreadsBase):
         direct_cred = (
             f"<at id={ALICE}></at> 你的测试环境账号已开通：\n"
             "- 登录地址：https://cinemap-stage.tapnow.tv\n"
-            "- 账号：`alice@tamaredge.ai`\n"
+            "- 账号：`alice@example.org`\n"
             "- 临时密码：`CinemaP#2026!`"
         )
         rc1, out1, err1 = self.cli("reply", "--topic", "tp_alpha", "--to", m_alice, "--card-text", direct_cred)
@@ -350,7 +350,7 @@ class MoreCardTest(ThreadsBase):
         folded_pwd = (
             f"<at id={ALICE}></at> 临时密码已经帮你重设好了，点开下方 more 即可直接复制登录。"
             " ---more--- 你的测试环境账号临时密码已重设完成：\n"
-            "- 登录邮箱：`alice@tamaredge.ai`\n"
+            "- 登录邮箱：`alice@example.org`\n"
             "- 临时密码：`Reset#2026!`\n"
             "请使用邮箱+密码直接登录。"
         )
@@ -391,20 +391,20 @@ class MoreCardTest(ThreadsBase):
         self.assertEqual(rc5, 2, out5 + err5)
         self.assertIn("00005-5vc", err5)
 
-        # 6) REG-090：未加反引号的裸密码若含十六进制随机后缀（如 KaiStage2026!643d1946），不得误判为 Git commit SHA，应正常自动上浮首屏
+        # 6) REG-090：未加反引号的裸密码若含十六进制随机后缀（如 DemoStage2026!a1b2c3d4），不得误判为 Git commit SHA，应正常自动上浮首屏
         bare_hex_pwd = (
             "出站走查已经在机器上跑起来了，持续抓三十分钟；另外 Stage 账号的 admin 权限已给你配好，开好后直接进控制台生效。\n"
             "---more---\n"
             "1. 出站走查已启动：\n"
-            "   已在 Stage 机器（ins-mu1sqp1i）后台执行 `sudo bash /opt/cinemap/stack/scripts/egress-audit.sh 1800`（抓取周期 30 分钟）。\n\n"
+            "   已在 Stage 机器（ins-stage001）后台执行 `sudo bash /opt/cinemap/stack/scripts/egress-audit.sh 1800`（抓取周期 30 分钟）。\n\n"
             "2. 腾讯云 Stage 管理权限已就绪（Matthew 已批复）：\n"
-            "   - 登录入口：https://intl.cloud.tencent.com/login/subAccount/200053747813\n"
-            "   - 主账号 ID：200053747813（Stage 独立成员账号）\n"
+            "   - 登录入口：https://intl.cloud.tencent.com/login/subAccount/200000000002\n"
+            "   - 主账号 ID：200000000002（Stage 独立成员账号）\n"
             "   - 子用户名：kai\n"
-            "   - 初始密码：KaiStage2026!643d1946（首次登录需修改密码）"
+            "   - 初始密码：DemoStage2026!a1b2c3d4（首次登录需修改密码）"
         )
         rc6, out6, err6 = self.cli("reply-card", "--text", bare_hex_pwd)
         self.assertEqual(rc6, 0, err6)
         els6 = json.loads(out6)["body"]["elements"]
-        self.assertIn("KaiStage2026!643d1946", els6[0]["content"])
-        self.assertIn("https://intl.cloud.tencent.com/login/subAccount/200053747813", els6[0]["content"])
+        self.assertIn("DemoStage2026!a1b2c3d4", els6[0]["content"])
+        self.assertIn("https://intl.cloud.tencent.com/login/subAccount/200000000002", els6[0]["content"])

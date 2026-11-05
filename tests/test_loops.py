@@ -349,7 +349,7 @@ duty = "负责 111 个服务迁移"
             "[System Notification]\n"
             "Sender ID: 03c96300-6908-4da5-ba4c-0038cd7f5ff5\n"
             "4. **DNSPod (`tapnow.tv`)**：已添加 `app-cn.tapnow.tv` 解析记录（RecordId `2442607029`，"
-            "当前指向 `129.211.237.172` 确保 HTTPS 立即 200 可通；待 EO `app-cn.tapnow.tv.eo.dnse4.com` "
+            "当前指向 `203.0.113.172` 确保 HTTPS 立即 200 可通；待 EO `app-cn.tapnow.tv.eo.dnse4.com` "
             "从 `process` 变 `online` 后可一键切 CNAME）。"
         )
         sanitized_summary = (

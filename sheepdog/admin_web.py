@@ -93,7 +93,7 @@ _ACCEPT_WORDS_RE = re.compile(
     re.I,
 )
 _OVERRIDE_WORDS_RE = re.compile(
-    r"(?:忽略|不用|取消|算了|不对|不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|不用我同意|已经过时间"
+    r"(?:忽略|不用|取消|算了|不对|(?<!要)不要|别|暂停|暂缓|推翻|改用|换成|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|不用我同意|已经过时间"
     r"|用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢"
     r"|有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我"
     r"|会不会有.{0,6}影响|有什么影响|有没有影响|有办法看|最高.{0,12}用了多少"
@@ -109,7 +109,7 @@ _OVERRIDE_WORDS_RE = re.compile(
     r"|(?:我)?(?:已经)?在(?:消息|私聊|聊天|飞书|对话框)里(?:已经)?(?:回|回复|说|答|发|交代)(?:了|过)|你可以观望|先观望一下|观望一下"
     r"|邮箱来的(?:消息)?|邮件来的(?:消息)?|暂时不管"
     r"|问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|先问一下腾讯云|问一下腾讯云的人|是给谁访问的|给谁访问的"
-    r"|问一下能不能用|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b"
+    r"|问一下能不能用|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b|(?:能不能用|改用|用)[^\n。]{0,12}国际站"
     r"|给他(?:账号密码|账密)|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|还不能动|把来龙去脉在群里讲清楚|来龙去脉.{0,8}讲清楚|已经在.{0,20}群里(?:在)?讨论|讨论的事情是同一个|统一转交给同一个\s*session|等澄清上下文|澄清上下文|暂时观望|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
     r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号)|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
     re.I,
@@ -139,7 +139,7 @@ def diagnose_override_reason(
     ):
         return ("stale_or_already_handled", "陈旧/已处理未重查")
     if re.search(
-        r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b"
+        r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b|(?:能不能用|改用|用)[^\n。]{0,12}国际站"
         r"|修复这一类|这一类的东西|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
         r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行|应该有所有数据库的最高权限|所有数据库的最高权限"
         r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9]))",
@@ -1752,16 +1752,18 @@ class WorkbenchService:
                 rec = upsert_person_alias(self.cfg.db_path, target=name, feishu_name=name, role_hint=f"vip:{name}")
                 return {"ok": True, "action": action, "name": name, "vip": True, "role_hint": rec.role_hint}
             rh = str(cur.role_hint or "")
+            if rh.lower().startswith("owner"):
+                return {"ok": False, "error": "主人（owner）身份受保护，不可通过 toggle_vip 降级"}
             desc = rh.split(":", 1)[1] if ":" in rh else (rh or cur.preferred_name)
-            was_vip = rh.lower().startswith(("vip", "owner"))
+            was_vip = rh.lower().startswith("vip")
             new_rh = f"colleague:{desc}" if was_vip else f"vip:{desc}"
             rec = upsert_person_alias(self.cfg.db_path, target=cur.person_key, role_hint=new_rh)
             return {"ok": True, "action": action, "name": name, "vip": not was_vip, "role_hint": rec.role_hint}
 
         if action == "clear_hook_block":
             topic_id = str(payload.get("topic_id") or "").strip()
-            if not topic_id:
-                return {"ok": False, "error": "缺少 topic_id"}
+            if not topic_id or not re.fullmatch(r"[A-Za-z0-9_.#-]{1,64}", topic_id) or ".." in topic_id:
+                return {"ok": False, "error": "缺少或非法的 topic_id"}
             clear_stop_state(self.cfg.state_dir, topic_id)
             return {"ok": True, "action": action, "topic_id": topic_id}
 
@@ -1882,16 +1884,49 @@ def make_handler(service: WorkbenchService):
         def log_message(self, fmt: str, *args: Any) -> None:
             pass
 
+        def _send_security_headers(self) -> None:
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'",
+            )
+
         def _send_json(self, data: Any, status: int = HTTPStatus.OK) -> None:
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
 
+        def _check_request_security(self, *, is_post: bool = False) -> bool:
+            host_hdr = (self.headers.get("Host") or "").strip().lower()
+            if host_hdr:
+                host_only = host_hdr.split(":", 1)[0] if not host_hdr.startswith("[") else host_hdr.split("]", 1)[0] + "]"
+                if host_only not in ("127.0.0.1", "localhost", "[::1]"):
+                    self._send_json({"ok": False, "error": "Forbidden Host header (loopback only)"}, status=HTTPStatus.FORBIDDEN)
+                    return False
+            if is_post:
+                ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype != "application/json":
+                    self._send_json({"ok": False, "error": "Content-Type must be application/json"}, status=HTTPStatus.FORBIDDEN)
+                    return False
+                for hdr_name in ("Origin", "Referer"):
+                    hdr_val = (self.headers.get(hdr_name) or "").strip()
+                    if hdr_val:
+                        p_url = urlparse(hdr_val)
+                        h_name = (p_url.hostname or "").lower()
+                        if h_name not in ("127.0.0.1", "localhost", "::1"):
+                            self._send_json({"ok": False, "error": f"Forbidden cross-origin {hdr_name}"}, status=HTTPStatus.FORBIDDEN)
+                            return False
+            return True
+
         def do_GET(self) -> None:
+            if not self._check_request_security(is_post=False):
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             qs = parse_qs(parsed.query)
@@ -1907,6 +1942,7 @@ def make_handler(service: WorkbenchService):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                self._send_security_headers()
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -1946,6 +1982,8 @@ def make_handler(service: WorkbenchService):
                 self._send_json({"error": f"{type(e).__name__}: {e}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def do_POST(self) -> None:
+            if not self._check_request_security(is_post=True):
+                return
             parsed = urlparse(self.path)
             if parsed.path != "/api/action":
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)

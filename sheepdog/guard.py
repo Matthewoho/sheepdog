@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import ANTIGRAVITY
+from .prompts import is_sheepdog_prompt
 
 # transcript_cursors.purpose
 COMPACTION = "compaction"
@@ -667,7 +668,7 @@ def subagent_returns_in(host: str, d: dict) -> list[SubagentReturn]:
         return []
     raw_content = d.get("content")
     text = (_decoded(raw_content) or raw_content) if isinstance(raw_content, str) else ""
-    if "[Message]" not in text:
+    if "[Message]" not in text or is_sheepdog_prompt(text):
         return []
     line_at = str(d.get("created_at") or d.get("timestamp") or "")
     matches = list(_SUBAGENT_RETURN_BLOCK_RE.finditer(text)) or list(_SUBAGENT_RETURN_DIRECT_RE.finditer(text))

@@ -74,7 +74,15 @@ def save_live_agentapi_env(state_dir: Path | None) -> bool:
             "ppid": os.getppid(),
         }
         tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
         tmp.replace(target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
         return True
     except OSError:
         return False

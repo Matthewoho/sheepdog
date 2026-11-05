@@ -211,7 +211,7 @@ _BARE_CREDENTIAL_VALUE_RE = re.compile(
 
 
 def _find_deliverable_forbidden_symbol(text: str) -> tuple[str, str] | None:
-    """7.119 / 1.1.1：核心交付物首屏豁免凭证值（含未加反引号的裸密码如 KaiStage2026!643d1946）、行内反引号与登录/订阅 URL，但仍拦截 Cloud Run revision、裸 Git SHA、代码文件路径与飞书内部 ID。"""
+    """7.119 / 1.1.1：核心交付物首屏豁免凭证值（含未加反引号的裸密码如 DemoStage2026!a1b2c3d4）、行内反引号与登录/订阅 URL，但仍拦截 Cloud Run revision、裸 Git SHA、代码文件路径与飞书内部 ID。"""
     cleaned = _AT_TAG_RE.sub("", text or "")
     cleaned = _BARE_CREDENTIAL_VALUE_RE.sub(r"\1 ", cleaned)
     cleaned = _INLINE_CODE_RE.sub(" ", cleaned)

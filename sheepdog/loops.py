@@ -854,9 +854,23 @@ def discover_loops(cfg: Config, store: Store | None = None) -> list[LoopSpec]:
     return specs
 
 
+_SAFE_LOOP_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
+
+
+def _validate_loop_id(loop_id: str) -> str:
+    s = (loop_id or "").strip()
+    if not s or not _SAFE_LOOP_ID_RE.match(s) or ".." in s:
+        raise ValueError(f"非法 loop_id: {loop_id!r}")
+    return s
+
+
 def get_loop_spec(cfg: Config, store: Store | None, loop_id: str) -> LoopSpec | None:
-    p = cfg.loops_dir / loop_id / "LOOP.md"
-    if not p.is_file():
+    try:
+        safe_id = _validate_loop_id(loop_id)
+    except ValueError:
+        return None
+    p = cfg.loops_dir / safe_id / "LOOP.md"
+    if not p.is_file() or p.is_symlink():
         return None
     spec = load_loop_spec(p)
     if store is not None:
@@ -966,6 +980,7 @@ def update_loop_item(
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """推进或更新单条跟进事项的阶段（stage）、状态（active|closed|exempted）及下次检查时间；豁免时自动写 MEMORY.md。"""
+    loop_id = _validate_loop_id(loop_id)
     ensure_loop_tables(store)
     spec = get_loop_spec(cfg, store, loop_id)
     now_dt = datetime.now(timezone.utc).astimezone()
@@ -1291,6 +1306,9 @@ def parse_load_output(stdout: str, dedup_key: str = "key") -> list[dict[str, Any
     for item in raw_list:
         if not isinstance(item, dict):
             item = {"title": str(item)[:120], "raw": str(item)}
+        else:
+            # 安全加固（REG-125）：严禁外部探测脚本 stdout JSON 注入 defer_check_cmd 触发 shell=True RCE
+            item = {k: v for k, v in item.items() if k != "defer_check_cmd"}
         k = str(
             item.get(dedup_key)
             or item.get("key")

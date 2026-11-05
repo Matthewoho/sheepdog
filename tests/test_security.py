@@ -1544,8 +1544,8 @@ class GateTest(Base):
             "建议：选 A。仅限测试环境服务账号，演练必需且风险可控。\n"
             "---more---\n"
             "- 目标环境：tap-testing-env（测试环境，非生产）\n"
-            "- 目标主体：user:elaine.shi@tamaredge.ai\n"
-            "- 目标资源：tap-edm-backend@tap-testing-env.iam.gserviceaccount.com\n"
+            "- 目标主体：user:elaine@example.org\n"
+            "- 目标资源：edm-backend@test-project.iam.gserviceaccount.com\n"
             "- 目标角色：roles/iam.serviceAccountTokenCreator"
         )
         with self.assertRaisesRegex(outbound.OutboundError, "REG-083 防打扰门禁"):
@@ -1953,7 +1953,7 @@ class GateTest(Base):
                 self.store,
                 "tp_alpha",
                 "Carl申请生产Cloud SQL白名单",
-                "Carl Pan 切换新专线（lsg6）申请将本机出口 IP 192.220.99.55/32 加入生产 Cloud SQL 白名单。\n"
+                "Carl Pan 切换新专线（lsg6）申请将本机出口 IP 198.51.100.55/32 加入生产 Cloud SQL 白名单。\n"
                 "选项：\nA. 同意追加该单点 IP 到生产白名单\nB. 暂缓追加\n建议：选 A",
             )
         self.assertIn("REG-085", str(ctx_db.exception))
@@ -2244,7 +2244,7 @@ class GateTest(Base):
             "选项：\nA. 采买新购 1 台专属住宅 VPS\nB. 暂不新购\n建议：选 A",
         )
 
-        # REG-090：在物理隔离的腾讯云 Stage 独立成员账号（200053747813）只提最小受限策略未提 AdministratorAccess/admin 时拦截
+        # REG-090：在物理隔离的腾讯云 Stage 独立成员账号（200000000002）只提最小受限策略未提 AdministratorAccess/admin 时拦截
         with self.assertRaises(OutboundError) as cm_stage:
             check_ask_pre_flight_guard(
                 self.cfg,
@@ -2252,7 +2252,7 @@ class GateTest(Base):
                 "tp_kaifeng",
                 "Kai申请腾讯云中国站Stage资源权限",
                 "Kai 申请腾讯云中国站资源权限用于今晚 Stage 联调。\n---more---\n"
-                "选项：\nA. 在腾讯云 Stage 成员账号（200053747813）为 Kai 配置对应资源的最小受限策略\n"
+                "选项：\nA. 在腾讯云 Stage 成员账号（200000000002）为 Kai 配置对应资源的最小受限策略\n"
                 "B. 不分配云权限，由专席代跑\n建议：选 A",
             )
         self.assertIn("REG-090", str(cm_stage.exception))
@@ -2263,7 +2263,7 @@ class GateTest(Base):
             "tp_kaifeng",
             "Kai申请腾讯云中国站Stage资源权限",
             "Kai 申请腾讯云中国站资源权限用于今晚 Stage 联调。\n---more---\n"
-            "选项：\nA. 在腾讯云 Stage 成员账号（200053747813）直接授予 AdministratorAccess（admin 权限，严格隔离主账号与生产）\n"
+            "选项：\nA. 在腾讯云 Stage 成员账号（200000000002）直接授予 AdministratorAccess（admin 权限，严格隔离主账号与生产）\n"
             "B. 不分配云权限，由专席代跑\n建议：选 A",
         )
 
