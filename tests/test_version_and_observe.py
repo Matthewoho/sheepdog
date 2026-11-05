@@ -4045,8 +4045,8 @@ class VersionAndObserveTest(unittest.TestCase):
                 st,
                 "tp_edm-open-tracking",
                 "是否新增国内跳转域名 edm.tapnow.media",
-                "已向 Elaine 确认该国内域名是给谁访问的（目标访问受众为国内站真实 C 端订阅客户）。\n"
-                "选项：\nA. 同意新增 edm.tapnow.media\nB. 暂不建新域名\n建议：选 A",
+                "已向 Elaine 确认该国内域名是给谁访问的（目标访问受众为国内站真实 C 端订阅客户），并已确认能否改用 edm.tapnow.tv。\n"
+                "选项：\nA. 同意新增 edm.tapnow.tv\nB. 暂不建新域名\n建议：选 A",
             )
 
             # 2) diagnose_override_reason classification
@@ -4128,6 +4128,131 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertTrue(e_err)
             self.assertNotIn("Or visit https://console.cloud.google.com", e_sum)
             self.assertIn("ModuleNotFoundError: No module named 'yaml'", e_sum)
+            st.close()
+
+    def test_reg116_tapnow_tv_domain_reuse_guard_and_subagent_sysmsg_stall_harvest_and_http_header_filter(self):
+        """1.1.27（REG-116）：
+        1. check_ask_pre_flight_guard 拦截请示新增 *.tapnow.media 国内子域名但未先询问/提供 *.tapnow.tv 复用方案的提问；
+        2. diagnose_override_reason 将『问一下能不能用 edm.tapnow.tv』归入 arch_or_config_posture（技术姿势纠偏）；
+        3. _harvest_subagent_stall_state 识别末尾停在 SYSTEM_MESSAGE DONE（后台任务完成/取消通知）的半途静默态并从 SYSTEM_MESSAGE 提取 Command output；
+        4. _summarize_cli_lamb_log 自动过滤 curl -i 打印的原始 HTTP 响应头（server:/via:/alt-svc: 等）保留真实执行摘要。
+        """
+        from sheepdog import admin_web, outbound
+        from sheepdog.config import Config
+        from sheepdog.engine import _harvest_subagent_stall_state, _summarize_cli_lamb_log
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sheepdog.sqlite3"
+            st = Store(db)
+            cfg = Config(state_dir=Path(tmp))
+
+            # 1) Proposing new *.tapnow.media domestic subdomain without checking *.tapnow.tv -> blocked
+            with self.assertRaises(outbound.OutboundError) as ctx1:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_edm-open-tracking",
+                    "大促第2批国内域名决策：是否新增 edm.tapnow.media",
+                    "事情：Elaine 追问国内直连域名决策，今天大促第 2 批国内站邮件正等该结论。\n"
+                    "调用链：国内用户 -> https://edm.tapnow.media/t/* -> 腾讯云 EdgeOne（生产子账号 200053747873） -> Cloud Run tapnow-edm。\n"
+                    "选项：\nA. 同意新增 edm.tapnow.media：由专席在生产子账号 200053747873 下配置 EdgeOne 与 DNSPod 解析\n"
+                    "B. 今天不做国内域名\n建议：选 A",
+                )
+            self.assertIn("REG-116", str(ctx1.exception))
+            self.assertIn("edm.tapnow.tv", str(ctx1.exception))
+
+            # With *.tapnow.tv option/confirmation included -> allowed
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_edm-open-tracking",
+                "大促第2批国内域名决策：是否新增 edm.tapnow.media 或改用 edm.tapnow.tv",
+                "事情：已向 Elaine 询问能不能直接用 edm.tapnow.tv（直接复用生产子账号 200053747873 下的 tapnow.tv 站点）。\n"
+                "调用链：国内用户 -> https://edm.tapnow.tv/t/* -> 腾讯云 EdgeOne（生产子账号 200053747873） -> Cloud Run tapnow-edm。\n"
+                "选项：\nA. 优先用 edm.tapnow.tv：直接复用生产子账号 200053747873 下的 tapnow.tv 站点\n"
+                "B. 仍新增 edm.tapnow.media\n建议：选 A",
+            )
+
+            # 2) diagnose_override_reason classification for "问一下能不能用 edm.tapnow.tv"
+            code, label = admin_web.diagnose_override_reason(
+                "大促第2批国内域名决策：是否新增 edm.tapnow.media",
+                "问一下能不能用 edm.tapnow.tv",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual(code, "arch_or_config_posture")
+            self.assertEqual(label, "技术姿势纠偏")
+
+            # 3) _harvest_subagent_stall_state recognizes trailing SYSTEM_MESSAGE DONE and extracts Command output from SYSTEM_MESSAGE
+            tp_sub = Path(tmp) / "subagent_transcript.jsonl"
+            steps = [
+                {
+                    "step_index": 100,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "You have 1 background task(s) currently running",
+                },
+                {
+                    "step_index": 101,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": (
+                        "<SYSTEM_MESSAGE>\n"
+                        'Task id "task-96" finished with result:\n'
+                        "Command exited with code 0.\n\n"
+                        "Command output:\n"
+                        "=== CURL TEST (api.ipify.org) ===\n"
+                        "Result: \n"
+                        "=== CURL TEST (httpbin.org/ip) ===\n"
+                        "Result 2: \n"
+                        "=== MIHOMO LOGS (last 20 lines) ===\n"
+                        'time="2026-11-05T12:43:08.026413000+08:00" level=warning msg="[TCP] dial PROXY (match Match/) 127.0.0.1:52325 --> api.ipify.org:443 error: 192.220.99.3:443 connect error: REALITY authentication failed"\n\n'
+                        "Log: file:///tmp/test_task-96.log\n"
+                        "</SYSTEM_MESSAGE>"
+                    ),
+                },
+                {"step_index": 102, "type": "PLANNER_RESPONSE", "status": "DONE", "content": ""},
+                {"step_index": 103, "type": "GENERIC", "status": "DONE", "content": 'Task "task-90" cancelled.'},
+                {
+                    "step_index": 104,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": '<SYSTEM_MESSAGE>Task id "task-90" was canceled</SYSTEM_MESSAGE>',
+                },
+            ]
+            tp_sub.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in steps) + "\n", encoding="utf-8")
+            stalled, harvested = _harvest_subagent_stall_state(tp_sub)
+            self.assertTrue(stalled)
+            self.assertIn("192.220.99.3:443 connect error: REALITY authentication failed", harvested)
+            self.assertNotIn("Log: file://", harvested)
+            self.assertNotIn("</SYSTEM_MESSAGE>", harvested)
+
+            # 4) _summarize_cli_lamb_log filters raw HTTP response headers (server:, via:, alt-svc:, etc.)
+            curl_log = (
+                "Execution [tapnow-edm-migrate-p95sq] has successfully completed.\n"
+                "[5/5] Verifying endpoint curl https://edm.tapnow.ai/t/o/check...\n"
+                "HTTP/2 200 \n"
+                "cache-control: no-store, no-cache, must-revalidate, max-age=0\n"
+                "content-type: image/gif\n"
+                "x-request-id: 1500d754-8a0f-4098-a9b1-ae2d3d5b6c12\n"
+                "x-cloud-trace-context: ba2728f77b12030bb35fe6125e3c5fe9;o=1\n"
+                "content-length: 43\n"
+                "date: Thu, 05 Nov 2026 05:11:17 GMT\n"
+                "server: Google Frontend\n"
+                "via: 1.1 google\n"
+                'alt-svc: h3=":443"; ma=2592000\n\n'
+                "=== [2026-11-05 13:11:16] Production Rollout Succeeded ===\n"
+                "SUMMARY: new_revision=tapnow-edm-00007-w5g, prev_revision=tapnow-edm-00006-2w4, curl_status=HTTP/2 200 \n"
+            )
+            c_sum, c_err = _summarize_cli_lamb_log(curl_log)
+            self.assertFalse(c_err)
+            self.assertNotIn("server: Google Frontend", c_sum)
+            self.assertNotIn("via: 1.1 google", c_sum)
+            self.assertNotIn("alt-svc:", c_sum)
+            self.assertIn("Execution [tapnow-edm-migrate-p95sq] has successfully completed.", c_sum)
+            self.assertIn("=== [2026-11-05 13:11:16] Production Rollout Succeeded ===", c_sum)
+            self.assertIn("SUMMARY: new_revision=tapnow-edm-00007-w5g", c_sum)
             st.close()
 
 

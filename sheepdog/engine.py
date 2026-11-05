@@ -4973,12 +4973,20 @@ class Dispatcher:
                         and (other["state"] == "running" or (other["started_at"] or "") > (lb["started_at"] or ""))
                         for other in topic_lambs
                     )
+                    tp_sub = transcript_path(lb["conversation_id"])
+                    cur_sub_sum = str(lb["result_summary"] or "").strip()
+                    if cur_sub_sum == f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时":
+                        stalled_done, harvested_out = _harvest_subagent_stall_state(tp_sub)
+                        if stalled_done and harvested_out:
+                            self.store.update_lamb(
+                                lb["lamb_id"],
+                                result_summary=f"羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟（已自动提取最近工具输出）：{harvested_out}",
+                            )
                     if has_newer_or_active:
                         continue
                     fin_dt = _parse(lb["finished_at"] or "")
                     if fin_dt and (_now() - fin_dt) > timedelta(minutes=self.cfg.lamb.timeout_minutes * 2):
                         continue
-                    tp_sub = transcript_path(lb["conversation_id"])
                     task_act = _subagent_latest_task_log_mtime(tp_sub)
                     revive_window = min(timedelta(minutes=self.cfg.lamb.timeout_minutes), timedelta(minutes=5))
                     if (
@@ -5009,6 +5017,7 @@ class Dispatcher:
                     if (
                         _GREP_MATCH_LINE_RE.search(cur_sum)
                         or _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(cur_sum)
+                        or _HTTP_RESPONSE_HEADER_LINE_RE.search(cur_sum)
                         or cur_sum in ("{", "[")
                         or cur_sum.startswith('File "')
                         or (bool(_SAVED_TMP_JSON_RE.match(cur_sum)) and "-> JSON(" not in cur_sum)
@@ -7010,21 +7019,28 @@ def _harvest_subagent_stall_state(tp: Path) -> tuple[bool, str]:
         return False, ""
     last_step = steps[-1]
     is_generic_done = bool(
-        str(last_step.get("type") or "") == "GENERIC"
+        str(last_step.get("type") or "") in ("GENERIC", "SYSTEM_MESSAGE")
         and str(last_step.get("status") or "") == "DONE"
     )
     harvested = ""
-    for st in reversed(steps[-8:]):
-        if str(st.get("type") or "") == "GENERIC":
+    for st in reversed(steps[-16:]):
+        if str(st.get("type") or "") in ("GENERIC", "SYSTEM_MESSAGE"):
             c = str(st.get("content") or "")
             if "Command output:" in c:
-                out_part = c.split("Command output:", 1)[1].strip()
+                out_part = c.split("Command output:", 1)[1]
+                out_part = re.sub(r"\n*Log:\s*file://[^\n]*[\s\S]*$", "", out_part)
+                out_part = re.sub(r'\btime="\d{4}-\d{2}-\d{2}T[^"]+"\s*', "", out_part)
+                out_part = out_part.replace("</SYSTEM_MESSAGE>", "").strip()
                 if out_part:
-                    harvested = " ".join(out_part.split())[:240]
+                    harvested = " ".join(out_part.split())[:400]
                     break
     return is_generic_done, harvested
 
 
+_HTTP_RESPONSE_HEADER_LINE_RE = re.compile(
+    r"^(?:server|via|alt-svc|date|content-type|content-length|cache-control|etag|vary|expires|last-modified|pragma|age|accept-ranges|strict-transport-security|cf-ray|cf-cache-status|x-cloud-trace-context|x-powered-by|x-frame-options|x-content-type-options|x-xss-protection|x-request-id|x-envoy-[a-z0-9-]+|x-guploader-[a-z0-9-]+|x-goog-[a-z0-9-]+|x-amz-[a-z0-9-]+):\s+\S",
+    re.I | re.M,
+)
 _CLI_PASS_BANNER_RE = re.compile(
     r"(?:^===\s*.*(?:^|[\s_-])(?:PASSED|VERIFIED|DONE|COMPLETE|COMPLETED|OK|SUCCESS)(?:$|[\s_-]).*===$"
     r"|=== VERIFICATION PASSED ==="
@@ -7166,6 +7182,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
         ln for ln in meaningful
         if not _GREP_MATCH_LINE_RE.match(ln)
         and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+        and not _HTTP_RESPONSE_HEADER_LINE_RE.match(ln)
         and not ('"WaitMsBeforeAsync"' in ln and '"toolSummary"' in ln)
     ]
     if non_grep_all:
@@ -7178,6 +7195,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
             and "Error response from daemon: removal of container" not in ln
             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
             and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+            and not _HTTP_RESPONSE_HEADER_LINE_RE.match(ln)
         ]
         if non_grep:
             meaningful = non_grep

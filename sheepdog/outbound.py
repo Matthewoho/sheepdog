@@ -606,11 +606,23 @@ _URGENCY_AND_TENCENT_CONTACT_EVIDENCE_RE = re.compile(
 )
 _NEW_DOMESTIC_DOMAIN_ASK_RE = re.compile(
     r"(?:(?:是否)?(?:新增|新建|开通|配置|给一个)[^\n。]{0,20}国内(?:跳转|直连|可达)?域名"
+    r"|国内(?:跳转|直连|可达)?域名[^\n。]{0,20}(?:是否)?(?:新增|新建|开通|配置)"
     r"|(?:新增|新建|开通)[^\n。]{0,20}\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.tapnow\.media\b[^\n。]{0,20}(?:国内|直连|跳转))",
     re.I,
 )
 _DOMESTIC_DOMAIN_AUDIENCE_EVIDENCE_RE = re.compile(
-    r"(?:给谁访问|访问(?:受众|对象|群体|人群)|受众(?:群体|对象|是谁)|目标(?:受众|访问群体|用户群体)|已(?:向|跟)[^\n。]{0,16}确认[^\n。]{0,20}(?:给.*访问|访问对象|受众))",
+    r"(?:给谁访问|访问(?:受众|对象|群体|人群)|受众(?:群体|对象|是谁)|目标(?:受众|访问群体|用户群体)"
+    r"|已(?:向|跟)[^\n。]{0,16}确认[^\n。]{0,20}(?:给.*访问|访问对象|受众)"
+    r"|调用链\s*[:：]\s*国内用户\s*->|面向国内(?:站)?(?:C\s*端)?(?:用户|客户))",
+    re.I,
+)
+_NEW_TAPNOW_MEDIA_DOMESTIC_SUBDOMAIN_ASK_RE = re.compile(
+    r"(?:(?:是否|同意)?(?:新增|新建|开通|配置)[^\n。]{0,24}\b([a-z0-9-]+)\.tapnow\.media\b"
+    r"|\b([a-z0-9-]+)\.tapnow\.media\b[^\n。]{0,24}(?:是否|同意)?(?:新增|新建|开通|配置))",
+    re.I,
+)
+_TAPNOW_TV_REUSE_EVIDENCE_RE = re.compile(
+    r"(?:\b[a-z0-9-]+\.tapnow\.tv\b|(?:能不能|是否可(?:以)?|改用|复用|优先用)\s*(?:[a-z0-9-]+\.)?tapnow\.tv\b)",
     re.I,
 )
 _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
@@ -887,6 +899,14 @@ def check_ask_pre_flight_guard(
             "请示新增/开通『国内直连/跳转域名』（如 `edm.tapnow.media` 等）前，必须先向申请人核实并在正文中写明『该国内域名具体是给谁访问的（目标访问受众是谁：真实国内 C 端客户、海外客户还是内部运营不挂梯子测试）』"
             "（主人 2026-11-05 12:40 在 `[其他]` 反问：『问一下国内域名是给谁访问的』，REG-115 新增国内域名必核访问受众门禁）："
             "请先向申请人问清该国内域名的真实访问受众（`给谁访问 / 访问受众`）并写入正文后再发起 `sheepdog ask`（没有发送）",
+        )
+    if (m_media_sub := _NEW_TAPNOW_MEDIA_DOMESTIC_SUBDOMAIN_ASK_RE.search(full_text)) and not _TAPNOW_TV_REUSE_EVIDENCE_RE.search(full_text):
+        sub_prefix = (m_media_sub.group(1) or m_media_sub.group(2) or "edm").lower()
+        raise OutboundError(
+            EXIT_INVALID,
+            f"请示新增/配置『{sub_prefix}.tapnow.media』国内子域名前，必须先向需求方询问确认『能不能直接用 {sub_prefix}.tapnow.tv（直接复用腾讯云国际站生产子账号 200053747873 下现有的 tapnow.tv 正式 EdgeOne 站点）』，"
+            f"并在正文中写明需求方对使用 `{sub_prefix}.tapnow.tv` 的确认结论或将其列为推荐选项 A"
+            f"（主人 2026-11-05 13:33 在 `[其他]` 纠偏：『问一下能不能用 edm.tapnow.tv』，REG-116 国内新子域名优先收敛复用 tapnow.tv 门禁，没有发送）",
         )
     if _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE.search(full_text):
         raise OutboundError(
