@@ -176,6 +176,14 @@ def diagnose_override_reason(
     ):
         return ("stale_or_already_handled", "陈旧/已处理未重查")
     if chosen_code in ("A", "B", "C", "D", "E") and recommended and chosen_code != recommended:
+        m_chosen = re.search(rf"(?:^|\n)\s*{re.escape(chosen_code)}\s*[\.、:：)\]]\s*([^\n]+)", text or "", re.I)
+        chosen_full = f"{s} {m_chosen.group(1) if m_chosen else ''}"
+        if re.search(r"开通[^\n。；]*(?:GitHub|仓库|仓)[^\n。；]*权限[^\n。；]*(?:自行|自己)?[^\n。；]*提\s*PR", chosen_full, re.I) and re.search(
+            r"不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n。；]*(?:由我们|我们)(?:克隆|直接)?[^\n。；]*(?:修改|代改|改)",
+            text or "",
+            re.I,
+        ):
+            return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
     return ("option_or_schedule_redirect", "人类改判 / 调整窗口")
 

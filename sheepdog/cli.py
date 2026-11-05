@@ -2673,9 +2673,11 @@ def _lamb_prepare(cfg, store: Store, args) -> int:
         spec_body = (args.spec if getattr(args, "spec", None) else
                      (sys.stdin.read() if args.spec_file == "-" else Path(args.spec_file).read_text(encoding="utf-8")) if getattr(args, "spec_file", None) else
                      sys.stdin.read() if getattr(args, "spec_stdin", False) else title)
+        from .outbound import OutboundError, check_no_direct_cnb_git_push_guard
+        check_no_direct_cnb_git_push_guard(f"{title}\n{spec_body}", scene="lamb prepare")
         lid = register_lamb(store, tid, title, kind=args.kind or "subagent",
                             conversation_id=getattr(args, "cid", None) or None, lamb_id=args.lamb_id or None)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, OutboundError) as e:
         print(f"lamb prepare 被拒绝: {e}", file=sys.stderr)
         return 2
     tasks_dir = cfg.state_dir / "lamb_tasks"
@@ -2740,6 +2742,12 @@ def cmd_lamb(args) -> int:
         tid, raw_cmd_str = _topic_arg(args.topic), (args.command or "").strip()
         if store.get_topic(tid) is None or not raw_cmd_str:
             print(f"lamb spawn 被拒绝: {'母羊会话 ' + tid + ' 不存在' if store.get_topic(tid) is None else '--cmd 不能为空'}", file=sys.stderr)
+            return 2
+        from .outbound import OutboundError, check_no_direct_cnb_git_push_guard
+        try:
+            check_no_direct_cnb_git_push_guard(f"{args.title}\n{raw_cmd_str}", scene="lamb spawn")
+        except OutboundError as e:
+            print(f"lamb spawn 被拒绝: {e}", file=sys.stderr)
             return 2
         cmd_str = _normalize_lamb_spawn_cmd(raw_cmd_str)
         raw_lid = (args.lamb_id or "").strip() or f"lamb_{uuid.uuid4().hex[:8]}"

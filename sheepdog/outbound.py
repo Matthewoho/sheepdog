@@ -659,6 +659,36 @@ _LSG14_SOLO_VIP_NODE_ASK_RE = re.compile(
     r"|(?:在\s*lsg14|选\s*[A-E][^\n。；]{0,16}lsg14|分配至\s*lsg14)[^\n。；]{0,40}(?:开通|分配|席位|专线))",
     re.I,
 )
+_INTERNAL_DEV_REPO_PROXY_EDIT_RECOMMEND_RE = re.compile(
+    r"(?:(?P<proxy_opt>[A-E])\s*[\.、:：]\s*不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n]*(?:由我们|我们)(?:克隆|直接)?[^\n]*(?:修改|代改|改)[\s\S]{0,160}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?(?P=proxy_opt)(?![A-Za-z0-9])"
+    r"|(?:建议|推荐)\s*[：:]?[^\n。]*(?:不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n。]*由我们(?:克隆|直接)?(?:修改|代改)|由我们(?:克隆|直接)?(?:修改|代改)[^\n。]*无需(?:开放|开通|扩散)(?:仓库|仓)?权限))",
+    re.I,
+)
+_DIRECT_CNB_GIT_PUSH_RE = re.compile(
+    r"(?:git\s+push\s+(?:--[a-z0-9-]+\s+)*(?:cnb(?:\s|$)|https?://cnb\.build/)"
+    r"|(?=[\s\S]*cnb\.build/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?=[\s\S]*(?:添加\s*cnb\s*remote|git\s+remote\s+add\s+cnb\b|推送(?:代码|分支)[^\n。；]{0,24}至\s*CNB)))",
+    re.I,
+)
+_CNB_MIRROR_SYNC_COMPLIANT_RE = re.compile(
+    r"(?:sync-to-cnb\.ya?ml|(?:严禁|禁止|不要|不得)[^\n。；]{0,24}(?:直接)?[^\n。；]{0,16}(?:向\s*cnb|git\s+push\s+cnb|推送[^\n。；]{0,12}CNB)|由\s*GitHub[^\n。；]{0,20}Action\s*自动同步到\s*CNB)",
+    re.I,
+)
+
+
+def check_no_direct_cnb_git_push_guard(text: str, *, scene: str = "lamb") -> None:
+    """1.1.30（REG-119）：拦截向只读镜像仓 cnb.build 直接执行或派发本机 git push 的任务单/命令/请示。"""
+    s = (text or "").strip()
+    if not s:
+        return
+    if _DIRECT_CNB_GIT_PUSH_RE.search(s) and not _CNB_MIRROR_SYNC_COMPLIANT_RE.search(s):
+        raise OutboundError(
+            EXIT_INVALID,
+            f"{scene} 拒绝（REG-119 CNB 只读镜像仓与 GitHub 唯一提交源铁律）："
+            "检测到直接向 `cnb.build` 添加 remote 并执行本机 `git push cnb` / 推送分支至 CNB！\n"
+            "主人 2026-11-05 15:40 明确立规：『cnb 这边的仓库只能是镜像仓库，所以提交和 push 都走 GitHub 仓库，由 GitHub 这边的 Action 自动同步到 CNB 仓库，并且 CNB 再跑 CI/CD 部署到腾讯云国际』。\n"
+            "本机直推 `cnb.build` 不仅会被后续 `sync-to-cnb.yml` 强推覆盖导致脑裂，还会在首次推送空仓时全量上传数十万 Git 对象造成 20+ 分钟卡死。"
+            "请改为：在 GitHub 源仓库提交/合入并通过 `.github/workflows/sync-to-cnb.yml` 自动同步至 `cnb.build` 触发 CNB 流水线。",
+        )
 _SHARED_CONFIG_IDENT_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b")
 _GENERIC_CONFIG_IDENTS = frozenset(
     {
@@ -980,6 +1010,15 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-05 17:18 在 `tp_sherwin` 误报 `lsg14 空余 1 席` 的旧卡上被迫点击 `[其他] 我去新买一个vps吧`，随后在 `tp_3x-ui-ops` 实据更正卡上改选 `A. 将 Carl 分配至 lsg4 唯一空位`，REG-118 `lsg14` 独占锁定与专线席位必先向 `tp_3x-ui-ops` 核实门禁）："
             "请先通过 `sheepdog tell --to tp_3x-ui-ops` 核实全网节点的最新真实空余席位（如 `lsg4` 等），严禁凭旧记忆提议分配 `lsg14`（没有发送）",
         )
+    if _INTERNAL_DEV_REPO_PROXY_EDIT_RECOMMEND_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部研发同学（如业务服务/关联模块作者）申请 GitHub 业务仓库（`Tamar-Edge-AI/*` / `TapNowAI/*`）权限以自行修改代码并提交 PR 时，"
+            "严禁倒置工程研发权责建议『不开仓库权限，由我们（SRE/Agent）克隆仓库代改代码提 PR』"
+            "（主人 2026-11-05 19:20 在 `tp_arena-release-guard` 建议选 B『不开仓库权限，由我们克隆代改』的卡片上直接改判选『A. 同意为 Jerry 的 GitHub 账号开通仓库写权限，由他自行修改提 PR』，REG-119 内部研发仓库权限申请禁推代改门禁）："
+            "业务代码变更应由研发作者在具备仓库权限后自行提交 PR 并走标准 Code Review 与发布审批闭环；请将『同意为该内部研发同学开通对应仓库写权限，由其自行提 PR 走评审发布流』作为首选建议（建议选 A）后再发起 `sheepdog ask`（没有发送）",
+        )
+    check_no_direct_cnb_git_push_guard(full_text, scene="sheepdog ask")
     if not _GROUP_HISTORY_EXPLAINED_EVIDENCE_RE.search(full_text):
         unexplained_owner_hist_req = False
         if _KEY_CHANGE_ROLLBACK_WITHOUT_GROUP_TIMELINE_ASK_RE.search(full_text):

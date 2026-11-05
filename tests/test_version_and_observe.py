@@ -4652,6 +4652,115 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(label_vps, "技术姿势纠偏")
             st.close()
 
+    def test_reg119_internal_dev_repo_proxy_edit_guard_and_cnb_direct_push_guard_and_override_diagnosis(self):
+        """REG-119 (v1.1.30):
+        1. Internal developer GitHub repo permission ask recommending '不开仓库权限，由我们克隆...代改' is blocked; recommending granting repo access passes.
+        2. Direct local `git push cnb` / `cnb.build` in `lamb prepare`, `lamb spawn`, or `sheepdog ask` is blocked; GitHub Actions `sync-to-cnb.yml` flow passes.
+        3. `diagnose_override_reason` classifies overriding '不开仓库权限，由我们克隆代改' (B) with '开通...仓库写权限，由他自行修改提 PR' (A) under `arch_or_config_posture`.
+        """
+        from types import SimpleNamespace
+        from sheepdog import admin_web, cli, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root)
+            st = Store(root / "sheepdog.sqlite3")
+            st.upsert_topic(
+                "tp_arena-release-guard",
+                title="Arena发版守卫",
+                kind="dynamic",
+                state="active",
+                conversation_id="cid_arena_119",
+                host="antigravity",
+            )
+
+            # 1) Recommending B (不开仓库权限，由我们克隆...代改) -> blocked by REG-119
+            bad_repo_ask_body = (
+                "事情：Jerry Chu（File Hub #201 后端作者）反馈 material-generation-service 上传生成结果需把 x-role 改为 agent，申请仓库权限或由我们代改。\n"
+                "选项：\n"
+                "A. 同意为 Jerry 的 GitHub 账号（Jerry030-1）开通 Tamar-Edge-AI/material-generation-service 仓库写权限，由他自行修改提 PR\n"
+                "B. 不开仓库权限，由我们克隆 material-generation-service 仓库将上传请求头 x-role 改为 agent 并提 PR 送测发版\n"
+                "建议：选 B。改动极其简单，由我们直接修改提 PR 发版推进更高效，无需扩散仓库权限。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_repo:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_arena-release-guard",
+                    "Jerry申请material-generation仓权限或代改x-role",
+                    bad_repo_ask_body,
+                    key="jerry-material-generation-perm",
+                )
+            self.assertIn("REG-119", str(cm_repo.exception))
+
+            # Recommending A (同意为研发同学开通仓库写权限，由他自行修改提 PR) -> passes
+            good_repo_ask_body = (
+                "事情：Jerry Chu（File Hub #201 后端作者）反馈 material-generation-service 上传生成结果需把 x-role 改为 agent，申请仓库写权限提 PR。\n"
+                "选项：\n"
+                "A. 同意为 Jerry 的 GitHub 账号（Jerry030-1）开通 Tamar-Edge-AI/material-generation-service 仓库写权限，由他自行修改提 PR\n"
+                "B. 不开仓库权限，由我们克隆 material-generation-service 仓库将上传请求头 x-role 改为 agent 并提 PR 送测发版\n"
+                "建议：选 A。遵循工程研发权责，由代码作者提 PR 走标准评审与发布流。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_arena-release-guard",
+                "Jerry申请material-generation仓权限",
+                good_repo_ask_body,
+                key="jerry-material-generation-perm",
+            )
+
+            # 2) Direct git push to cnb.build in lamb prepare / lamb spawn / ask -> blocked by REG-119
+            bad_cnb_spec = (
+                "4. 推送代码至 CNB：\n"
+                "   - 添加 cnb remote: https://cnb.build/Tamar-Edge-AI/cinemap_3D_world.git\n"
+                "   - 推送分支 claude/cm-455-china-on-prod 至 CNB\n"
+            )
+            rc_prep = cli._lamb_prepare(
+                cfg,
+                st,
+                SimpleNamespace(
+                    topic="tp_arena-release-guard",
+                    title="CM-584 CNB Git Push & Image Build Lamb",
+                    spec=bad_cnb_spec,
+                    spec_file=None,
+                    spec_stdin=False,
+                    kind="subagent",
+                    cid=None,
+                    lamb_id="lamb_test119a",
+                    json=True,
+                ),
+            )
+            self.assertEqual(rc_prep, 2)
+            self.assertIsNone(st.get_lamb("lamb_test119a"))
+
+            with self.assertRaises(outbound.OutboundError) as cm_cnb_cmd:
+                outbound.check_no_direct_cnb_git_push_guard(
+                    "cd /tmp/repo_test_cinemap && git push cnb claude/cm-455-china-on-prod",
+                    scene="lamb spawn",
+                )
+            self.assertIn("REG-119", str(cm_cnb_cmd.exception))
+
+            # Compliant GitHub -> sync-to-cnb.yml spec -> passes
+            good_cnb_spec = (
+                "4. 同步代码至 CNB 镜像仓：\n"
+                "   - 提交和 push 统一走 GitHub 仓库，由 GitHub Actions (sync-to-cnb.yml) 自动同步到 cnb.build/Tamar-Edge-AI/cinemap_3D_world.git，严禁本机直接 git push cnb\n"
+            )
+            outbound.check_no_direct_cnb_git_push_guard(good_cnb_spec, scene="lamb prepare")
+
+            # 3) diagnose_override_reason classifies overriding B (proxy edit) with A (grant repo access, even when callback label is truncated at 60 chars) under arch_or_config_posture
+            code_repo, label_repo = admin_web.diagnose_override_reason(
+                f"🐕 需要你定 · Jerry申请material-generation仓权限或代改x-role [tp_arena-release-guard]\n{bad_repo_ask_body}",
+                "[卡片回调] A：同意为 Jerry 的 GitHub 账号（Jerry030-1）开通 Tamar-Edge-AI/material-generation-service 仓库",
+                chosen_code="A",
+                recommended="B",
+            )
+            self.assertEqual(code_repo, "arch_or_config_posture")
+            self.assertEqual(label_repo, "技术姿势纠偏")
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
