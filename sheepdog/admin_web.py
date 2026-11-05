@@ -139,7 +139,7 @@ def diagnose_override_reason(
     if re.search(
         r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b"
         r"|修复这一类|这一类的东西|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
-    r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行"
+        r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行|应该有所有数据库的最高权限|所有数据库的最高权限"
         r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9]))",
         s,
         re.I,
@@ -192,6 +192,9 @@ def diagnose_override_reason(
         ) or (
             re.search(r"全部按申请开通[^\n。；]*(?:EdgeOne|DNSPod|站点权限)", chosen_full, re.I)
             and re.search(r"(?:DNSPod|EdgeOne)[^\n。；]*(?:给只读|走受控变更)", text or "", re.I)
+        ) or (
+            re.search(r"(?:停用|offline)[^\n。；]*并下线[^\n。；]*域名|直接下线[^\n。；]*(?:联调|过渡|临时)域名", chosen_full, re.I)
+            and re.search(r"(?:联调域名|过渡域名|临时域名)[\s\S]{0,420}(?:301|302|重定向|跳转)", text or "", re.I)
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")

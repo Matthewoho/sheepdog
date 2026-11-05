@@ -647,6 +647,24 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def norm_local_iso(val: str | None) -> str | None:
+    """将任意带时区的 ISO-8601 时间字符串（含宿主 transcript.jsonl 的 UTC `Z` 或微秒后缀）统一归一化为本机时区秒级格式（如 `+08:00`），
+    保证 SQLite 对同一时间列执行字符串比较（`>=` / `<` / `ORDER BY`）时字典序与物理时间序严格一致（REG-122）。"""
+    if val is None or not isinstance(val, str):
+        return val
+    s = val.strip()
+    if not s:
+        return s
+    try:
+        raw = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            return s
+        return dt.astimezone().isoformat(timespec="seconds")
+    except ValueError:
+        return s
+
+
 class Store:
     def __init__(self, path: Path | str):
         self.path = path
@@ -672,6 +690,26 @@ class Store:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         if {r["name"] for r in self.conn.execute("PRAGMA table_info(escalations)")}:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_escalations_hub ON escalations(hub_message_id)")
+        if {r["name"] for r in self.conn.execute("PRAGMA table_info(lambs)")}:
+            z_rows = self.conn.execute(
+                """SELECT lamb_id, started_at, last_act_at, finished_at, reported_at
+                   FROM lambs
+                   WHERE started_at LIKE '%Z' OR last_act_at LIKE '%Z'
+                      OR finished_at LIKE '%Z' OR reported_at LIKE '%Z'"""
+            ).fetchall()
+            for zr in z_rows:
+                self.conn.execute(
+                    """UPDATE lambs
+                       SET started_at = ?, last_act_at = ?, finished_at = ?, reported_at = ?
+                       WHERE lamb_id = ?""",
+                    (
+                        norm_local_iso(zr["started_at"]),
+                        norm_local_iso(zr["last_act_at"]),
+                        norm_local_iso(zr["finished_at"]),
+                        norm_local_iso(zr["reported_at"]),
+                        zr["lamb_id"],
+                    ),
+                )
         self.conn.commit()
 
     @classmethod
@@ -2185,8 +2223,11 @@ class Store:
         reported_at: str | None = None, report_msg_id: str | None = None,
     ) -> dict:
         ptid, ttitle = (parent_topic_id or topic_id).strip(), (task_title or title or lamb_id).strip()
-        ts = started_at or now_iso()
-        act, cid = (last_act_at if last_act_at is not None else ts), ((conversation_id or "").strip() or None)
+        ts = norm_local_iso(started_at) or now_iso()
+        act = norm_local_iso(last_act_at) if last_act_at is not None else ts
+        fin = norm_local_iso(finished_at)
+        rep = norm_local_iso(reported_at)
+        cid = (conversation_id or "").strip() or None
         with self.tx() as c:
             c.execute(
                 """INSERT INTO lambs(lamb_id, parent_topic_id, kind, task_title, conversation_id, pid, state,
@@ -2199,7 +2240,7 @@ class Store:
                        result_summary=COALESCE(excluded.result_summary, lambs.result_summary),
                        log_path=COALESCE(excluded.log_path, lambs.log_path),
                        report_msg_id=COALESCE(excluded.report_msg_id, lambs.report_msg_id)""",
-                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, finished_at, result_summary, log_path, reported_at, report_msg_id))
+                (lamb_id, ptid, kind, ttitle, cid, pid, state, ts, act, fin, result_summary, log_path, rep, report_msg_id))
         return self.get_lamb(lamb_id) or {}
 
     register_lamb = create_lamb
@@ -2211,6 +2252,9 @@ class Store:
     def update_lamb(self, lamb_id: str, **fields) -> dict | None:
         if not (allowed := {k: v for k, v in fields.items() if k in self.LAMB_FIELDS}):
             return self.get_lamb(lamb_id)
+        for ts_col in ("started_at", "last_act_at", "finished_at", "reported_at"):
+            if ts_col in allowed and isinstance(allowed[ts_col], str):
+                allowed[ts_col] = norm_local_iso(allowed[ts_col])
         with self.tx() as c:
             c.execute(f"UPDATE lambs SET {', '.join(f'{k}=?' for k in allowed)} WHERE lamb_id=?", (*allowed.values(), lamb_id))
         return self.get_lamb(lamb_id)

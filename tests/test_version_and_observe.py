@@ -5099,6 +5099,171 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(new_row["state"], "running")
             st2.close()
 
+    def test_reg122_legacy_temp_domain_offline_guard_override_diagnosis_and_lamb_utc_z_timestamp_norm(self) -> None:
+        """REG-122 (1.1.33):
+        1) check_ask_pre_flight_guard blocks retiring a temporary/joint-debugging domain (联调域名 / 过渡域名)
+           when Option A recommends 302 redirecting to keep it alive instead of directly disabling/decommissioning it;
+        2) admin_web.diagnose_override_reason classifies overriding Option A (302 redirect) to Option B (停用并下线)
+           as ('arch_or_config_posture', '技术姿势纠偏');
+        3) store.create_lamb, store.update_lamb, and Store._migrate normalize UTC 'Z' ISO timestamps to local
+           timezone (+08:00), ensuring SQLite string ordering and evolve parent-recovery comparison work accurately.
+        """
+        from datetime import datetime, timedelta, timezone
+        from sheepdog import admin_web, config, evolve, outbound, store
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = config.Config(state_dir=Path(td), self_open_id="ou_owner")
+            st = store.Store(cfg.db_path)
+
+            bad_temp_domain_ask = (
+                "腾讯云国际 Prod（200053747873）正式站点下，落后版本的联调域名 app-cn.tapnow.tv 仍在线并指向集群内旧容器前端。"
+                "请拍板将该域名 302 跳转到正式 app.tapnow.tv 还是直接下线。\n"
+                "---more---\n"
+                "事情：Linear `ENG-1061`：国际 Prod 子账号（`200053747873`）正式 EdgeOne（`zone-3wzk608w22ku`）中，"
+                "正式域名 `app.tapnow.tv` 已走最新 EdgeOne Pages，但联调域名 `app-cn.tapnow.tv` 仍处于 `online` 状态且回源南京 CLB 旧容器化前端副本。\n"
+                "选项：\n"
+                "A. 在正式 EdgeOne 上为 `app-cn.tapnow.tv` 配置边缘 L7 `302` 重定向至 `https://app.tapnow.tv`（保留路径参数）\n"
+                "B. 直接在正式 EdgeOne 停用（offline）并下线 `app-cn.tapnow.tv` 加速域名\n"
+                "C. 暂维持现状不动\n"
+                "建议：选 A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_temp_dom:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "ENG-1061 收口联调域名 app-cn.tapnow.tv",
+                    bad_temp_domain_ask,
+                    key="eng-1061-app-cn-retire",
+                )
+            self.assertIn("REG-122", str(cm_temp_dom.exception))
+
+            good_temp_domain_ask = (
+                "腾讯云国际 Prod（200053747873）正式站点下，落后版本的联调域名 app-cn.tapnow.tv 仍在线并指向集群内旧容器前端。\n"
+                "---more---\n"
+                "事情：正式域名 `app.tapnow.tv` 已上线，临时联调域名 `app-cn.tapnow.tv` 已完成历史使命。\n"
+                "选项：\n"
+                "A. 直接在正式 EdgeOne 停用（offline）并下线 `app-cn.tapnow.tv` 加速域名\n"
+                "B. 在正式 EdgeOne 上为 `app-cn.tapnow.tv` 配置边缘 L7 `302` 重定向至 `https://app.tapnow.tv`\n"
+                "建议：选 A 。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_tapnow-prod-topology",
+                "ENG-1061 收口联调域名 app-cn.tapnow.tv",
+                good_temp_domain_ask,
+                key="eng-1061-app-cn-retire",
+            )
+
+            c_code, c_label = admin_web.diagnose_override_reason(
+                bad_temp_domain_ask,
+                "直接在正式 EdgeOne 停用（offline）并下线 `app-cn.tapnow.tv` 加速域名",
+                chosen_code="B",
+                recommended="A",
+            )
+            self.assertEqual((c_code, c_label), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # Verify ADB machine IP (192.220.19.132) whitelist ask with "B. 转交 Nicky 老师处理" is blocked
+            bad_adb_whitelist_ask = (
+                "Kai反馈新加坡阿里云ADB（am-gs5l37e19m92e2wff）上他机器的IP（192.220.19.132，一小时前可连）白名单没了，请求补加192.220.19.132/32。\n"
+                "---more---\n"
+                "事情：Kai 反馈新加坡阿里云 ADB 数仓实例（集群 `am-gs5l37e19m92e2wff`）上他机器的公网 IP `192.220.19.132` 白名单被清掉了。\n"
+                "选项：\n"
+                "A. 同意：核查 `am-gs5l37e19m92e2wff` 现有白名单分组，在独立分组补加 `192.220.19.132/32` 并回读通知 Kai\n"
+                "B. 转交 Nicky 老师处理（由数据库负责人评估加白）\n"
+                "C. 不同意加白\n"
+                "建议：A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_adb_wl:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "新加坡阿里云ADB(am-gs5l37e19m92e2wff)补加Kai机器IP白名单",
+                    bad_adb_whitelist_ask,
+                    key="kai_adb_whitelist",
+                )
+            self.assertIn("Nicky", str(cm_adb_wl.exception))
+
+            # Verify withholding DB permissions from DBA Nicky Ye is blocked and override is diagnosed as arch_or_config_posture
+            bad_dba_nicky_ask = (
+                "ENG-1123（.tv价格页去境外品牌与下架9个礼包SKU）SQL已复核就绪，Andy请Nicky找你要南京生产MySQL建表权限账号执行。"
+                "建议选A由专席经跳板机免发账密代执行备份更新与回读，或选B由你私发账号/开权限给Nicky。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 不外发生产库账密，授权由 `tp_infra-migration-ops` 核对附件 SQL 直接经南京生产跳板机执行备份、更新、回读\n"
+                "B. 同意给 Nicky Ye 开通南京生产腾讯云控制台 DB 访问权限（或由你私聊发给他生产库连接账号），由 Nicky 自行执行该 SQL\n"
+                "C. 暂缓处理\n"
+                "建议：A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_dba_nicky:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "ENG-1123生产MySQL执行或账密请示",
+                    bad_dba_nicky_ask,
+                    key="eng-1123-mysql-nicky",
+                )
+            self.assertIn("REG-122", str(cm_dba_nicky.exception))
+
+            c_nicky, l_nicky = admin_web.diagnose_override_reason(
+                bad_dba_nicky_ask,
+                "nicky应该有所有数据库的最高权限 给他",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_nicky, l_nicky), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # Verify UTC 'Z' timestamp normalization in create_lamb, update_lamb, and _migrate
+            now_local = datetime.now().astimezone().replace(microsecond=0)
+            fail_dt = now_local - timedelta(minutes=20)
+            retry_dt_utc = (now_local - timedelta(minutes=5)).astimezone(timezone.utc)
+            retry_utc_str = retry_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            expected_retry_local = retry_dt_utc.astimezone().isoformat(timespec="seconds")
+
+            st.create_lamb(
+                "lamb_to_fail",
+                "tp_tapnow-prod-topology",
+                "subagent",
+                "Wave 2 Prep",
+                state="timeout",
+                started_at=(fail_dt - timedelta(minutes=10)).isoformat(timespec="seconds"),
+                finished_at=fail_dt.isoformat(timespec="seconds"),
+                result_summary="timeout",
+            )
+            st.create_lamb(
+                "lamb_utc_retry",
+                "tp_tapnow-prod-topology",
+                "subagent",
+                "Authorized Prod Executor",
+                state="done",
+                started_at=retry_utc_str,
+                last_act_at=retry_utc_str,
+                finished_at=retry_utc_str,
+                result_summary="all done",
+            )
+            row_retry = st.get_lamb("lamb_utc_retry")
+            self.assertEqual(row_retry["started_at"], expected_retry_local)
+            self.assertNotIn("Z", row_retry["started_at"])
+
+            # Simulate legacy raw Z row in SQLite and verify _migrate normalizes it
+            st.conn.execute(
+                "UPDATE lambs SET started_at = ?, last_act_at = ? WHERE lamb_id = ?",
+                (retry_utc_str, retry_utc_str, "lamb_utc_retry"),
+            )
+            st.conn.commit()
+            st._migrate()
+            row_migrated = st.get_lamb("lamb_utc_retry")
+            self.assertEqual(row_migrated["started_at"], expected_retry_local)
+
+            digest = evolve.build_evolve_digest(cfg, st, now_dt=now_local)
+            lambs_map = {x["lamb_id"]: x for x in digest["d5_bus_and_lambs"]["recent_lambs"]}
+            self.assertIn("lamb_utc_retry", lambs_map)
+            self.assertTrue(lambs_map["lamb_to_fail"]["recovered_by_parent"])
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

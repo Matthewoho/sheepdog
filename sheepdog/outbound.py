@@ -416,16 +416,16 @@ _LOCAL_TCCLI_CHECK_EVIDENCE_RE = re.compile(
     re.I,
 )
 _VPS_DB_WHITELIST_SINGLE_IP_ASK_RE = re.compile(
-    r"(?:(?:专线|本机出口\s*IP|出口\s*IP|lsg\d+|Titan|家宽)[\s\S]{0,220}"
+    r"(?:(?:专线|本机出口\s*IP|出口\s*IP|机器(?:的)?\s*(?:公网\s*)?IP|\b192\.220\.\d+\.\d+\b|lsg\d+|Titan|家宽)[\s\S]{0,220}"
     r"(?:Cloud\s*SQL|AlloyDB|ADB|RDS|数据库[^\n。]{0,16}白名单|授权网络|authorized\s*networks)"
     r"|(?:Cloud\s*SQL|AlloyDB|ADB|RDS|数据库[^\n。]{0,16}白名单)[\s\S]{0,220}"
-    r"(?:专线|本机出口\s*IP|出口\s*IP|lsg\d+|Titan|家宽))",
+    r"(?:专线|本机出口\s*IP|出口\s*IP|机器(?:的)?\s*(?:公网\s*)?IP|\b192\.220\.\d+\.\d+\b|lsg\d+|Titan|家宽))",
     re.I,
 )
 _VPS_FLEET_WHITELIST_EVIDENCE_RE = re.compile(
     r"(?:tp_3x-ui-ops|3x-ui[\s\S]{0,36}(?:全量|全部|全套|14\s*台|清单)|"
     r"(?:全量|全部|全套)\s*(?:需要加白的\s*)?(?:专线|VPS)\s*(?:出口\s*)?IP\s*清单|"
-    r"Nicky|tp_nicky)",
+    r"(?<!转交\s)(?<!转交)(?:Nicky|tp_nicky))",
     re.I,
 )
 _LAOHU_PROXY_OR_CONFIRMED_ASK_RE = re.compile(
@@ -808,6 +808,27 @@ _RD_SERVICE_ADMIN_VS_NETWORK_BOUNDARY_EVIDENCE_RE = re.compile(
     r"(?:开发|产研)(?:相关)?(?:高频)?改动.{0,20}admin.{0,30}(?:网络|VPC|安全组).{0,16}(?:不行|不开|不放开|除外))",
     re.I,
 )
+_LEGACY_TEMP_DOMAIN_REDIRECT_OVER_OFFLINE_ASK_RE = re.compile(
+    r"(?:联调域名|过渡域名|临时域名)[\s\S]{0,420}"
+    r"A\s*[\.、:：)\]]\s*[^\n]*(?:301|302|重定向|跳转)[\s\S]{0,280}"
+    r"B\s*[\.、:：)\]]\s*[^\n]*(?:停用|offline)[^\n]*(?:并下线|下线)",
+    re.I,
+)
+_LEGACY_TEMP_DOMAIN_DIRECT_OFFLINE_RECOMMEND_A_RE = re.compile(
+    r"(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选|选择)?\s*B\b|"
+    r"A\s*[\.、:：)\]]\s*[^\n]*(?:直接[^\n]*(?:停用|offline)[^\n]*并下线|直接下线[^\n]*(?:联调|过渡|临时)域名)",
+    re.I,
+)
+_DBA_NICKY_WITHHOLD_DB_PERM_ASK_RE = re.compile(
+    r"A\s*[\.、:：)\]]\s*[^\n]*不外发[^\n]*(?:账密|密码|账号)[^\n]*由\s*[`a-z0-9_-]*\s*[^\n]*(?:执行|代执行)[\s\S]{0,280}"
+    r"B\s*[\.、:：)\]]\s*[^\n]*(?:给\s*Nicky(?:\s*Ye)?\s*开通[^\n]*(?:DB|数据库|MySQL|PG)[^\n]*权限|发给[他她]?生产库连接账号)",
+    re.I,
+)
+_DBA_NICKY_GRANT_RECOMMEND_A_RE = re.compile(
+    r"(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选|选择)?\s*B\b|"
+    r"A\s*[\.、:：)\]]\s*[^\n]*给\s*Nicky(?:\s*Ye)?\s*开通[^\n]*(?:DB|数据库|MySQL|PG|最高)[^\n]*权限",
+    re.I,
+)
 
 
 def check_unverified_ticket_promise_guard(text: str) -> None:
@@ -930,6 +951,24 @@ def check_ask_pre_flight_guard(
             "内部研发同学笼统追问『要不直接给全量的 admin 权限』时，严禁未先向其问清日常操作的资源范围与常做改动，就直接向主人抛『A. 不开全量 Admin 维持原状 vs B. 挂载生产账号全量 AdministratorAccess』的二选一拍板卡"
             "（主人 2026-11-05 23:15:28 在 `tp_kaifeng` 卡片 `[其他]` 明确纠偏：『你可以问一下他一般资源范围 一般都做什么，然后我们先可以把，比如说腾讯云国际这一边有没有什么比较经常需要开发产研相关改动的东西，可以给他 admin权限。但是你说网络这一些就不行。』，REG-121 按产研高频服务授 Admin 与网络红线切分门禁）："
             "请先向申请人问清日常资源范围与常做改动，并按『经常需要开发产研改动的服务域可授予 Admin 权限，但底层网络（VPC/CLB/安全组等）不开放 Admin』切分方案后再发起请示（没有发送）",
+        )
+    if (
+        _LEGACY_TEMP_DOMAIN_REDIRECT_OVER_OFFLINE_ASK_RE.search(full_text)
+        and not _LEGACY_TEMP_DOMAIN_DIRECT_OFFLINE_RECOMMEND_A_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "收口清理已完成历史使命的临时联调域名 / 过渡域名（如 `app-cn.tapnow.tv`）时，正式域名上线后应遵循奥卡姆剃刀『如无必要，勿增实体，能删不留』，"
+            "严禁把『A. 为临时联调域名配置 302 重定向保留平行入口』作为首选建议，而把『B. 直接停用（offline）并下线该联调域名』贬为次选"
+            "（主人 2026-11-05 23:30:06 在 `tp_tapnow-prod-topology` 卡片直接改选 B：『直接在正式 EdgeOne 停用（offline）并下线 app-cn.tapnow.tv 加速域名』，REG-122 临时联调域名收口直接下线门禁）："
+            "请将『直接停用（offline）并下线该临时联调/过渡域名』作为首选建议（选项 A）后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _DBA_NICKY_WITHHOLD_DB_PERM_ASK_RE.search(full_text) and not _DBA_NICKY_GRANT_RECOMMEND_A_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "Nicky Ye（DBA / 数据库负责人）应拥有所有数据库的最高权限与管理入口，严禁在涉及数据库 SQL 执行或库表权限时把『A. 不外发生产库账密，由业务/迁移专席代执行』作为首选建议，而把『B. 给 Nicky Ye 开通数据库权限/连接账号』贬为次选"
+            "（主人 2026-11-05 23:58:55 在 `tp_infra-migration-ops` 卡片 `[其他]` 明确纠偏：『nicky应该有所有数据库的最高权限 给他』，REG-122 DBA 所有数据库最高权限门禁）："
+            "请直接将给 Nicky Ye 开通/交付对应数据库的最高权限与连接凭据作为首选建议（选项 A）后再发起请示（没有发送）",
         )
     if floor or floor_type:
         return
