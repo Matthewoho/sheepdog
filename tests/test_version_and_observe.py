@@ -4895,6 +4895,210 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertFalse(eng._check_stopped_in_flight(t_row, "b20261105194335-kaifeng", sent_dt, now_dt, True))
             st.close()
 
+    def test_reg121_class_wide_api_cache_guard_stage_self_access_guard_and_superseded_subagent_auto_close(self) -> None:
+        """REG-121：
+        1. 针对 EdgeOne / CDN API 缓存或 CORS 串域发起请示时，若仅将单个 API 子路径（如 `/api/bff/app-store/*`）设为 NoCache 而不排查全站 `/api/*`，当场拦截；
+        2. 内部同事申请在 Stage 机器运行评测脚本时，若仅提供『由专席在 Stage 机器代跑』而不开通 Stage 自助权限，当场拦截；且两类人类改判均归入 `arch_or_config_posture`；
+        3. 母羊在新批次交回 `waiting` 回执并显式声明新 `lamb:<id>` 锚点时，自动将本批次前启动且未列入新锚点的旧在途 subagent 收口为 `done`。
+        """
+        from datetime import datetime, timedelta
+        from sheepdog import admin_web, config, engine, outbound, session as sm, store
+
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td)
+            cfg = config.Config(state_dir=tpath, self_open_id="ou_owner")
+            st = store.Store(cfg.db_path)
+
+            # 1) Single API subpath cache patch ask is blocked without class-wide /api/* audit
+            bad_cache_ask = (
+                "Andy Xiao 提请修复 ENG-1112 应用市场 CORS 串域，需在生产 EdgeOne 将 /api/bff/app-store/* 设为 NoCache 并刷新缓存，请审批选项 A。\n"
+                "---more---\n"
+                "事情：Andy Xiao 提请修复 ENG-1112（tv 应用市场跨域报错，因 EdgeOne 缓存未区分 Origin 导致 app 与 embed 域名命中同一条缓存被 CORS 拦截），"
+                "需在生产 EdgeOne 将 /api/bff/app-store/* 设为不缓存并刷新该目录缓存。\n\n"
+                "选项：\n"
+                "A. 授权在生产 EdgeOne 站点配置 /api/bff/app-store/* 为 NoCache 并刷新该路径缓存，并协同 agent-first 专席推进 BFF 发版\n"
+                "B. 暂不修改 EdgeOne 规则，仅推进 BFF 镜像升级"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_cache:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "ENG-1112 EdgeOne配置与BFF发版授权",
+                    bad_cache_ask,
+                    key="eng-1112-edgeone-nocache",
+                    floor="修改生产 EdgeOne 缓存规则",
+                    floor_type="prod",
+                )
+            self.assertIn("REG-121", str(cm_cache.exception))
+
+            good_cache_ask = (
+                "已核查全站 API 缓存规则，提请将生产 EdgeOne 全量 /api/* 动态接口统一设为 NoCache 并刷新缓存，请审批选项 A。\n"
+                "---more---\n"
+                "事情：排查该站点下其他 API 接口缓存情况后，确认需将所有 /api/* 路径统一设为 NoCache。\n"
+                "选项：\n"
+                "A. 授权在生产 EdgeOne 站点统一将全量 /api/* 配置为 NoCache 并刷新缓存\n"
+                "B. 暂不修改 EdgeOne 规则"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_infra-migration-ops",
+                "ENG-1112 EdgeOne 全站 API 缓存治理授权",
+                good_cache_ask,
+                key="eng-1112-edgeone-nocache",
+                floor="修改生产 EdgeOne 缓存规则",
+                floor_type="prod",
+            )
+
+            # 2) Stage machine proxy-run ask is blocked without direct self-access option
+            bad_stage_ask = (
+                "Elaine 需在 Stage 机器执行约 5 分钟的首页推荐离线 bench 脚本，请拍板是否由专席在 Stage 代跑并返回结果。\n"
+                "---more---\n"
+                "Elaine 正在验证首页推荐离线评测脚本，因本机无法直连，申请在 Stage 环境机器（ins-mu1sqp1i）运行。\n\n"
+                "选项：\n"
+                "A. 同意在 Stage 机器代跑该 bench，将无凭据的耗时与推荐结果发给 Elaine\n"
+                "B. 暂不在 Stage 机器跑离线脚本，请 Elaine 改走其他方式"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_stage:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tp_elaine",
+                    "Elaine申请在Stage机器跑推荐离线bench",
+                    bad_stage_ask,
+                    key="elaine-stage-bench",
+                )
+            self.assertIn("REG-121", str(cm_stage.exception))
+
+            good_stage_ask = (
+                "Elaine 申请在 Stage 机器（ins-mu1sqp1i）运行首页推荐离线 bench 脚本，建议直接为其开通 Stage 机器登录权限让其自己运行。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 直接给其开通 Stage 机器 SSH 登录权限，让其自己上去跑 bench 脚本\n"
+                "B. 由专席在 Stage 机器代跑该 bench"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_tp_elaine",
+                "Elaine申请Stage机器权限跑推荐离线bench",
+                good_stage_ask,
+                key="elaine-stage-bench",
+            )
+
+            c1, l1 = admin_web.diagnose_override_reason(
+                bad_cache_ask,
+                "要修复就修复这一类的东西 我理解可能会存在其他api接口缓存的情况",
+            )
+            self.assertEqual((c1, l1), ("arch_or_config_posture", "技术姿势纠偏"))
+            c2, l2 = admin_web.diagnose_override_reason(
+                bad_stage_ask,
+                "stage你就直接给他权限让他自己弄呗",
+            )
+            self.assertEqual((c2, l2), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 2b) Domain owner autonomous release/rollback withholding EdgeOne/DNSPod & binary full-account Admin guards
+            bad_domain_e2e_ask = (
+                "Kai申请明天白天为其Stage子账号配置Prod跨账号角色(强制MFA)+Cinemap最小权限以自主发版回滚。建议选A。\n"
+                "---more---\n"
+                "事情：授予 Cinemap 域内最小权限以自主完成构建、发布与回滚：\n"
+                "选项：\n"
+                "A. 同意按最小权限原则开通：配置 Prod 跨账号 CAM 角色、cinemapprod 单命名空间 kubeconfig、COS/TCR/CNB 权限（DNSPod 等不支持单记录隔离的项给只读或走受控变更）\n"
+                "B. 全部按申请开通（含 EdgeOne/DNSPod 站点权限）\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_domain_e2e:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "Kai申请Cinemap生产最小权限跨账号角色与受限kubeconfig",
+                    bad_domain_e2e_ask,
+                    key="kai-cinemap-prod-perm",
+                )
+            self.assertIn("REG-121", str(cm_domain_e2e.exception))
+
+            bad_binary_admin_ask = (
+                "Kai追问能否直接给南京生产腾讯云账号全量Admin权限。因该账号与TapNow国内主站生产共号，建议维持Cinemap域内最小权限（选项A），或按选项B开通全量Admin。\n"
+                "---more---\n"
+                "事情：Kai 追问「然后要不直接给全量的 admin 权限」（指南京生产腾讯云账号 `1506862273` 的全量 `AdministratorAccess`）。\n"
+                "选项：\n"
+                "A. 不开全量 Admin：维持已批准的 Cinemap 生产最小权限跨账号角色 + `cinemapprod` 命名空间编辑权限\n"
+                "B. 同意升级：直接给 Kai 的跨账号角色（强制 MFA）挂载生产账号全量 `AdministratorAccess`（含 TKE `cluster-admin`）\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_bin_admin:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "Kai追问是否直接给生产账号全量Admin权限",
+                    bad_binary_admin_ask,
+                    key="kai-full-admin",
+                )
+            self.assertIn("REG-121", str(cm_bin_admin.exception))
+
+            c3, l3 = admin_web.diagnose_override_reason(
+                bad_domain_e2e_ask,
+                "全部按申请开通（含 EdgeOne/DNSPod 站点权限）",
+                chosen_code="B",
+                recommended="A",
+            )
+            self.assertEqual((c3, l3), ("arch_or_config_posture", "技术姿势纠偏"))
+            c4, l4 = admin_web.diagnose_override_reason(
+                bad_binary_admin_ask,
+                "你可以问一下他一般资源范围 一般都做什么，然后我们先可以把，比如说腾讯云国际这一边有没有什么比较经常需要开发产研相关改动的东西，可以给他 admin权限。但是你说网络这一些就不行。",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c4, l4), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 3) Superseded pre-batch subagent is auto-closed when write_receipt receives waiting + new lamb anchors
+            now_dt = datetime.now().astimezone()
+            old_start = (now_dt - timedelta(minutes=30)).isoformat(timespec="seconds")
+            batch_sent = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+            new_start = (now_dt - timedelta(minutes=1)).isoformat(timespec="seconds")
+
+            st.create_topic("tp_kaifeng", "Kai Feng", "adopted", "duty", sm.RUNNING, "antigravity")
+            st.update_topic(
+                "tp_kaifeng",
+                pending_batch_id="b20261105205547-kaifeng",
+                dispatched_at=batch_sent,
+            )
+            st.record_dispatch("b20261105205547-kaifeng", "tp_kaifeng", ["m1"])
+            st.conn.execute(
+                "UPDATE dispatches SET sent_at = ? WHERE batch_id = ?",
+                (batch_sent, "b20261105205547-kaifeng"),
+            )
+            st.conn.commit()
+
+            st.create_lamb("lamb_old_superseded", "tp_kaifeng", "subagent", "Old Git Push", conversation_id="cid-old")
+            st.update_lamb("lamb_old_superseded", state="running", started_at=old_start, last_act_at=old_start)
+
+            st.create_lamb("lamb_new_active", "tp_kaifeng", "subagent", "New Build Watch", conversation_id="cid-new")
+            st.update_lamb("lamb_new_active", state="running", started_at=new_start, last_act_at=new_start)
+            st.close()
+
+            engine.write_receipt(
+                cfg,
+                "tp_kaifeng",
+                "b20261105205547-kaifeng",
+                {
+                    "status": "waiting",
+                    "summary": "已切换等待新羔羊",
+                    "anchors": ["project:cinemap", "lamb:lamb_new_active"],
+                },
+            )
+
+            st2 = store.Store(cfg.db_path)
+            old_row = st2.get_lamb("lamb_old_superseded")
+            new_row = st2.get_lamb("lamb_new_active")
+            self.assertEqual(old_row["state"], "done")
+            self.assertEqual(old_row["report_msg_id"], "superseded_by_new_lamb_anchors")
+            self.assertEqual(new_row["state"], "running")
+            st2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

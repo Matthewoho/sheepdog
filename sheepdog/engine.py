@@ -2688,6 +2688,8 @@ class Dispatcher:
                 self._auto_settle_open_escalations_on_owner_batch(t["topic_id"], batch)
             if status != "waiting":
                 _auto_close_topic_subagents(self.store, t["topic_id"])
+            else:
+                _auto_close_superseded_subagents(self.store, t["topic_id"], batch, receipt.get("anchors") or [])
             if status in ("handled", "done"):
                 clear_handled_owner_reactions(self.store, getattr(self.acker, "im", None) or self.source, t["topic_id"], batch)
             self._receipt_duty(t["topic_id"], batch, {**receipt, "status": status, "summary": summary} if answered else receipt)
@@ -6765,6 +6767,40 @@ def _auto_close_topic_subagents(store: Store, topic_id: str, summary: str = "随
             complete_lamb(store, lb["lamb_id"], summary=summary, state="done", report_msg_id="parent_receipt_auto_close")
 
 
+def _auto_close_superseded_subagents(
+    store: Store,
+    topic_id: str,
+    batch_id: str,
+    anchors: list,
+    summary: str = "随母羊新回执切换等待新羔羊自动收口",
+) -> None:
+    """REG-121：当母羊在新批次交回 waiting 回执且显式声明了新的 lamb:<id> 锚点时，
+    自动将本批次之前启动、且已不在最新 anchors 等待集合中的旧在途 subagent 羔羊收口为 done，
+    防止已被母羊换代接管的旧批次残留 subagent 在 20 分钟后触发虚假超时唤醒。
+    """
+    declared_lids = {
+        a.removeprefix("lamb:").strip()
+        for a in (anchors or [])
+        if isinstance(a, str) and a.startswith("lamb:") and a.removeprefix("lamb:").strip()
+    }
+    if not declared_lids:
+        return
+    d_row = store.get_dispatch(batch_id) if batch_id else None
+    sent_dt = _parse(d_row["sent_at"]) if d_row is not None and d_row["sent_at"] else None
+    for lb in store.get_active_lambs(topic_id):
+        if lb["kind"] not in ("subagent", "native_subagent") or lb["state"] != "running":
+            continue
+        lid = lb["lamb_id"]
+        cid = (lb["conversation_id"] or "").strip()
+        if lid in declared_lids or (cid and cid in declared_lids):
+            continue
+        if sent_dt is not None:
+            started_dt = _parse(lb["started_at"])
+            if started_dt is None or started_dt >= sent_dt - timedelta(seconds=5):
+                continue
+        complete_lamb(store, lid, summary=summary, state="done", report_msg_id="superseded_by_new_lamb_anchors")
+
+
 def _reset_closed_topic(store: Store, topic_id: str, why: str = "会话已关闭") -> None:
     _auto_close_topic_subagents(store, topic_id, summary=why, force=True)
     if (card := store.get_card(topic_id)) is not None and (card["run_state"] != duty.IDLE or card["queued"] or card["spinning"]):
@@ -6858,6 +6894,8 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
         has_lamb_anchor = any(isinstance(a, str) and a.startswith("lamb:") for a in anchors)
         if store is not None and status != "waiting":
             _auto_close_topic_subagents(store, topic_id)
+        elif store is not None and status == "waiting" and has_lamb_anchor:
+            _auto_close_superseded_subagents(store, topic_id, batch_id, anchors)
         if store is not None and status in ("handled", "done"):
             im = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages) if cfg.source.enabled else None
             clear_handled_owner_reactions(store, im, topic_id, batch_id)

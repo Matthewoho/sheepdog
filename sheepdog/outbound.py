@@ -767,6 +767,47 @@ _VIP_HIGH_PERM_E2E_RECOMMEND_RE = re.compile(
     r"A\s*[\.、:：)\]]\s*[^\n]*(?:高权限|管理员|AdministratorAccess|全量|完整权限|端到端)[\s\S]{0,360}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?A\b",
     re.I,
 )
+_SINGLE_API_SUBPATH_CACHE_OR_CORS_PATCH_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:EdgeOne|CDN|缓存|NoCache|不缓存|CORS|跨域|串域))"
+    r"(?=[\s\S]*/api/[a-z0-9_-]+/[a-z0-9_/*-]+)"
+    r"(?=[\s\S]*(?:设为\s*(?:NoCache|不缓存)|配置\s*/api/[a-z0-9_-]+/[a-z0-9_/*-]+\s*为\s*(?:NoCache|不缓存)|刷新(?:该(?:路径|目录))?缓存))",
+    re.I,
+)
+_CLASS_WIDE_API_CACHE_AUDIT_EVIDENCE_RE = re.compile(
+    r"(?:全量\s*/api/\*|所有\s*/api/\*|全部\s*(?:API|/api)|整个\s*/api(?:/bff)?/\*|排查.{0,16}其他\s*API\s*接口|已核查全站\s*API\s*缓存规则|统一将\s*/api/\*)",
+    re.I,
+)
+_STAGE_PROXY_RUN_INSTEAD_OF_SELF_ACCESS_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:Stage|测试环境)\s*(?:环境)?(?:机器|CVM|主机|跳板机|ins-[a-z0-9]+))"
+    r"(?=[\s\S]*(?:由专席在\s*Stage\s*代跑|同意在\s*Stage\s*机器代跑|在\s*Stage\s*机器代跑))",
+    re.I,
+)
+_STAGE_DIRECT_SELF_ACCESS_OPTION_RE = re.compile(
+    r"(?:直接给[他她其]?.{0,12}(?:Stage|机器|登录|SSH|跳板机)?权限|为.{0,12}开通\s*Stage\s*(?:机器|CVM|跳板机|SSH)\s*(?:登录|访问)?权限|让[他她其]自己(?:登录|上去|在\s*Stage)?(?:跑|执行|操作|弄))",
+    re.I,
+)
+_DOMAIN_OWNER_E2E_WITHHOLD_DNS_EDGEONE_ASK_RE = re.compile(
+    r"自主(?:完成)?(?:构建、)?(?:发布|发版)(?:与|和)?回滚[\s\S]{0,680}"
+    r"A\s*[\.、:：)\]]\s*[^\n]*(?:DNSPod|EdgeOne)[^\n]*(?:给只读|走受控变更)[\s\S]{0,240}"
+    r"B\s*[\.、:：)\]]\s*[^\n]*全部按申请开通[^\n]*(?:EdgeOne|DNSPod|站点权限)",
+    re.I,
+)
+_DOMAIN_OWNER_FULL_GRANT_RECOMMEND_A_RE = re.compile(
+    r"(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选|选择)?\s*B\b|"
+    r"A\s*[\.、:：)\]]\s*[^\n]*全部按申请开通[^\n]*(?:EdgeOne|DNSPod|站点权限)",
+    re.I,
+)
+_BINARY_FULL_ACCOUNT_ADMIN_ASK_RE = re.compile(
+    r"(?:直接给|能否直接给|申请)[^\n。；]{0,20}全量(?:的)?\s*`?admin`?\s*权限[\s\S]{0,680}"
+    r"A\s*[\.、:：)\]]\s*不开全量\s*`?Admin`?[\s\S]{0,280}"
+    r"B\s*[\.、:：)\]]\s*[^\n]*全量\s*`?AdministratorAccess`?",
+    re.I,
+)
+_RD_SERVICE_ADMIN_VS_NETWORK_BOUNDARY_EVIDENCE_RE = re.compile(
+    r"(?:已(?:向|跟).{0,12}(?:确认|核实|问清).{0,16}(?:一般资源范围|日常资源范围|一般都做什么)|"
+    r"(?:开发|产研)(?:相关)?(?:高频)?改动.{0,20}admin.{0,30}(?:网络|VPC|安全组).{0,16}(?:不行|不开|不放开|除外))",
+    re.I,
+)
 
 
 def check_unverified_ticket_promise_guard(text: str) -> None:
@@ -859,6 +900,36 @@ def check_ask_pre_flight_guard(
             "严禁把『A. 不外发云凭据/kubeconfig，由专席直接代建并仅交付后台只读 Key』作为首选建议，或仅提供单命名空间受限窄权限"
             "（主人 2026-11-05 19:39 在 `tp_laohu` 卡片 `[其他]` 明确纠偏：『laohu 的权限要高 你要让他尽可能端到端完成』，REG-120 VIP 高权限端到端闭环门禁）："
             "请将『为老胡/VIP 开通高权限（如高权限 CAM 子账号与完整集群 kubeconfig），支持其端到端自主完成部署与验证』作为首选建议（建议选 A）后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _SINGLE_API_SUBPATH_CACHE_OR_CORS_PATCH_ASK_RE.search(full_text) and not _CLASS_WIDE_API_CACHE_AUDIT_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对 EdgeOne / CDN 出现 API 接口缓存或 CORS 串域（如未区分 `Origin` 或误缓存动态接口）发起请示时，"
+            "严禁只针对报错的那单个 API 子路径（如仅将 `/api/bff/app-store/*` 设为 `NoCache`）打局部点状补丁而不排查同类全部 API 接口"
+            "（主人 2026-11-05 21:15 在 `tp_infra-migration-ops` 卡片 `[其他]` 明确纠偏：『要修复就修复这一类的东西 我理解可能会存在其他api接口缓存的情况』，REG-121 同类 API 缓存全域治理门禁）："
+            "请先全量盘点该站点下所有 `/api/*`（及 `/api/bff/*`）路径的缓存与 Origin 规则，在正文中写明全站同类 API 接口排查结论，并提出覆盖整类 `/api/*` 动态接口的统一 `NoCache`/Origin 缓存修复方案后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _STAGE_PROXY_RUN_INSTEAD_OF_SELF_ACCESS_ASK_RE.search(full_text) and not _STAGE_DIRECT_SELF_ACCESS_OPTION_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部同事申请在 Stage / 测试环境机器（如 `ins-mu1sqp1i`）运行评测脚本或联调任务时，测试/Stage 环境属于预授权自治与自助开放范围，"
+            "严禁只提供『由专席在 Stage 机器代跑脚本』与『拒绝执行』两个选项而不给同事开通 Stage 机器自助权限"
+            "（主人 2026-11-05 21:06 在 `tp_tp_elaine` 卡片 `[其他]` 明确纠偏：『stage你就直接给他权限让他自己弄呗』，REG-121 Stage 机器自助权限门禁）："
+            "请直接为同事配置 Stage 机器 SSH 公钥/跳板机受控登录权限让其自行运行验证（无需发 ask，完成后 `sheepdog report` 报备），或在选项 A 中明确推荐『直接为其开通 Stage 机器登录权限让其自己运行』（没有发送）",
+        )
+    if _DOMAIN_OWNER_E2E_WITHHOLD_DNS_EDGEONE_ASK_RE.search(full_text) and not _DOMAIN_OWNER_FULL_GRANT_RECOMMEND_A_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "业务域负责人申请本域端到端自主构建、发布与回滚权限时，严禁将选项 A 设为『把 EdgeOne/DNSPod 等收紧为只读或走受控变更』而把『全部按申请开通（含 EdgeOne/DNSPod 站点权限）』贬为选项 B"
+            "（主人 2026-11-05 22:16:59 在 `tp_kaifeng` 卡片直接改选 B：『全部按申请开通（含 EdgeOne/DNSPod 站点权限）』，REG-121 业务域负责人端到端发版权限门禁）："
+            "请将支持业务域负责人端到端闭环的『全部按申请开通（含 EdgeOne/DNSPod 站点权限）』作为首选建议（选项 A）后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _BINARY_FULL_ACCOUNT_ADMIN_ASK_RE.search(full_text) and not _RD_SERVICE_ADMIN_VS_NETWORK_BOUNDARY_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部研发同学笼统追问『要不直接给全量的 admin 权限』时，严禁未先向其问清日常操作的资源范围与常做改动，就直接向主人抛『A. 不开全量 Admin 维持原状 vs B. 挂载生产账号全量 AdministratorAccess』的二选一拍板卡"
+            "（主人 2026-11-05 23:15:28 在 `tp_kaifeng` 卡片 `[其他]` 明确纠偏：『你可以问一下他一般资源范围 一般都做什么，然后我们先可以把，比如说腾讯云国际这一边有没有什么比较经常需要开发产研相关改动的东西，可以给他 admin权限。但是你说网络这一些就不行。』，REG-121 按产研高频服务授 Admin 与网络红线切分门禁）："
+            "请先向申请人问清日常资源范围与常做改动，并按『经常需要开发产研改动的服务域可授予 Admin 权限，但底层网络（VPC/CLB/安全组等）不开放 Admin』切分方案后再发起请示（没有发送）",
         )
     if floor or floor_type:
         return

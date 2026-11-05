@@ -101,6 +101,8 @@ _OVERRIDE_WORDS_RE = re.compile(
     r"|能具体讲讲|具体讲讲|讲讲前因后果|直接跑新镜像|跑新镜像|保证.{0,16}cicd是通的|可以部署到\s*prod"
     r"|有个?开关(?:来控制)?|开关来?控制|什么配置下|只给国内|跟\s*tapnow\.tv\s*一样|都放在腾讯云国际站|子成员账号环境"
     r"|我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|为啥没有选项|为什么没有选项"
+    r"|修复这一类|这一类的东西|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
+    r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行"
     r"|完整的方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]"
     r"|在\s*agy\s*里.{0,12}(?:讨论|聊|说)|跟\s*session\s*讨论|在面板里.{0,12}(?:讨论|聊|说)|确定还是需要我拍板.{0,12}再"
     r"|(?:我)?在群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)|群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)"
@@ -136,6 +138,8 @@ def diagnose_override_reason(
         return ("stale_or_already_handled", "陈旧/已处理未重查")
     if re.search(
         r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b"
+        r"|修复这一类|这一类的东西|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
+    r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行"
         r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9]))",
         s,
         re.I,
@@ -178,10 +182,16 @@ def diagnose_override_reason(
     if chosen_code in ("A", "B", "C", "D", "E") and recommended and chosen_code != recommended:
         m_chosen = re.search(rf"(?:^|\n)\s*{re.escape(chosen_code)}\s*[\.、:：)\]]\s*([^\n]+)", text or "", re.I)
         chosen_full = f"{s} {m_chosen.group(1) if m_chosen else ''}"
-        if re.search(r"开通[^\n。；]*(?:GitHub|仓库|仓)[^\n。；]*权限[^\n。；]*(?:自行|自己)?[^\n。；]*提\s*PR", chosen_full, re.I) and re.search(
-            r"不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n。；]*(?:由我们|我们)(?:克隆|直接)?[^\n。；]*(?:修改|代改|改)",
-            text or "",
-            re.I,
+        if (
+            re.search(r"开通[^\n。；]*(?:GitHub|仓库|仓)[^\n。；]*权限[^\n。；]*(?:自行|自己)?[^\n。；]*提\s*PR", chosen_full, re.I)
+            and re.search(
+                r"不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n。；]*(?:由我们|我们)(?:克隆|直接)?[^\n。；]*(?:修改|代改|改)",
+                text or "",
+                re.I,
+            )
+        ) or (
+            re.search(r"全部按申请开通[^\n。；]*(?:EdgeOne|DNSPod|站点权限)", chosen_full, re.I)
+            and re.search(r"(?:DNSPod|EdgeOne)[^\n。；]*(?:给只读|走受控变更)", text or "", re.I)
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
