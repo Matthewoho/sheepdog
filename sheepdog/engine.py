@@ -2845,7 +2845,7 @@ class Dispatcher:
         last_type = str(last.get("type") or "")
         last_done = str(last.get("status") or "").upper() == "DONE" and not bool(last.get("tool_calls"))
         if not last_done or last_type not in (
-            ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT")
+            ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT", "GENERIC")
             if allow_unawakened_system_msg
             else ("PLANNER_RESPONSE",)
         ):
@@ -2868,6 +2868,16 @@ class Dispatcher:
             if any(s.get("type") == "PLANNER_RESPONSE" for s in tail_after_batch):
                 return None, False
             return at, False
+        if last_type == "GENERIC":
+            if batch_idx is None:
+                return None, False
+            tail_after_batch = steps[batch_idx + 1 :]
+            if any(
+                s.get("type") == "GENERIC" and str(s.get("status") or "").upper() == "RUNNING"
+                for s in tail_after_batch
+            ):
+                return None, False
+            return at, True
         post_steps = steps[batch_idx + 1:] if batch_idx is not None else [
             s for s in steps
             if sent is None or ((st_dt := _parse(str(s.get("created_at") or ""))) is not None and st_dt >= sent)

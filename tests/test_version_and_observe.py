@@ -4255,6 +4255,277 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("SUMMARY: new_revision=tapnow-edm-00007-w5g", c_sum)
             st.close()
 
+    def test_reg117_attention_half_open_reprobe_and_echo_multi_requeue_and_generic_done_stall_and_tv_compliance_guard(self):
+        """1.1.28（REG-117）：
+        1. 回执超时（receipt_timeout）进入 attention 的会话在冷却满 10 分钟后，由 observe(self_heal=True) 与 engine._check_recovery 自动半开探测恢复并解除 Priority SLA / Queue Head-of-Line SLA 队头死锁；
+        2. Owner Echo SLA 自愈支持带 15 分钟冷却的最多 3 次有界重投（不会因首次重投后偶发二次 429 超时而永久卡死）；
+        3. running 批次在工具执行完毕（GENERIC DONE）后模型回合中断静默 >= 90s（batch_age >= 180s）时，observe 探针 2 与 _transcript_planner_idle_at 检出并自愈；
+        4. check_ask_pre_flight_guard 覆盖测试环境 Nacos 账号预授权自治、国内 *.tapnow.tv 指向海外 GCP 的数据出境合规校验、主人要求先在群内讲清来龙去脉时抢发请示拦截、以及跨会话同一配置项（如 COMMUNITY_API_KEY）重复发卡拦截；
+        5. diagnose_override_reason 精准识别上述四类批复。
+        """
+        from sheepdog import admin_web, observe, outbound
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_owner", state_dir=state_dir)
+            cfg.source.enabled = False
+            st = Store(cfg.db_path)
+
+            # 1) tp_bus stuck in attention (receipt_timeout) for 89 minutes with queued priority + normal messages
+            now_dt = datetime.fromisoformat("2026-11-05T16:45:00+08:00")
+            st.upsert_topic(
+                "tp_bus",
+                title="[managed] Lark 信号·总线",
+                kind="bus",
+                conversation_id="conv-bus-117",
+                state="attention",
+            )
+            st.update_topic(
+                "tp_bus",
+                attention_at="2026-11-05T15:05:43+08:00",
+                attention_reason="receipt_timeout",
+                retries=3,
+            )
+            m_q1 = Message(
+                message_id="om_bus_q_117",
+                chat_id="oc_1",
+                chat_name="群1",
+                chat_type="group",
+                sender_id="ou_u1",
+                sender_name="Colleague",
+                sender_type="user",
+                content="排队的群消息",
+                msg_type="text",
+                create_time="2026-11-05T15:10:00+08:00",
+            )
+            m_prio = Message(
+                message_id="om_bus_prio_117",
+                chat_id="oc_1",
+                chat_name="群1",
+                chat_type="group",
+                sender_id="ou_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="@Mattheuu 主人指令",
+                msg_type="text",
+                create_time="2026-11-05T16:40:00+08:00",
+            )
+            st.upsert_message(m_q1, "dispatch", "keyword", [], "tp_bus")
+            st.upsert_message(m_prio, "dispatch", "owner_instruction", ["owner_instruction"], "tp_bus")
+            with st.tx() as c:
+                c.execute(
+                    "INSERT INTO acks(message_id, chat_id, reason, identity, reaction_id, added_at) VALUES(?,?,?,?,?,?)",
+                    ("om_bus_q_117", "oc_1", "keyword", "bot", "r1", "2026-11-05T15:10:02+08:00"),
+                )
+                c.execute(
+                    "INSERT INTO acks(message_id, chat_id, reason, identity, reaction_id, added_at) VALUES(?,?,?,?,?,?)",
+                    ("om_bus_prio_117", "oc_1", "owner_instruction", "bot", "r2", "2026-11-05T16:40:02+08:00"),
+                )
+
+            # 2) tp_cinemap-stress-runner has an Owner Echo that was requeued once 80 minutes ago and timed out again
+            st.upsert_topic(
+                "tp_cinemap-stress-runner",
+                title="项目·Cinemap压测",
+                kind="dynamic",
+                conversation_id="conv-cinemap-117",
+                state="waiting_human",
+                pending_batch_id=None,
+            )
+            m_echo = Message(
+                message_id="sd_card_cb_4bb2286f814e21b8eff44ebb5fa24fb9",
+                chat_id="oc_hub",
+                chat_name="拍板台",
+                chat_type="group",
+                sender_id="ou_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="[卡片回调] 其他：给他账号密码",
+                msg_type="text",
+                create_time="2026-11-05T14:42:48+08:00",
+            )
+            st.upsert_message(m_echo, "dispatch", "owner_reply", [], "tp_cinemap-stress-runner")
+            with st.tx() as c:
+                c.execute(
+                    "UPDATE messages SET dispatch_state='missed', batch_id='b20261105152338' WHERE message_id=?",
+                    ("sd_card_cb_4bb2286f814e21b8eff44ebb5fa24fb9",),
+                )
+                c.execute(
+                    "INSERT INTO owner_echoes(message_id, chat_id, topic_id, kind, stage, said_at, recorded_at, delivered_at, stage_at, batch_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "sd_card_cb_4bb2286f814e21b8eff44ebb5fa24fb9",
+                        "oc_hub",
+                        "tp_cinemap-stress-runner",
+                        "owner_reply",
+                        "delivered",
+                        "2026-11-05T14:42:48+08:00",
+                        "2026-11-05T14:42:48+08:00",
+                        "2026-11-05T15:23:38+08:00",
+                        "2026-11-05T15:23:38+08:00",
+                        "b20261105152338",
+                    ),
+                )
+            st.set_meta("owner_echo_requeued:sd_card_cb_4bb2286f814e21b8eff44ebb5fa24fb9", "2026-11-05T15:23:34+08:00")
+
+            # 3) Running session stalled on GENERIC DONE for > 90s (batch_age >= 180s)
+            cid_stall = "conv-generic-stall-117"
+            t_stall = brain_dir / cid_stall / ".system_generated" / "logs" / "transcript.jsonl"
+            t_stall.parent.mkdir(parents=True, exist_ok=True)
+            st.upsert_topic(
+                "tp_generic-stall",
+                title="排查·工具完成后429中断",
+                kind="dynamic",
+                conversation_id=cid_stall,
+                state="running",
+                pending_batch_id="b20261105164000-generic",
+                dispatched_at="2026-11-05T16:40:00+08:00",
+            )
+            t_stall.write_text(
+                "\n".join(
+                    json.dumps(x, ensure_ascii=False)
+                    for x in [
+                        {
+                            "step_index": 10,
+                            "type": "SYSTEM_MESSAGE",
+                            "status": "DONE",
+                            "created_at": "2026-11-05T08:40:01Z",
+                            "content": "[sheepdog] 新信号批次 `b20261105164000-generic`",
+                        },
+                        {
+                            "step_index": 11,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-05T08:40:05Z",
+                            "tool_calls": [{"name": "run_command"}],
+                        },
+                        {
+                            "step_index": 12,
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "created_at": "2026-11-05T08:40:10Z",
+                            "content": "Command exited with code 0.",
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            obs = observe.run_observe(
+                cfg,
+                db_path=cfg.db_path,
+                now_dt=now_dt,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertIn("tp_bus:attention_timeout_auto_reprobe", obs["self_healed"])
+            self.assertIn("tp_cinemap-stress-runner:owner_echo_requeue", obs["self_healed"])
+            self.assertIn("tp_generic-stall:b20261105164000-generic", obs["self_healed"])
+            self.assertFalse(any("tp_bus" in w for w in obs["warns"]), obs["warns"])
+            self.assertFalse(any("Owner Echo SLA" in w for w in obs["warns"]), obs["warns"])
+            self.assertEqual(st.get_topic("tp_bus")["state"], "active")
+            self.assertEqual(st.get_meta("owner_echo_requeue_count:sd_card_cb_4bb2286f814e21b8eff44ebb5fa24fb9"), "2")
+
+            # 4a) Testing-env Nacos account ask -> blocked (pre-authorized)
+            with self.assertRaises(outbound.OutboundError) as cm_nacos:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_cinemap-stress-runner",
+                    "Glenn申请测试Nacos专用账号供Loops自动化配置",
+                    "事情：Glenn 的 Agent 为自动化流程申请在测试环境（tap-testing-env）创建专用 Nacos 账号 loops-model-onboard-test。\n"
+                    "选项：\nA. 批准在测试环境 Nacos 创建受限账号\nB. 不创建专用账号\n建议：选 A",
+                )
+            self.assertIn("REG-117", str(cm_nacos.exception))
+
+            # 4b) Domestic *.tapnow.tv pointing to overseas GCP proxy without cross-border compliance -> blocked
+            with self.assertRaises(outbound.OutboundError) as cm_tv:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_felix-fang",
+                    "配置 track.tapnow.tv 广告追踪域名解析与 GCP 代理证书",
+                    "事情：Felix 申请接入 track.tapnow.tv 承接广告投放回传。需在 DNSPod 为 tapnow.tv 新增 track A 记录指向 8.233.219.66，"
+                    "并在 GCP 生产环境（taplabs-453508）为 tapnow-ga4-sgtm-https-proxy 追加证书。\n"
+                    "选项：\nA. 同意配置 DNSPod A 记录与 GCP 生产证书\nB. 暂缓配置\n建议：选 A",
+                )
+            self.assertIn("REG-117", str(cm_tv.exception))
+            self.assertIn("数据出境", str(cm_tv.exception))
+
+            # 4c) Premature ask for COMMUNITY_API_KEY dual-key compatibility before explaining root-cause timeline in group -> blocked
+            with self.assertRaises(outbound.OutboundError) as cm_hist:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_google-youtube-cua-gemini-quota",
+                    "社区COMMUNITY_API_KEY双Key兼容恢复",
+                    "事情：Yuyang 反馈下游写死依赖原 25 位 COMMUNITY_API_KEY，今日凌晨发版单 202611040051 硬切为 48 位新 Key 导致下游报 401。\n"
+                    "选项：\nA. 实施生产鉴权双 Key 兼容\nB. 维持 48 位新 Key\n建议：选 A",
+                )
+            self.assertIn("REG-117", str(cm_hist.exception))
+            self.assertIn("来龙去脉", str(cm_hist.exception))
+
+            # 4d) Cross-session duplicate ask on COMMUNITY_API_KEY -> blocked
+            with st.tx() as c:
+                c.execute(
+                    "INSERT INTO sends(idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at, title) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        "sda-hist-117",
+                        "ask",
+                        "tp_google-youtube-cua-gemini-quota",
+                        "om_ask_117_first",
+                        "community-api-key-compatibility",
+                        "COMMUNITY-API-KEY-COMPATIBILITY",
+                        "社区 COMMUNITY_API_KEY 双 Key 兼容恢复",
+                        "2026-11-05T16:32:17+08:00",
+                        "社区COMMUNITY_API_KEY双Key兼容恢复",
+                    ),
+                )
+            with self.assertRaises(outbound.OutboundError) as cm_dup:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_mcp-ops",
+                    "生产Nacos社区APIKey核查",
+                    "事情：Dashell 反馈生产环境用 X-API-Key 调用社区接口报 401，需确认生产 Nacos 的 COMMUNITY_API_KEY 是否被改动。\n"
+                    "选项：\nA. 核查生产 Nacos 确认线上 COMMUNITY_API_KEY 是否被改动\nB. 暂缓处理\n建议：选 A",
+                    key="COMMUNITY_API_KEY",
+                )
+            self.assertIn("REG-117", str(cm_dup.exception))
+            self.assertIn("tp_google-youtube-cua-gemini-quota", str(cm_dup.exception))
+
+            # 5) diagnose_override_reason for all 4 replies
+            self.assertEqual(
+                admin_web.diagnose_override_reason("配置 track.tapnow.tv", "这个有没有合规问题 要确认一下，原则上我理解数据是不能出境的 得看是不是要不是再腾讯云国际这边", "其他", "A")[0],
+                "arch_or_config_posture",
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason("社区COMMUNITY_API_KEY双Key兼容恢复", "还不能动 把来龙去脉在群里讲清楚先", "其他", "A")[0],
+                "context_incomplete",
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason("Glenn申请测试Nacos专用账号", "给他账号密码", "其他", "A")[0],
+                "context_incomplete",
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason("生产Nacos社区APIKey核查", "这个已经在google youtube群里在讨论 这和yuyang讨论的事情是同一个 统一转交给同一个session处理", "其他", "A")[0],
+                "peer_or_owner_delegate",
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason("授权开通国内广告回传域名track.tapnow.tv", "等澄清上下文把 目前暂时观望", "其他", "A")[0],
+                "context_incomplete",
+            )
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

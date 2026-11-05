@@ -585,9 +585,9 @@ _TENCENT_INTL_SUBACCOUNT_POSTURE_RE = re.compile(
     re.I,
 )
 _TENCENT_EDGEONE_RESOURCE_CHANGE_ASK_RE = re.compile(
-    r"(?:(?:在|于)?(?:生产|预发|Stage|Prod)?\s*EdgeOne[^\n。]{0,36}(?:新增|创建|配置|修改|绑定)[^\n。]{0,36}(?:加速域名|域名|站点|回源)"
-    r"|EdgeOne\s*[（(]?\s*tapnow\.tv\s*站点[）)]?\s*(?:新增|创建|配置)"
-    r"|配置\s+[a-z0-9.-]+\.tapnow\.tv\s+加速域名)",
+    r"(?:(?:在|于)?(?:生产|预发|Stage|Prod)?\s*EdgeOne[^\n。]{0,36}(?:新增|添加|开通|创建|配置|修改|绑定)[^\n。]{0,36}(?:加速域名|子域名|域名|站点|回源|[a-z0-9.-]+\.tapnow\.tv)"
+    r"|EdgeOne\s*[（(]?\s*tapnow\.tv\s*站点[）)]?\s*(?:新增|添加|开通|创建|配置)"
+    r"|(?:配置|添加|开通)\s+[a-z0-9.-]+\.tapnow\.tv\s+(?:加速域名|子域名))",
     re.I,
 )
 _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE = re.compile(
@@ -624,6 +624,51 @@ _NEW_TAPNOW_MEDIA_DOMESTIC_SUBDOMAIN_ASK_RE = re.compile(
 _TAPNOW_TV_REUSE_EVIDENCE_RE = re.compile(
     r"(?:\b[a-z0-9-]+\.tapnow\.tv\b|(?:能不能|是否可(?:以)?|改用|复用|优先用)\s*(?:[a-z0-9-]+\.)?tapnow\.tv\b)",
     re.I,
+)
+_TEST_ENV_NACOS_ACCOUNT_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:测试环境|tap-testing-env|测试\s*Nacos|tap-testing-nacos))"
+    r"(?=[\s\S]*(?:申请|创建|开通)[^\n。]{0,28}Nacos[^\n。]{0,20}账号)"
+    r"(?![\s\S]*(?:生产环境|taplabs-453508|tpn-prod|生产\s*Nacos))",
+    re.I,
+)
+_DOMESTIC_TV_TO_OVERSEAS_GCP_ASK_RE = re.compile(
+    r"(?=[\s\S]*\b[a-z0-9-]+\.tapnow\.tv\b)"
+    r"(?=[\s\S]*(?:GCP\s*生产|taplabs-453508|8\.233\.219\.66|sgtm-https-proxy|GCP\s*代理))",
+    re.I,
+)
+_DATA_CROSS_BORDER_COMPLIANCE_EVIDENCE_RE = re.compile(
+    r"(?:数据(?:不能|不准|禁止|是否)?出境|跨境合规|出境合规|合规(?:问题|风险|确认|评估)|放在腾讯云国际|收束到腾讯云国际|腾讯云国际(?:站|这边))",
+    re.I,
+)
+_OWNER_ASKED_HISTORY_EXPLANATION_RE = re.compile(
+    r"(?:查一下|讲一下|说一下|看看|梳理)[^\n。]{0,28}(?:来龙去脉|前因后果|相关版本)",
+    re.I,
+)
+_KEY_CHANGE_ROLLBACK_WITHOUT_GROUP_TIMELINE_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:COMMUNITY_API_KEY|API_KEY)[^\n。]{0,28}(?:双\s*Key\s*兼容|兼容恢复|兼容放行))"
+    r"(?=[\s\S]*(?:发版单|硬切为|硬换成))",
+    re.I,
+)
+_GROUP_HISTORY_EXPLAINED_EVIDENCE_RE = re.compile(
+    r"(?:已在群(?:里|内)[^\n。]{0,20}(?:讲清|说明|同步|回复|汇报)[^\n。]{0,20}(?:来龙去脉|前因后果|相关版本)"
+    r"|来龙去脉[^\n。]{0,20}已在群(?:里|内)(?:讲清|说明|同步|回复))",
+    re.I,
+)
+_SHARED_CONFIG_IDENT_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b")
+_GENERIC_CONFIG_IDENTS = frozenset(
+    {
+        "DEFAULT_GROUP",
+        "CLOUD_RUN",
+        "CLOUD_BUILD",
+        "CLOUD_SQL",
+        "GITHUB_ACTIONS",
+        "SECRET_MANAGER",
+        "SERVICE_ACCOUNT",
+        "SYSTEM_MESSAGE",
+        "PLANNER_RESPONSE",
+        "USER_INPUT",
+        "USER_EXPLICIT",
+    }
 )
 _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
     r"(?=(?:[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b))"
@@ -908,6 +953,98 @@ def check_ask_pre_flight_guard(
             f"并在正文中写明需求方对使用 `{sub_prefix}.tapnow.tv` 的确认结论或将其列为推荐选项 A"
             f"（主人 2026-11-05 13:33 在 `[其他]` 纠偏：『问一下能不能用 edm.tapnow.tv』，REG-116 国内新子域名优先收敛复用 tapnow.tv 门禁，没有发送）",
         )
+    if _TEST_ENV_NACOS_ACCOUNT_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部研发/自动化流程（如 Loops）申请在测试环境（`tap-testing-env` / 测试 Nacos）创建专用或受限 Nacos 账号及凭据属于测试环境预授权范围"
+            "（主人 2026-11-05 14:42 在 `[其他]` 明确指示：『给他账号密码』，REG-117 测试环境 Nacos 账号预授权自治门禁）："
+            "请直接在测试环境 Nacos 为其创建对应测试命名空间的受限账号并把账号密码交付给申请人，完成后调用 `sheepdog report` 报备，严禁发 `sheepdog ask` 打扰主人（没有发送）",
+        )
+    if _DOMESTIC_TV_TO_OVERSEAS_GCP_ASK_RE.search(full_text) and not _DATA_CROSS_BORDER_COMPLIANCE_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示将国内站点子域名（`*.tapnow.tv`，如 `track.tapnow.tv`）解析指向海外 GCP 生产代理/负载均衡（如 `taplabs-453508` / `8.233.219.66` / `tapnow-ga4-sgtm-https-proxy`）前，"
+            "必须先确认是否存在国内用户数据出境合规风险，并评估是否应按 `tapnow.tv` 统一基线收束部署在腾讯云国际站生产子账号（`200053747873`）境内节点"
+            "（主人 2026-11-05 15:23 在 `[其他]` 明确纠偏：『这个有没有合规问题 要确认一下，原则上我理解数据是不能出境的 得看是不是要不是再腾讯云国际这边』，REG-117 国内 .tapnow.tv 域名数据出境合规与腾讯云国际收束门禁）："
+            "请先核实数据出境合规边界及腾讯云国际站承接方案并写入正文后再发起 `sheepdog ask`（没有发送）",
+        )
+    if not _GROUP_HISTORY_EXPLAINED_EVIDENCE_RE.search(full_text):
+        unexplained_owner_hist_req = False
+        if _KEY_CHANGE_ROLLBACK_WITHOUT_GROUP_TIMELINE_ASK_RE.search(full_text):
+            unexplained_owner_hist_req = True
+        elif getattr(store, "conn", None) is not None and topic_id:
+            try:
+                hist_rows = store.conn.execute(
+                    """
+                    SELECT message_id, create_time, content
+                    FROM messages
+                    WHERE topic_id = ?
+                      AND reason IN ('owner_instruction', 'owner_reply')
+                      AND dispatch_state IN ('pending', 'delivered')
+                    ORDER BY create_time DESC LIMIT 5
+                    """,
+                    (topic_id,),
+                ).fetchall()
+                for hr in hist_rows:
+                    if _OWNER_ASKED_HISTORY_EXPLANATION_RE.search(str(hr["content"] or "")):
+                        replied_after = store.conn.execute(
+                            "SELECT 1 FROM sends WHERE topic_id = ? AND kind = 'reply' AND sent_at >= ? LIMIT 1",
+                            (topic_id, str(hr["create_time"] or "")),
+                        ).fetchone()
+                        if not replied_after:
+                            unexplained_owner_hist_req = True
+                            break
+            except Exception:
+                pass
+        if unexplained_owner_hist_req:
+            raise OutboundError(
+                EXIT_INVALID,
+                "主人在群内明确要求『查一下…相关版本来龙去脉』时，必须先通过 `sheepdog reply` 在群内把版本变更的前因后果与来龙去脉讲清楚，"
+                "严禁尚未在群里讲清来龙去脉就抢先发 `sheepdog ask` 请示修改生产配置或双 Key 兼容"
+                "（主人 2026-11-05 16:32 在 `[其他]` 明确批评：『还不能动 把来龙去脉在群里讲清楚先』，REG-117 先在群内讲清来龙去脉再请示变更门禁）："
+                "请先用 `sheepdog reply` 在群内完整回复版本改动来龙去脉，并在正文中写明『已在群内讲清来龙去脉』后再发起 `sheepdog ask`（没有发送）",
+            )
+    if getattr(store, "conn", None) is not None and topic_id and topic_id != BUS_TOPIC_ID:
+        idents = {
+            m_id.group(0)
+            for m_id in _SHARED_CONFIG_IDENT_RE.finditer(f"{key}\n{full_text}")
+            if len(m_id.group(0)) >= 12 and m_id.group(0) not in _GENERIC_CONFIG_IDENTS
+        }
+        norm_k = (key or "").strip().upper().replace("_", "-")
+        if len(norm_k) >= 12 and "-" in norm_k:
+            idents.add(norm_k)
+        if idents:
+            try:
+                peer_asks = store.conn.execute(
+                    """
+                    SELECT topic_id, title, text, key, norm_key, sent_at
+                    FROM sends
+                    WHERE kind = 'ask'
+                      AND topic_id IS NOT NULL
+                      AND topic_id != ''
+                      AND topic_id != ?
+                    ORDER BY sent_at DESC LIMIT 30
+                    """,
+                    (topic_id,),
+                ).fetchall()
+                for pa in peer_asks:
+                    other_tid = str(pa["topic_id"] or "")
+                    if not other_tid or other_tid in full_text:
+                        continue
+                    pa_blob = f"{pa['key'] or ''}\n{pa['norm_key'] or ''}\n{pa['title'] or ''}\n{pa['text'] or ''}"
+                    shared = sorted(x for x in idents if x in pa_blob)
+                    if shared:
+                        raise OutboundError(
+                            EXIT_INVALID,
+                            f"检测到另一专席 `{other_tid}` 近期已就同一配置/事项（`{shared[0]}`）发起过拍板请示（`{pa['title'] or ''}`）"
+                            "（主人 2026-11-05 16:36 在 `[其他]` 明确纠偏：『这个已经在…群里在讨论 这和…讨论的事情是同一个 统一转交给同一个session处理』，REG-117 跨会话同根因事件防撞车门禁）："
+                            f"请先通过 `sheepdog tell --to {other_tid}` 或 `sheepdog forward --topic {other_tid}` 将线索统一归口到 `{other_tid}` 合并处理，"
+                            f"若确需独立请示请在正文中显式说明已与 `{other_tid}` 对齐边界（没有发送）",
+                        )
+            except OutboundError:
+                raise
+            except Exception:
+                pass
     if _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,

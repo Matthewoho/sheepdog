@@ -579,12 +579,55 @@ def run_observe(
             info.extend(d_infos)
 
             # 卡住的 attention / lost 会话
+            healed_attention_tids: set[str] = set()
             if "topics" in tabs:
                 for r in c.execute(
                     "SELECT topic_id, title, state, attention_at, attention_reason FROM topics "
                     "WHERE state IN ('attention','lost') AND COALESCE(kind, '') != 'known'"
                 ):
                     m = age_min(r["attention_at"], ref_now) if r["attention_at"] else None
+                    tid_att = str(r["topic_id"] or "")
+                    if (
+                        self_heal
+                        and r["state"] == "attention"
+                        and r["attention_reason"] == "receipt_timeout"
+                        and m is not None
+                        and m >= 10
+                    ):
+                        try:
+                            now_s = iso(ref_now)
+                            with sqlite3.connect(db, timeout=5.0) as wc:
+                                wc.execute(
+                                    "UPDATE topics SET state='active', retries=0, pending_batch_id=NULL, "
+                                    "attention_at=NULL, attention_reason=NULL WHERE topic_id=?",
+                                    (tid_att,),
+                                )
+                                if "meta" in tabs:
+                                    wc.execute(
+                                        "INSERT INTO meta(key, value) VALUES(?, ?) "
+                                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                        (f"duty_reset:{tid_att}", now_s),
+                                    )
+                                if "duty_cards" in tabs:
+                                    wc.execute(
+                                        "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, "
+                                        "idle_since=?, updated_at=? WHERE topic_id=?",
+                                        (now_s, now_s, tid_att),
+                                    )
+                                wc.commit()
+                            if state_dir is not None:
+                                try:
+                                    (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                except OSError:
+                                    pass
+                            healed_attention_tids.add(tid_att)
+                            self_healed.append(f"{tid_att}:attention_timeout_auto_reprobe")
+                            info.append(
+                                f"已对 {tid_att}「{r['title']}」解除回执超时 attention 熔断（已冷却 {m:.0f} 分钟）并触发半开重投探测"
+                            )
+                            continue
+                        except sqlite3.Error:
+                            pass
                     txt = (
                         f"会话 {r['topic_id']}「{r['title']}」{r['state']}（{r['attention_reason'] or '原因没记'}）"
                         + (f"，已 {m:.0f} 分钟" if m is not None else "")
@@ -657,6 +700,8 @@ def run_observe(
                 ).fetchall()
                 for r in prio_rows:
                     priority_msg_ids.add(r["message_id"])
+                    if str(r["topic_id"] or "") in healed_attention_tids:
+                        continue
                     req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
                     eff_create_ts = max(str(r["create_time"] or ""), req_ts) if req_ts else str(r["create_time"] or "")
                     age_s = age_seconds(eff_create_ts, ref_now)
@@ -724,7 +769,7 @@ def run_observe(
                             if "duty_cards" in tabs
                             else None
                         )
-                        healed_hol = False
+                        healed_hol = tid in healed_attention_tids
                         if (
                             self_heal
                             and pending_batch == "无"
@@ -791,7 +836,7 @@ def run_observe(
                                 )
                                 healed_hol = True
                             except sqlite3.Error:
-                                healed_hol = False
+                                healed_hol = tid in healed_attention_tids
                         if not healed_hol:
                             if self_heal and topic_state == "running" and pending_batch != "无" and state_dir is not None:
                                 try:
@@ -812,15 +857,24 @@ def run_observe(
                     mid = str(r["message_id"] or "")
                     tid = str(r["topic_id"] or "")
                     requeue_key = f"owner_echo_requeued:{mid}"
+                    requeue_cnt_key = f"owner_echo_requeue_count:{mid}"
                     requeued_at = ""
+                    requeue_cnt = 0
                     if "meta" in tabs and mid:
                         meta_r = c.execute("SELECT value FROM meta WHERE key = ?", (requeue_key,)).fetchone()
                         requeued_at = str((meta_r["value"] if meta_r else "") or "").strip()
+                        cnt_r = c.execute("SELECT value FROM meta WHERE key = ?", (requeue_cnt_key,)).fetchone()
+                        try:
+                            requeue_cnt = int((cnt_r["value"] if cnt_r else "") or 0)
+                        except (TypeError, ValueError):
+                            requeue_cnt = 1 if requeued_at else 0
+                        if requeued_at and requeue_cnt == 0:
+                            requeue_cnt = 1
                     eff_since = max(str(r["said_at"] or ""), requeued_at) if requeued_at else str(r["said_at"] or "")
                     age_s = age_seconds(eff_since, ref_now)
                     if age_s is not None and age_s >= 900:
                         healed_echo = False
-                        if self_heal and not requeued_at and tid and "topics" in tabs and "messages" in tabs:
+                        if self_heal and requeue_cnt < 3 and tid and "topics" in tabs and "messages" in tabs:
                             t_row = c.execute(
                                 "SELECT state, pending_batch_id FROM topics WHERE topic_id = ?",
                                 (tid,),
@@ -875,6 +929,10 @@ def run_observe(
                                             wc.execute(
                                                 "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                                                 (requeue_key, now_s),
+                                            )
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (requeue_cnt_key, str(requeue_cnt + 1)),
                                             )
                                             wc.execute(
                                                 "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -983,10 +1041,15 @@ def run_observe(
                             if not has_receipt:
                                 last_step = post_steps[-1]
                                 last_type = str(last_step.get("type") or "")
+                                has_running_generic = any(
+                                    s.get("type") == "GENERIC" and str(s.get("status") or "").upper() == "RUNNING"
+                                    for s in post_steps
+                                )
                                 if (
-                                    last_type in ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT")
+                                    last_type in ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT", "GENERIC")
                                     and last_step.get("status") == "DONE"
                                     and not last_step.get("tool_calls")
+                                    and not has_running_generic
                                 ):
                                     silent_s = age_seconds(str(last_step.get("created_at") or ""), ref_now)
                                     if silent_s is not None and silent_s >= 90:
