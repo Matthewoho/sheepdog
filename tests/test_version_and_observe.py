@@ -5264,6 +5264,178 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertTrue(lambs_map["lamb_to_fail"]["recovered_by_parent"])
             st.close()
 
+    def test_reg123_p2p_live_owner_conversation_guard_owner_context_auto_settle_and_tccli_help_filter(self):
+        """1.1.34（REG-123）：
+        1. check_ask_pre_flight_guard 拦截在一对一私聊主人正在亲自对话、或尚未找账单负责人（Sammy/Ethan）核查时，抢发『A. 由我们找账单负责人核查 vs B. 由你本人在私聊回复』的伪选择题；
+        2. write_receipt（status='waiting'）与 _auto_settle_open_escalations_on_owner_batch 在批次包含 owner_context/escalation_check 且回执 summary 确认『由主人在私聊亲自沟通，本会话保持静默观望』时，自动结案 open escalation；
+        3. diagnose_override_reason 将『我已经在消息里回复了 你可以观望一下』精准归入 stale_or_already_handled；
+        4. _summarize_cli_lamb_log 自动剥离 tccli 报错末尾的 5 行『To tccli help text... / tccli service[...] help』冗余提示，保留前面的 RuntimeError 与 SDK 报错行。
+        """
+        from sheepdog import admin_web, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_owner", state_dir=state_dir)
+            cfg.source.enabled = False
+            st = Store(cfg.db_path)
+
+            now_local = datetime.now().astimezone().replace(microsecond=0)
+            t_kai_iso = (now_local - timedelta(minutes=2)).isoformat(timespec="seconds")
+            t_owner_iso = (now_local - timedelta(minutes=1)).isoformat(timespec="seconds")
+            t_ask_iso = (now_local - timedelta(seconds=45)).isoformat(timespec="seconds")
+
+            st.upsert_topic(
+                "tp_kaifeng",
+                title="[managed] Kai Feng",
+                kind="adopted",
+                conversation_id="conv-kaifeng-123",
+                state="running",
+            )
+            m_kai = Message(
+                message_id="om_kai_livekit_123",
+                chat_id="oc_p2p_kaifeng",
+                chat_name="Kai Feng",
+                chat_type="p2p",
+                sender_id="ou_kaifeng",
+                sender_name="Kai Feng",
+                sender_type="user",
+                content="Matthew，接着问一下 LiveKit：你说「好像没充钱」，麻烦有权限的人看一眼 Billing / Usage 页面截个图？",
+                msg_type="text",
+                create_time=t_kai_iso,
+            )
+            st.upsert_message(m_kai, "dispatch", "managed_chat", [], "tp_kaifeng")
+            st.mark_batch(["om_kai_livekit_123"], "b20261106002228-kaifeng", "tp_kaifeng", "delivered")
+            st.record_dispatch("b20261106002228-kaifeng", "tp_kaifeng", ["om_kai_livekit_123"], state="sent")
+
+            m_owner_p2p = Message(
+                message_id="om_owner_p2p_reply_123",
+                chat_id="oc_p2p_kaifeng",
+                chat_name="Kai Feng",
+                chat_type="p2p",
+                sender_id="ou_owner",
+                sender_name="Matthew Hong",
+                sender_type="user",
+                content="用得哪个key你知道吗 知道的话发给我 不知道的话告诉我在哪里 我去查",
+                msg_type="text",
+                create_time=t_owner_iso,
+            )
+            st.upsert_message(m_owner_p2p, "dispatch", "owner_context", [], "tp_kaifeng")
+
+            bad_livekit_ask = (
+                "Kai在私聊跟进询问：国际站Cinemap目前使用的LiveKit Cloud项目是否确实欠费/未充值，请求有权限的人查看LiveKit Cloud控制台Billing/Usage状态并截图反馈。\n"
+                "---more---\n"
+                "事情：Kai 在私聊跟进询问国际站 LiveKit Cloud 账号 Billing 状态并请求截图。\n"
+                "选项：\n"
+                "A. 由我们找外部渠道/账单负责人（Sammy 或 Ethan）核查 LiveKit Cloud 控制台 Billing / Usage 状态并截图发给 Kai\n"
+                "B. 由你本人登录 LiveKit Cloud 控制台查看截图（或直接在私聊回复 Kai）\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_livekit:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "Kai请求核查国际站LiveKit Cloud账号Billing状态并截图",
+                    bad_livekit_ask,
+                    about=["om_kai_livekit_123"],
+                    batch="b20261106002228-kaifeng",
+                )
+            self.assertIn("REG-123", str(cm_livekit.exception))
+
+            # Once delegate already checked or owner is not in live p2p and delegate replied, ask is allowed
+            good_livekit_ask = (
+                "已联系 Sammy 核实确认 LiveKit Cloud 账单需绑卡充值 $500，请拍板充值额度。\n"
+                "---more---\n"
+                "事情：已向 Sammy 核实确认 LiveKit Cloud 账单状态，当前需绑卡充值。\n"
+                "选项：\n"
+                "A. 批准充值 $500\n"
+                "B. 暂不充值\n"
+                "建议：A。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kaifeng",
+                "LiveKit Cloud 账单充值额度请示",
+                good_livekit_ask,
+            )
+
+            # 2) Auto-settle open escalation when write_receipt(status='waiting') confirms owner is communicating in P2P
+            st.add_escalation(
+                "om_esc_livekit_123",
+                "tp_kaifeng",
+                "oc_owner_dm",
+                f"🐕 需要你定 · Kai请求核查国际站LiveKit Cloud账号Billing状态并截图 [tp_kaifeng]\n{bad_livekit_ask}",
+                t_ask_iso,
+            )
+            st.add_escalation_sources(
+                "om_esc_livekit_123",
+                "tp_kaifeng",
+                [("om_kai_livekit_123", "oc_p2p_kaifeng")],
+                "explicit",
+            )
+            st.record_dispatch(
+                "b20261106002331-kaifeng",
+                "tp_kaifeng",
+                ["om_owner_p2p_reply_123", "sd_escalation_check_123"],
+                state="sent",
+            )
+            st.update_topic("tp_kaifeng", state="running", pending_batch_id="b20261106002331-kaifeng", dispatched_at=t_owner_iso)
+            st.create_lamb("lamb_7fac7af9", "tp_kaifeng", "subagent", "Check LiveKit")
+            st.close()
+
+            engine.write_receipt(
+                cfg,
+                "tp_kaifeng",
+                "b20261106002331-kaifeng",
+                {
+                    "status": "waiting",
+                    "summary": "已收到主人两项指示：①LiveKit由主人在私聊亲自沟通，本会话保持静默观望；②已派羔羊lamb_7fac7af9跟进。",
+                    "anchors": ["lamb:lamb_7fac7af9"],
+                },
+            )
+
+            st2 = Store(cfg.db_path)
+            esc_row = st2.get_escalation("om_esc_livekit_123")
+            self.assertEqual(esc_row["close_reason"], "answered")
+            self.assertEqual(esc_row["answer_message_id"], "om_owner_p2p_reply_123")
+            self.assertIsNotNone(esc_row["closed_at"])
+            st2.close()
+
+            # 3) diagnose_override_reason classifies '我已经在消息里回复了 你可以观望一下' as stale_or_already_handled
+            c_code, c_label = admin_web.diagnose_override_reason(
+                bad_livekit_ask,
+                "[卡片回调] 其他：我已经在消息里回复了 你可以观望一下",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_code, c_label), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            # 4) _summarize_cli_lamb_log strips tccli help boilerplate lines
+            tccli_err_log = (
+                "Traceback (most recent call last):\n"
+                '  File "/tmp/create_jump.py", line 42, in <module>\n'
+                '    raise RuntimeError("tccli RunInstances failed")\n'
+                "RuntimeError: tccli cvm RunInstances failed:\n"
+                "[TencentCloudSDKException] code:InvalidParameterValue.ZoneInvalid message:The specified zone ap-nanjing-1 does not support pay-as-you-go.\n"
+                "To tccli help text, you can run:\n"
+                "  tccli help\n"
+                "  tccli configure help\n"
+                "  tccli service[cvm] help\n"
+                "  tccli service[cvm] action[RunInstances] help\n"
+            )
+            sum_tccli, has_err_tccli = engine._summarize_cli_lamb_log(tccli_err_log)
+            self.assertTrue(has_err_tccli)
+            self.assertIn("RuntimeError: tccli cvm RunInstances failed:", sum_tccli)
+            self.assertIn("InvalidParameterValue.ZoneInvalid", sum_tccli)
+            self.assertNotIn("tccli help", sum_tccli)
+            self.assertNotIn("tccli service[cvm] help", sum_tccli)
+
 
 if __name__ == "__main__":
     unittest.main()

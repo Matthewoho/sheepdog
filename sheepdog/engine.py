@@ -2685,7 +2685,7 @@ class Dispatcher:
             if anchors := self._receipt_anchors(t, receipt): fields["anchors_json"] = anchors
             self.store.update_topic(t["topic_id"], **fields)
             if status != "needs_decision":
-                self._auto_settle_open_escalations_on_owner_batch(t["topic_id"], batch)
+                self._auto_settle_open_escalations_on_owner_batch(t["topic_id"], batch, receipt=receipt)
             if status != "waiting":
                 _auto_close_topic_subagents(self.store, t["topic_id"])
             else:
@@ -4211,68 +4211,17 @@ class Dispatcher:
                 chosen_display=" ".join(plain_text(r["content"] or "").split())[:60] or "主人文字批复",
                 answered_at=r["create_time"] or now_iso())
 
-    def _auto_settle_open_escalations_on_owner_batch(self, topic_id: str, batch_id: str) -> list[str]:
-        """1.1.21（REG-110）：当某个会话名下有未关闭的「需要你定」提问，且主人在原业务群（或对该会话）直接下达了
-        owner_instruction / owner_reply 指令（如『@Mattheuu 你直接起 subagent review 完没问题直接合』），
-        会话收到并处理该批次后交回非 needs_decision 回执（handled / waiting / done）时，
-        自动用主人的这条群内指令将同会话对应的 open escalation 结案，并同步将话题群与拍板总台双卡片置绿，
-        避免主人已经在群里拍板指挥完，拍板总台还挂着未结案卡片迫使主人点『[其他] 我在群里回了呀』。"""
-        if not topic_id or not batch_id or not self.cfg.self_open_id:
-            return []
-        open_escs = [
-            e
-            for e in open_escalations(self.store, self.cfg.escalation.open_hours, topic_id)
-            if not e["closed_at"]
-        ]
-        if not open_escs:
-            return []
-        d = self.store.get_dispatch(batch_id)
-        mids = json.loads(d["message_ids"] or "[]") if d is not None and d["message_ids"] else []
-        if not mids:
-            return []
-        from . import pending as pend
-        owner_msgs = []
-        for mid in mids:
-            r = self.store.get_message(mid)
-            if r is None or r["sender_id"] != self.cfg.self_open_id or r["deleted"]:
-                continue
-            reason = (r["reason"] or "").strip()
-            if (reason in (OWNER_INSTRUCTION, OWNER_REPLY) or _has_owner_instruction_tag(r)) and not pend.is_owner_busy_or_defer_text(r["content"] or ""):
-                owner_msgs.append(r)
-        if not owner_msgs:
-            return []
-        settled: list[str] = []
-        for e in open_escs:
-            asked = _parse(e["asked_at"] or "")
-            src_chats = {
-                s["about_chat_id"]
-                for s in self.store.escalation_sources(e["message_id"])
-                if s["about_chat_id"]
-            }
-            matched_r = None
-            for r in reversed(owner_msgs):
-                c_dt = _parse(r["create_time"] or "")
-                f_dt = _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
-                dts = [x for x in (c_dt, f_dt) if x is not None]
-                r_dt = max(dts) if dts else None
-                if asked is not None and r_dt is not None and r_dt < asked - timedelta(seconds=90):
-                    continue
-                same_source_chat = not src_chats or (r["chat_id"] in src_chats)
-                recent_on_topic = asked is not None and r_dt is not None and (r_dt - asked) <= timedelta(minutes=30)
-                if same_source_chat or recent_on_topic:
-                    matched_r = r
-                    break
-            if matched_r is not None:
-                self._answer_escalation_row(e["message_id"], matched_r)
-                settled.append(e["message_id"])
-                log.info(
-                    "会话 %s 批次 %s 已按主人群内指令 %s 处理完毕，自动结案待定提问 %s",
-                    topic_id,
-                    batch_id,
-                    matched_r["message_id"],
-                    e["message_id"],
-                )
-        return settled
+    def _auto_settle_open_escalations_on_owner_batch(
+        self, topic_id: str, batch_id: str, receipt: dict | None = None
+    ) -> list[str]:
+        """1.1.21（REG-110）/ 1.1.34（REG-123）：当某个会话名下有未关闭的「需要你定」提问，且：
+        1) 主人在原业务群（或对该会话）直接下达了 owner_instruction / owner_reply 指令，会话交回非 needs_decision 回执；或
+        2) 主人在来源私聊/群内亲自发言（owner_context / escalation_check），且会话交回的回执 summary 明确确认
+           『由主人在私聊/群里亲自沟通/回复，本会话保持静默观望』时，
+        自动用主人的这条发言将同会话对应的 open escalation 结案，并同步将话题群与拍板总台双卡片置绿。"""
+        return auto_settle_open_escalations_on_owner_batch(
+            self.cfg, self.store, self.source, topic_id, batch_id, receipt=receipt
+        )
 
     def _complete_delivery(self, t, batch_id: str, signals: list, context: list, sent_at: str | None = None) -> dict:
         """批次已送达后的记账：标记消息、改会话状态、关闭被回答的「需要你定」、点确认表情。正常发送与崩溃恢复共用。"""
@@ -6876,6 +6825,116 @@ def bind_echo_relay(cfg: Config, store: Store, topic_id: str, batch_id: str, rec
                 store.echo_bind_relay(e["message_id"], batch_id, now, eff_status, summary_clean)
 
 
+_RECEIPT_CONFIRMS_OWNER_HANDLED_RE = re.compile(
+    r"(?:(?:由)?主人在(?:私聊|群里|消息里|飞书)[^\n。；]{0,16}(?:亲自)?(?:沟通|回复|处理|跟进|对接)"
+    r"|保持(?:静默)?观望|静默观望|已由主人(?:亲自)?(?:回复|处理|拍板|沟通))",
+    re.I,
+)
+
+
+def auto_settle_open_escalations_on_owner_batch(
+    cfg: Config,
+    store: Store,
+    source,
+    topic_id: str,
+    batch_id: str,
+    receipt: dict | None = None,
+) -> list[str]:
+    """1.1.21（REG-110）/ 1.1.34（REG-123）：当某个会话名下有未关闭的「需要你定」提问，且：
+    1) 主人在原业务群（或对该会话）直接下达了 owner_instruction / owner_reply 指令，会话交回非 needs_decision 回执；或
+    2) 主人在来源私聊/群内亲自发言（owner_context / escalation_check），且会话交回的回执 summary 明确确认
+       『由主人在私聊/群里亲自沟通/回复，本会话保持静默观望』时，
+    自动用主人的这条发言将同会话对应的 open escalation 结案，并同步将话题群与拍板总台双卡片置绿。"""
+    if not topic_id or not batch_id or not cfg.self_open_id:
+        return []
+    open_escs = [
+        e
+        for e in open_escalations(store, cfg.escalation.open_hours, topic_id)
+        if not e["closed_at"]
+    ]
+    if not open_escs:
+        return []
+    d = store.get_dispatch(batch_id)
+    mids = json.loads(d["message_ids"] or "[]") if d is not None and d["message_ids"] else []
+    if not mids:
+        return []
+    from . import decision_hub
+    from . import pending as pend
+    rcpt_summary = str((receipt or {}).get("summary") or "")
+    confirms_owner_handled = bool(_RECEIPT_CONFIRMS_OWNER_HANDLED_RE.search(rcpt_summary))
+    owner_msgs = []
+    has_esc_check_in_batch = False
+    for mid in mids:
+        if mid.startswith("sd_escalation_check_"):
+            has_esc_check_in_batch = True
+        r = store.get_message(mid)
+        if r is None:
+            continue
+        reason = (r["reason"] or "").strip()
+        if reason == "escalation_check":
+            has_esc_check_in_batch = True
+        if r["sender_id"] != cfg.self_open_id or r["deleted"]:
+            continue
+        if pend.is_owner_busy_or_defer_text(r["content"] or ""):
+            continue
+        if reason in (OWNER_INSTRUCTION, OWNER_REPLY) or _has_owner_instruction_tag(r):
+            owner_msgs.append(r)
+        elif confirms_owner_handled and reason == OWNER_CONTEXT:
+            owner_msgs.append(r)
+    settled: list[str] = []
+    for e in open_escs:
+        asked = _parse(e["asked_at"] or "")
+        src_chats = {
+            s["about_chat_id"]
+            for s in store.escalation_sources(e["message_id"])
+            if s["about_chat_id"]
+        }
+        cand_msgs = list(owner_msgs)
+        if not cand_msgs and confirms_owner_handled and has_esc_check_in_batch and src_chats:
+            q_chats = ",".join("?" for _ in src_chats)
+            for row_ctx in store.conn.execute(
+                f"SELECT * FROM messages WHERE sender_id=? AND deleted=0 AND chat_id IN ({q_chats}) "
+                "AND reason IN ('owner_context', 'owner_instruction', 'owner_reply') ORDER BY create_time DESC LIMIT 10",
+                (cfg.self_open_id, *src_chats),
+            ).fetchall():
+                if not pend.is_owner_busy_or_defer_text(row_ctx["content"] or ""):
+                    cand_msgs.append(row_ctx)
+        matched_r = None
+        for r in reversed(cand_msgs):
+            c_dt = _parse(r["create_time"] or "")
+            f_dt = _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
+            dts = [x for x in (c_dt, f_dt) if x is not None]
+            r_dt = max(dts) if dts else None
+            if asked is not None and r_dt is not None and r_dt < asked - timedelta(seconds=90):
+                continue
+            same_source_chat = not src_chats or (r["chat_id"] in src_chats)
+            recent_on_topic = asked is not None and r_dt is not None and (r_dt - asked) <= timedelta(minutes=30)
+            if same_source_chat or recent_on_topic:
+                matched_r = r
+                break
+        if matched_r is not None:
+            store.answer_escalation(e["message_id"], matched_r["message_id"], allow_update=True)
+            is_cb = "raw_json" in matched_r.keys() and '"_sd_card_callback"' in (matched_r["raw_json"] or "")
+            if decision_hub.hub_active(cfg, store) and not is_cb:
+                decision_hub.sync_escalation_dual_cards(
+                    cfg,
+                    store,
+                    source,
+                    e["message_id"],
+                    chosen_display=" ".join(plain_text(matched_r["content"] or "").split())[:60] or "主人已亲自回复",
+                    answered_at=matched_r["create_time"] or now_iso(),
+                )
+            settled.append(e["message_id"])
+            log.info(
+                "会话 %s 批次 %s 已按主人现场发言 %s 处理完毕，自动结案待定提问 %s",
+                topic_id,
+                batch_id,
+                matched_r["message_id"],
+                e["message_id"],
+            )
+    return settled
+
+
 def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> Path:
     from . import hook, outbound
     store = Store(cfg.db_path) if cfg.db_path.exists() else None
@@ -6911,6 +6970,13 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
                 if merged_anchors := Dispatcher._receipt_anchors(t, receipt):
                     fields["anchors_json"] = merged_anchors
                 store.update_topic(topic_id, **fields)
+                if eff_status != "needs_decision":
+                    try:
+                        im_src = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages) if cfg.source.enabled else None
+                        auto_settle_open_escalations_on_owner_batch(cfg, store, im_src, topic_id, batch_id, receipt=receipt)
+                    except Exception as e:
+                        log.warning("自动结案待定提问出错（%s/%s）: %s", topic_id, batch_id, e)
+                _auto_close_superseded_subagents(store, topic_id, batch_id, anchors)
                 duty.apply_receipt_work(store, topic_id, receipt, log)
                 store.add_history(topic_id, "receipt", f"{batch_id} {status}：{duty.short(str(receipt.get('summary') or ''), 80)}")
                 try:
@@ -6986,7 +7052,8 @@ _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
     r"Provisioning resources\.*done|Starting execution\.*done|Running execution\.*done|"
     r"To execute this job,\s*use:|gcloud\s+run\s+jobs\s+(?:execute|executions\s+describe)\b|"
     r"View details about this execution by running:|Or visit https://console\.cloud\.google\.com/|"
-    r"Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b)",
+    r"Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b|"
+    r"To tccli help text,\s*you can run:|tccli\s+(?:help|configure\s+help|service\[[^\]]+\]\s+(?:help|action\[[^\]]+\]\s+help))\b)",
     re.I | re.M,
 )
 _JSON_PROP_FRAGMENT_LINE_RE = re.compile(

@@ -829,6 +829,69 @@ _DBA_NICKY_GRANT_RECOMMEND_A_RE = re.compile(
     r"A\s*[\.、:：)\]]\s*[^\n]*给\s*Nicky(?:\s*Ye)?\s*开通[^\n]*(?:DB|数据库|MySQL|PG|最高)[^\n]*权限",
     re.I,
 )
+_P2P_LIVE_OWNER_CONVERSATION_OR_DELEGATE_CHECK_ASK_RE = re.compile(
+    r"(?:(?:请求确认)?(?:你刚才提到的|你说的)\s*[「『\"][^」』\"\n]{1,40}[」』\"]\s*，?\s*是否指"
+    r"|A\s*[\.、:：)\]]\s*[^\n]*由我们找(?:外部渠道|账单|相关)?[^\n]*负责人\s*[（(][^）)\n]*(?:Sammy|Ethan|Nicky|老胡)[^）)\n]*[）)][^\n]*核查[^\n]*控制台[^\n]*(?:状态|截图)[\s\S]{0,260}"
+    r"B\s*[\.、:：)\]]\s*[^\n]*由你本人登录[^\n]*控制台[^\n]*(?:查看|截图)[^\n]*(?:或直接在私聊回复|私聊回复))",
+    re.I,
+)
+_P2P_OWNER_DELEGATE_ALREADY_CHECKED_EVIDENCE_RE = re.compile(
+    r"(?:已(?:通过|向|找)\s*(?:`?tp_[a-z0-9_-]+`?|Sammy|Ethan)\s*(?:核实|确认|反馈)|"
+    r"负责人(?:反馈|表示|确认)(?:无权限|无法登录|需要主人)|主人在私聊(?:明确)?指示由专席)",
+    re.I,
+)
+
+
+def _has_live_p2p_owner_conversation(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    *,
+    about: list[str] | None = None,
+    batch: str = "",
+) -> bool:
+    """REG-123：检测当前 ask 的来源私聊（p2p）中，主人本人是否已经在来源消息之后（或近 2 分钟内）直接回复了对方（owner_context）。"""
+    if getattr(store, "conn", None) is None or not cfg.self_open_id:
+        return False
+    try:
+        from . import pending as pend
+        _, srcs, _ = ask_sources(cfg, store, topic_id, about, batch)
+        for src_mid, src_chat in srcs:
+            if not src_mid or not src_chat:
+                continue
+            src_row = store.get_message(src_mid)
+            if src_row is None or (src_row["chat_type"] or "") != "p2p":
+                continue
+            src_ct = _parse(src_row["create_time"] or "")
+            src_fs = _parse(src_row["first_seen"] or "") if "first_seen" in src_row.keys() else None
+            rows = store.conn.execute(
+                """
+                SELECT message_id, create_time, first_seen, content, reply_to
+                FROM messages
+                WHERE chat_id = ?
+                  AND sender_id = ?
+                  AND reason = 'owner_context'
+                  AND deleted = 0
+                ORDER BY first_seen DESC, rowid DESC
+                LIMIT 5
+                """,
+                (src_chat, cfg.self_open_id),
+            ).fetchall()
+            for r in rows:
+                txt = str(r["content"] or "")
+                if not txt.strip() or pend.is_agent_text(cfg, txt):
+                    continue
+                if (r["reply_to"] or "") == src_mid:
+                    return True
+                r_ct = _parse(r["create_time"] or "")
+                r_fs = _parse(r["first_seen"] or "")
+                if src_fs is not None and r_fs is not None and r_fs >= src_fs:
+                    return True
+                if src_ct is not None and r_ct is not None and r_ct > src_ct:
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def check_unverified_ticket_promise_guard(text: str) -> None:
@@ -858,6 +921,8 @@ def check_ask_pre_flight_guard(
     floor: str = "",
     floor_type: str | None = None,
     options: str = "",
+    about: list[str] | None = None,
+    batch: str = "",
 ) -> None:
     """7.108 / 7.110 / 7.113 / 7.114 / 7.115 / 7.116 / 7.117 / 7.118（REG-076 ~ REG-086）：从人类改判错题本自进化提炼的 ask 发前防打扰门禁：
     0. 发起待拍板 ask 卡片（含写明『建议选 A』或启用聚合台/白话总结折叠模式）时，必须提供至少 2 个可解析的 A/B 互斥选项，严禁发无选项按钮的空头决策卡；
@@ -969,6 +1034,21 @@ def check_ask_pre_flight_guard(
             "Nicky Ye（DBA / 数据库负责人）应拥有所有数据库的最高权限与管理入口，严禁在涉及数据库 SQL 执行或库表权限时把『A. 不外发生产库账密，由业务/迁移专席代执行』作为首选建议，而把『B. 给 Nicky Ye 开通数据库权限/连接账号』贬为次选"
             "（主人 2026-11-05 23:58:55 在 `tp_infra-migration-ops` 卡片 `[其他]` 明确纠偏：『nicky应该有所有数据库的最高权限 给他』，REG-122 DBA 所有数据库最高权限门禁）："
             "请直接将给 Nicky Ye 开通/交付对应数据库的最高权限与连接凭据作为首选建议（选项 A）后再发起请示（没有发送）",
+        )
+    if not _P2P_OWNER_DELEGATE_ALREADY_CHECKED_EVIDENCE_RE.search(full_text) and (
+        _P2P_LIVE_OWNER_CONVERSATION_OR_DELEGATE_CHECK_ASK_RE.search(full_text)
+        or (
+            _has_live_p2p_owner_conversation(cfg, store, topic_id, about=about, batch=batch)
+            and re.search(r"(?:私聊|你刚才提到的|你说的|直接在私聊回复)", full_text, re.I)
+        )
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当主人正在私聊（p2p）与对方直接实时对话（如对方追问『你说「…」是否指的是…』或主人已在私聊亲自回复对方），"
+            "或仅需找内部渠道/账单负责人（如 Sammy / Ethan）只读核查控制台状态时，严禁抢发『A. 由我们找负责人核查截图 vs B. 由你本人登录控制台查看（或直接在私聊回复）』的拍板卡打断主人"
+            "（主人 2026-11-06 00:23:50 在 `tp_kaifeng` 卡片 `[其他]` 明确纠偏：『我已经在消息里回复了 你可以观望一下』，REG-123 主人私聊实时在场观望与免请示找负责人只读核查门禁）："
+            "① 若主人在私聊正与对方实时沟通，请保持静默观望并直接交 `handled` / `waiting` 回执，严禁发 `sheepdog ask` 打扰主人；"
+            "② 若需内部负责人（如 `tp_sammy`）协助只读核查控制台状态，请直接通过 `sheepdog tell` 协同核实，无需事先发 `sheepdog ask` 请示（没有发送）",
         )
     if floor or floor_type:
         return
@@ -1582,7 +1662,10 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
     combined_for_check = f"{summary.strip()}\n---more---\n{body}" if (summary or "").strip() else body
     if kind == ASK:
         check_vip_floor(cfg, store, topic_id, about, vips, raw_floor, batch, floor_type=floor_type)
-        check_ask_pre_flight_guard(cfg, store, topic_id, title, combined_for_check, key=key, floor=raw_floor, floor_type=floor_type, options=options)
+        check_ask_pre_flight_guard(
+            cfg, store, topic_id, title, combined_for_check,
+            key=key, floor=raw_floor, floor_type=floor_type, options=options, about=about, batch=batch,
+        )
     else:
         ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
         check_transitional_state_report_guard(
