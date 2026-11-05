@@ -128,6 +128,25 @@ def age_seconds(s: str | None, ref: datetime) -> float | None:
     return (ref - dt).total_seconds()
 
 
+def _queue_entry_ts(create_time: str | None, first_seen: str | None, ref_now: datetime) -> str:
+    """Return the effective queue entry timestamp for SLA accounting.
+    Lark user search often returns minute-truncated `create_time` (e.g. `:00+08:00`), which can be up to 98s
+    earlier than actual queue ingestion (`first_seen`). When `first_seen` is valid, not after `ref_now`
+    (preserving historical-timestamp unit tests), and `>= create_time`, use `first_seen` as the queue entry clock.
+    """
+    ct_str = str(create_time or "").strip()
+    fs_str = str(first_seen or "").strip()
+    if not fs_str:
+        return ct_str
+    fs_dt = parse_iso(fs_str)
+    if fs_dt is None or fs_dt > ref_now:
+        return ct_str
+    ct_dt = parse_iso(ct_str)
+    if ct_dt is not None and fs_dt < ct_dt:
+        return ct_str
+    return fs_str
+
+
 def age_min(s: str | None, ref: datetime | None = None) -> float | None:
     sec = age_seconds(s, ref or now_tz())
     return (sec / 60.0) if sec is not None else None
@@ -686,7 +705,7 @@ def run_observe(
             if "messages" in tabs:
                 prio_rows = c.execute(
                     """
-                    SELECT message_id, topic_id, reason, tags_json, create_time
+                    SELECT message_id, topic_id, reason, tags_json, create_time, first_seen
                     FROM messages
                     WHERE route = 'dispatch'
                       AND dispatch_state = 'pending'
@@ -703,7 +722,8 @@ def run_observe(
                     if str(r["topic_id"] or "") in healed_attention_tids:
                         continue
                     req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
-                    eff_create_ts = max(str(r["create_time"] or ""), req_ts) if req_ts else str(r["create_time"] or "")
+                    base_ts = _queue_entry_ts(r["create_time"], r["first_seen"], ref_now)
+                    eff_create_ts = max(base_ts, req_ts) if req_ts else base_ts
                     age_s = age_seconds(eff_create_ts, ref_now)
                     if age_s is not None and age_s >= 90:
                         warn.append(
@@ -740,7 +760,7 @@ def run_observe(
                         tid_r = str(r["topic_id"] or "")
                         q_ts = relay_ts_by_topic.get(tid_r) or str(r["last_seen"] or r["create_time"] or "")
                     else:
-                        q_ts = str(r["create_time"] or "")
+                        q_ts = _queue_entry_ts(r["create_time"], r["first_seen"], ref_now)
                     req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
                     if req_ts and req_ts > q_ts:
                         q_ts = req_ts

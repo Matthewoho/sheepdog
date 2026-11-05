@@ -5436,6 +5436,137 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertNotIn("tccli help", sum_tccli)
             self.assertNotIn("tccli service[cvm] help", sum_tccli)
 
+    def test_reg124_owner_action_done_accept_hol_first_seen_sla_and_multiframe_tb_collapse(self):
+        """REG-124 (v1.1.35):
+        1. Owner action-completion replies in `[其他]` (`[卡片回调] 其他：已重置`, `已买好`, `已续费`, `已加白`) are classified as `accepted` (`采纳建议 (带参/直接放行)`), not `overridden`.
+        2. `observe.run_observe` Stage 2/3 and `engine._maybe_nudge_hol_queue_pressure` use `first_seen` (when `first_seen <= ref_now` and `first_seen >= create_time`) instead of minute-truncated Lark search `create_time`, preventing false-positive SLA alerts at 3m33s.
+        3. `_summarize_cli_lamb_log` collapses multi-frame Python Traceback blocks on `cand_lines` before slicing `tail_lines = cand_lines[-5:]`, and `_scan_lambs` self-heals existing summaries starting with a dangling frame code line (`run_cmd(`, `r_cdb = run_tccli([`).
+        """
+        from datetime import datetime
+        from sheepdog import admin_web, engine, observe
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        lsg4_ask = (
+            "lsg4（香港原生家宽 103.118.244.142，现载 John、Ethan、Carl 3 人）月度流量已用 95%（950.25 GiB / 1000 GiB，仅剩 50 GiB），请拍板处置方案。\n"
+            "---more---\n"
+            "选项：\n"
+            "A. 在 ZoroCloud 后台为 lsg4 购买流量重置包/扩容流量包，保持 John、Ethan、Carl 原地不断网（买完告知额度，专席同步改 exporter 配置）\n"
+            "B. 购买 1 台新香港原生家宽 VPS 接替 lsg4\n"
+            "建议：选 A（直接重置/扩容 lsg4 流量包，3 位同事零感知不断网）。"
+        )
+        for reply_txt in ("[卡片回调] 其他：已重置", "[卡片回调] 其他：已购买", "[卡片回调] 其他：已续费", "[卡片回调] 其他：扩容好了"):
+            cls_res = admin_web.classify_escalation(
+                {
+                    "message_id": "om_lsg4_124",
+                    "topic_id": "tp_3x-ui-ops",
+                    "chat_id": "oc_owner_dm",
+                    "text": lsg4_ask,
+                    "asked_at": "2026-11-06T01:28:53+08:00",
+                    "closed_at": "2026-11-06T01:33:18+08:00",
+                    "answered_at": "2026-11-06T01:33:18+08:00",
+                    "answer_message_id": "sd_card_cb_124",
+                    "close_reason": "answered",
+                    "resolved_by": "",
+                    "resolve_note": "",
+                    "nudge_count": 0,
+                },
+                reply_txt,
+            )
+            self.assertEqual(cls_res["alignment"], "accepted", msg=f"Failed for {reply_txt}: {cls_res}")
+            self.assertEqual(cls_res["alignment_label"], "采纳建议 (带参/直接放行)")
+
+        # 2) Minute-truncated create_time (01:30:00) vs actual first_seen (01:31:38) at ref_now (01:35:11 -> 213s < 300s)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "sheepdog.sqlite3"
+            cfg = Config(state_dir=root)
+            st = Store(db_path)
+            st.upsert_topic(
+                "tp_kaifeng",
+                title="Kaifeng",
+                kind="dynamic",
+                state="running",
+                conversation_id="cid_kaifeng_124",
+                host="antigravity",
+                pending_batch_id="b20261106013126-kaifeng",
+                dispatched_at="2026-11-06T01:31:26+08:00",
+            )
+            st.upsert_message(
+                Message(
+                    message_id="om_ryan_trunc_124",
+                    chat_id="oc_group_124",
+                    chat_name="Group 124",
+                    chat_type="group",
+                    sender_id="ou_ryan",
+                    sender_name="Ren Ryan",
+                    sender_type="user",
+                    msg_type="text",
+                    content="这个是sammy 负责的",
+                    create_time="2026-11-06T01:30:00+08:00",
+                ),
+                "dispatch",
+                "group_chat",
+                [],
+                "tp_kaifeng",
+            )
+            with st.tx() as c:
+                c.execute(
+                    "UPDATE messages SET first_seen = ?, last_seen = ? WHERE message_id = ?",
+                    ("2026-11-06T01:31:38+08:00", "2026-11-06T01:31:38+08:00", "om_ryan_trunc_124"),
+                )
+            st.close()
+
+            ref_013511 = datetime.fromisoformat("2026-11-06T01:35:11+08:00")
+            obs_res = observe.run_observe(
+                cfg,
+                db_path=db_path,
+                state_path=root / "watchdog.json",
+                log_path=root / "sidecar.log",
+                roster_path=root / "roster.toml",
+                antigravity_brain_dir=root / "brain",
+                check_processes=False,
+                check_log=False,
+                now_dt=ref_013511,
+            )
+            hol_warns = [w for w in obs_res["warns"] if "Queue Head-of-Line SLA" in w]
+            self.assertEqual(hol_warns, [], msg=f"Unexpected HOL warn at 213s queue age: {hol_warns}")
+
+            # Once real queue time reaches 305s (01:36:43), Queue Head-of-Line SLA fires accurately
+            ref_013643 = datetime.fromisoformat("2026-11-06T01:36:43+08:00")
+            obs_res_late = observe.run_observe(
+                cfg,
+                db_path=db_path,
+                state_path=root / "watchdog.json",
+                log_path=root / "sidecar.log",
+                roster_path=root / "roster.toml",
+                antigravity_brain_dir=root / "brain",
+                check_processes=False,
+                check_log=False,
+                now_dt=ref_013643,
+            )
+            hol_warns_late = [w for w in obs_res_late["warns"] if "Queue Head-of-Line SLA" in w]
+            self.assertEqual(len(hol_warns_late), 1)
+
+            # 3) Multi-frame traceback with tccli help lines collapses cleanly without orphan frame code line
+            multiframe_log = (
+                "Traceback (most recent call last):\n"
+                '  File "/tmp/create_jump.py", line 67, in <module>\n'
+                "    run_cmd([\n"
+                '  File "/tmp/create_jump.py", line 18, in run_cmd\n'
+                '    raise RuntimeError(f"Command failed: {r.stderr}")\n'
+                "RuntimeError: Command failed:\n"
+                "[TencentCloudSDKException] code:InvalidParameterValue.ZoneInvalid message:Zone unsupported.\n"
+                "To tccli help text, you can run:\n"
+                "  tccli help\n"
+                "  tccli service[cvm] help\n"
+            )
+            sum_mf, has_err_mf = engine._summarize_cli_lamb_log(multiframe_log)
+            self.assertTrue(has_err_mf)
+            self.assertFalse(sum_mf.startswith("run_cmd("), msg=f"Dangling frame code line remained: {sum_mf!r}")
+            self.assertTrue(sum_mf.startswith("RuntimeError: Command failed:"), msg=f"Unexpected summary: {sum_mf!r}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3677,7 +3677,17 @@ class Dispatcher:
         for r in signals:
             tags_raw = str(r["tags_json"] or "") if "tags_json" in r.keys() else ""
             is_fwd = '"forwarded"' in tags_raw or '"forwarded_from:' in tags_raw
-            q_ts = str((r["last_seen"] if is_fwd and "last_seen" in r.keys() else None) or r["create_time"] or "")
+            ct_str = str(r["create_time"] or "")
+            if is_fwd and "last_seen" in r.keys() and r["last_seen"]:
+                q_ts = str(r["last_seen"])
+            else:
+                fs_str = str(r["first_seen"] or "") if "first_seen" in r.keys() else ""
+                fs_dt = _parse(fs_str) if fs_str else None
+                ct_dt = _parse(ct_str) if ct_str else None
+                if fs_dt is not None and fs_dt.tzinfo is not None and fs_dt <= now and (ct_dt is None or fs_dt >= ct_dt):
+                    q_ts = fs_str
+                else:
+                    q_ts = ct_str
             q_dt = _parse(q_ts)
             if q_dt is None or q_dt.tzinfo is None:
                 continue
@@ -5028,6 +5038,11 @@ class Dispatcher:
                         or "Reply, forward, and other actions:" in cur_sum
                         or "羊群看板 ·" in cur_sum
                         or bool(re.search(r"^-\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}\s+Reply,\s+forward", cur_sum, re.M))
+                        or (
+                            len(cur_sum.splitlines()) >= 2
+                            and cur_sum.splitlines()[0].rstrip().endswith(("(", "["))
+                            and bool(_PY_EXCEPTION_LINE_RE.match(cur_sum.splitlines()[1].strip()))
+                        )
                     ):
                         try:
                             lp = Path(lb["log_path"])
@@ -7332,6 +7347,12 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                 continue
             deduped_cand.append(ln)
         cand_lines = deduped_cand
+    if has_err and any(ln.startswith(('File "', "Traceback")) for ln in cand_lines):
+        exc_indices_c = [i for i, ln in enumerate(cand_lines) if _PY_EXCEPTION_LINE_RE.match(ln)]
+        if exc_indices_c:
+            first_tb_c = next((i for i, ln in enumerate(cand_lines) if ln.startswith(('File "', "Traceback"))), 0)
+            last_exc_c = exc_indices_c[-1]
+            cand_lines = [*cand_lines[:first_tb_c], *cand_lines[last_exc_c:]]
     tail_lines = cand_lines[-5:]
     if tail_lines and not all(_JSON_PROP_FRAGMENT_LINE_RE.match(ln) for ln in tail_lines):
         non_json_frag = [ln for ln in tail_lines if not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)]
