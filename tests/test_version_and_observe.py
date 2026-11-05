@@ -4526,6 +4526,132 @@ class VersionAndObserveTest(unittest.TestCase):
             )
             st.close()
 
+    def test_reg118_lsg14_solo_vip_guard_and_same_topic_correction_ask_in_place_patch_and_override_diagnosis(self):
+        """1.1.29（REG-118）：
+        1. check_ask_pre_flight_guard 拦截将 VIP 独占锁定节点 lsg14（192.220.48.237）当作尚有空位/共用席位提议分配的 ask，放行已核实为 lsg4 空位的 ask；
+        2. decision_hub.try_patch_open_ask 与 send_to_owner 在同一会话对同一主题补发『实据更正』拍板卡（即使更换了 --key 且 origin='batch' 无显式 --about）时，原地 PATCH 更新首张未决卡，不新刷第 2 张冲突卡；且 sync_escalation_dual_cards 拍板任一卡时自动结案同会话同主题的重复未决卡；
+        3. diagnose_override_reason 将『我去新买一个vps吧』归入 arch_or_config_posture（技术姿势纠偏）。
+        """
+        from sheepdog import admin_web, decision_hub, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sheepdog.sqlite3"
+            st = Store(db)
+            cfg = Config(state_dir=Path(tmp))
+            cfg.self_open_id = "ou_test_owner_118"
+            cfg.topic_group.enabled = True
+            cfg.topic_group.chat_id = "oc_test_tg_118"
+            cfg.topic_group.decision_hub = True
+
+            # 1) Proposing lsg14 as having available seats -> blocked
+            with self.assertRaises(outbound.OutboundError) as cm_lsg14:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_sherwin",
+                    "为Carl开通专属网络",
+                    "事情：Sherwin 提出为 Carl 开通一个他的专属网络。当前 lsg14 尚余 1 个专属席位（目前仅 Felix 与 Sammy 共用，空余 1 席）。\n"
+                    "选项：\n"
+                    "A. 在 lsg14（原生双 ISP 高质专线，空余 1 席）开通专属席位，立即可用无需新购\n"
+                    "B. 新购一台专属 VPS 节点，做完全独占单人专线\n"
+                    "建议：选 A",
+                    key="carl-dedicated-vpn",
+                )
+            self.assertIn("REG-118", str(cm_lsg14.exception))
+            self.assertIn("lsg14", str(cm_lsg14.exception))
+
+            # Proposing verified lsg4 while noting lsg14 is locked -> allowed
+            corrected_body = (
+                "经 tp_3x-ui-ops 核实：lsg14 已锁定为 Sammy 独占不可分配，仅 lsg4 余 1 个空位。\n"
+                "A. 将 Carl 分配至 lsg4 唯一空位（建议）\n"
+                "B. 新购一台 VPS 节点"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_sherwin",
+                "为Carl开通专属网络(实据更正)",
+                corrected_body,
+                key="T-127",
+            )
+
+            # 2) Same-topic correction ask with changed key ("carl-dedicated-vpn" -> "T-127") and batch origin patches in place
+            st.upsert_topic("tp_sherwin", title="Sherwin", kind="dynamic", state="active", conversation_id="cid_sherwin_118", host="antigravity")
+            first_text = outbound.compose(cfg, outbound.ASK, "tp_sherwin", "为Carl开通专属网络", "初版内容\n选项：\nA. 方案A\nB. 方案B\n建议：选 A")
+            with st.tx() as c:
+                c.execute(
+                    "INSERT INTO sends(idem_key, kind, topic_id, message_id, root_message_id, key, norm_key, text, sent_at, title) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "sda-118-first",
+                        "ask",
+                        "tp_sherwin",
+                        "om_ask_118_first",
+                        "om_root_118",
+                        "carl-dedicated-vpn",
+                        "CARL-DEDICATED-VPN",
+                        first_text,
+                        "2026-11-05T17:15:29+08:00",
+                        "为Carl开通专属网络",
+                    ),
+                )
+            st.add_escalation("om_ask_118_first", "tp_sherwin", "oc_test_tg_118", first_text, "2026-11-05T17:15:29+08:00")
+
+            patched_Calls = []
+
+            class _FakeSource:
+                def patch_card(self, mid, card, identity="bot"):
+                    patched_Calls.append(mid)
+
+            res_corr = outbound.send_to_owner(
+                cfg,
+                st,
+                _FakeSource(),
+                outbound.ASK,
+                "tp_sherwin",
+                "为Carl开通专属网络(实据更正)",
+                corrected_body,
+                key="T-127",
+            )
+            self.assertTrue(res_corr.patched_in_place)
+            self.assertEqual(res_corr.message_id, "om_ask_118_first")
+            self.assertIn("lsg4 唯一空位", st.get_escalation("om_ask_118_first")["text"])
+            self.assertIn("om_ask_118_first", patched_Calls)
+
+            # If a legacy duplicate open escalation on the same topic/subject coexists, answering one auto-resolves the sibling
+            st.add_escalation(
+                "om_ask_118_dup",
+                "tp_sherwin",
+                "oc_test_tg_118",
+                "🐕 需要你定 · 为Carl开通专属网络 [tp_sherwin]\n旧卡",
+                "2026-11-05T17:15:00+08:00",
+            )
+            decision_hub.sync_escalation_dual_cards(
+                cfg,
+                st,
+                _FakeSource(),
+                "om_ask_118_first",
+                chosen_display="A：将 Carl 分配至 lsg4 唯一空位",
+                topic_id="tp_sherwin",
+                answer_mid="sd_card_cb_118_ans",
+            )
+            dup_row = st.get_escalation("om_ask_118_dup")
+            self.assertEqual(dup_row["close_reason"], "resolved")
+            self.assertIsNotNone(dup_row["closed_at"])
+
+            # 3) diagnose_override_reason classifies "我去新买一个vps吧" under arch_or_config_posture
+            code_vps, label_vps = admin_web.diagnose_override_reason(
+                "为Carl开通专属网络",
+                "我去新买一个vps吧",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual(code_vps, "arch_or_config_posture")
+            self.assertEqual(label_vps, "技术姿势纠偏")
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

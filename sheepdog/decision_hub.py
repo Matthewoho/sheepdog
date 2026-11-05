@@ -486,6 +486,14 @@ def _build_hub_mirror_card(cfg, shown: str, *, origin_mid: str, topic_id: str, k
     return mirror_text, (card if card_fits(card) else None)
 
 _TITLE_PREFIX_STRIP_RE = re.compile(r"^\s*🐕\s*需要你定\s*·\s*|\s*\[[^\[\]]*\]\s*$", re.I)
+_TITLE_CORRECTION_SUFFIX_RE = re.compile(
+    r"\s*[（(\[]\s*(?:实据更正|实据更新|更正|修正|勘误|更新选项|补充|修订版?)\s*[）)\]]\s*$",
+    re.I,
+)
+_ASK_CORRECTION_MARKER_RE = re.compile(
+    r"(?:实据更正|实据更新|台账纠偏|更正说明|勘误|[（(\[]\s*(?:实据更正|更正|修正|勘误|修订版?)\s*[）)\]])",
+    re.I,
+)
 _TITLE_STOP_BIGRAMS = frozenset({
     "需要", "要你", "你定", "申请", "请示", "确认", "提议", "关于", "是否", "问题", "处理", "方案", "定夺", "拍板",
 })
@@ -494,11 +502,12 @@ _TITLE_STOP_BIGRAMS = frozenset({
 def _clean_ask_title(raw: str, topic_id: str = "") -> str:
     first = ((raw or "").strip().splitlines() or [""])[0]
     cleaned = _TITLE_PREFIX_STRIP_RE.sub("", first).strip()
+    cleaned = _TITLE_CORRECTION_SUFFIX_RE.sub("", cleaned).strip()
     t_short = base_topic_id(topic_id).removeprefix("tp_").strip()
     if t_short:
         cleaned = re.sub(rf"^\s*{re.escape(t_short)}\s*[:：·\-]?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^\s*[a-z0-9_\-]{2,16}\s*(?=(?:提议|申请|请示|询问|请求|反馈|需要|想|要))", "", cleaned, flags=re.I)
-    return cleaned.strip()
+    return _TITLE_CORRECTION_SUFFIX_RE.sub("", cleaned).strip()
 
 
 def _titles_same_subject(title_a: str, title_b: str, *, topic_id: str = "") -> bool:
@@ -546,22 +555,45 @@ def try_patch_open_ask(cfg, store, source, topic_id: str, key: str, norm_key: st
         disjoint_about = bool(existing_about and new_about_set and existing_about.isdisjoint(new_about_set))
         if not same_subj and (disjoint_about or _is_generic_session_key(topic_id, nk)):
             esc = None
-    if esc is None and new_about_set and hasattr(store, "escalation_sources"):
+    if esc is None and hasattr(store, "conn"):
+        is_correction = bool(_ASK_CORRECTION_MARKER_RE.search(f"{title}\n{shown}"))
         for cand in store.conn.execute(
             "SELECT * FROM escalations WHERE topic_id=? AND closed_at IS NULL AND answered_at IS NULL ORDER BY asked_at DESC, rowid DESC",
             (topic_id,),
         ).fetchall():
-            cand_about = {
-                r["about_message_id"]
-                for r in store.escalation_sources(cand["message_id"])
-                if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
-            }
-            if cand_about and (cand_about & new_about_set):
-                s_cand = store.send_by_message(cand["message_id"]) if hasattr(store, "send_by_message") else None
-                cand_title = (s_cand["title"] if s_cand is not None and "title" in s_cand.keys() and s_cand["title"] else "") or (cand["text"] or "")
-                if _titles_same_subject(cand_title, title, topic_id=topic_id):
-                    esc = cand
-                    break
+            cand_about = (
+                {
+                    r["about_message_id"]
+                    for r in store.escalation_sources(cand["message_id"])
+                    if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
+                }
+                if hasattr(store, "escalation_sources")
+                else set()
+            )
+            if cand_about and new_about_set and cand_about.isdisjoint(new_about_set):
+                continue
+            s_cand = store.send_by_message(cand["message_id"]) if hasattr(store, "send_by_message") else None
+            cand_title = (s_cand["title"] if s_cand is not None and "title" in s_cand.keys() and s_cand["title"] else "") or (cand["text"] or "")
+            cand_nk = (s_cand["norm_key"] if s_cand is not None and "norm_key" in s_cand.keys() and s_cand["norm_key"] else "")
+            if not _titles_same_subject(cand_title, title, topic_id=topic_id):
+                continue
+            shared_about = bool(cand_about and new_about_set and (cand_about & new_about_set))
+            same_clean_title = bool(
+                _clean_ask_title(cand_title, topic_id)
+                and _clean_ask_title(cand_title, topic_id).lower() == _clean_ask_title(title, topic_id).lower()
+            )
+            batch_same_subject = (not cand_about and not new_about_set) and (
+                is_correction
+                or same_clean_title
+                or not nk
+                or not cand_nk
+                or nk == cand_nk
+                or _is_generic_session_key(topic_id, nk)
+                or _is_generic_session_key(topic_id, cand_nk)
+            )
+            if shared_about or batch_same_subject or (is_correction and not (cand_about and new_about_set and cand_about.isdisjoint(new_about_set))):
+                esc = cand
+                break
     if esc is None:
         return None
     canon_mid = esc["message_id"]
@@ -628,23 +660,47 @@ def sync_escalation_dual_cards(cfg, store, source, any_mid: str, *, chosen_displ
             for r in store.escalation_sources(canon_mid)
             if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
         ]
+        sib_cands: list = []
         if about_mids:
             for sib_src in store.sources_about(about_mids):
                 sib_mid = sib_src["ask_message_id"]
-                if not sib_mid or sib_mid == canon_mid:
-                    continue
-                sib = store.get_escalation(sib_mid)
-                if sib is None or sib["topic_id"] != tid or sib["closed_at"] or sib["answered_at"]:
-                    continue
-                if _titles_same_subject(text_to_use, sib["text"] or "", topic_id=tid):
-                    why_dup = f"同源重复提问已随主卡 {canon_mid} 一并拍板（{chosen_display}）"
-                    if store.resolve_escalation(sib_mid, tid, why_dup, resolved_by=tid):
-                        sib_hub = str(sib["hub_message_id"] or "") if "hub_message_id" in sib.keys() else ""
-                        sib_green = build_answered_owner_card(_truncate_hub_more(sib["text"] or ""), chosen_display=f"已结案（{why_dup}）", topic_id=tid, answered_at=ans_ts)
-                        if source is not None and hasattr(source, "patch_card"):
-                            for smid in dict.fromkeys([m for m in (sib_mid, sib_hub) if m]):
-                                try: source.patch_card(smid, copy.deepcopy(sib_green), identity="bot")
-                                except Exception as e: log.warning("同步同源重复提问绿卡失败（%s）: %s", smid, e)
+                if sib_mid and sib_mid != canon_mid and (sib := store.get_escalation(sib_mid)) is not None:
+                    sib_cands.append(sib)
+        if hasattr(store, "conn"):
+            seen_sids = {str(s["message_id"]) for s in sib_cands}
+            for sib in store.conn.execute(
+                "SELECT * FROM escalations WHERE topic_id=? AND closed_at IS NULL AND answered_at IS NULL",
+                (tid,),
+            ).fetchall():
+                sm = str(sib["message_id"] or "")
+                if sm and sm != canon_mid and sm not in seen_sids:
+                    sib_about = {
+                        r["about_message_id"]
+                        for r in store.escalation_sources(sm)
+                        if ("origin" in r.keys() and r["origin"] == "about") and r["about_message_id"]
+                    }
+                    if sib_about and about_mids and sib_about.isdisjoint(set(about_mids)):
+                        continue
+                    sib_txt = str(sib["text"] or "")
+                    same_clean = bool(
+                        _clean_ask_title(text_to_use, tid)
+                        and _clean_ask_title(text_to_use, tid).lower() == _clean_ask_title(sib_txt, tid).lower()
+                    )
+                    if same_clean or _ASK_CORRECTION_MARKER_RE.search(f"{text_to_use}\n{sib_txt}"):
+                        sib_cands.append(sib)
+        for sib in sib_cands:
+            sib_mid = str(sib["message_id"] or "")
+            if not sib_mid or sib_mid == canon_mid or sib["topic_id"] != tid or sib["closed_at"] or sib["answered_at"]:
+                continue
+            if _titles_same_subject(text_to_use, sib["text"] or "", topic_id=tid):
+                why_dup = f"同源重复提问已随主卡 {canon_mid} 一并拍板（{chosen_display}）"
+                if store.resolve_escalation(sib_mid, tid, why_dup, resolved_by=tid):
+                    sib_hub = str(sib["hub_message_id"] or "") if "hub_message_id" in sib.keys() else ""
+                    sib_green = build_answered_owner_card(_truncate_hub_more(sib["text"] or ""), chosen_display=f"已结案（{why_dup}）", topic_id=tid, answered_at=ans_ts)
+                    if source is not None and hasattr(source, "patch_card"):
+                        for smid in dict.fromkeys([m for m in (sib_mid, sib_hub) if m]):
+                            try: source.patch_card(smid, copy.deepcopy(sib_green), identity="bot")
+                            except Exception as e: log.warning("同步同源重复提问绿卡失败（%s）: %s", smid, e)
     if tid:
         reconcile_closed_escalation_work(store, tid)
     try:

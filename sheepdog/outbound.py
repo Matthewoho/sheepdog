@@ -654,6 +654,11 @@ _GROUP_HISTORY_EXPLAINED_EVIDENCE_RE = re.compile(
     r"|来龙去脉[^\n。]{0,20}已在群(?:里|内)(?:讲清|说明|同步|回复))",
     re.I,
 )
+_LSG14_SOLO_VIP_NODE_ASK_RE = re.compile(
+    r"(?:(?:lsg14|192\.220\.48\.237)(?:(?!lsg(?!14\b)\d+)[^\n。；]){0,45}?(?:尚余|空余|余\s*[1-9]\d*\s*[席名个位]|有空位|空余\s*[1-9]|共用|(?<![不未禁可])开通|(?<![不未禁可])分配)"
+    r"|(?:在\s*lsg14|选\s*[A-E][^\n。；]{0,16}lsg14|分配至\s*lsg14)[^\n。；]{0,40}(?:开通|分配|席位|专线))",
+    re.I,
+)
 _SHARED_CONFIG_IDENT_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b")
 _GENERIC_CONFIG_IDENTS = frozenset(
     {
@@ -967,6 +972,13 @@ def check_ask_pre_flight_guard(
             "必须先确认是否存在国内用户数据出境合规风险，并评估是否应按 `tapnow.tv` 统一基线收束部署在腾讯云国际站生产子账号（`200053747873`）境内节点"
             "（主人 2026-11-05 15:23 在 `[其他]` 明确纠偏：『这个有没有合规问题 要确认一下，原则上我理解数据是不能出境的 得看是不是要不是再腾讯云国际这边』，REG-117 国内 .tapnow.tv 域名数据出境合规与腾讯云国际收束门禁）："
             "请先核实数据出境合规边界及腾讯云国际站承接方案并写入正文后再发起 `sheepdog ask`（没有发送）",
+        )
+    if _LSG14_SOLO_VIP_NODE_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "`lsg14`（`192.220.48.237`）已由主人明确锁定为 VIP Sammy Shi 100% 单人独占节点（`1/1 独占锁定，禁止加人`），严禁将 `lsg14` 当作尚有空余/共用席位的候选节点向主人发起 `sheepdog ask`"
+            "（主人 2026-11-05 17:18 在 `tp_sherwin` 误报 `lsg14 空余 1 席` 的旧卡上被迫点击 `[其他] 我去新买一个vps吧`，随后在 `tp_3x-ui-ops` 实据更正卡上改选 `A. 将 Carl 分配至 lsg4 唯一空位`，REG-118 `lsg14` 独占锁定与专线席位必先向 `tp_3x-ui-ops` 核实门禁）："
+            "请先通过 `sheepdog tell --to tp_3x-ui-ops` 核实全网节点的最新真实空余席位（如 `lsg4` 等），严禁凭旧记忆提议分配 `lsg14`（没有发送）",
         )
     if not _GROUP_HISTORY_EXPLAINED_EVIDENCE_RE.search(full_text):
         unexplained_owner_hist_req = False
@@ -1435,7 +1447,7 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         it = store.item_by_root(prev["root_message_id"]) if prev["root_message_id"] else None
         res.item = tg.label(it["item_no"]) if it is not None else ""
         return _record_ask_sources(cfg, store, res, topic_id, origin, srcs, floor, source=source)
-    if kind == ASK and (nk or (origin == pend.ORIGIN_ABOUT and srcs)) and decision_hub.hub_active(cfg, store):
+    if kind == ASK and decision_hub.hub_active(cfg, store):
         _, ask_card = owner_content(cfg, text, at=True, kind=ASK, topic_id=topic_id, key=key, title=title, options=options)
         about_ids = [m for m, _ in srcs] if origin == pend.ORIGIN_ABOUT else []
         if (patched := decision_hub.try_patch_open_ask(cfg, store, source, topic_id, key, nk, title, text, ask_card, options_spec=options, about_ids=about_ids)) is not None:
