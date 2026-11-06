@@ -1150,9 +1150,16 @@ def register_deferred_report_item(
 def _append_memory_note(mem_path: Path, line: str) -> None:
     mem_path.parent.mkdir(parents=True, exist_ok=True)
     existing = mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
-    if line in existing:
+    clean_line = line.strip()
+    if clean_line in existing:
         return
-    updated = existing.rstrip() + "\n" + line.strip() + "\n"
+    body_without_ts = re.sub(r"^-\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*", "", clean_line)
+    if body_without_ts and any(
+        re.sub(r"^-\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*", "", ln.strip()) == body_without_ts
+        for ln in existing.splitlines()
+    ):
+        return
+    updated = existing.rstrip() + "\n" + clean_line + "\n"
     mem_path.write_text(updated, encoding="utf-8")
 
 
@@ -1178,16 +1185,23 @@ def record_loop_feedback(
         )
     else:
         row = store.conn.execute(
-            """SELECT run_id FROM loop_runs
+            """SELECT run_id, human_feedback FROM loop_runs
                WHERE loop_id = ?
-               ORDER BY CASE WHEN status != 'empty' THEN 0 ELSE 1 END, started_at DESC
+               ORDER BY CASE WHEN status NOT IN ('empty', 'failed') THEN 0 WHEN status = 'empty' THEN 1 ELSE 2 END, started_at DESC
                LIMIT 1""",
             (loop_id,),
         ).fetchone()
         if row:
+            prev_fb = str(row["human_feedback"] or "").strip()
+            if not prev_fb:
+                merged_fb = clean_fb
+            elif norm_fb in prev_fb or clean_fb in prev_fb:
+                merged_fb = prev_fb
+            else:
+                merged_fb = f"{prev_fb} | {clean_fb}"
             store.conn.execute(
                 "UPDATE loop_runs SET human_feedback = ? WHERE run_id = ?",
-                (clean_fb, row["run_id"]),
+                (merged_fb, row["run_id"]),
             )
     store.conn.commit()
     spec = get_loop_spec(cfg, store, loop_id)

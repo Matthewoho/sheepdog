@@ -7167,10 +7167,61 @@ def auto_settle_open_escalations_on_owner_batch(
     return settled
 
 
-def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> Path:
+def resolve_active_receipt_batch_id(
+    store: Store | None,
+    topic_id: str,
+    batch_id: str,
+    receipts_dir: Path | None = None,
+) -> str:
+    """REG-134：当会话交过 status='waiting' 卸锁后收到后续批次（如 lamb_report），若结束时误传了已 acked 的旧批次号（或空批次号），
+    自动重定向到当前 running 的 pending_batch_id（或已进入 receipt_timeout attention 时最后一批未交回执的超时批次），
+    防止覆盖旧批次 JSON 导致当前批次缺失回执、会话陷入假 running 僵尸锁。"""
+    raw_bid = (batch_id or "").strip()
+    if store is None:
+        return raw_bid
+    tid = (topic_id or "").strip()
+    t = store.get_topic(tid) if tid else None
+    if t is None and tid and not tid.startswith("tp_"):
+        t = store.get_topic("tp_" + tid)
+    if t is None:
+        return raw_bid
+    tid = str(t["topic_id"])
+    d_arg = store.get_dispatch(raw_bid) if raw_bid else None
+    arg_is_stale_or_empty = (not raw_bid) or (
+        d_arg is not None
+        and str(d_arg["topic_id"] or "") == tid
+        and str(d_arg["state"] or "") in ("acked", "acked_late")
+    )
+    if not arg_is_stale_or_empty:
+        return raw_bid
+    pending_bid = str(t["pending_batch_id"] or "").strip()
+    if t["state"] == sm.RUNNING and pending_bid and pending_bid != raw_bid:
+        return pending_bid
+    if t["state"] == sm.ATTENTION or str(t["attention_reason"] or "") in (ATTN_RECEIPT_TIMEOUT, RECEIPT_TIMEOUT):
+        timed_out = store.timed_out_dispatches(tid, RECEIPT_TIMEOUT) or store.timed_out_dispatches(tid, ATTN_RECEIPT_TIMEOUT)
+        if timed_out:
+            if receipts_dir is not None:
+                for d_to in reversed(timed_out):
+                    cand_bid = str(d_to["batch_id"] or "").strip()
+                    if cand_bid and not (receipts_dir / tid / f"{cand_bid}.json").exists():
+                        return cand_bid
+            return str(timed_out[-1]["batch_id"] or raw_bid).strip()
+    return raw_bid
+
+
+def write_receipt(
+    cfg: Config,
+    topic_id: str,
+    batch_id: str,
+    receipt: dict,
+    *,
+    orig_batch_id: str | None = None,
+) -> Path:
     from . import hook, outbound
     store = Store(cfg.db_path) if cfg.db_path.exists() else None
     try:
+        raw_orig = (orig_batch_id if orig_batch_id is not None else (batch_id or "")).strip()
+        batch_id = resolve_active_receipt_batch_id(store, topic_id, batch_id, cfg.receipts_dir)
         if msg := outbound.lamb_violation_message(store, "receipt", topic_id=topic_id): raise ValueError(msg)
         status = receipt.get("status")
         if status not in sm.RECEIPT_EVENTS:
@@ -7179,6 +7230,8 @@ def write_receipt(cfg: Config, topic_id: str, batch_id: str, receipt: dict) -> P
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"{batch_id}.json"
         receipt = {**receipt, "received_at": now_iso()}
+        if raw_orig and raw_orig != batch_id:
+            receipt["redirected_from_batch"] = raw_orig
         p.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
         hook.clear_stop_state(cfg.state_dir, topic_id)
         anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
@@ -7287,6 +7340,8 @@ _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
     r"To execute this job,\s*use:|gcloud\s+run\s+jobs\s+(?:execute|executions\s+describe)\b|"
     r"View details about this execution by running:|Or visit https://console\.cloud\.google\.com/|"
     r"Done\.|Proxy locally with:\s*gcloud\b|Container\s+\S+\s+(?:Waiting|Healthy|Running|Starting|Created|Started|Stopping|Stopped|Recreate|Recreated)\b|"
+    r"If you would like to report this issue,\s*please run the following command:|gcloud\s+feedback\b|"
+    r"To check gcloud for common problems,\s*please run the following command:|gcloud\s+info\s+--run-diagnostics\b|"
     r"To tccli help text,\s*you can run:|tccli\s+(?:help|configure\s+help|service\[[^\]]+\]\s+(?:help|action\[[^\]]+\]\s+help))\b)",
     re.I | re.M,
 )

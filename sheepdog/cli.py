@@ -24,7 +24,7 @@ from .engine import (BUS_TOPIC_ID, DYNAMIC, HOST_LABEL, MANAGED_KINDS, NOTICE_ST
                      Dispatcher, add_watch, attention_notice_key, attention_reason_label, auto_recovers,
                      bus_quote_verifier, cancel_lamb, close_session, complete_lamb, delivered_text, display_time,
                      duty_reset_key, escalation_summary, forward_messages, open_escalations, owner_quote_verifier,
-                     register_lamb, touch_wakeup, unsent_notice_line, write_receipt)
+                     register_lamb, resolve_active_receipt_batch_id, touch_wakeup, unsent_notice_line, write_receipt)
 from .models import Message, Mention
 from .people_roster import add_roster_arguments, run_roster_cli
 from .playbook import PLAYBOOK_FILES, Playbook
@@ -1634,20 +1634,22 @@ def _check_monolithic_parent_turn(cfg, store: Store, tid: str, bid: str) -> str 
 def cmd_receipt(args) -> int:
     cfg = _load_cfg()
     warn_msg: str | None = None
+    eff_batch = args.batch
     try:
         receipt = json.loads(args.json)
         if isinstance(receipt, dict) and cfg.db_path.exists():
             store = Store(cfg.db_path)
             try:
+                eff_batch = resolve_active_receipt_batch_id(store, args.topic, args.batch, cfg.receipts_dir)
                 if not outbound.lamb_violation_message(store, "receipt", topic_id=args.topic):
-                    if err := (_reject_vip_needs_decision_without_floor_ask(cfg, store, args.topic, args.batch, str(receipt.get("status") or ""))
-                               or decision_hub.verify_receipt_no_dead_ball(cfg, store, args.topic, args.batch, receipt)
-                               or decision_hub.verify_bus_at_me_no_silent_drop(cfg, store, args.topic, args.batch, receipt)):
+                    if err := (_reject_vip_needs_decision_without_floor_ask(cfg, store, args.topic, eff_batch, str(receipt.get("status") or ""))
+                               or decision_hub.verify_receipt_no_dead_ball(cfg, store, args.topic, eff_batch, receipt)
+                               or decision_hub.verify_bus_at_me_no_silent_drop(cfg, store, args.topic, eff_batch, receipt)):
                         print(err, file=sys.stderr); return 2
-                    warn_msg = _check_monolithic_parent_turn(cfg, store, args.topic, args.batch)
+                    warn_msg = _check_monolithic_parent_turn(cfg, store, args.topic, eff_batch)
             finally:
                 store.close()
-        p = write_receipt(cfg, args.topic, args.batch, receipt)
+        p = write_receipt(cfg, args.topic, eff_batch, receipt, orig_batch_id=args.batch)
     except (json.JSONDecodeError, ValueError) as e:
         print(f"回执无效: {e}", file=sys.stderr)
         return 2

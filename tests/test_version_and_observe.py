@@ -7234,6 +7234,200 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("自动换壳", out_str)
             st.close()
 
+    def test_reg134_redirect_stale_acked_batch_receipt_to_active_pending_batch_and_filter_gcloud_crash_footer(self):
+        """REG-134 (v1.1.45):
+        1) 专席在首批次 b1 交回 status='waiting' 卸锁（b1 state='acked'）后，收到 lamb_report 新批次 b2（state='running', pending_batch_id=b2）；
+           若专席结束时误传 --batch b1，resolve_active_receipt_batch_id 与 write_receipt 自动将其重定向到在途的 b2，
+           不覆盖 b1.json，写入 b2.json（记录 redirected_from_batch=b1），且 Dispatcher._check_receipt 正常将 b2 收口为 acked、专席恢复 active；
+        2) 若专席已因 b2 未交回执进入 attention (receipt_timeout)，此时补交回执仍误传已 acked 的 --batch b1，
+           同样自动重定向到超时的 b2，由 _late_receipts 自动恢复；
+        3) CLI 羔羊遇到 gcloud crashed 时，末尾 4 行 gcloud feedback / gcloud info --run-diagnostics 模板被过滤并由 _scan_lambs 自动自愈存量记录；
+        4) 四步生产集群架构加固（含 CoreDNS 虚拟节点调度 + 49 个 PDB 清单）未附 .md/飞书文档，或请示采购生产 RabbitMQ 托管集群未核实具体业务用途与现网消息收发流量时，被 check_ask_pre_flight_guard 当场拦截；
+           且 diagnose_override_reason 将『整理成一个 MD 文件给我，我要找腾讯的人看一下这个问题』与『我想知道这个 RabbitMQ 是干嘛的？有没有用？我理解可能没有人在用 RabbitMQ』精准归入 context_incomplete（不误判为 peer_or_owner_delegate）。
+        """
+        from sheepdog import admin_web, engine, loops as loops_mod, outbound
+        from sheepdog.config import Config
+        from sheepdog.engine import Dispatcher
+        from sheepdog.roster import Roster
+        from sheepdog.security import SecurityConfig
+        from sheepdog.sink.agentapi import DryRunSink
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root)
+            st = Store(cfg.db_path)
+            st.create_topic("tp_ssl-cert-ops", "证书运维专席", "adopted", "SSL 证书续期", "running", "antigravity")
+            st.update_topic("tp_ssl-cert-ops", conversation_id="cid-ssl-134")
+            b1 = "b20261107011648-ssl-cert-ops"
+            b2 = "b20261107011814-ssl-cert-ops"
+            st.record_dispatch(b1, "tp_ssl-cert-ops", ["om_ssl_1"])
+            st.update_topic("tp_ssl-cert-ops", state="running", pending_batch_id=b1)
+            st.close()
+
+            # Step 1: 首批次 b1 提交 status="waiting" 卸锁 -> b1 变为 acked
+            p1 = engine.write_receipt(
+                cfg,
+                "tp_ssl-cert-ops",
+                b1,
+                {"status": "waiting", "summary": "已派发子任务续期证书", "anchors": ["lamb:lamb_demo_134"]},
+            )
+            self.assertEqual(p1.name, f"{b1}.json")
+            st = Store(cfg.db_path)
+            self.assertEqual(st.get_dispatch(b1)["state"], "acked")
+            self.assertEqual(st.get_topic("tp_ssl-cert-ops")["state"], "active")
+            self.assertIsNone(st.get_topic("tp_ssl-cert-ops")["pending_batch_id"])
+
+            # Step 2: 子任务完工汇报触发新批次 b2（state='running', pending_batch_id=b2）
+            st.record_dispatch(b2, "tp_ssl-cert-ops", ["sd_lamb_report_134"])
+            st.update_topic("tp_ssl-cert-ops", state="running", pending_batch_id=b2)
+            st.close()
+
+            # Step 3: 专席完成处理但误传旧批次号 b1 提交 handled 回执
+            p2 = engine.write_receipt(
+                cfg,
+                "tp_ssl-cert-ops",
+                b1,
+                {"status": "handled", "summary": "证书续期已全部核验完成"},
+            )
+            # 必须重定向写入 b2.json，且保留 b1.json 原 waiting 回执不被覆盖
+            self.assertEqual(p2.name, f"{b2}.json")
+            r1_saved = json.loads(p1.read_text(encoding="utf-8"))
+            r2_saved = json.loads(p2.read_text(encoding="utf-8"))
+            self.assertEqual(r1_saved["status"], "waiting")
+            self.assertEqual(r2_saved["status"], "handled")
+            self.assertEqual(r2_saved.get("redirected_from_batch"), b1)
+
+            # Dispatcher._check_receipt 正常消费 b2.json 并将专席收口为 active
+            st = Store(cfg.db_path)
+            disp = Dispatcher(cfg, st, DryRunSink(), Roster(), SecurityConfig())
+            disp._check_receipt(st.get_topic("tp_ssl-cert-ops"))
+            self.assertEqual(st.get_dispatch(b2)["state"], "acked")
+            self.assertEqual(st.get_topic("tp_ssl-cert-ops")["state"], "active")
+            self.assertIsNone(st.get_topic("tp_ssl-cert-ops")["pending_batch_id"])
+
+            # Step 4: 若批次 b3 已因超时进入 attention(receipt_timeout)，补交回执仍误传已 acked 的 b1，自动重定向到 b3
+            b3 = "b20261107013000-ssl-cert-ops"
+            st.record_dispatch(b3, "tp_ssl-cert-ops", ["sd_lamb_report_134_b"])
+            st.finish_dispatch(b3, "failed", "", error="回执超时：超过 20 分钟未收到回执")
+            st.update_topic(
+                "tp_ssl-cert-ops",
+                state="attention",
+                pending_batch_id=None,
+                attention_reason="receipt_timeout",
+                attention_at="2026-11-07T01:50:00+08:00",
+            )
+            resolved_b3 = engine.resolve_active_receipt_batch_id(st, "tp_ssl-cert-ops", b1, cfg.receipts_dir)
+            self.assertEqual(resolved_b3, b3)
+
+            # Step 5: CLI 羔羊遇到 gcloud crashed 时剥离末尾 4 行 feedback/diagnostics 引导模板并自愈存量记录
+            gcloud_crash_log = (
+                "Checking certificate map entries...\n"
+                "ERROR: gcloud crashed (SSLError): HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded\n"
+                "\n"
+                "If you would like to report this issue, please run the following command:\n"
+                "  gcloud feedback\n"
+                "\n"
+                "To check gcloud for common problems, please run the following command:\n"
+                "  gcloud info --run-diagnostics\n"
+            )
+            clean_sum, has_err = engine._summarize_cli_lamb_log(gcloud_crash_log)
+            self.assertTrue(has_err)
+            self.assertIn("ERROR: gcloud crashed (SSLError)", clean_sum)
+            self.assertNotIn("gcloud feedback", clean_sum)
+            self.assertNotIn("gcloud info --run-diagnostics", clean_sum)
+
+            log_file = root / "lamb_gcloud_crash_134.log"
+            log_file.write_text(gcloud_crash_log, encoding="utf-8")
+            polluted_sum = (
+                "ERROR: gcloud crashed (SSLError): HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded\n"
+                "If you would like to report this issue, please run the following command:\n"
+                "gcloud feedback\n"
+                "To check gcloud for common problems, please run the following command:\n"
+                "gcloud info --run-diagnostics"
+            )
+            st.create_lamb(
+                "lamb_crash134",
+                "tp_ssl-cert-ops",
+                kind="cli",
+                task_title="检查 GCP 证书映射",
+                state="failed",
+                log_path=str(log_file),
+            )
+            st.update_lamb("lamb_crash134", result_summary=polluted_sum)
+            disp._scan_lambs()
+            healed_sum = str(st.get_lamb("lamb_crash134")["result_summary"] or "")
+            self.assertIn("ERROR: gcloud crashed (SSLError)", healed_sum)
+            self.assertNotIn("gcloud feedback", healed_sum)
+            self.assertNotIn("gcloud info --run-diagnostics", healed_sum)
+
+            # Step 6: 四步生产集群加固未附 MD/飞书文档 & RabbitMQ 采购未核实真实业务用途与实测消息流量门禁 + 错题本归因
+            bad_tke_harden_ask = (
+                "已查实生产 TKE 现状，申请执行四步无损加固。\n"
+                "---more---\n"
+                "1. 维护窗口改期 + 压测冻结\n"
+                "2. CoreDNS 扩至 4 副本跨双可用区对称分布（当前 2/2 全挤在一区虚拟节点，走 UpdateAddon）\n"
+                "3. 补齐 49 个多副本工作负载 maxUnavailable: 1 PDB\n"
+                "4. websocket-service 优雅摘流与温和缩容\n"
+                "选项：\n"
+                "A. 同意执行四步无损加固\n"
+                "B. 暂不执行\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_tke:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "南京生产集群四步无损加固授权",
+                    bad_tke_harden_ask,
+                    key="SD-236",
+                )
+            self.assertIn("REG-134", str(cm_tke.exception))
+
+            bad_rmq_ask = (
+                "南京生产集群的 rabbitmq-stage 挂的是 emptyDir，建议生产开通 3 节点跨双可用区托管 RabbitMQ。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 在国际生产子账号准备按量开通同规格 3 节点跨双可用区托管 TDMQ RabbitMQ 专享版\n"
+                "B. 新建挂 cbs 云盘 PVC 的单副本 StatefulSet\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_rmq:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "生产 RabbitMQ 持久化与双可用区选型",
+                    bad_rmq_ask,
+                    key="ENG-1018",
+                )
+            self.assertIn("REG-134", str(cm_rmq.exception))
+
+            c_md, l_md = admin_web.diagnose_override_reason(
+                bad_tke_harden_ask,
+                "[卡片回调] 其他：这个东西你需要整理成一个 MD 文件给我，我要找腾讯的人看一下这个问题。",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_md, l_md), ("context_incomplete", "缺环境/调用链反问"))
+
+            c_rmq, l_rmq = admin_web.diagnose_override_reason(
+                bad_rmq_ask,
+                "[卡片回调] 其他：我想知道这个 RabbitMQ 是干嘛的？有没有用？我理解可能没有人在用 RabbitMQ。",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_rmq, l_rmq), ("context_incomplete", "缺环境/调用链反问"))
+
+            # Step 7: loops._append_memory_note 跨分钟边界去重
+            mem_file = root / "MEMORY.md"
+            loops_mod._append_memory_note(mem_file, "- [2026-11-07 01:40] 主人反馈纠偏: 其他：测试跨分钟幂等")
+            loops_mod._append_memory_note(mem_file, "- [2026-11-07 01:41] 主人反馈纠偏: 其他：测试跨分钟幂等")
+            mem_lines = [ln for ln in mem_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len(mem_lines), 1)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -727,11 +727,24 @@ _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE = re.compile(
     r"|"
     r"(?=[\s\S]*第\s*1\s*组[\s\S]*第\s*2\s*组[\s\S]*第\s*3\s*组)"
     r"(?=[\s\S]*(?:\b1A\b[\s\S]*\b2[AB]\b[\s\S]*\b3[AB]\b|生产环境[^\n。]{0,24}(?:深度体检|专项核实|资源治理|降配|缩容)))"
+    r"|"
+    r"(?=[\s\S]*\b1\.\s*[^\n]+[\s\S]*\b2\.\s*[^\n]+[\s\S]*\b3\.\s*[^\n]+[\s\S]*\b4\.\s*[^\n]+)"
+    r"(?=[\s\S]*(?:CoreDNS[\s\S]{0,120}(?:UpdateAddon|虚拟节点)|[0-9]{2,}\s*个(?:多副本)?(?:工作负载)?[^\n。]{0,16}\bPDB\b))"
     r")",
     re.I,
 )
 _LARK_DOC_LINK_EVIDENCE_RE = re.compile(
-    r"(?:(?:larksuite\.com|feishu\.cn)/(?:docx|docs|wiki)/[A-Za-z0-9]+|飞书(?:云)?文档|Lark\s*文档)",
+    r"(?:(?:larksuite\.com|feishu\.cn)/(?:docx|docs|wiki)/[A-Za-z0-9]+|飞书(?:云)?文档|Lark\s*文档|(?:20_Projects|40_Resources)/[^\s`'\"<>]+\.md\b|已整理(?:成)?\s*MD\s*(?:文件|文档))",
+    re.I,
+)
+_MIDDLEWARE_PROVISION_WITHOUT_USAGE_PROOF_ASK_RE = re.compile(
+    r"(?=[\s\S]*\b(?:RabbitMQ|TDMQ|RocketMQ|ActiveMQ)\b)"
+    r"(?=[\s\S]*(?:开通|购买|新建|采购|部署)[^\n。]{0,36}(?:托管|专享版|3\s*节点|集群|cbs\s*云盘\s*PVC))"
+    r"(?=[\s\S]*(?:选项|建议\s*[：:]?\s*(?:选\s*)?[AB]))",
+    re.I,
+)
+_MIDDLEWARE_LIVE_TRAFFIC_AND_PURPOSE_EVIDENCE_RE = re.compile(
+    r"(?:(?:publish|deliver|ack)[_\s-]*(?:rate|count|吞吐|速率)|队列(?:消息|积压|消费)(?:量|数|速率)|实际(?:在用|收发|消费|生产)[^\n。]{0,20}(?:消息|队列|业务)|具体(?:业务用途|干嘛的|哪个业务功能在用)|没有人(?:在)?用|0\s*条(?:消息|队列)|建议直接(?:下线|移除|删除|关停))",
     re.I,
 )
 _MAIL_ASSISTANT_ONLY_ACCESS_ASK_RE = re.compile(
@@ -1647,10 +1660,21 @@ def check_ask_pre_flight_guard(
     if _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(full_text) and not _LARK_DOC_LINK_EVIDENCE_RE.search(full_text):
         raise OutboundError(
             EXIT_INVALID,
-            "涉及多组件（PG + MySQL/ADB + Redis 等）生产/全栈压测升配与容量规划方案请示时，严禁只塞在飞书卡片正文里让主人盲批"
-            "（主人 2026-11-04 21:29 在 `[其他]` 明确要求：『给我完整的方案吧 用lark文档 我要仔细看看』，REG-106 多组件容量方案必附飞书文档门禁）："
-            "请先将完整的全栈容量对比、连接数/IOPS/内存水位测算、各组件目标规格与回缩预案整理成飞书云文档（Lark Docx）并授权主人可访问，"
-            "在 `sheepdog ask` 正文中附上飞书文档链接（`https://.../docx/...`）后再发起请示（没有发送）",
+            "涉及多组件（PG + MySQL/ADB + Redis 等）容量方案、多组生产资源治理或四步以上生产集群架构加固（如 TKE CoreDNS 虚拟节点调度 + 批量数十个 PDB 清单等）请示时，严禁只把脚本或摘要塞在飞书卡片里让主人盲批"
+            "（主人 2026-11-04 21:29 与 2026-11-07 01:40 在 `[其他]` 明确要求：『给我完整的方案吧 用lark文档 我要仔细看看』『这个东西你需要整理成一个 MD 文件给我，我要找腾讯的人看一下这个问题』，REG-106 / REG-131 / REG-134 复杂方案必附飞书文档或 MD 文件门禁）："
+            "请先将完整的背景现状、技术细节清单与处置方案整理成结构化 Markdown 文档（写入知识库 `20_Projects/` 或 `40_Resources/`）及飞书云文档（Lark Docx），"
+            "在 `sheepdog ask` 正文中附上 `.md` 文档路径与飞书文档链接（`https://.../docx/...`）后再发起请示（没有发送）",
+        )
+    if (
+        _MIDDLEWARE_PROVISION_WITHOUT_USAGE_PROOF_ASK_RE.search(full_text)
+        and not _MIDDLEWARE_LIVE_TRAFFIC_AND_PURPOSE_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示在生产环境开通、购买或扩容消息队列中间件（如 RabbitMQ / TDMQ 等）前，严禁仅凭集群存在旧 Pod 或服务挂了环境变量就盲目建议采购多节点托管集群"
+            "（主人 2026-11-07 01:40 在 `[其他]` 明确反问：『我想知道这个 RabbitMQ 是干嘛的？有没有用？我理解可能没有人在用 RabbitMQ。』，REG-134 中间件采购必先核实真实业务用途与实测消息流量门禁）："
+            "请先只读核查业务代码调用链与 Broker 实时队列/Exchange 指标，在正文中明确交代 ① 具体业务用途（哪个功能模块在发/收什么消息）与 ② 现网实际消息收发吞吐/队列消息量（publish/deliver rate）；"
+            "若核实实际无业务消息收发或无人使用，应按奥卡姆剃刀建议直接清理冗余环境变量与空跑实例（没有发送）",
         )
     if _MAIL_ASSISTANT_ONLY_ACCESS_ASK_RE.search(full_text) and not _FEISHU_DIRECT_REQUEST_EVIDENCE_RE.search(full_text):
         raise OutboundError(
