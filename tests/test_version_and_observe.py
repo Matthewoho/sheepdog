@@ -6802,6 +6802,174 @@ class VersionAndObserveTest(unittest.TestCase):
                     os.environ["SHEEPDOG_RELEASE_GATE_DIR"] = old_env
             st.close()
 
+    def test_reg131_withdrawn_reply_to_notice_230011_heal_and_grant_all_acceptance(self) -> None:
+        """REG-131:
+        1) When an owner notice ('回执带回' for a withdrawn '[Invalid text JSON]' message) fails with
+           Feishu code 230011 ('The message was withdrawn.'), send_owner_notice / retry_owner_notices /
+           observe --self-heal automatically settle it as 'sent' without infinite retry warnings;
+           and a normal notice whose reply_to was withdrawn falls back to sending without reply_to.
+        2) classify_escalation recognizes '[卡片回调] 其他：都给他开' as 'accepted', and
+           diagnose_override_reason classifies '完整给我各资源处理方案' as 'context_incomplete'.
+        3) _build_hub_mirror_card preserves option buttons and the trailing options block even when
+           the ---more--- section exceeds 1600 characters, and check_ask_pre_flight_guard requires a
+           Lark Doc link for multi-group (第 1 组 ... 第 2 组 ... 第 3 组) production resource plans.
+        """
+        from types import SimpleNamespace
+        from sheepdog import admin_web, alert_group, decision_hub, observe, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            st = Store(root / "sheepdog.sqlite3")
+            cfg = Config(state_dir=root, self_open_id="ou_test_owner")
+
+            # 1a) Redundant '回执带回' for withdrawn '[Invalid text JSON]' message settles on 230011
+            nid1 = st.add_owner_notice(
+                "回执带回",
+                "tp_bus",
+                "✅ Lark 信号·总线 处理了你的话 [tp_bus]\n你 19:31 说的「[Invalid text JSON]」\n主人撤回了原消息并在下一条重发指令\n状态：已处理".encode("utf-8"),
+                "idem-131-1",
+                reply_to="om_withdrawn_131",
+                in_thread=True,
+            )
+
+            class _FakeWithdrawnNotifier:
+                ledger = True
+
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str, str]] = []
+
+                def send(self, body: str, idem_key: str, reply_to: str = "", in_thread: bool = False) -> None:
+                    self.calls.append((body, idem_key, reply_to))
+                    if reply_to:
+                        raise RuntimeError(
+                            "lark-cli 调用失败 ['im', '+messages-reply']: {'code': 230011, 'message': 'The message was withdrawn.'}"
+                        )
+
+            notifier = _FakeWithdrawnNotifier()
+            disp = SimpleNamespace(cfg=cfg, store=st, notifier=notifier, source=None)
+            row1 = st.get_owner_notice(nid1)
+            self.assertTrue(alert_group.send_owner_notice(disp, row1))
+            self.assertEqual(st.get_owner_notice(nid1)["state"], "sent")
+            self.assertEqual(len(notifier.calls), 1)
+
+            # 1b) Normal notice whose reply_to was withdrawn falls back to sending without reply_to
+            nid2 = st.add_owner_notice(
+                "版本查询",
+                "tp_bus",
+                "🐕 汇报 · 当前版本 v1.1.42 [tp_bus]".encode("utf-8"),
+                "idem-131-2",
+                reply_to="om_withdrawn_131_b",
+                in_thread=False,
+            )
+            notifier2 = _FakeWithdrawnNotifier()
+            disp2 = SimpleNamespace(cfg=cfg, store=st, notifier=notifier2, source=None)
+            self.assertTrue(alert_group.send_owner_notice(disp2, st.get_owner_notice(nid2)))
+            self.assertEqual(st.get_owner_notice(nid2)["state"], "sent")
+            self.assertEqual(len(notifier2.calls), 2)
+            self.assertEqual(notifier2.calls[1][2], "")
+
+            # 1c) observe --self-heal settles an existing pending 230011 '回执带回' notice
+            nid3 = st.add_owner_notice(
+                "回执带回",
+                "tp_bus",
+                "✅ Lark 信号·总线 处理了你的话 [tp_bus]\n你 19:31 说的「[Invalid text JSON]」".encode("utf-8"),
+                "idem-131-3",
+                reply_to="om_withdrawn_131_c",
+                in_thread=True,
+            )
+            st.conn.execute(
+                "UPDATE owner_notices SET created_at='2026-11-06T19:31:00+08:00', attempts=5, "
+                "last_error='code: 230011, message: The message was withdrawn.' WHERE id=?",
+                (nid3,),
+            )
+            st.conn.commit()
+            obs = observe.run_observe(cfg, db_path=root / "sheepdog.sqlite3", self_heal=True)
+            self.assertEqual(st.get_owner_notice(nid3)["state"], "sent")
+            self.assertFalse(any(f"#{nid3}" in w for w in obs.get("warns", [])))
+
+            # 2) '[卡片回调] 其他：都给他开' is classified as accepted; '完整给我各资源处理方案' is context_incomplete
+            esc_row = {
+                "message_id": "om_esc_131",
+                "topic_id": "tp_kaifeng",
+                "chat_id": "oc_test",
+                "text": (
+                    "🐕 需要你定 · Kai申请Cinemap三项只读权限 [tp_kaifeng]\n"
+                    "选项：\n"
+                    "A. 同意按最小隔离边界开通三项只读并私发 Kai\n"
+                    "B. 仅开通 CLS + TKE 只读\n"
+                    "C. 暂不开通\n"
+                    "建议：选 A"
+                ),
+                "asked_at": "2026-11-06T19:45:00+08:00",
+                "answered_at": "2026-11-06T19:53:40+08:00",
+                "closed_at": "2026-11-06T19:53:40+08:00",
+                "close_reason": "answered",
+                "resolved_by": None,
+                "resolve_note": None,
+                "nudge_count": 0,
+            }
+            res_cls = admin_web.classify_escalation(esc_row, "[卡片回调] 其他：都给他开")
+            self.assertEqual(res_cls["alignment"], "accepted")
+
+            cat, label = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · 生产环境专项核实结论与纯选择题方案 [tp_studio]",
+                "完整给我各资源处理方案",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((cat, label), ("context_incomplete", "缺环境/调用链反问"))
+
+            # 3a) _build_hub_mirror_card preserves option buttons and trailing options block on >1600 char ---more---
+            long_bg = "背景说明段落。" * 300
+            long_ask_shown = (
+                "🐕 需要你定 · 生产环境专项核实结论与纯选择题方案 [tp_studio]\n"
+                "4件事已查清定死，请拍板。\n"
+                "---more---\n"
+                f"{long_bg}\n\n"
+                "### 选项：\n"
+                "A. 全部按推荐定死方案执行（1A + 2A + 3A）\n"
+                "B. library-service 保持 min=8 不动，其余按推荐执行\n"
+                "建议：选 A\n"
+            )
+            mirror_txt, mirror_card = decision_hub._build_hub_mirror_card(
+                cfg,
+                long_ask_shown,
+                origin_mid="om_origin_131",
+                topic_id="tp_studio",
+                key="prod-gov-131",
+                title="生产环境专项核实结论与纯选择题方案",
+            )
+            self.assertIn("A. 全部按推荐定死方案执行", mirror_txt)
+            self.assertIsNotNone(mirror_card)
+            card_json_str = json.dumps(mirror_card, ensure_ascii=False)
+            self.assertIn('"choice": "A"', card_json_str)
+            self.assertIn('"choice": "B"', card_json_str)
+
+            # 3b) Multi-group production resource governance ask without Lark Doc link is blocked
+            bad_multi_group_ask = (
+                "生产环境 7 天深度体检：专项核实结论与纯选择题拍板方案。\n"
+                "---more---\n"
+                "### 第 1 组：生产 tap-prod-redis-tokyo-8\n- 1A：保持现状\n"
+                "### 第 2 组：生产 Cloud Run 4 个高常驻服务 minScale\n- 2A：定死改为 min=2\n"
+                "### 第 3 组：生产 tap-prod-redis-tokyo-7\n- 3A：缩容至 1GB\n"
+                "选项：\n"
+                "A. 全部按推荐执行（1A + 2A + 3A）\n"
+                "B. 暂不执行\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_mg:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_studio",
+                    "生产环境专项核实结论与纯选择题方案",
+                    bad_multi_group_ask,
+                    key="mg-131",
+                )
+            self.assertIn("REG-106", str(cm_mg.exception))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

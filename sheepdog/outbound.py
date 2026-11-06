@@ -719,10 +719,15 @@ _VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE = re.compile(
     re.I,
 )
 _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE = re.compile(
+    r"\A(?:"
     r"(?=[\s\S]*(?:压测|全栈|生产|容量|扩容|升配)[^\n。]{0,24}(?:升配|扩容|容量|规格)[^\n。]{0,16}方案)"
     r"(?=[\s\S]*\b(?:PG|PostgreSQL)\b)"
     r"(?=[\s\S]*\b(?:MySQL|ADB|AnalyticDB)\b)"
-    r"(?=[\s\S]*\bRedis\b)",
+    r"(?=[\s\S]*\bRedis\b)"
+    r"|"
+    r"(?=[\s\S]*第\s*1\s*组[\s\S]*第\s*2\s*组[\s\S]*第\s*3\s*组)"
+    r"(?=[\s\S]*(?:\b1A\b[\s\S]*\b2[AB]\b[\s\S]*\b3[AB]\b|生产环境[^\n。]{0,24}(?:深度体检|专项核实|资源治理|降配|缩容)))"
+    r")",
     re.I,
 )
 _LARK_DOC_LINK_EVIDENCE_RE = re.compile(

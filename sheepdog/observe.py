@@ -1170,14 +1170,42 @@ def run_observe(
             # owner_notices 失败检查
             if "owner_notices" in tabs:
                 bad = c.execute(
-                    "SELECT id, kind, state, attempts, last_error, created_at FROM owner_notices "
+                    "SELECT id, kind, state, attempts, last_error, created_at, body FROM owner_notices "
                     "WHERE state NOT IN ('sent','acked','closed') AND created_at < ?",
                     (iso(ref_now - timedelta(minutes=5)),),
                 ).fetchall()
                 for r in bad:
+                    err_txt = str(r["last_error"] or "")
+                    body_txt = (
+                        bytes(r["body"]).decode("utf-8", errors="replace")
+                        if isinstance(r["body"], (bytes, bytearray))
+                        else str(r["body"] or "")
+                    )
+                    if (
+                        r["state"] == "pending"
+                        and r["kind"] == "回执带回"
+                        and ("230011" in err_txt or "The message was withdrawn" in err_txt)
+                        and ("[Invalid text JSON]" in body_txt or "主人撤回了" in body_txt)
+                    ):
+                        if self_heal and db.exists():
+                            try:
+                                now_s = iso(ref_now)
+                                with sqlite3.connect(str(db), timeout=5.0) as wc:
+                                    wc.execute(
+                                        "UPDATE owner_notices SET state='sent', sent_at=?, inflight_at=NULL, next_at=NULL WHERE id=?",
+                                        (now_s, r["id"]),
+                                    )
+                                    wc.commit()
+                                self_healed.append(f"owner_notice:{r['id']}:withdrawn_anchor_settled")
+                                info.append(
+                                    f"已自动结清引用已撤回消息（230011）且已被新指令替代的回执带回通知 #{r['id']}"
+                                )
+                                continue
+                            except sqlite3.Error:
+                                pass
                     warn.append(
                         f"给你的通知 #{r['id']}（{r['kind']}）{r['state']}，试了 {r['attempts']} 次："
-                        f"{(r['last_error'] or '')[:120]}"
+                        f"{err_txt[:120]}"
                     )
                 sent = c.execute(
                     "SELECT kind, count(*) FROM owner_notices WHERE sent_at >= ? GROUP BY kind",

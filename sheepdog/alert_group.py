@@ -180,7 +180,19 @@ def send_owner_notice(disp, row) -> bool:
     try:
         send = getattr(disp.notifier, "send", None)
         if callable(send) and anchor and _accepts(send, "reply_to"):
-            send(body, row["idem_key"], reply_to=anchor, in_thread=in_thread)
+            try:
+                send(body, row["idem_key"], reply_to=anchor, in_thread=in_thread)
+            except Exception as e_reply:
+                err_s = str(e_reply)
+                if "230011" in err_s or "The message was withdrawn" in err_s or "message has been recalled" in err_s:
+                    if what == "回执带回" and ("[Invalid text JSON]" in body or "主人撤回了" in body):
+                        disp.store.owner_notice_sent(nid)
+                        log.info("给主人的%s（通知 #%d）引用的原消息 %s 已撤回且正文已替代，自动结清免重发", what, nid, anchor)
+                        return True
+                    log.info("给主人的%s（通知 #%d）引用的原消息 %s 已撤回（230011），退回无引用发送", what, nid, anchor)
+                    send(body, row["idem_key"])
+                else:
+                    raise
         elif callable(send):
             send(body, row["idem_key"])
         else:
@@ -208,6 +220,14 @@ def abandon_owner_notice(disp, row, err: str) -> None:
 def retry_owner_notices(disp) -> None:
     now = _now()
     for row in disp.store.pending_owner_notices():
+        err_s = str(row["last_error"] or "")
+        is_withdrawn_err = "230011" in err_s or "The message was withdrawn" in err_s or "message has been recalled" in err_s
+        if is_withdrawn_err and row["kind"] == "回执带回":
+            body_s = bytes(row["body"]).decode("utf-8", errors="replace") if row["body"] else ""
+            if "[Invalid text JSON]" in body_s or "主人撤回了" in body_s:
+                disp.store.owner_notice_sent(row["id"])
+                log.info("给主人的%s（通知 #%d）原消息已撤回且正文已替代，自动结清免重发", row["kind"], row["id"])
+                continue
         window, inflight = _parse(row["window_at"] or ""), _parse(row["inflight_at"] or "")
         if inflight is not None:
             if now - inflight >= timedelta(minutes=NOTICE_RESEND_SAFE_MINUTES):
@@ -216,7 +236,7 @@ def retry_owner_notices(disp) -> None:
         elif window is not None and now - window >= timedelta(hours=NOTICE_GIVE_UP_HOURS):
             abandon_owner_notice(disp, row, row["last_error"] or "2 小时内没发出去")
             continue
-        elif (nxt := _parse(row["next_at"] or "")) is not None and now < nxt:
+        elif not is_withdrawn_err and (nxt := _parse(row["next_at"] or "")) is not None and now < nxt:
             continue
         if disp.notifier is not None and getattr(disp.notifier, "ledger", True):
             send_owner_notice(disp, row)

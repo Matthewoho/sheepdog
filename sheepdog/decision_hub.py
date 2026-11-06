@@ -472,20 +472,38 @@ def _truncate_hub_more(shown: str, max_detail_chars: int = 1600) -> str:
     if "\n---more---\n" in s:
         head, sep, tail = s.partition("\n---more---\n")
         if len(tail) > max_detail_chars or len(s) > 3500:
+            m_opt = re.search(
+                r"(?m)^(?:#{1,4}\s*)?(?:[二三四五六七八九十]+、\s*纯选择题拍板清单|选项\s*[：:]|拍板清单\s*[：:])",
+                tail,
+            )
+            if m_opt and m_opt.start() > 200:
+                opt_tail = tail[m_opt.start() :].strip()
+                if len(opt_tail) > max_detail_chars:
+                    m_bottom_opt = re.search(r"(?m)^(?:#{1,4}\s*)?选项\s*[：:]", opt_tail)
+                    if m_bottom_opt and m_bottom_opt.start() > 0:
+                        bottom_part = opt_tail[m_bottom_opt.start() :]
+                        keep_top = max(200, max_detail_chars - len(bottom_part) - 40)
+                        opt_tail = f"{opt_tail[:keep_top].rstrip()}\n…\n{bottom_part}"
+                    else:
+                        opt_tail = opt_tail[-max_detail_chars:]
+                lead_budget = max(200, max_detail_chars - len(opt_tail))
+                lead_part = tail[: min(m_opt.start(), lead_budget)].rstrip()
+                return f"{head}{sep}{lead_part}\n…（详情已截断，完整原文见来源业务话题）\n\n{opt_tail}"
             return f"{head}{sep}{tail[:max_detail_chars].rstrip()}\n…（详情已截断，完整原文见来源业务话题）"
     elif len(s) > 3500:
         return f"{s[:max_detail_chars].rstrip()}\n…（详情已截断，完整原文见来源业务话题）"
     return s
 
 def _build_hub_mirror_card(cfg, shown: str, *, origin_mid: str, topic_id: str, key: str, title: str, options_spec: str = "auto", item_no: int | None = None) -> tuple[str, dict | None]:
-    shown = _truncate_hub_more(shown)
+    orig_shown = shown or ""
+    shown = _truncate_hub_more(orig_shown)
     badge = f"📍 来源话题：{f'T-{item_no} · ' if item_no else ''}[{topic_id}]{f' · 钥匙 {key}' if key else ''}"
     mirror_text = f"{shown.rstrip()}\n{badge}"
     if not getattr(getattr(cfg, "notify", None), "owner_card", True): return mirror_text, None
     try: base_card = build_owner_card(shown, getattr(cfg, "self_open_id", "") or "")
     except ValueError: return mirror_text, None
     base_card.setdefault("body", {}).setdefault("elements", []).insert(0, {"tag": "markdown", "content": badge})
-    card = attach_ask_interactions(base_card, text=shown, options_spec=options_spec or "auto", topic_id=topic_id, key=key, title=title, interactive=True)
+    card = attach_ask_interactions(base_card, text=orig_shown, options_spec=options_spec or "auto", topic_id=topic_id, key=key, title=title, interactive=True)
     for el in card.get("body", {}).get("elements", []):
         cols = el.get("columns", []) if el.get("tag") == "column_set" else [c for r in el.get("elements", []) for c in r.get("columns", [])] if el.get("tag") == "form" else []
         for sub_el in (s for col in cols for s in col.get("elements", [])):

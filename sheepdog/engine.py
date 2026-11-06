@@ -3985,6 +3985,13 @@ class Dispatcher:
             if (r := self.store.get_message(e["message_id"])) is None:
                 self.store.echo_settle([e["message_id"]], "gone")
                 continue
+            if e["kind"] != "recalled" and plain_text(r["content"] or "").strip() in (
+                "[Invalid text JSON]",
+                "This message was recalled.",
+                "该消息已被撤回",
+            ):
+                self.store.echo_settle([e["message_id"]], "recalled")
+                continue
             tid, st = r["topic_id"] or "", r["dispatch_state"]
             if r["route"] != DISPATCH or not tid:
                 continue
