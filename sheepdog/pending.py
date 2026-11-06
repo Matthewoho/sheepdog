@@ -41,6 +41,7 @@ PH_REACTION = "owner_reaction"
 PH_SIBLING_ANSWERED = "sibling_answered"
 PH_SIBLING_RESOLVED = "sibling_resolved"
 PH_PANEL_SPOKE = "owner_panel_spoke"
+PH_PEER_SPOKE = "peer_spoke"
 
 # sends 表里这两种是牧羊犬自己的话（7.36）：拉回来时一律丢弃，不登记「需要你定」、不投给任何会话
 SEND_RESOLVE = "resolve"
@@ -258,6 +259,18 @@ _OWNER_DIRECT_DECISION_RE = re.compile(
     r"(?:同意|批准|放行|确认按|按方案|选\s*[A-E]|点选\s*[A-E]|已经(?:处理|搞定|建好|配好|发了))",
     re.I,
 )
+_PEER_BUMP_ONLY_RE = re.compile(
+    r"^(?:\+1|dd|顶(?:一下)?|同问|蹲(?:一个)?|一样|我也(?:是|遇到|碰到|有)(?:这个问题|一样的问题|类似问题)?)[.!！~～?？\s]*$",
+    re.I,
+)
+
+
+def is_peer_bump_only(content: str) -> bool:
+    """过滤群内单纯『+1 / 同问 / 顶一下』等附议噪音，避免误标 peer_spoke。"""
+    txt = plain_text(content or "").strip()
+    if not txt:
+        return True
+    return bool(_PEER_BUMP_ONLY_RE.match(txt))
 
 
 def is_owner_busy_or_defer_text(content: str) -> bool:
@@ -345,6 +358,36 @@ def _owner_followups(cfg, store: Store, srcs, e=None) -> list:
         for r in store.conn.execute(
                 f"SELECT * FROM messages WHERE sender_id=? AND chat_id IN ({marks}) AND COALESCE(deleted,0)=0",
                 (me, *sorted(p2p_chats))):
+            out[r["message_id"]] = r
+    return list(out.values())
+
+
+def _peer_followups(cfg, store: Store, srcs, e=None) -> list:
+    """1.1.38 (REG-127): 群来源消息下，除主人本人（me）和原提问人（src.sender_id）以外的其他群成员/VIP（及挂在其个人账号下的助理）
+    对来源消息的直接回复或同话题跟进（未按时间与代回筛）。私聊来源与找主人聊天不算。"""
+    me = cfg.self_open_id
+    owner_chats = set(cfg.owner_side_chat_ids)
+    out: dict[str, object] = {}
+    for s in srcs:
+        chat = s["about_chat_id"]
+        if not chat or chat in owner_chats:
+            continue
+        src = store.get_message(s["about_message_id"])
+        ctype = (src["chat_type"] if src is not None else "") or ""
+        if ctype == "p2p":
+            continue
+        mid = s["about_message_id"]
+        tid = (src["thread_id"] if src is not None else "") or ""
+        src_sender = ((src["sender_id"] if src is not None and "sender_id" in src.keys() else "") or "").strip()
+        rows = store.conn.execute(
+            "SELECT * FROM messages WHERE chat_id=? AND COALESCE(deleted,0)=0 "
+            "AND message_id != ? AND sender_id != ? AND (? = '' OR sender_id != ?) "
+            "AND COALESCE(sender_type, '') NOT IN ('app', 'bot', 'system') "
+            "AND (reply_to=? OR root_id=? OR (? != '' AND thread_id=?)) "
+            "ORDER BY create_time ASC, rowid ASC",
+            (chat, mid, me, src_sender, src_sender, mid, mid, tid, tid),
+        ).fetchall()
+        for r in rows:
             out[r["message_id"]] = r
     return list(out.values())
 
@@ -471,6 +514,59 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
     panel_hit = _owner_panel_followup(cfg, store, e, asked, until)
     if panel_hit is not None:
         return panel_hit
+    # 5. 原群来源消息下已有其他群成员/VIP（非提问人本人、非主人、非机器人）直接回复跟进（1.1.38 REG-127）
+    if srcs:
+        peer_hits: list[tuple[datetime, datetime, object]] = []
+        for r in _peer_followups(cfg, store, srcs, e):
+            c_dt = _parse(r["create_time"])
+            f_dt = _parse(r["first_seen"]) if "first_seen" in r.keys() else None
+            at = (
+                f_dt
+                if (
+                    c_dt is not None
+                    and f_dt is not None
+                    and c_dt <= asked < f_dt
+                    and (asked - c_dt).total_seconds() <= 120
+                )
+                else c_dt
+            )
+            if (
+                at is None
+                or at <= asked
+                or not _before(at, until)
+                or is_agent_text(cfg, r["content"])
+                or is_peer_bump_only(r["content"])
+            ):
+                continue
+            peer_hits.append((c_dt or at, at, r))
+        if peer_hits:
+            peer_hits.sort(key=lambda x: (x[0], x[1], x[2]["message_id"]))
+            _, _, rep_r = peer_hits[-1]
+            for _, _, pr in peer_hits:
+                if re.search(r"不在我们管的账号里|不是我们管的|外部团队开的|已经(?:充值|充好|处理|解决|恢复|搞定)了?", str(pr["content"] or ""), re.I):
+                    rep_r = pr
+                    break
+            combined_parts: list[str] = []
+            for _, _, pr in peer_hits:
+                raw_p = plain_text(pr["content"] or "")
+                head_p = re.split(r"▶\s*详情", raw_p, maxsplit=1)[0]
+                head_p = re.sub(r"\(ou_[0-9a-fA-F]+\)", "", head_p)
+                head_p = re.sub(r"(?:✦\s*由\s*\S+\s*代回|[▲✦]?\s*Sammi\s*·\s*Sammy\s*的\s*AI\s*助理)\s*$", "", head_p).strip()
+                ptxt = _short(" ".join((head_p or raw_p).split()), 110)
+                if ptxt and ptxt not in combined_parts:
+                    combined_parts.append(ptxt)
+            combined_text = _short(" / ".join(combined_parts), OWNER_TEXT_CHARS)
+            who = (rep_r["sender_name"] if "sender_name" in rep_r.keys() and rep_r["sender_name"] else "") or "群内同事"
+            return Hit(
+                PH_PEER_SPOKE,
+                rep_r["message_id"],
+                rep_r["create_time"],
+                rep_r["chat_id"],
+                rep_r["chat_name"] or "",
+                rep_r["chat_type"] or "",
+                combined_text,
+                other_topic=who,
+            )
     return None
 
 
@@ -484,6 +580,14 @@ def hit_of(cfg, store: Store, e) -> Hit | None:
             return detect(cfg, store, e)
         return Hit(PH_SPOKE, mid, m["create_time"] or "", m["chat_id"], m["chat_name"] or "", m["chat_type"] or "",
                    _short(m["content"], OWNER_TEXT_CHARS))
+    if reason == PH_PEER_SPOKE:
+        live_hit = detect(cfg, store, e)
+        if live_hit is not None and live_hit.reason == PH_PEER_SPOKE:
+            return live_hit
+        if (m := store.get_message(mid)) is not None:
+            who = (m["sender_name"] if "sender_name" in m.keys() and m["sender_name"] else "") or "群内同事"
+            return Hit(PH_PEER_SPOKE, mid, m["create_time"] or "", m["chat_id"], m["chat_name"] or "",
+                       m["chat_type"] or "", _short(m["content"], OWNER_TEXT_CHARS), other_topic=who)
     if reason == PH_REACTION:
         r = store.conn.execute("SELECT * FROM owner_reactions WHERE message_id=? AND operator_id=? ORDER BY seen_at LIMIT 1",
                                (mid, cfg.self_open_id)).fetchone()
@@ -556,6 +660,12 @@ def hit_line(cfg, store: Store, hit: Hit, me_word: str = "主人", short: bool =
         return f"同来源的另一条提问（{who} 问的「{hit.text}」）{me_word} {at}已经答复{ref}"
     if hit.reason == PH_PANEL_SPOKE:
         return f"{me_word} {at}已在 IDE 面板直接对该会话输入指令：「{hit.text}」{ref}"
+    if hit.reason == PH_PEER_SPOKE:
+        peer_who = hit.other_topic or "群内同事"
+        return (
+            f"群内成员 {peer_who} {at}在{chat_label(cfg, store, hit.chat_id, hit.chat_type, hit.chat_name)}"
+            f"回复过来源消息：「{hit.text}」{ref}"
+        )
     return f"标为可能已处理（{hit.reason or '-'}，{hit.message_id or '-'}）"
 
 
@@ -1037,6 +1147,9 @@ def _ph_phrase(cfg, store: Store, ph: dict, now: datetime) -> str:
         return f"{at} 同来源的另一条已结案"
     if r == PH_PANEL_SPOKE:
         return f"{at} 你已在 IDE 面板跟该会话讨论"
+    if r == PH_PEER_SPOKE:
+        peer_who = ph.get("other_topic") or "群内同事"
+        return f"{at} {peer_who}在{where_}里回复过"
     return "标了可能已处理"
 
 

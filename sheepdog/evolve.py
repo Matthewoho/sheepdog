@@ -196,7 +196,11 @@ def build_evolve_digest(
 
     # D3 & D4: 人类拍板错题本、自治候选与 T0->T5 阶段耗时
     from .admin_web import WorkbenchService
-    wb = WorkbenchService(cfg)
+    wb_cfg = cfg
+    if not cfg.db_path.is_file() and getattr(store, "path", None) and Path(store.path).is_file():
+        import dataclasses
+        wb_cfg = dataclasses.replace(cfg, state_dir=Path(store.path).parent)
+    wb = WorkbenchService(wb_cfg)
     overview = wb.get_overview(minutes=1440)
     dec_analytics = wb.get_decisions_analytics()
     dec_summary = dec_analytics.get("summary") or {}

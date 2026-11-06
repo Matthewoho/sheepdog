@@ -3700,7 +3700,7 @@ class VersionAndObserveTest(unittest.TestCase):
             # 2) evolve running retry lamb recovery
             db_path = Path(tmp) / "sheepdog.sqlite3"
             st = store.Store(db_path)
-            cfg = config.Config()
+            cfg = config.Config(state_dir=Path(tmp))
             now_dt = datetime.now().astimezone()
             t_fail_start = (now_dt - timedelta(minutes=6)).isoformat(timespec="seconds")
             t_fail_end = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
@@ -5609,7 +5609,7 @@ class VersionAndObserveTest(unittest.TestCase):
                 json.dumps({"matthew_hong": {"open_id": "ou_test_local_owner", "p2p_chat_id": "oc_test_local_dm"}}),
                 encoding="utf-8",
             )
-            with mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(root)}):
+            with mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(root), "SHEEPDOG_STATE_DIR": ""}):
                 eff = people_roster._effective_roster_seeds(None)
                 owner_rec = next(r for r in eff if r.person_key == "matthew_hong")
                 self.assertEqual(owner_rec.open_id, "ou_test_local_owner")
@@ -5878,6 +5878,473 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(len(s_items), 2)
             self.assertIn("空闲", u_items[0])
             self.assertIn("重复", s_items[1])
+            st.close()
+
+    def test_reg127_peer_source_followup_possibly_handled_and_collision_notes_and_proxy_guard(self) -> None:
+        """REG-127:
+        1) pending.detect / hit_of / followup_round 识别原群来源消息下其他群成员/VIP（PH_PEER_SPOKE）的回复，
+           自动标 possibly_handled 并排入含群内最新回复的 escalation_check 提醒，同时阻止 nudge_open_escalations 盲目催办并放行 verify_resolve_allowed；
+        2) Dispatcher._collision_notes 在投递卡片回调（escalation:<mid>）时，自动从账本附带原群来源消息下的后续群内回复；
+        3) check_source_peer_followup_and_proxy_guard 拦截无视账本中群内同事『不在我们管的账号里 / 外部团队开的』回复仍要求主人登录控制台充值的 ask / report(--ball owner)；
+        4) diagnose_override_reason 识别『这个问题解决了吗』归入 stale_or_already_handled。
+        """
+        from sheepdog import admin_web, decision_hub, engine, outbound, pending
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.roster import parse_roster
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(self_open_id="ou_test_owner", state_dir=state_dir, config_path=state_dir / "config.toml")
+            cfg.playbook_dir = str(Path(__file__).resolve().parent / "fixtures" / "playbook")
+            cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
+            st = Store(cfg.db_path)
+            roster = parse_roster(
+                {
+                    "session": [
+                        {
+                            "key": "youtube-proxy-quota",
+                            "mode": "managed",
+                            "conversation_id": "conv_test_yt_127",
+                            "title": "YouTube 代理配额专席",
+                            "duty": "负责代理与配额排障",
+                            "chats": [{"chat_id": "oc_test_yt_group_127", "name": "YouTube 项目群", "all_messages": False}],
+                        }
+                    ]
+                }
+            )
+            sent_to_sink: list[tuple[str, str]] = []
+
+            class _FakeSink:
+                name = "agentapi"
+
+                def send_message(self, conversation_id: str, text: str, batch_id: str = "") -> None:
+                    sent_to_sink.append((conversation_id, text))
+
+                def transcript_contains(self, conversation_id: str, needle: str) -> bool:
+                    return True
+
+            disp = engine.Dispatcher(cfg, st, _FakeSink(), roster=roster)
+            st.upsert_topic(
+                "tp_youtube-proxy-quota",
+                kind="standing",
+                title="YouTube 代理配额专席",
+                conversation_id="conv_test_yt_127",
+                state="active",
+                onboarded_at="2026-11-06T09:00:00+08:00",
+                rules_hash=disp.rules_hash(
+                    st.get_topic("tp_youtube-proxy-quota")
+                    or {
+                        "topic_id": "tp_youtube-proxy-quota",
+                        "kind": "standing",
+                        "title": "YouTube 代理配额专席",
+                        "duty": "负责代理与配额排障",
+                        "authority": "",
+                        "self_polling": "",
+                        "retire_self_polling": 0,
+                        "group_id": "",
+                    }
+                ),
+            )
+
+            # 原群来源消息（Ethan 提问 Smartproxy nebula 账号 403 Traffic exhausted）
+            src_msg = Message(
+                message_id="om_test_src_proxy_127",
+                chat_id="oc_test_yt_group_127",
+                chat_name="YouTube 项目群",
+                chat_type="group",
+                sender_id="ou_test_requester",
+                sender_name="Ethan",
+                sender_type="user",
+                content="住宅代理 403 Quota / Traffic exhausted，账号 nebula18850230714，需要去 smartproxycn.com 看看余额和自动续订",
+                msg_type="text",
+                create_time="2026-11-06T09:27:05+08:00",
+            )
+            st.upsert_message(src_msg, "dispatch", "at_me", [], "tp_youtube-proxy-quota")
+            st.mark_batch(["om_test_src_proxy_127"], "b_src_127", "tp_youtube-proxy-quota", "acked")
+
+            # 1) 未核实账号归属即发起 Smartproxy nebula* 控制台充值 ask 应被拦截
+            raw_proxy_ask = (
+                "需登录 Smartproxy 控制台确认余额并充值续订以恢复住宅代理。\n"
+                "---more---\n"
+                "事情：住宅代理 403 Quota exhausted，账号 nebula18850230714。\n"
+                "选项：\n"
+                "A. 立即登录 Smartproxy 控制台充值续订（推荐）\n"
+                "B. 暂不充值，切换其他备用代理池\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_unverified:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_youtube-proxy-quota",
+                    "Smartproxy控制台充值续订决策",
+                    raw_proxy_ask,
+                    key="smartproxy-quota-127",
+                    about=["om_test_src_proxy_127"],
+                )
+            self.assertIn("REG-127", str(cm_unverified.exception))
+
+            # 模拟历史已发出的 ask（09:28:26），随后群内同事 Sammy（及其代回）在原群来源消息下回复该账号不在我方纳管范围内
+            st.add_send(
+                "ik_test_proxy_127",
+                "ask",
+                "tp_youtube-proxy-quota",
+                "om_test_ask_proxy_127",
+                f"🐕 需要你定 · Smartproxy控制台充值续订决策 [tp_youtube-proxy-quota]\n{raw_proxy_ask}",
+                key="smartproxy-quota-127",
+                norm_key="smartproxy-quota-127",
+                title="Smartproxy控制台充值续订决策",
+            )
+            st.add_escalation(
+                "om_test_ask_proxy_127",
+                "tp_youtube-proxy-quota",
+                "oc_test_owner_dm",
+                f"🐕 需要你定 · Smartproxy控制台充值续订决策 [tp_youtube-proxy-quota]\n{raw_proxy_ask}",
+                "2026-11-06T09:28:26+08:00",
+            )
+            st.add_escalation_sources(
+                "om_test_ask_proxy_127",
+                "tp_youtube-proxy-quota",
+                [("om_test_src_proxy_127", "oc_test_yt_group_127")],
+                "about",
+            )
+
+            # 群内单纯 "+1 / 同问" 不应误触发 PH_PEER_SPOKE
+            bump_msg = Message(
+                message_id="om_test_peer_bump_127",
+                chat_id="oc_test_yt_group_127",
+                chat_name="YouTube 项目群",
+                chat_type="group",
+                sender_id="ou_test_other_dev",
+                sender_name="Other Dev",
+                sender_type="user",
+                content="同问",
+                msg_type="text",
+                reply_to="om_test_src_proxy_127",
+                root_id="om_test_src_proxy_127",
+                create_time="2026-11-06T09:28:27+08:00",
+            )
+            st.upsert_message(bump_msg, "drop", "no_mention", [], None, None)
+            self.assertIsNone(pending.detect(cfg, st, st.get_escalation("om_test_ask_proxy_127")))
+
+            # Sammy 在原群回复：1) 09:28:20 正在查询；2) 09:28:27 带『▶ 详情 ... ▲ Sammi』折叠尾部的长卡说明不在纳管账号里；3) 09:29:00 补充登不进去
+            peer_r1 = Message(
+                message_id="om_test_sammy_reply1_127",
+                chat_id="oc_test_yt_group_127",
+                chat_name="YouTube 项目群",
+                chat_type="group",
+                sender_id="ou_test_sammy",
+                sender_name="Sammy Shi",
+                sender_type="user",
+                content="正在查询 Smartproxy 账户余额及自动续订状态，稍等。 ✦ 由 Sammi 代回",
+                msg_type="text",
+                reply_to="om_test_src_proxy_127",
+                root_id="om_test_src_proxy_127",
+                create_time="2026-11-06T09:28:20+08:00",
+            )
+            peer_r2 = Message(
+                message_id="om_test_sammy_reply2_127",
+                chat_id="oc_test_yt_group_127",
+                chat_name="YouTube 项目群",
+                chat_type="group",
+                sender_id="ou_test_sammy",
+                sender_name="Sammy Shi",
+                sender_type="user",
+                content=(
+                    "@Ethan(ou_00000000000000000000000000000001) Ethan，爬虫用的是 smartproxycn 的住宅代理（账号名以 nebula 开头），"
+                    "是 2025 年外部团队开的号，不在我们管的账号里，我看不到余额。\n"
+                    "▶ 详情\n"
+                    "已核对我们这边维护的 Smartproxy 账号台账，均无 nebula_ext_01 记录。\n"
+                    "▲ Sammi · Sammy 的 AI 助理"
+                ),
+                msg_type="text",
+                reply_to="om_test_src_proxy_127",
+                root_id="om_test_src_proxy_127",
+                create_time="2026-11-06T09:28:27+08:00",
+            )
+            peer_r3 = Message(
+                message_id="om_test_sammy_reply3_127",
+                chat_id="oc_test_yt_group_127",
+                chat_name="YouTube 项目群",
+                chat_type="group",
+                sender_id="ou_test_sammy",
+                sender_name="Sammy Shi",
+                sender_type="user",
+                content=(
+                    "@Ethan 这个号我们这边登不进去，充不了值。需要找当时开 nebula_ext_01 这个号的外部团队同学登录后台处理。\n"
+                    "▶ 详情\n"
+                    "详细说明略。\n"
+                    "▲ Sammi · Sammy 的 AI 助理"
+                ),
+                msg_type="text",
+                reply_to="om_test_src_proxy_127",
+                root_id="om_test_src_proxy_127",
+                create_time="2026-11-06T09:29:00+08:00",
+            )
+            st.upsert_message(peer_r1, "drop", "no_mention", [], None, None)
+            st.upsert_message(peer_r2, "drop", "no_mention", [], None, None)
+            st.upsert_message(peer_r3, "drop", "no_mention", [], None, None)
+            with st.tx() as c:
+                c.execute(
+                    "UPDATE messages SET first_seen='2026-11-06T09:28:32+08:00' WHERE message_id IN ('om_test_sammy_reply1_127', 'om_test_sammy_reply2_127')"
+                )
+                c.execute(
+                    "UPDATE messages SET first_seen='2026-11-06T09:29:05+08:00' WHERE message_id='om_test_sammy_reply3_127'"
+                )
+
+            # 2) pending.detect 命中 PH_PEER_SPOKE，剥离 ▶ 详情 折叠尾部后完整保留首条关键结论『不在我们管的账号里』
+            e_open = st.get_escalation("om_test_ask_proxy_127")
+            hit = pending.detect(cfg, st, e_open)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit.reason, pending.PH_PEER_SPOKE)
+            self.assertEqual(hit.message_id, "om_test_sammy_reply2_127")
+            self.assertIn("不在我们管的账号里", hit.text)
+            self.assertNotIn("▶ 详情", hit.text)
+
+            # nudge_open_escalations 遇到 PH_PEER_SPOKE 自动跳过飞书催办，且 verify_resolve_allowed 放行结案
+            ref_nudge = datetime.fromisoformat("2026-11-06T10:05:00+08:00")
+            nudged = decision_hub.nudge_open_escalations(cfg, st, None, now=ref_nudge)
+            self.assertEqual(nudged, [])
+            decision_hub.verify_resolve_allowed(cfg, st, [st.get_escalation("om_test_ask_proxy_127")])
+
+            # followup_round 排入 escalation_check 系统提醒，正文带出 Sammy 在原群的回复
+            f_res = pending.followup_round(cfg, st, disp.playbook)
+            self.assertEqual(f_res["checked"], 1)
+            pend_rows = st.pending_dispatch()
+            self.assertEqual(len(pend_rows), 1)
+            self.assertEqual(pend_rows[0]["reason"], "escalation_check")
+            self.assertIn("不在我们管的账号里", pend_rows[0]["content"])
+
+            # 3) 当主人点击卡片回调『[卡片回调] 其他：这个问题解决了吗』投递给专席时，_collision_notes 自动附带原群来源消息下的后续群内回复
+            cb_msg = Message(
+                message_id="sd_card_cb_test_127",
+                chat_id="oc_test_owner_dm",
+                chat_name="拍板总台",
+                chat_type="group",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="[卡片回调] 其他：这个问题解决了吗",
+                msg_type="text",
+                create_time="2026-11-06T13:53:13+08:00",
+            )
+            st.upsert_message(
+                cb_msg,
+                "dispatch",
+                "escalation_reply",
+                ["card_callback", "escalation:om_test_ask_proxy_127", "key:smartproxy-quota-127", "owner_verified"],
+                "tp_youtube-proxy-quota",
+                "pending",
+            )
+            notes = disp._collision_notes(st.get_topic("tp_youtube-proxy-quota"), [st.get_message("sd_card_cb_test_127")])
+            self.assertIn("sd_card_cb_test_127", notes)
+            joined_note = "\n".join(notes["sd_card_cb_test_127"])
+            self.assertIn("原群来源消息（`om_test_src_proxy_127`）后续已有", joined_note)
+            self.assertIn("不在我们管的账号里", joined_note)
+
+            # 4) 专席若仍无视群内回复调用 report(--ball owner) 让主人登录控制台充值，被 check_source_peer_followup_and_proxy_guard 当场拦截并同时回显 09:28 与 09:29 两条回复
+            bad_report_body = (
+                "Smartproxy 住宅代理配额耗尽问题目前尚未解决，仍需你或 Sammy 登录控制台 (smartproxycn.com) 确认余额并完成充值续订。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_rep:
+                outbound.check_source_peer_followup_and_proxy_guard(
+                    cfg,
+                    st,
+                    "tp_youtube-proxy-quota",
+                    "Smartproxy 代理配额状态核查汇报",
+                    bad_report_body,
+                    key="smartproxy-quota-127",
+                    kind="report",
+                    ball="owner",
+                )
+            self.assertIn("REG-127", str(cm_rep.exception))
+            self.assertIn("不在我们管的账号里", str(cm_rep.exception))
+            self.assertIn("登不进去，充不了值", str(cm_rep.exception))
+
+            # 若专席如实引用群内结论（不在我们管的账号里，ball=done）则正常放行
+            good_report_body = (
+                "Sammy 已在原群回复确认 nebula_ext_01 不在我们管的账号里（外部团队开的号），无需主人处理。"
+            )
+            outbound.check_source_peer_followup_and_proxy_guard(
+                cfg,
+                st,
+                "tp_youtube-proxy-quota",
+                "Smartproxy 代理配额状态核查汇报",
+                good_report_body,
+                key="smartproxy-quota-127",
+                kind="report",
+                ball="done",
+            )
+
+            # 5) diagnose_override_reason 将『这个问题解决了吗』精准归入 stale_or_already_handled，
+            #    且 classify_escalation 将『[卡片回调] 其他：我需要一个小时之后去购买 目前在路上』精准识别为 accepted
+            c_ov, l_ov = admin_web.diagnose_override_reason(
+                raw_proxy_ask,
+                "[卡片回调] 其他：这个问题解决了吗",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_ov, l_ov), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            later_buy_item = admin_web.classify_escalation(
+                {
+                    "message_id": "om_test_later_buy_127",
+                    "topic_id": "tp_3x-ui-ops",
+                    "text": "Sheena申请专线\n选项：\nA. 你新购一台原生双 ISP 机器\nB. 回收备用二线\n建议：A",
+                    "asked_at": "2026-11-06T14:30:00+08:00",
+                    "answered_at": "2026-11-06T14:37:00+08:00",
+                    "closed_at": "2026-11-06T14:37:00+08:00",
+                    "close_reason": "answered",
+                    "resolved_by": None,
+                    "resolve_note": None,
+                    "nudge_count": 0,
+                },
+                answer_content="[卡片回调] 其他：我需要一个小时之后去购买 目前在路上",
+            )
+            self.assertEqual(later_buy_item["alignment"], "accepted")
+
+            # 6) 数据库负责人 Nicky 申请为生产 Redis/DB 开通受白名单安全组保护的外网连接及凭据时，
+            #    若倒置推荐『A. 保持纯内网，不开放公网端口与密码外发』，被 check_ask_pre_flight_guard 当场拦截；
+            #    且主人改选 B『授权开通外网并由主人交付凭据』被精准归入 arch_or_config_posture
+            bad_nicky_redis_ask = (
+                "Nicky 老师申请为两台生产 Redis 开通外网连接并获取账号密码。建议选 A：生产 Redis 严禁暴露公网；备选 B 授权开通外网并由主人交付凭据。\n"
+                "---more---\n"
+                "事情：Nicky 老师申请将生产两台核心 Redis 开通外网连接，并申请获取公网连接信息与账号密码用于排查。\n"
+                "选项：\n"
+                "A. 保持纯内网，不开放公网端口与密码外发：建议 DBA 调试通过腾讯云 DMC 控制台或内网跳板机访问\n"
+                "B. 同意开通外网并由 Matthew 授权交付凭据：由拓扑专席开通外网并严格限制 28 个 IP 白名单，由 Matthew 亲自向 Nicky 交付 Redis 密码\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_nicky_wan:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_nicky",
+                    "Nicky申请生产两台Redis开公网及凭据",
+                    bad_nicky_redis_ask,
+                    key="nicky-prod-redis-wan",
+                )
+            self.assertIn("REG-127", str(cm_nicky_wan.exception))
+
+            good_nicky_pg_ask = (
+                "Nicky 老师申请将生产 PG 开通外网地址直连排查。建议选 B 同意开通并严格绑定 28 个受信专线 IP 安全组。\n"
+                "---more---\n"
+                "事情：Nicky 老师申请将生产 PG 开通外网地址，方便客户端直连排查。\n"
+                "选项：\n"
+                "A. 保持纯内网不分配公网：生产数据库不暴露公网，DBA 继续走腾讯云 DMC 控制台操作\n"
+                "B. 同意开通外网并严格绑安全组：由拓扑专席开通外网，仅放行已获批的 28 个受信专线 IP 白名单\n"
+                "建议：选 B"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_nicky",
+                "Cinemap生产PG申请开公网",
+                good_nicky_pg_ask,
+                key="cinemap-prod-pg-wan",
+            )
+
+            c_redis_ov, l_redis_ov = admin_web.diagnose_override_reason(
+                bad_nicky_redis_ask,
+                "[卡片回调] B：授权开通外网并由主人交付凭据",
+                chosen_code="B",
+                recommended="A",
+            )
+            self.assertEqual((c_redis_ov, l_redis_ov), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            bad_manual_script_ask = (
+                "前置部署已成功，Step 3 遇 pre-tool hook 拦截请示（推荐 A）。\n"
+                "---more---\n"
+                "- **选项 A（推荐）：你在本机终端直接跑一遍幂等收尾脚本（约 30~60 秒），跑完告诉我一声**\n"
+                "- **选项 B：点名授权父会话直接调用该脚本（走既有 SDK + 官方 CLI，不手写裸凭据请求）**\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_script_ask:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "Step 3 遇 pre-tool hook 拦截请示",
+                    bad_manual_script_ask,
+                    key="cutover-step3-127",
+                )
+            self.assertIn("REG-127", str(cm_script_ask.exception))
+            c_sc_ov, l_sc_ov = admin_web.diagnose_override_reason(
+                bad_manual_script_ask,
+                "[卡片回调] B：授权父会话执行收尾脚本完成切换",
+                chosen_code="B",
+                recommended="A",
+            )
+            self.assertEqual((c_sc_ov, l_sc_ov), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 7) 主人误触点击 A 后 23 秒内发送『这个我搞错了 我要选b』：
+            #    find_misclick_target_escalation 精准定位刚刚误触的提问单（不误关同会话其他提问），
+            #    且 get_decisions_analytics / classify_escalation 将其修正为 chosen_code='B', alignment='accepted'
+            st.upsert_topic("tp_nicky", title="Nicky 专席", state="active", conversation_id="cid_nicky_127")
+            st.add_escalation(
+                "om_test_pg_misclick_127",
+                "tp_nicky",
+                "oc_test_tg_127",
+                f"🐕 需要你定 · Cinemap生产PG申请开公网 [tp_nicky]\n{good_nicky_pg_ask}",
+                "2026-11-06T14:11:41+08:00",
+            )
+            cb_mis_a = Message(
+                message_id="sd_card_cb_misclick_a_127",
+                chat_id="oc_test_tg_127",
+                chat_name="话题群",
+                chat_type="topic",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="[卡片回调] A：保持纯内网不分配公网",
+                msg_type="text",
+                create_time="2026-11-06T14:16:13+08:00",
+            )
+            st.upsert_message(cb_mis_a, "dispatch", "escalation_reply", ["card_callback"], "tp_nicky", "acked")
+            st.answer_escalation("om_test_pg_misclick_127", "sd_card_cb_misclick_a_127")
+            with st.tx() as c:
+                c.execute(
+                    "UPDATE escalations SET answered_at='2026-11-06T14:16:13+08:00', closed_at='2026-11-06T14:16:10+08:00', origin_root_id='om_test_t131_root_127' WHERE message_id='om_test_pg_misclick_127'"
+                )
+
+            fix_msg = Message(
+                message_id="om_test_fix_b_127",
+                chat_id="oc_test_tg_127",
+                chat_name="话题群",
+                chat_type="topic",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="![Image](img_test_127)\n这个我搞错了 我要选b",
+                msg_type="post",
+                reply_to="om_test_t131_root_127",
+                root_id="om_test_t131_root_127",
+                create_time="2026-11-06T14:16:00+08:00",
+            )
+            st.upsert_message(fix_msg, "dispatch", "owner_reply", ["owner_verified"], "tp_nicky", "acked")
+            with st.tx() as c:
+                c.execute(
+                    "UPDATE messages SET first_seen='2026-11-06T14:16:42+08:00' WHERE message_id='om_test_fix_b_127'"
+                )
+
+            mis_target, corr_opt = decision_hub.find_misclick_target_escalation(
+                st,
+                st.get_message("om_test_fix_b_127"),
+                topic_id="tp_nicky",
+                origin_root_id="om_test_t131_root_127",
+            )
+            self.assertIsNotNone(mis_target)
+            self.assertEqual(mis_target["message_id"], "om_test_pg_misclick_127")
+            self.assertEqual(corr_opt, "B")
+
+            wb = admin_web.WorkbenchService(cfg)
+            dec = wb.get_decisions_analytics()
+            pg_entry = next(x for x in dec["ledger"] if x["message_id"] == "om_test_pg_misclick_127")
+            self.assertEqual(pg_entry["chosen_code"], "B")
+            self.assertEqual(pg_entry["alignment"], "accepted")
+            self.assertIn("误触更正", pg_entry["alignment_label"])
             st.close()
 
 

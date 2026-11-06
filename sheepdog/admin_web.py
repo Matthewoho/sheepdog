@@ -88,6 +88,7 @@ _ACCEPT_WORDS_RE = re.compile(
     r"(?:^(?:好|好的|可以|行|同意|没问题|按你建议|都按你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
     r"|直接配|直接弄|帮我弄|有空(?:位|额)就给他?|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理"
     r"|(?:18\s*点|(?:下午|晚上|今晚)\s*6\s*点)\s*(?:弄|执行|再动|操作|改|调|发|切)"
+    r"|(?:(?:我)?(?:需要|得|要|准备|打算)?\s*(?:[一二三四五六七八九十两半\d]+\s*个?(?:小时|钟头|分钟)|稍后|晚点|一会|待会|回头|回去|到(?:公司|家))(?:之?后|以后|后|再)?\s*去?\s*(?:购买|新购|买|充值|续费|开通|办理|处理|弄|搞|付|支付))"
     r"|(?:(?:我)?(?:已经|已|直接|自己|刚)(?:直接)?(?:撤回|删掉|删除|处理|弄好|发过|改好|搞定|重置|购买|买好|续费|扩容|充值|充好|开通|开好|添加|加好|加白|配置|配好|更新|创建|建好|放行|完成)了?|(?:重置|购买|买好|续费|扩容|充值|充好|开通|开好|加白|搞定|弄好|改好|配好|建好)(?:了|完毕|完成|好了))"
     r"|\bwsurl\s*[:=]|\bkey\s*[:=].*\bsecret\s*[:=])",
     re.I,
@@ -108,6 +109,7 @@ _OVERRIDE_WORDS_RE = re.compile(
     r"|(?:我)?在群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)|群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)"
     r"|(?:我)?(?:已经)?在(?:消息|私聊|聊天|飞书|对话框)里(?:已经)?(?:回|回复|说|答|发|交代)(?:了|过)|你可以观望|先观望一下|观望一下"
     r"|我不是(?:已经)?(?:买|购买|充|充值|开|开通|弄|处理|付|支付|发|改|建|配|加)(?:好|完|过)?了吗|(?:他|她|它|那边)(?:(?:没法|不能|无法)用|用不了)[吗嘛?？]"
+    r"|(?:这个|这件|那件|该)?(?:问题|事情|故障|卡点|报错)?(?:已经)?(?:解决|搞定|弄好|处理好|恢复|修好)了?[吗嘛?？]|现在(?:解决|恢复|搞定|怎么样)了?[吗嘛?？]"
     r"|邮箱来的(?:消息)?|邮件来的(?:消息)?|暂时不管"
     r"|问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|先问一下腾讯云|问一下腾讯云的人|是给谁访问的|给谁访问的"
     r"|问一下能不能用|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b|(?:能不能用|改用|用)[^\n。]{0,12}国际站"
@@ -117,6 +119,11 @@ _OVERRIDE_WORDS_RE = re.compile(
 )
 _SYMBOLIC_CRITIQUE_RE = re.compile(
     r"(?:有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我)",
+    re.I,
+)
+_OWNER_MISCLICK_CORRECTION_RE = re.compile(
+    r"(?:搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
+    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:搞错了|点错了|选错了|按错了|手滑了?)",
     re.I,
 )
 
@@ -135,6 +142,7 @@ def diagnose_override_reason(
         r"|(?:我)?在群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)|群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)"
     r"|(?:我)?(?:已经)?在(?:消息|私聊|聊天|飞书|对话框)里(?:已经)?(?:回|回复|说|答|发|交代)(?:了|过)|你可以观望|先观望一下|观望一下"
         r"|我不是(?:已经)?(?:买|购买|充|充值|开|开通|弄|处理|付|支付|发|改|建|配|加)(?:好|完|过)?了吗|(?:他|她|它|那边)(?:(?:没法|不能|无法)用|用不了)[吗嘛?？]"
+        r"|(?:这个|这件|那件|该)?(?:问题|事情|故障|卡点|报错)?(?:已经)?(?:解决|搞定|弄好|处理好|恢复|修好)了?[吗嘛?？]|现在(?:解决|恢复|搞定|怎么样)了?[吗嘛?？]"
         r"|邮箱来的(?:消息)?|邮件来的(?:消息)?|暂时不管)",
         s,
         re.I,
@@ -199,6 +207,12 @@ def diagnose_override_reason(
         ) or (
             re.search(r"(?:停用|offline)[^\n。；]*并下线[^\n。；]*域名|直接下线[^\n。；]*(?:联调|过渡|临时)域名", chosen_full, re.I)
             and re.search(r"(?:联调域名|过渡域名|临时域名)[\s\S]{0,420}(?:301|302|重定向|跳转)", text or "", re.I)
+        ) or (
+            re.search(r"(?:同意|授权)?开通外网[^\n。；]*(?:交付凭据|白名单|安全组)", chosen_full, re.I)
+            and re.search(r"Nicky[\s\S]{0,420}保持纯内网[^\n。；]*(?:不开放公网|密码外发)", text or "", re.I)
+        ) or (
+            re.search(r"授权(?:父会话|专席|本会话)[^\n。；]*(?:执行|调用)[^\n。；]*脚本", chosen_full, re.I)
+            and re.search(r"(?:你在本机终端直接跑|由你在本机[^\n。；]*执行)[^\n。；]*脚本", text or "", re.I)
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
@@ -619,6 +633,15 @@ def classify_escalation(
                 alignment = "accepted"
                 alignment_label = "采纳建议 (带参/直接放行)"
         elif chosen_code in ("A", "B", "C", "D", "E"):
+            misclick_corrected = False
+            m_corr = _OWNER_MISCLICK_CORRECTION_RE.search(critique_clean) if critique_clean else None
+            if m_corr:
+                corr_code = (m_corr.group(1) or m_corr.group(2) or "").upper()
+                if corr_code in ("A", "B", "C", "D", "E") and corr_code != chosen_code:
+                    orig_chosen = chosen_code
+                    chosen_code = corr_code
+                    ans_clean = f"[{chosen_code}] (误触 {orig_chosen} 后更正) {critique_clean}"
+                    misclick_corrected = True
             if critique_clean and _SYMBOLIC_CRITIQUE_RE.search(critique_clean):
                 alignment = "overridden"
                 override_code, override_reason = diagnose_override_reason(
@@ -632,7 +655,7 @@ def classify_escalation(
                 alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
             else:
                 alignment = "accepted"
-                alignment_label = f"采纳建议 ({chosen_code})"
+                alignment_label = f"采纳建议 ({chosen_code} · 误触更正)" if misclick_corrected else f"采纳建议 ({chosen_code})"
         else:
             if _OVERRIDE_WORDS_RE.search(ans_body):
                 alignment = "overridden"
@@ -1335,9 +1358,11 @@ class WorkbenchService:
                           (SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1) AS ask_floor,
                           (SELECT fm.content FROM messages fm
                            WHERE (fm.topic_id = e.topic_id OR fm.reason = 'decision_hub_hint' OR fm.tags_json LIKE '%' || e.message_id || '%')
+                             AND (fm.tags_json NOT LIKE '%escalation_followup:%' OR fm.tags_json LIKE '%escalation_followup:' || e.message_id || '%')
                              AND e.answered_at IS NOT NULL
                              AND unixepoch(fm.create_time) BETWEEN unixepoch(e.answered_at) - 60 AND unixepoch(e.answered_at) + 600
-                             AND (fm.content LIKE '%决策点%' OR fm.content LIKE '%还需要问我%' OR fm.content LIKE '%象征性问问%' OR fm.content LIKE '%不用问我%')
+                             AND (fm.content LIKE '%决策点%' OR fm.content LIKE '%还需要问我%' OR fm.content LIKE '%象征性问问%' OR fm.content LIKE '%不用问我%'
+                                  OR fm.content LIKE '%搞错%' OR fm.content LIKE '%点错%' OR fm.content LIKE '%选错%' OR fm.content LIKE '%按错%' OR fm.content LIKE '%手滑%' OR fm.content LIKE '%改选%')
                            ORDER BY fm.create_time ASC LIMIT 1) AS followup_critique
                    FROM escalations e
                    LEFT JOIN messages am ON am.message_id = e.answer_message_id

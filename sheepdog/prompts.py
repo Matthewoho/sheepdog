@@ -743,7 +743,7 @@ def _fmt_msg(row: sqlite3.Row, banner: str = "", quote: str = "", max_lines: int
         # 主人回复按标记认，不按 reason 值认：已上线账本里的旧行用的是改名前的 reason
         label = REASON_LABEL["owner_reply"]
     if row["chat_type"] == SYSTEM_CHAT:
-        return "\n".join([f"### [{label}] sheepdog | {row['create_time']}", *(row["content"] or "").splitlines()])
+        return "\n".join([f"### [{label}] sheepdog | {row['create_time']}", *(row["content"] or "").splitlines(), *(extra or [])])
     where = chat_label(row["chat_type"], row["chat_name"], row["chat_id"])
     lines = [f"### [{label}] {where} | {_person(row['sender_name'], row['sender_id'])} | {row['create_time']}{read}"]
     mentions = _mention_line(row["mentions_json"])

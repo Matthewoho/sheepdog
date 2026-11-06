@@ -760,6 +760,68 @@ def is_hub_message(store, m) -> bool:
     if thr_id and m_thr == thr_id: return True
     return bool(reply_to and (esc := store.get_escalation(reply_to)) is not None and "hub_message_id" in esc.keys() and esc["hub_message_id"] == reply_to)
 
+_OWNER_MISCLICK_CORRECTION_RE = re.compile(
+    r"(?:搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
+    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:搞错了|点错了|选错了|按错了|手滑了?)",
+    re.I,
+)
+
+
+def find_misclick_target_escalation(
+    store,
+    m,
+    *,
+    topic_id: str = "",
+    origin_root_id: str = "",
+):
+    """REG-127：当主人在点选拍板按钮后 10 分钟内发送『这个我搞错了 我要选B』等误触更正时，
+    定位刚刚被误触拍板的那张提问单（answered_at 在 600s 内且原选项 != 更正选项），避免张冠李戴关掉同话题其他未决提问。"""
+    def _v(k: str) -> str:
+        if hasattr(m, "keys") and k in m.keys():
+            return str(m[k] or "")
+        return str(getattr(m, k, "") or "")
+
+    raw_txt = plain_text(_v("content"))
+    m_corr = _OWNER_MISCLICK_CORRECTION_RE.search(raw_txt)
+    if not m_corr or store is None or not hasattr(store, "conn"):
+        return None, ""
+    corr_code = (m_corr.group(1) or m_corr.group(2) or "").upper()
+    if corr_code not in ("A", "B", "C", "D", "E"):
+        return None, ""
+    ref_ts = _v("first_seen") or _v("create_time") or now_iso()
+    try:
+        m_dt = datetime.fromisoformat(ref_ts)
+    except Exception:
+        m_dt = datetime.now().astimezone()
+    rows = store.conn.execute(
+        """SELECT e.*, am.content AS ans_content
+           FROM escalations e
+           LEFT JOIN messages am ON am.message_id = e.answer_message_id
+           WHERE e.answered_at IS NOT NULL
+           ORDER BY e.answered_at DESC, e.rowid DESC LIMIT 10"""
+    ).fetchall()
+    for r in rows:
+        if topic_id and origin_root_id:
+            if r["topic_id"] != topic_id and (r["origin_root_id"] or "") != origin_root_id:
+                continue
+        elif topic_id and r["topic_id"] != topic_id:
+            continue
+        elif origin_root_id and (r["origin_root_id"] or "") != origin_root_id:
+            continue
+        try:
+            ans_dt = datetime.fromisoformat(str(r["answered_at"]))
+            if not (-60 <= (m_dt - ans_dt).total_seconds() <= 600):
+                continue
+        except Exception:
+            continue
+        ans_c = str(r["ans_content"] or "")
+        m_cb = re.search(r"\[卡片回调\]\s*([A-E]|其他)\b", ans_c, re.I)
+        prev_code = m_cb.group(1).upper() if m_cb else ""
+        if prev_code and prev_code != corr_code:
+            return r, corr_code
+    return None, corr_code
+
+
 def handle_hub_text_reply(collector, m) -> bool:
     """7.81 / 7.118 (REG-036 / REG-086): 处理主人在『🐕 拍板总台』话题内的文字/图片回复：
     1. 若显式引用某张待拍板子卡或当前仅 1 项未决提问，直接作答该提问并双端变绿；
@@ -771,6 +833,18 @@ def handle_hub_text_reply(collector, m) -> bool:
         return False
     reply_to = getattr(m, "reply_to", "") or ""
     esc = store.get_escalation(reply_to) if reply_to else None
+    if esc is None:
+        mis_esc, _ = find_misclick_target_escalation(store, m)
+        if mis_esc is not None:
+            rmid = str(mis_esc["message_id"] or "")
+            store.upsert_message(
+                m,
+                "dispatch",
+                "owner_instruction",
+                ["owner_verified", f"escalation_followup:{rmid}"],
+                topic_id=str(mis_esc["topic_id"]),
+            )
+            return True
     opens = _open_escalation_rows(store)
     if esc is None and len(opens) == 1:
         esc = opens[0]

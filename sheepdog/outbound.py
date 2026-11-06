@@ -869,6 +869,141 @@ _EXISTING_PACKAGE_UNUSABLE_VERIFIED_EVIDENCE_RE = re.compile(
     r"实测[^\n。]{0,36}(?:已开通的?按量付费|package-[a-z0-9]{6,})[^\n。]{0,24}(?:无法|不能|报错|余量不足))",
     re.I,
 )
+_UNVERIFIED_EXTERNAL_PROXY_CONSOLE_RECHARGE_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:Smartproxy|smartproxycn\.com|住宅代理)[^\n。]{0,60}(?:配额耗尽|流量耗尽|余额|充值|续订))"
+    r"(?=[\s\S]*(?:登录\s*(?:Smartproxy\s*)?控制台|确认余额[^\n。]{0,20}充值|充值续订|nebula\d+))",
+    re.I,
+)
+_EXTERNAL_PROXY_OWNERSHIP_VERIFIED_EVIDENCE_RE = re.compile(
+    r"(?:不在我们管的账号里|不是我们管的账号|外部团队开的(?:号|账号)?|我们这边只管了\s*tapnow|"
+    r"已(?:向|与)\s*Sammy(?:\s*Shi)?\s*(?:或\s*Sammi\s*)?(?:核实|确认)[^\n。]{0,24}账号归属)",
+    re.I,
+)
+_PEER_SOURCE_HANDLED_OR_NOT_OURS_RE = re.compile(
+    r"(?:不在我们管的账号里|不是我们管的|外部团队开的|我们这边登不进去|已经(?:充值|充好|处理|解决|恢复|搞定)了?)",
+    re.I,
+)
+_STILL_ASKING_OWNER_ACTION_RE = re.compile(
+    r"(?:登录[^\n。]{0,24}控制台[^\n。]{0,24}(?:充值|续订|确认余额|处理)|"
+    r"仍需(?:你|主人|你或\s*Sammy)[^\n。]{0,24}(?:登录|充值|续订|处理)|"
+    r"A\s*[\.、:：)\]]\s*[^\n]*(?:立即)?登录[^\n]*控制台[^\n]*(?:充值|续订))",
+    re.I,
+)
+_DBA_NICKY_WITHHOLD_WAN_OR_CRED_ASK_RE = re.compile(
+    r"(?=[\s\S]*Nicky(?:\s*Ye|\s*老师)?[^\n。]{0,48}申请[^\n。]{0,48}(?:开通外网|开公网|公网连接|账号密码))"
+    r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:保持纯内网|不开放公网|不分配公网)[^\n]*(?:不开放公网|密码外发|DMC|控制台))"
+    r"(?=[\s\S]*B\s*[\.、:：)\]]\s*[^\n]*(?:同意|授权)?开通外网[^\n]*(?:28\s*个|白名单|安全组|交付凭据))"
+    r"(?=[\s\S]*建议\s*[：:]?\s*(?:选\s*)?A\b)",
+    re.I,
+)
+_PREFER_MANUAL_TERMINAL_OVER_SESSION_SCRIPT_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:选项\s*A|A\s*[\.、:：)\]])[^\n]*(?:你在本机终端直接跑|由你在本机[^\n]*执行)[^\n]*脚本)"
+    r"(?=[\s\S]*(?:选项\s*B|B\s*[\.、:：)\]])[^\n]*(?:点名)?授权(?:父会话|专席|本会话)(?:直接)?(?:调用|执行)(?:该|收尾)?脚本)"
+    r"(?=[\s\S]*(?:推荐\s*A|建议\s*[：:]?\s*(?:选\s*)?A\b|选项\s*A\s*[（(]\s*推荐\s*[）)]))",
+    re.I,
+)
+
+
+def check_source_peer_followup_and_proxy_guard(
+    cfg: Config,
+    store: Store,
+    topic_id: str,
+    title: str,
+    body_or_combined: str,
+    *,
+    key: str = "",
+    about: list[str] | None = None,
+    batch: str = "",
+    kind: str = "ask",
+    ball: str = "",
+    fyi: bool = False,
+) -> None:
+    """1.1.38 (REG-127): 发送 ask 或 report(--ball owner) 前，核查：
+    1) 账本里原群来源消息下是否已有群成员/VIP（如 Sammy Shi / Sammi）回复『不在我们管的账号里 / 外部团队开的 / 已处理』，
+       而当前外发仍无视该回复让主人去登录控制台/充值；
+    2) 是否在未核实第三方代理账号（如 Smartproxy `nebula*`）是否属于我方纳管账号（`tapnow / tapnow_test / tapnow02 / tapnow0001`）
+       的情况下，直接要求主人登录控制台充值续订。"""
+    if fyi or topic_id in (BUS_TOPIC_ID, "tp_3x-ui-ops"):
+        return
+    full_text = f"{title or ''}\n{body_or_combined or ''}"
+    is_owner_action_request = kind == ASK or (kind == REPORT and (ball or "").strip().lower() == "owner")
+    if getattr(store, "conn", None) is not None and (is_owner_action_request or _STILL_ASKING_OWNER_ACTION_RE.search(full_text)):
+        try:
+            cand_srcs: list[tuple[str, str]] = []
+            try:
+                _, a_srcs, _ = ask_sources(cfg, store, topic_id, about, batch)
+                for smid, schat in a_srcs:
+                    if smid and schat and (smid, schat) not in cand_srcs:
+                        cand_srcs.append((smid, schat))
+            except Exception:
+                pass
+            nk = duty.norm_key(key) if key else ""
+            esc_rows = store.conn.execute(
+                "SELECT e.message_id FROM escalations e LEFT JOIN sends s ON s.message_id = e.message_id "
+                "WHERE e.topic_id = ? AND (? = '' OR s.norm_key = ? OR s.key = ?) "
+                "ORDER BY e.asked_at DESC LIMIT 5",
+                (topic_id, nk, nk, key),
+            ).fetchall()
+            for er in esc_rows:
+                for es in store.escalation_sources(er["message_id"]):
+                    smid, schat = (es["about_message_id"] or "").strip(), (es["about_chat_id"] or "").strip()
+                    if smid and schat and (smid, schat) not in cand_srcs:
+                        cand_srcs.append((smid, schat))
+            me = cfg.self_open_id
+            for src_mid, src_chat in cand_srcs:
+                src_row = store.get_message(src_mid)
+                if src_row is None or (src_row["chat_type"] or "") == "p2p":
+                    continue
+                src_sender = ((src_row["sender_id"] if "sender_id" in src_row.keys() else "") or "").strip()
+                tid = ((src_row["thread_id"] if "thread_id" in src_row.keys() else "") or "").strip()
+                p_rows = store.conn.execute(
+                    "SELECT message_id, sender_name, sender_id, create_time, content FROM messages "
+                    "WHERE chat_id=? AND COALESCE(deleted,0)=0 AND message_id != ? AND sender_id != ? "
+                    "AND (? = '' OR sender_id != ?) AND COALESCE(sender_type, '') NOT IN ('app', 'bot', 'system') "
+                    "AND (reply_to=? OR root_id=? OR (? != '' AND thread_id=?)) "
+                    "ORDER BY create_time ASC, rowid ASC LIMIT 8",
+                    (src_chat, src_mid, me, src_sender, src_sender, src_mid, src_mid, tid, tid),
+                ).fetchall()
+                matched_lines: list[str] = []
+                for pr in p_rows:
+                    raw_p = str(pr["content"] or "")
+                    ptxt = " ".join(raw_p.split())
+                    if not ptxt or not _PEER_SOURCE_HANDLED_OR_NOT_OURS_RE.search(ptxt):
+                        continue
+                    if pr["message_id"] in full_text or _EXTERNAL_PROXY_OWNERSHIP_VERIFIED_EVIDENCE_RE.search(full_text):
+                        continue
+                    head_p = " ".join(re.split(r"▶\s*详情", raw_p, maxsplit=1)[0].split())
+                    p_who = (pr["sender_name"] or pr["sender_id"] or "群内同事").strip()
+                    matched_lines.append(
+                        f"- {p_who}（{pr['create_time'] or '-'}，`{pr['message_id']}`）：「{(head_p or ptxt)[:180]}」"
+                    )
+                if matched_lines and (_STILL_ASKING_OWNER_ACTION_RE.search(full_text) or is_owner_action_request):
+                    raise OutboundError(
+                        EXIT_INVALID,
+                        f"{kind} 拒绝（REG-127 原群来源消息已有同事跟进/澄清防盲问门禁）："
+                        f"账本显示原群来源消息（`{src_mid}`）下已有同事回复：\n"
+                        + "\n".join(matched_lines)
+                        + "\n（主人 2026-11-06 13:53 针对 Smartproxy 充值卡追问：『这个问题解决了吗』，实为 Sammy/Sammi 早在 09:28 已在原群回复该账号不在我方纳管范围内，专席漏看群内跟进仍催主人登录充值）：\n"
+                        "请先读取并依据上述群内最新回复处理（如已无需主人操作则调 `sheepdog resolve` 结案或如实汇报『Sammy 已在群内确认非我方纳管账号，无需主人处理 --ball done』），"
+                        "严禁无视群内已有的同源澄清继续要求主人登录控制台或充值（没有发送）",
+                    )
+        except OutboundError:
+            raise
+        except Exception:
+            pass
+    if (
+        is_owner_action_request
+        and _UNVERIFIED_EXTERNAL_PROXY_CONSOLE_RECHARGE_ASK_RE.search(full_text)
+        and not _EXTERNAL_PROXY_OWNERSHIP_VERIFIED_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            f"{kind} 拒绝（REG-127 第三方代理/控制台充值前必核账号归属与群内回复门禁）："
+            "请示或要求主人/Sammy 登录第三方代理控制台（如 Smartproxy `smartproxycn.com`）确认余额并充值续订（如 `nebula*` 等账号）前，"
+            "必须先核实该账号是否属于我方运维纳管账号（我方仅纳管 `tapnow / tapnow_test / tapnow02 / tapnow0001` 等账号，`nebula*` 等外部团队自开账号不在我方控制台内），"
+            "并先核查原群来源消息下是否已有 Sammy / Sammi 或同事回复澄清（主人 2026-11-06 13:53 纠偏：『这个问题解决了吗』）；"
+            "若非我方纳管账号或群内已澄清，请勿发卡让主人登录充值（没有发送）",
+        )
 
 
 def _has_live_p2p_owner_conversation(
@@ -1101,6 +1236,34 @@ def check_ask_pre_flight_guard(
             "严禁未经核实已有资源包/按量付费为何无法使用，就再次向主人发卡请款支付新订单"
             "（主人 2026-11-06 12:10:15 在 `tp_kc` 卡片 `[其他]` 明确纠偏：『奇怪  我不是买了吗  他没法用吗』，REG-126 已购资源包防重复请款门禁）："
             "请先核实并指引需求方直接使用已购买的资源包或已开通的按量付费；若确因规格/地域/余量限制导致已购资源无法使用，必须在正文中写明『已核实...无法使用』的具体技术原因后再发起请示（没有发送）",
+        )
+    check_source_peer_followup_and_proxy_guard(
+        cfg,
+        store,
+        topic_id,
+        title,
+        body,
+        key=key,
+        about=about,
+        batch=batch,
+        kind=ASK,
+    )
+    if _DBA_NICKY_WITHHOLD_WAN_OR_CRED_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "Nicky Ye（DBA / 数据库负责人）拥有所有数据库与 Redis 的最高管理权限（`REG-122`：『nicky应该有所有数据库的最高权限 给他』），"
+            "当 Nicky 老师申请为已配置 28 个受信专线/DBA 白名单安全组的数据库或 Redis 开通外网连接地址并获取凭据时，"
+            "严禁在请示中把『A. 保持纯内网，不开放公网端口与密码外发』作为推荐首选（`建议：选 A`），而把『B. 同意开通外网（严格限制 28 个 IP 白名单）并交付凭据』贬为次选"
+            "（主人 2026-11-06 14:16:33 在 `T-131` 更正 PG 卡『这个我搞错了 我要选b（同意开通外网并严格绑安全组）』，并于 14:16:38 在 Redis 卡直接推翻『建议：选 A』改选『B：授权开通外网并由主人交付凭据』，REG-127 DBA 数据库/Redis 白名单外网与凭据推荐门禁）："
+            "请将『同意为 Nicky 老师开通外网连接（严格绑定 28 个受信专线 IP 白名单安全组）并交付连接凭据』作为明确推荐首选后再发起请示（没有发送）",
+        )
+    if _PREFER_MANUAL_TERMINAL_OVER_SESSION_SCRIPT_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当专席/父会话已备妥不手写裸凭据的合规幂等收尾脚本（如走既有 SDK / 官方 CLI）且只需主人授权即可由父会话直接执行闭环时，"
+            "严禁把『选项 A（推荐）：你在本机终端直接跑一遍脚本』作为首选推给主人手工跑，而把『选项 B：授权父会话直接调用该脚本完成切换』贬为次选"
+            "（主人 2026-11-06 15:11 在 `tp_tapnow-prod-topology` 卡片直接推翻推荐 A、改选『B：授权父会话执行收尾脚本完成切换』，REG-127 授权会话自动执行合规脚本优先门禁）："
+            "请将『授权父会话/专席直接调用合规脚本端到端完成并回读验证』作为首选建议（选项 A）后再发起请示（没有发送）",
         )
     if floor or floor_type:
         return
@@ -1720,6 +1883,10 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
         )
     else:
         ball = decision_hub.enforce_report_contract(cfg, store, topic_id, title, combined_for_check, key=key, ball=ball, fyi=fyi)
+        check_source_peer_followup_and_proxy_guard(
+            cfg, store, topic_id, title, combined_for_check,
+            key=key, about=about, batch=batch, kind=REPORT, ball=ball, fyi=fyi,
+        )
         check_transitional_state_report_guard(
             cfg, store, topic_id, title, summary, body,
             defer_item=defer_item, ball=ball, fyi=fyi, transcript_text=transcript_text,

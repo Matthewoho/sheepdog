@@ -1986,10 +1986,24 @@ class Collector:
             e = self.store.get_escalation(quoted)
             if e is not None:
                 target = e["topic_id"]
-                answered = [e] if not e["closed_at"] else []
+                if not e["closed_at"]:
+                    answered = [e]
+                else:
+                    tags.append(f"escalation_followup:{e['message_id']}")
             else:
                 o = self.store.get_bot_outbox(quoted) or self.store.send_by_message(quoted)
                 target = (o["topic_id"] or "") if o is not None else ""
+        if not target and not from_index:
+            from . import decision_hub
+            mis_esc, _ = decision_hub.find_misclick_target_escalation(
+                self.store,
+                m,
+                topic_id=tg.owner_of(self.store, item),
+                origin_root_id=item["root_message_id"] or "",
+            )
+            if mis_esc is not None:
+                target = mis_esc["topic_id"]
+                tags.append(f"escalation_followup:{mis_esc['message_id']}")
         if not target and not from_index and opens:
             target = opens[0]["topic_id"]
             for e in opens:
@@ -5768,6 +5782,67 @@ class Dispatcher:
         except Exception as e:
             log.warning("回执 %s/%s 写进羊群看板出错: %s", topic_id, batch_id, e)
 
+    def _escalation_source_followup_notes(self, r) -> list[str]:
+        """1.1.38 (REG-127): 当投递卡片回调（escalation:<mid>）或核实提醒（escalation_check:<mid>）时，
+        自动从账本附带原群来源消息（about_message_id）下的后续群内回复（含其他成员或 VIP 助理如 Sammi 的回复），
+        杜绝专席因未收到无 @ 的群内跟进而对主人误报『尚未解决 / 仍需主人登录充值』。"""
+        try:
+            tags = json.loads(r["tags_json"] or "[]")
+        except Exception:
+            return []
+        esc_mids: list[str] = []
+        for tg in tags:
+            if not isinstance(tg, str):
+                continue
+            for pfx in ("escalation:", "escalation_check:", "escalation_expiring:"):
+                if tg.startswith(pfx):
+                    emid = tg[len(pfx) :].strip()
+                    if emid and emid not in esc_mids:
+                        esc_mids.append(emid)
+        if not esc_mids:
+            return []
+        me = self.cfg.self_open_id
+        notes: list[str] = []
+        seen_about: set[str] = set()
+        r_content = r["content"] or ""
+        for emid in esc_mids:
+            for s in self.store.escalation_sources(emid):
+                about_mid = (s["about_message_id"] or "").strip()
+                about_chat = (s["about_chat_id"] or "").strip()
+                if not about_mid or not about_chat or about_mid in seen_about:
+                    continue
+                seen_about.add(about_mid)
+                src = self.store.get_message(about_mid)
+                if src is None or (src["chat_type"] or "") == "p2p":
+                    continue
+                tid = (src["thread_id"] or "").strip()
+                rows = self.store.conn.execute(
+                    "SELECT message_id, sender_id, sender_name, create_time, content "
+                    "FROM messages WHERE chat_id=? AND COALESCE(deleted,0)=0 "
+                    "AND message_id != ? AND sender_id != ? "
+                    "AND COALESCE(sender_type, '') NOT IN ('app', 'bot', 'system') "
+                    "AND (reply_to=? OR root_id=? OR (? != '' AND thread_id=?)) "
+                    "ORDER BY create_time ASC, rowid ASC LIMIT 8",
+                    (about_chat, about_mid, me, about_mid, about_mid, tid, tid),
+                ).fetchall()
+                items: list[str] = []
+                unmentioned_count = 0
+                for m in rows:
+                    txt = " ".join((m["content"] or "").split())
+                    if not txt:
+                        continue
+                    if m["message_id"] not in r_content:
+                        unmentioned_count += 1
+                    who = (m["sender_name"] or m["sender_id"] or "群成员").strip()
+                    items.append(f"- {m['create_time'] or '-'} {who}（`{m['message_id']}`）：{txt[:220]}")
+                if items and (r["chat_type"] != SYSTEM_CHAT or unmentioned_count > 0):
+                    notes.append(
+                        f"💬 原群来源消息（`{about_mid}`）后续已有 {len(items)} 条群内回复"
+                        "（账本记录，请结合群内最新进展处理，勿重复旧结论或漏看他人回复）：\n"
+                        + "\n".join(items)
+                    )
+        return notes
+
     def _collision_notes(self, t, rows) -> dict[str, list[str]]:
         """第 3 步撞车检查（只提醒不拦，送给谁不变）。以路由事实为主：消息里的编号，最近 routed_active_hours 小时内
         送到过别的会话（还没转交、没自报做完）；别的会话手上还开着的活（自动补的、会话自报的）也算，措辞写明来源。"""
@@ -5775,9 +5850,12 @@ class Dispatcher:
         hours = self.cfg.duty.routed_active_hours
         out: dict[str, list[str]] = {}
         for r in rows:
+            src_notes = self._escalation_source_followup_notes(r)
             if r["chat_type"] == SYSTEM_CHAT:
+                if src_notes:
+                    out[r["message_id"]] = src_notes
                 continue
-            lines: list[str] = []
+            lines: list[str] = list(src_notes)
             for key in duty.extract_keys(r["content"] or "", pats):
                 owners: dict[str, dict] = {}
                 for rt in duty.route_holders(self.store, key, t["topic_id"], now, hours):
