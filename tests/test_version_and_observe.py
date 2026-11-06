@@ -6970,6 +6970,121 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("REG-106", str(cm_mg.exception))
             st.close()
 
+    def test_reg132_no_cross_escalation_auto_settle_on_card_callback_and_a_not_a_accept(self) -> None:
+        """1.1.43 (REG-132):
+        1) 当同一会话名下并存两张待拍板卡（ask1 与 ask2），主人点击 ask2 的卡片按钮产生 `sd_card_cb_*`（带 `card_callback` 与
+           `escalation:om_ask2_132` 标签，或已作为 ask2 的 `answer_message_id`）后，会话为该回调批次交回 `waiting` 回执时，
+           `auto_settle_open_escalations_on_owner_batch` 与 `pending._owner_followups` 严禁拿 ask2 的专属回调或已绑定回复
+           跨卡自动结案仍未拍板的 ask1；而无卡片排他绑定的通用现场指令仍正常自动结案 ask1。
+        2) 主人在 `[其他]` 回复『按你建议推荐给他看看用不用』或『按你的建议看看对不对』时，`_ACCEPT_WORDS_RE` 命中且
+           `_OVERRIDE_WORDS_RE` 不因中文正反问（`用不用` / `对不对`）误判为推翻，决策对齐结果必为 `accepted`。"""
+        from sheepdog import admin_web, engine, pending
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Store(Path(tmp) / "state.db")
+            cfg = Config(
+                state_dir=Path(tmp),
+                self_open_id="ou_owner_132",
+            )
+            st.upsert_topic(
+                "tp_infra_132",
+                title="迁移运维专席",
+                state="active",
+                host="codex",
+                conversation_id="019a0000-0000-7000-8000-000000000132",
+            )
+            # 登记两张同专席不同事项的拍板卡：ask1 仍未决，ask2 刚由卡片按钮回调结案
+            st.conn.execute(
+                "INSERT INTO escalations (message_id, topic_id, chat_id, asked_at, text, hub_message_id) "
+                "VALUES ('om_ask1_132', 'tp_infra_132', 'oc_tg_132', '2026-11-06T20:59:02+08:00', "
+                "'🐕 需要你定 · 7张上线审计运维安全单认领确认 [tp_infra_132]\nA. 同意认领\nB. 暂不认领\n建议：选 A', 'om_hub1_132')"
+            )
+            st.conn.execute(
+                "INSERT INTO escalations (message_id, topic_id, chat_id, asked_at, answered_at, closed_at, close_reason, answer_message_id, text, hub_message_id) "
+                "VALUES ('om_ask2_132', 'tp_infra_132', 'oc_tg_132', '2026-11-06T21:23:54+08:00', "
+                "'2026-11-06T21:27:36+08:00', '2026-11-06T21:27:36+08:00', 'answered', 'sd_card_cb_ask2_132', "
+                "'🐕 需要你定 · 生产摘除旧对象存储挂载确认 [tp_infra_132]\nA. 同意摘除\nB. 暂缓\n建议：选 A', 'om_hub2_132')"
+            )
+            # 写入 ask2 的卡片回调消息（距 ask1 仅 28 分钟，落在 30 分钟窗口内）
+            st.conn.execute(
+                "INSERT INTO messages (message_id, chat_id, chat_type, sender_id, sender_name, content, create_time, first_seen, last_seen, "
+                "reply_to, thread_id, reason, topic_id, tags_json) "
+                "VALUES ('sd_card_cb_ask2_132', 'oc_tg_132', 'group', 'ou_owner_132', 'Matthew', "
+                "'{\"text\":\"[卡片回调] A：同意摘除\"}', '2026-11-06T21:27:36+08:00', '2026-11-06T21:27:36+08:00', '2026-11-06T21:27:36+08:00', "
+                "'om_ask2_132', 'omt_132', 'owner_reply', 'tp_infra_132', "
+                "'[\"owner_verified\", \"card_callback\", \"item:T-12\", \"escalation:om_ask2_132\"]')"
+            )
+            st.conn.execute(
+                "INSERT INTO dispatches (batch_id, topic_id, sent_at, state, message_ids) "
+                "VALUES ('batch_cb_ask2_132', 'tp_infra_132', "
+                "'2026-11-06T21:27:37+08:00', 'acked', '[\"sd_card_cb_ask2_132\"]')"
+            )
+            st.conn.commit()
+
+            cb_row = st.get_message("sd_card_cb_ask2_132")
+            self.assertTrue(engine.msg_targets_other_escalation(st, cb_row, "om_ask1_132", "om_hub1_132"))
+            self.assertFalse(engine.msg_targets_other_escalation(st, cb_row, "om_ask2_132", "om_hub2_132"))
+
+            settled = engine.auto_settle_open_escalations_on_owner_batch(
+                cfg,
+                st,
+                None,
+                "tp_infra_132",
+                "batch_cb_ask2_132",
+                {"status": "waiting", "summary": "已按卡片回调 A 完成生产旧挂载摘除"},
+            )
+            self.assertEqual(settled, [])
+            ask1_after = st.get_escalation("om_ask1_132")
+            self.assertIsNone(ask1_after["closed_at"])
+            self.assertIsNone(ask1_after["answered_at"])
+
+            # 同时验证：若主人在群里对另一张卡 om_ask2_132 引用回复普通消息，也不会跨卡自动结案 om_ask1_132
+            st.conn.execute(
+                "INSERT INTO messages (message_id, chat_id, chat_type, sender_id, sender_name, content, create_time, first_seen, last_seen, "
+                "reply_to, thread_id, reason, topic_id, tags_json) "
+                "VALUES ('om_reply_ask2_132', 'oc_src_132', 'group', 'ou_owner_132', 'Matthew', "
+                "'{\"text\":\"选 A\"}', '2026-11-06T21:28:00+08:00', '2026-11-06T21:28:00+08:00', '2026-11-06T21:28:00+08:00', "
+                "'om_ask2_132', '', 'owner_instruction', 'tp_infra_132', "
+                "'[\"owner_instruction\"]')"
+            )
+            st.conn.execute(
+                "INSERT INTO escalation_sources (ask_message_id, about_message_id, about_chat_id, topic_id, origin, created_at) "
+                "VALUES ('om_ask1_132', 'om_src1_132', 'oc_src_132', 'tp_infra_132', 'batch', '2026-11-06T20:59:02+08:00')"
+            )
+            st.conn.commit()
+            fups = pending._owner_followups(cfg, st, st.escalation_sources("om_ask1_132"), ask1_after)
+            self.assertEqual([r["message_id"] for r in fups], [])
+
+            # 2) 验证『按你建议推荐给他看看用不用』被精准判为 accepted（而非被『不用』子串误判为 overridden）
+            esc_voice_row = {
+                "message_id": "om_voice_ask_132",
+                "topic_id": "tp_infra_132",
+                "chat_id": "oc_tg_132",
+                "text": (
+                    "🐕 需要你定 · 语音服务生产独立域名选定 [tp_infra_132]\n"
+                    "A. 用 asr 独立子域名（推荐）\n"
+                    "B. 用 voice 子域名\n"
+                    "建议：选 A"
+                ),
+                "asked_at": "2026-11-06T21:11:36+08:00",
+                "answered_at": "2026-11-06T21:14:51+08:00",
+                "closed_at": "2026-11-06T21:14:51+08:00",
+                "close_reason": "answered",
+                "resolved_by": None,
+                "resolve_note": None,
+                "nudge_count": 0,
+            }
+            voice_dec = admin_web.classify_escalation(esc_voice_row, "[卡片回调] 其他：按你建议推荐给他看看用不用")
+            self.assertEqual(voice_dec["alignment"], "accepted")
+            # 真正的否定词『先不用』『不对』仍保持命中 _OVERRIDE_WORDS_RE
+            self.assertIsNotNone(admin_web._OVERRIDE_WORDS_RE.search("先不用弄这个"))
+            self.assertIsNotNone(admin_web._OVERRIDE_WORDS_RE.search("这个方案不对"))
+            self.assertIsNone(admin_web._OVERRIDE_WORDS_RE.search("按你建议推荐给他看看用不用"))
+            self.assertIsNone(admin_web._OVERRIDE_WORDS_RE.search("你看看对不对"))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

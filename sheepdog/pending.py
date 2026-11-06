@@ -359,6 +359,11 @@ def _owner_followups(cfg, store: Store, srcs, e=None) -> list:
                 f"SELECT * FROM messages WHERE sender_id=? AND chat_id IN ({marks}) AND COALESCE(deleted,0)=0",
                 (me, *sorted(p2p_chats))):
             out[r["message_id"]] = r
+    if e is not None and "message_id" in e.keys():
+        e_mid = str(e["message_id"] or "").strip()
+        e_hub = str(e["hub_message_id"] or "").strip() if "hub_message_id" in e.keys() else ""
+        if e_mid:
+            return [r for r in out.values() if not eng.msg_targets_other_escalation(store, r, e_mid, e_hub)]
     return list(out.values())
 
 

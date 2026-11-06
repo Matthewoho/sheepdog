@@ -6988,6 +6988,71 @@ _RECEIPT_CONFIRMS_OWNER_HANDLED_RE = re.compile(
 )
 
 
+def msg_targets_other_escalation(
+    store: Store,
+    r,
+    target_mid: str,
+    target_hub: str = "",
+) -> bool:
+    """1.1.43（REG-132）：判断一条主人消息 r 是否已排他性绑定到另一张待决/已决拍板卡（而非当前卡 target_mid / target_hub）。
+    满足以下任一条件即视为指向其他拍板卡，严禁跨卡复用于自动结案当前卡或误标 possibly_handled：
+    1) tags_json 中带 `escalation:<id>` 或 `escalation_followup:<id>`，且与当前卡 message_id/hub_message_id 均不匹配；
+    2) 消息本身是卡片回调（`sd_card_cb_*` 或带 `card_callback` 标签），且未显式绑定到当前卡；
+    3) reply_to 指向账本中的另一张拍板卡（escalations.message_id 或 hub_message_id）；
+    4) 该消息已作为另一张拍板卡的 answer_message_id 记录在案。"""
+    if r is None:
+        return False
+    allowed = {m.strip() for m in (target_mid or "", target_hub or "") if (m or "").strip()}
+    if not allowed:
+        return False
+    r_keys = set(r.keys()) if hasattr(r, "keys") else set()
+    mid = str((r["message_id"] if "message_id" in r_keys else "") or "").strip()
+    rep_to = str((r["reply_to"] if "reply_to" in r_keys else "") or "").strip()
+    tags_raw = str((r["tags_json"] if "tags_json" in r_keys else "") or "[]")
+    try:
+        tags = json.loads(tags_raw) if tags_raw else []
+    except Exception:
+        tags = []
+    if not isinstance(tags, list):
+        tags = []
+    bound_escs = {
+        t.split(":", 1)[1].strip()
+        for t in tags
+        if isinstance(t, str)
+        and t.startswith(("escalation:", "escalation_followup:"))
+        and ":" in t
+        and t.split(":", 1)[1].strip()
+    }
+    if bound_escs and bound_escs.isdisjoint(allowed):
+        return True
+    is_cb = mid.startswith("sd_card_cb_") or ("card_callback" in tags)
+    if is_cb and not ((bound_escs & allowed) or (rep_to and rep_to in allowed)):
+        return True
+    if rep_to and rep_to not in allowed:
+        other_esc = store.get_escalation(rep_to)
+        if other_esc is None:
+            other_esc = store.conn.execute(
+                "SELECT message_id FROM escalations WHERE hub_message_id=?",
+                (rep_to,),
+            ).fetchone()
+        if other_esc is not None and str(other_esc["message_id"] or "").strip() not in allowed:
+            return True
+    if mid:
+        ans_rows = store.conn.execute(
+            "SELECT message_id, COALESCE(hub_message_id, '') AS hub_message_id "
+            "FROM escalations WHERE answer_message_id=?",
+            (mid,),
+        ).fetchall()
+        for ar in ans_rows:
+            ar_mids = {
+                str(ar["message_id"] or "").strip(),
+                str(ar["hub_message_id"] or "").strip(),
+            } - {""}
+            if ar_mids and ar_mids.isdisjoint(allowed):
+                return True
+    return False
+
+
 def auto_settle_open_escalations_on_owner_batch(
     cfg: Config,
     store: Store,
@@ -6996,8 +7061,8 @@ def auto_settle_open_escalations_on_owner_batch(
     batch_id: str,
     receipt: dict | None = None,
 ) -> list[str]:
-    """1.1.21（REG-110）/ 1.1.34（REG-123）：当某个会话名下有未关闭的「需要你定」提问，且：
-    1) 主人在原业务群（或对该会话）直接下达了 owner_instruction / owner_reply 指令，会话交回非 needs_decision 回执；或
+    """1.1.21（REG-110）/ 1.1.34（REG-123）/ 1.1.43（REG-132）：当某个会话名下有未关闭的「需要你定」提问，且：
+    1) 主人在原业务群（或对该会话）直接下达了未排他绑定到其他卡片的 owner_instruction / owner_reply 指令，会话交回非 needs_decision 回执；或
     2) 主人在来源私聊/群内亲自发言（owner_context / escalation_check），且会话交回的回执 summary 明确确认
        『由主人在私聊/群里亲自沟通/回复，本会话保持静默观望』时，
     自动用主人的这条发言将同会话对应的 open escalation 结案，并同步将话题群与拍板总台双卡片置绿。"""
@@ -7039,10 +7104,13 @@ def auto_settle_open_escalations_on_owner_batch(
             owner_msgs.append(r)
     settled: list[str] = []
     for e in open_escs:
+        e_keys = set(e.keys()) if hasattr(e, "keys") else set()
+        e_mid = str(e["message_id"] or "").strip()
+        e_hub = str(e["hub_message_id"] or "").strip() if "hub_message_id" in e_keys else ""
         asked = _parse(e["asked_at"] or "")
         src_chats = {
             s["about_chat_id"]
-            for s in store.escalation_sources(e["message_id"])
+            for s in store.escalation_sources(e_mid)
             if s["about_chat_id"]
         }
         cand_msgs = list(owner_msgs)
@@ -7057,6 +7125,8 @@ def auto_settle_open_escalations_on_owner_batch(
                     cand_msgs.append(row_ctx)
         matched_r = None
         for r in reversed(cand_msgs):
+            if msg_targets_other_escalation(store, r, e_mid, e_hub):
+                continue
             c_dt = _parse(r["create_time"] or "")
             f_dt = _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
             dts = [x for x in (c_dt, f_dt) if x is not None]
@@ -7069,24 +7139,30 @@ def auto_settle_open_escalations_on_owner_batch(
                 matched_r = r
                 break
         if matched_r is not None:
-            store.answer_escalation(e["message_id"], matched_r["message_id"], allow_update=True)
-            is_cb = "raw_json" in matched_r.keys() and '"_sd_card_callback"' in (matched_r["raw_json"] or "")
+            store.answer_escalation(e_mid, matched_r["message_id"], allow_update=True)
+            m_mid = str(matched_r["message_id"] or "").strip()
+            m_tags_raw = str((matched_r["tags_json"] if "tags_json" in matched_r.keys() else "") or "[]")
+            is_cb = (
+                m_mid.startswith("sd_card_cb_")
+                or '"card_callback"' in m_tags_raw
+                or ("raw_json" in matched_r.keys() and '"_sd_card_callback"' in (matched_r["raw_json"] or ""))
+            )
             if decision_hub.hub_active(cfg, store) and not is_cb:
                 decision_hub.sync_escalation_dual_cards(
                     cfg,
                     store,
                     source,
-                    e["message_id"],
+                    e_mid,
                     chosen_display=" ".join(plain_text(matched_r["content"] or "").split())[:60] or "主人已亲自回复",
                     answered_at=matched_r["create_time"] or now_iso(),
                 )
-            settled.append(e["message_id"])
+            settled.append(e_mid)
             log.info(
                 "会话 %s 批次 %s 已按主人现场发言 %s 处理完毕，自动结案待定提问 %s",
                 topic_id,
                 batch_id,
                 matched_r["message_id"],
-                e["message_id"],
+                e_mid,
             )
     return settled
 
