@@ -1104,10 +1104,15 @@ def run_observe(
                     t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir))
                     in_flight = {id(x) for x in _extract_post_dispatch_steps(t_steps, (tr["pending_batch_id"] or "").strip(), tr["dispatched_at"])} if (tr["state"] or "") == "running" and (tr["pending_batch_id"] or "").strip() else set()
                     healed_at_dt = None
+                    bus_healed_at_dt = None
                     if "meta" in tabs:
                         r_heal = c.execute("SELECT value FROM meta WHERE key = ?", (f"reg057_healed_at:{t_tid}",)).fetchone()
                         if r_heal and r_heal["value"]:
                             healed_at_dt = parse_iso(str(r_heal["value"]))
+                        if t_tid == bus_topic_id:
+                            r_bus_heal = c.execute("SELECT value FROM meta WHERE key = ?", (f"bus_boundary_healed_at:{t_tid}",)).fetchone()
+                            if r_bus_heal and r_bus_heal["value"]:
+                                bus_healed_at_dt = parse_iso(str(r_bus_heal["value"]))
                     bad_calls: list[str] = []
                     unbounded_cmds: list[str] = []
                     for s in t_steps:
@@ -1122,6 +1127,8 @@ def run_observe(
                             t_name = str(tc.get("name") or tc.get("tool_name") or "")
                             t_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
                             if t_tid == bus_topic_id and t_name in _BUS_FORBIDDEN_TOOLS:
+                                if bus_healed_at_dt is not None and s_dt is not None and s_dt <= bus_healed_at_dt:
+                                    continue
                                 wf_path = str(t_args.get("Path") or t_args.get("path") or "").strip() if t_name == "write_file" else ""
                                 if t_name == "write_file" and wf_path.startswith(("/tmp/", "/private/tmp/")) and wf_path.endswith(".md"):
                                     continue
@@ -1130,6 +1137,8 @@ def run_observe(
                                 raw_cmd = decode_command_line(t_args.get("CommandLine") or t_args.get("command") or "")
                                 cmd_str = normalize(raw_cmd)
                                 if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
+                                    if bus_healed_at_dt is not None and s_dt is not None and s_dt <= bus_healed_at_dt:
+                                        continue
                                     bad_calls.append(f"run_command({cmd_str[:60]})")
                                 if _is_unbounded_code_search(raw_cmd):
                                     if healed_at_dt is not None and s_dt is not None and s_dt <= healed_at_dt:
@@ -1157,7 +1166,24 @@ def run_observe(
                             for uc in unbounded_cmds:
                                 warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {uc}")
                     if bad_calls:
-                        warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
+                        if self_heal and (tr["state"] or "") != "running":
+                            try:
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (t_tid,))
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"bus_boundary_healed_at:{t_tid}", iso(ref_now)),
+                                        )
+                                    wc.commit()
+                                self_healed.append(f"{t_tid}:bus_boundary_rules_reset")
+                                info.append(
+                                    f"已对 {t_tid} 的历史越权调用（{', '.join(bad_calls[:3])}）执行规则指纹自愈重置（rules_hash=NULL，下一批重发总线边界红线）"
+                                )
+                            except sqlite3.Error:
+                                warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
+                        else:
+                            warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
 
             # ==================== L4: 噪音剃刀与核心不变量 ====================
             # L4.2: ask_jumps 噪音剃刀（仅统计未结案/超时异常提问；持续入 warn 由指纹冷却防重复飞书通知与防假恢复）

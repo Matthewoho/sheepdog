@@ -7085,6 +7085,155 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIsNone(admin_web._OVERRIDE_WORDS_RE.search("你看看对不对"))
             st.close()
 
+    def test_reg133_bus_boundary_guard_post_batch_self_heal_rules_reset(self):
+        """REG-133 (1.1.44):
+        1) 当 tp_bus 正在运行（state='running'）或 self_heal=False 时，检测到越界调用（gcloud / write_file 非 .md）立即报 warn；
+        2) 当 tp_bus 越权批次已收口（state='active'）且 self_heal=True 时，自动将 tp_bus 的 rules_hash 置为 NULL，
+           写入 meta['bus_boundary_healed_at:tp_bus'] 水位并记入 self_healed=['tp_bus:bus_boundary_rules_reset']，
+           后续滑窗内不再对水位之前的已自愈越权步骤重复报 warn；若水位之后再次发生越权，仍重新拦截自愈；
+        3) cli._show_topic 在历史专席无本地问答记录时，明确提示直接用 sheepdog forward 转交即可由守护进程自动换壳重建容器。
+        """
+        import io
+        from contextlib import redirect_stdout
+        from sheepdog import cli
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(state_dir=root)
+            st = Store(cfg.db_path)
+            brain_dir = root / "brain"
+            ref_now = observe.parse_iso("2026-11-06T22:30:00+08:00")
+            disp_at = observe.iso(ref_now - timedelta(minutes=20))
+
+            st.conn.execute(
+                """
+                INSERT INTO topics (topic_id, title, kind, conversation_id, host, state, pending_batch_id, dispatched_at, rules_hash, created_at, last_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("tp_bus", "总线", "bus", "cid-bus-133", "antigravity", "running", "b-bus-133", disp_at, "hash_old_133", disp_at, disp_at),
+            )
+            t_bus = brain_dir / "cid-bus-133" / ".system_generated" / "logs" / "transcript.jsonl"
+            t_bus.parent.mkdir(parents=True, exist_ok=True)
+            step1 = {
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": observe.iso(ref_now - timedelta(minutes=15)),
+                "tool_calls": [
+                    {"name": "write_file", "args": {"Path": "/tmp/appeal_summary.txt"}},
+                    {"name": "run_command", "args": {"CommandLine": json.dumps("gcloud projects describe demo-test-env")}},
+                ],
+            }
+            t_bus.write_text(json.dumps(step1, ensure_ascii=False) + "\n", encoding="utf-8")
+            st.conn.commit()
+
+            # 1) 在途运行（state='running'）时，即使传 self_heal=True 也必须保留实时告警，不提前吞掉
+            res_running = observe.run_observe(
+                cfg,
+                now_dt=ref_now,
+                since_minutes=65.0,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertTrue(
+                any("总线越权干活" in w and "write_file" in w and "gcloud" in w for w in res_running["warns"]),
+                res_running["warns"],
+            )
+            self.assertEqual(st.get_topic("tp_bus")["rules_hash"], "hash_old_133")
+
+            # 2) 批次收口后（state='active', pending_batch_id=None），self_heal=False 仍报 warn
+            st.conn.execute("UPDATE topics SET state = 'active', pending_batch_id = NULL WHERE topic_id = 'tp_bus'")
+            st.conn.commit()
+            res_no_heal = observe.run_observe(
+                cfg,
+                now_dt=ref_now,
+                since_minutes=65.0,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=False,
+            )
+            self.assertTrue(
+                any("总线越权干活" in w for w in res_no_heal["warns"]),
+                res_no_heal["warns"],
+            )
+
+            # 3) 批次收口后（state='active'）且 self_heal=True：自动重置 rules_hash=NULL 并记录 bus_boundary_healed_at:tp_bus 水位
+            res_healed = observe.run_observe(
+                cfg,
+                now_dt=ref_now,
+                since_minutes=65.0,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=True,
+            )
+            self.assertFalse(
+                any("总线越权干活" in w for w in res_healed["warns"]),
+                res_healed["warns"],
+            )
+            self.assertIn("tp_bus:bus_boundary_rules_reset", res_healed["self_healed"])
+            self.assertIsNone(st.get_topic("tp_bus")["rules_hash"])
+            self.assertEqual(st.get_meta("bus_boundary_healed_at:tp_bus"), observe.iso(ref_now))
+
+            # 4) 5 分钟后再次巡检（即使 self_heal=False），已自愈水位之前的历史步骤不再重复拉红
+            res_after = observe.run_observe(
+                cfg,
+                now_dt=ref_now + timedelta(minutes=5),
+                since_minutes=65.0,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=False,
+            )
+            self.assertFalse(
+                any("总线越权干活" in w for w in res_after["warns"]),
+                res_after["warns"],
+            )
+
+            # 4b) 若自愈水位之后（+3 分钟）再次发生新的越权调用，仍会重新捕获告警
+            step2 = {
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": observe.iso(ref_now + timedelta(minutes=3)),
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": json.dumps("gcloud services list --project=demo-test-env")}},
+                ],
+            }
+            t_bus.write_text(
+                json.dumps(step1, ensure_ascii=False) + "\n" + json.dumps(step2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            res_new_overreach = observe.run_observe(
+                cfg,
+                now_dt=ref_now + timedelta(minutes=5),
+                since_minutes=65.0,
+                antigravity_brain_dir=brain_dir,
+                check_processes=False,
+                check_log=False,
+                self_heal=False,
+            )
+            self.assertTrue(
+                any("总线越权干活" in w and "gcloud services list" in w for w in res_new_overreach["warns"]),
+                res_new_overreach["warns"],
+            )
+
+            # 5) 验证 cli._show_topic 在历史专席无本地记录时输出自动换壳提示
+            st.create_topic("tp_hist_133", "历史排查专席", "dynamic", "排查职责", "active")
+            st.update_topic("tp_hist_133", conversation_id="cid-missing-local-133")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli._show_topic(cfg, st, "tp_hist_133", 5)
+            self.assertEqual(rc, 0)
+            out_str = buf.getvalue()
+            self.assertIn("可能会话记录不在本机", out_str)
+            self.assertIn("直接用 sheepdog forward 转交即可", out_str)
+            self.assertIn("自动换壳", out_str)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2081,7 +2081,10 @@ def _show_topic(cfg, store: Store, topic_id: str, limit: int) -> int:
     print(f"{t['title']}（{HOST_LABEL.get(host, host)}，topic {topic_id}，会话 {t['conversation_id']}）")
     items = sink.history(t["conversation_id"], limit)
     if not items:
-        print("（记录里没有问答，可能会话记录不在本机，或者还没跑过）")
+        print(
+            "（记录里没有问答，可能会话记录不在本机，或者还没跑过；如需让该会话处理，直接用 sheepdog forward 转交即可，"
+            "守护进程会自动换壳拉起新容器并恢复历史上下文，总线切勿替它自己跑命令或发 report）"
+        )
     for role, text, ts in items:
         text = (text or "").strip()
         lines = text.splitlines() or [""]
