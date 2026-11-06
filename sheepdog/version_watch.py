@@ -171,6 +171,23 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def is_release_gate_inflight() -> bool:
+    """REG-130：检查本机是否正在运行 scripts/release_gate.py 全量测试闸门，避免在闸门运行期间抢先发『新版提醒』或误报『版本不一致已超 N 分钟』。"""
+    env_dir = os.environ.get("SHEEPDOG_RELEASE_GATE_DIR")
+    gdir = Path(env_dir).expanduser() if env_dir else Path.home() / ".local" / "state" / "sheepdog-release-gate"
+    inflight_file = gdir / "inflight.json"
+    if not inflight_file.is_file():
+        return False
+    try:
+        data = json.loads(inflight_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        pid = int(data.get("pid") or 0)
+        return pid > 0 and _pid_alive(pid)
+    except Exception:
+        return False
+
+
 def _resolve_mem(store, runtime_info: dict | None, root: Path) -> dict:
     mem = runtime_info if isinstance(runtime_info, dict) else (_safe_json(store.get_meta("daemon_runtime")) if store else None)
     return mem if isinstance(mem, dict) else version_info(root, prefer_disk_version=False)
@@ -225,7 +242,7 @@ def check_version_update(cfg, store, dispatcher, *, runtime_info: dict | None = 
 
     disk_t, mem_t = parse_version_tuple(disk["version"]), parse_version_tuple(mem.get("version") or "")
     sha_changed = bool(disk["git_sha"] and mem.get("git_sha") and disk["git_sha"] != mem.get("git_sha"))
-    if (disk_t and mem_t and disk_t > mem_t) or (disk_t == mem_t and sha_changed):
+    if ((disk_t and mem_t and disk_t > mem_t) or (disk_t == mem_t and sha_changed)) and not is_release_gate_inflight():
         local_key = f"local:{disk['version']}:{disk['git_sha'][:12]}"
         mem_disp, pid = mem.get("display") or mem.get("version") or "?", mem.get("pid") or os.getpid()
         _emit(local_key, (
@@ -847,7 +864,9 @@ def check_version_drift(c, disk_ver_info: dict, version_mismatch_since: str | No
                 mismatch_sec = max(0.0, (ref_now - datetime.fromisoformat(mismatch_since)).total_seconds())
             except ValueError:
                 mismatch_sec = 0.0
-            if mismatch_sec >= 300:
+            if is_release_gate_inflight():
+                infos.append(f"磁盘版本 {disk_ver_info['display']} ≠ 常驻进程 {daemon_runtime.get('display', d_ver)}（上线闸门测试运行中 {int(mismatch_sec)}s）")
+            elif mismatch_sec >= 300:
                 warns.append(f"版本不一致已超 {int(mismatch_sec // 60)} 分钟：磁盘代码为 {disk_ver_info['display']}，但常驻进程仍运行在 {daemon_runtime.get('display', d_ver)}（PID {daemon_runtime.get('pid')}），请重启")
             else:
                 infos.append(f"磁盘版本 {disk_ver_info['display']} ≠ 常驻进程 {daemon_runtime.get('display', d_ver)}（观察中 {int(mismatch_sec)}s）")

@@ -6706,6 +6706,102 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertLessEqual(len(summary), 160)
             st.close()
 
+    def test_reg130_fe_repo_owner_feedback_first_guard_and_release_gate_inflight_suppress(self) -> None:
+        """REG-130:
+        1) Asking Matthew whether to claim a Linear issue and submit a PR to frontend repo
+           fe-app-tapnow (or embed-cn-pages.yml) without first feeding back to frontend owner
+           laohu and confirming he has no bandwidth is blocked by check_ask_pre_flight_guard;
+           if laohu already confirmed he has no bandwidth ('老胡没空处理'), the ask passes.
+        2) While scripts/release_gate.py has an active inflight.json with a live PID,
+           version_watch.check_version_drift emits an info ('上线闸门测试运行中') instead of
+           a warning ('版本不一致已超 N 分钟').
+        """
+        from datetime import datetime, timedelta, timezone
+        from sheepdog import admin_web, outbound, version_watch
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            st = Store(root / "sheepdog.sqlite3")
+            cfg = Config(state_dir=root, self_open_id="ou_test_owner")
+
+            bad_fe_pr_ask = (
+                "已查清：embed-dev.tapnow.tv 在 17:58~18:24 期间打不开是因为 main 密集合入触发 CI cancel-in-progress 强杀 pages deploy。请定要不要建单提 PR 把这个 CI 强杀缺陷修掉。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 在 Linear P-ENG-249 建单认领，并向 Tamar-Edge-AI/fe-app-tapnow 提 PR 修复 .github/workflows/embed-cn-pages.yml\n"
+                "B. 暂不建单提 PR，仅同步千问对接侧\n"
+                "建议：选 A\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_fe:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "是否建单并提 PR 修复 embed-dev 发布中途强杀导致 /api 404",
+                    bad_fe_pr_ask,
+                    key="fe-pr-130",
+                )
+            self.assertIn("REG-130", str(cm_fe.exception))
+
+            good_fe_pr_ask = (
+                "已向老胡反馈 embed-dev.tapnow.tv CI cancel-in-progress 强杀问题，老胡回复目前没空处理、让我们代提 PR 修复。请确认是否建单并向 fe-app-tapnow 提 PR。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 在 Linear P-ENG-249 建单认领，并向 Tamar-Edge-AI/fe-app-tapnow 提 PR 修复 .github/workflows/embed-cn-pages.yml\n"
+                "B. 暂缓提 PR\n"
+                "建议：选 A\n"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_tapnow-prod-topology",
+                "老胡没空处理后代提 fe-app-tapnow CI 修复 PR",
+                good_fe_pr_ask,
+                key="fe-pr-good-130",
+            )
+
+            cat, label = admin_web.diagnose_override_reason(
+                bad_fe_pr_ask,
+                "这个你让laohu来吧 你跟他反馈一下问题 如果他说没空 你就要跟我说",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((cat, label), ("peer_or_owner_delegate", "未先找专席或Owner"))
+
+            gate_dir = root / "gate"
+            gate_dir.mkdir(parents=True, exist_ok=True)
+            inflight_file = gate_dir / "inflight.json"
+            inflight_file.write_text(
+                json.dumps({"commit": "a" * 40, "pid": os.getpid(), "started_at": "2026-11-06T19:00:00+08:00"}),
+                encoding="utf-8",
+            )
+            st.set_meta(
+                "daemon_runtime",
+                json.dumps({"version": "1.1.40", "git_sha": "b" * 40, "display": "1.1.40 (bbbbbbb)", "pid": os.getpid()}),
+            )
+            t0 = datetime(2026, 11, 6, 19, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+            t_20m = t0 + timedelta(minutes=20)
+            old_env = os.environ.get("SHEEPDOG_RELEASE_GATE_DIR")
+            try:
+                os.environ["SHEEPDOG_RELEASE_GATE_DIR"] = str(gate_dir)
+                self.assertTrue(version_watch.is_release_gate_inflight())
+                warns, infos, _ = version_watch.check_version_drift(
+                    st.conn.cursor(),
+                    {"version": "1.1.41", "git_sha": "a" * 40, "display": "1.1.41 (aaaaaaa)"},
+                    t0.isoformat(timespec="seconds"),
+                    t_20m,
+                )
+                self.assertEqual(warns, [])
+                self.assertTrue(any("上线闸门测试运行中" in x for x in infos))
+            finally:
+                if old_env is None:
+                    os.environ.pop("SHEEPDOG_RELEASE_GATE_DIR", None)
+                else:
+                    os.environ["SHEEPDOG_RELEASE_GATE_DIR"] = old_env
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

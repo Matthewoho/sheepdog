@@ -934,10 +934,16 @@ _LONG_TERM_NON_EXPIRING_TOKEN_REMEDY_RE = re.compile(
     re.I,
 )
 _STAGE_DB_OR_TUNNEL_WITHHOLD_OVER_GRANT_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:Stage|测试环境)[^\n。]{0,36}(?:Postgres|数据库|只读连接|只读账号|评测))"
+    r"\A(?=[\s\S]*(?:Stage|测试环境)[^\n。]{0,36}(?:Postgres|数据库|只读连接|只读账号|评测))"
     r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:不对外发连接串|不开(?:跨境)?隧道|不开放[^\n]*连接))"
     r"(?=[\s\S]*(?:选项\s*B|B)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:受限\s*SSH\s*隧道|无\s*Shell\s*端口转发)[^\n]*交付)"
     r"(?=[\s\S]*(?:建议\s*[：:]?\s*(?:选\s*)?A\b|(?:选项\s*A|A\.)[^\n]*[（(]\s*推荐\s*[）)]))",
+    re.I,
+)
+_FE_REPO_SELF_PR_WITHOUT_OWNER_FEEDBACK_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:fe-app-tapnow|embed-cn-pages\.yml|embed(?:-dev)?\.tapnow\.tv)[\s\S]{0,240}(?:建单[^\n。]{0,24}提\s*PR|向[^\n。]{0,36}提\s*PR|提\s*PR\s*修复|提交\s*PR))"
+    r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:建单[^\n]*提\s*PR|向[^\n]*fe-app-tapnow[^\n]*提\s*PR|提\s*PR\s*修复))"
+    r"(?![\s\S]*(?:老胡|laohu|前端负责人)[^\n。]{0,36}(?:没空|忙|暂无法|来不及|委托我们|让我们代|已反馈))",
     re.I,
 )
 
@@ -1353,6 +1359,14 @@ def check_ask_pre_flight_guard(
             "严禁将『A. 不对外发连接串、不开隧道（仅限本机闭环）』作为首选建议，而把『B. 建受限 SSH 隧道并交付脱敏只读连接』贬为次选"
             "（主人 2026-11-05 21:15 已立规『stage你就直接给他权限让他自己弄呗』，并于 2026-11-06 18:29:35 在业务专席卡片推翻推荐 A、改选『B：同意建受限SSH隧道交付』，REG-129 Stage 脱敏只读与受限隧道自助赋能优先门禁）："
             "请将『按最小权限脱敏只读角色 + 受限白名单 SSH 隧道开通并交付申请人自助评测』作为首选建议（选项 A）后再发起请示（没有发送）",
+        )
+    if _FE_REPO_SELF_PR_WITHOUT_OWNER_FEEDBACK_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "排查出前端仓库（`fe-app-tapnow` / `embed-cn-pages.yml`）代码或发布工作流缺陷时，"
+            "严禁未先向前端负责人（老胡 / `laohu`）反馈问题，就直接请示主人『要不要由本会话建单认领并向 `fe-app-tapnow` 提 PR 修复』"
+            "（主人 2026-11-06 18:59:09 在拓扑专席卡片 `[其他]` 纠偏：『这个你让laohu来吧 你跟他反馈一下问题 如果他说没空 你就要跟我说』，REG-130 领域仓库缺陷先反馈领域 Owner 门禁）："
+            "请先将已查明的根因与日志证据反馈给前端负责人老胡（`laohu`）由其团队处理；只有当老胡明确表示没空处理时，再向主人发起代提 PR 请示（没有发送）",
         )
     if floor or floor_type:
         return

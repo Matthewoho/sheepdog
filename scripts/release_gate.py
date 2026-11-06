@@ -66,6 +66,10 @@ def record_path(sha: str) -> Path:
     return gate_dir() / f"{sha}.json"
 
 
+def inflight_path() -> Path:
+    return gate_dir() / "inflight.json"
+
+
 def default_repo() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -240,6 +244,23 @@ def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool 
     print(f"闸门：{sha}（{repo}）")
     work = Path(tempfile.mkdtemp(prefix="sheepdog-gate-"))
     results: list[dict] = []
+    inflight = inflight_path()
+    try:
+        inflight.parent.mkdir(parents=True, exist_ok=True)
+        inflight.write_text(
+            json.dumps(
+                {
+                    "commit": sha,
+                    "pid": os.getpid(),
+                    "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
     try:
         for i in range(1, runs + 1):
             src = export(repo, sha, work / f"src{i}")
@@ -311,6 +332,13 @@ def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool 
         print(f"✓ 闸门通过，记录写到 {dest}")
         return 0
     finally:
+        try:
+            if inflight.exists():
+                data = json.loads(inflight.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("pid") == os.getpid():
+                    inflight.unlink(missing_ok=True)
+        except Exception:
+            pass
         if keep:
             print(f"  （临时目录留着：{work}）")
         else:
