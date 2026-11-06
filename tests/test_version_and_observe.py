@@ -7428,6 +7428,61 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(len(mem_lines), 1)
             st.close()
 
+    def test_reg135_no_redos_catastrophic_backtracking_in_ask_pre_flight_guards_and_all_lookaheads_anchored(self) -> None:
+        """REG-135 (1.1.46):
+        1) 静态结构不变量：outbound.py 中所有使用 (?=[\\s\\S]* 或 (?![\\s\\S]* 的全文明文合取正则必须带 \\A 起始锚点，
+           且禁止在单个先行断言内串联多个无界 [\\s\\S]* 或使用 [^\\n]+[\\s\\S]* 重叠量词；
+        2) 动态对抗基准：在包含 1./2./3. 三条编号列表、多处版本号（1.1/2.1/3.1）且缺 4. 的 7KB 对抗文本上，
+           _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE 与 check_ask_pre_flight_guard 总耗时必须 < 50ms（消除 O(N^5) ReDoS 卡死），
+           同时包含完整 1./2./3./4. 四步生产集群加固且未附文档时仍被精准拦截。"""
+        import re
+        import time
+        from sheepdog import outbound
+
+        # 1) 静态结构审计：所有含 (?=[\s\S]* 的正则必须带 \A，且不得出现 [^\n]+[\s\S]* 重叠回溯模式
+        for name, val in vars(outbound).items():
+            if not isinstance(val, re.Pattern):
+                continue
+            pat = val.pattern
+            if "(?=[\\s\\S]*" in pat or "(?![\\s\\S]*" in pat:
+                self.assertIn(
+                    "\\A",
+                    pat,
+                    f"{name} uses (?=[\\s\\S]* without \\A anchor, causing O(N^2) rescan across text offsets",
+                )
+            self.assertNotIn(
+                "[^\\n]+[\\s\\S]*",
+                pat,
+                f"{name} contains overlapping quantifier [^\\n]+[\\s\\S]* causing catastrophic backtracking",
+            )
+
+        # 2) 动态 7KB 对抗样本耗时断言（含 1./2./3. 列表但缺 4.）
+        adv_body = (
+            "南京生产集群 TKE CoreDNS 虚拟节点与 49 个工作负载 PDB 巡检说明（已附只读证据）\n"
+            "1. CoreDNS 当前 2 副本运行在虚拟节点（延迟 2.01ms，版本 1.11.1）\n"
+            "2. 梳理 49 个多副本工作负载 PDB 清单（集群 3.13.7，共 74 个工作负载）\n"
+            "3. 检查集群维护窗口与自动升级状态（当前 1.0 / 2.0 / 3.0）\n"
+            "第 1 组 1A 第 2 组 2A Sammy Sammi 老胡 Nicky Stage Postgres GITHUB_TOKEN RabbitMQ TDMQ\n"
+            + ("补充说明：节点 1.1 与 2.1 与 3.1 运行正常，无需第四步。" * 200)
+        )
+        self.assertGreater(len(adv_body), 6000)
+
+        t0 = time.perf_counter()
+        self.assertIsNone(outbound._MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(adv_body))
+        dt_multi_ms = (time.perf_counter() - t0) * 1000
+        self.assertLess(dt_multi_ms, 15.0, f"_MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE took {dt_multi_ms:.2f}ms on 7KB input")
+
+        t1 = time.perf_counter()
+        for name, val in vars(outbound).items():
+            if isinstance(val, re.Pattern):
+                val.search(adv_body)
+        dt_all_ms = (time.perf_counter() - t1) * 1000
+        self.assertLess(dt_all_ms, 80.0, f"All outbound regexes took {dt_all_ms:.2f}ms on 7KB input")
+
+        # 3) 正向行为验证：包含完整 1./2./3./4. 四步生产集群加固且无 .md/飞书文档时仍正常匹配拦截
+        four_step_no_doc = adv_body + "\n4. 为 websocket-service 补齐 preStop/liveness 与 HPA 温和缩容策略\n"
+        self.assertIsNotNone(outbound._MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(four_step_no_doc))
+
 
 if __name__ == "__main__":
     unittest.main()

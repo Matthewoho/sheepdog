@@ -470,11 +470,11 @@ _NEW_VPS_PURCHASE_FULL_ASK_RE = re.compile(
 )
 _OVERALL_VPS_ROSTER_EVIDENCE_RE = re.compile(
     r"(?:(?:总体|全网|全部|14\s*台|各节点)[^\n。]{0,20}(?:在用|使用|占用)[^\n。]{0,12}(?:人员)?名单|"
-    r"(?=[\s\S]*\blsg1\b)(?=[\s\S]*\blsg2\b)(?=[\s\S]*\blsg3\b)(?=[\s\S]*\blsg4\b))",
+    r"\A(?=[\s\S]*\blsg1\b)(?=[\s\S]*\blsg2\b)(?=[\s\S]*\blsg3\b)(?=[\s\S]*\blsg4\b))",
     re.I,
 )
 _US_PROD_GCP_IAM_ASK_RE = re.compile(
-    r"(?=[\s\S]*\btpn-prod-506507\b)(?=[\s\S]*(?:开通|授予|赋权|申请)[^\n。]{0,36}(?:日志|只读|IAM|权限|roles/logging\.viewer|viewer))",
+    r"\A(?=[\s\S]*\btpn-prod-506507\b)(?=[\s\S]*(?:开通|授予|赋权|申请)[^\n。]{0,36}(?:日志|只读|IAM|权限|roles/logging\.viewer|viewer))",
     re.I,
 )
 _SAMMY_US_COMPLIANCE_CONFIRMED_RE = re.compile(
@@ -482,7 +482,7 @@ _SAMMY_US_COMPLIANCE_CONFIRMED_RE = re.compile(
     re.I,
 )
 _STAGE_SUBACCOUNT_MINIMAL_IAM_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:\b2000\d{8}\b|Stage\s*(?:独立\s*)?成员账号))(?:[\s\S]*(?:最小受限策略|最小策略|受限权限))",
+    r"\A(?=[\s\S]*(?:\b2000\d{8}\b|Stage\s*(?:独立\s*)?成员账号))(?=[\s\S]*(?:最小受限策略|最小策略|受限权限))",
     re.I,
 )
 _STAGE_SUBACCOUNT_ADMIN_OPTION_RE = re.compile(
@@ -523,7 +523,7 @@ _REFUSAL_OR_RESTRICT_OPT_RE = re.compile(
     re.I,
 )
 _GRANT_WRITE_PERM_OPT_RE = re.compile(
-    r"(?:(?:同意|批准|按申请|直接)?[^\n]{0,16}(?:给他|为其|向其|给\s*\S+)?(?:授权|开通|开放|授予|下放)[^\n]{0,24}(?:修改权限|写权限|读写权限|所申请权限|全部权限)|^(?:[A-E]\s*[.、:：]\s*)?(?:同意|批准)(?:授权|开通))",
+    r"(?:(?:(?:同意|批准|按申请|直接)[^\n]{0,16})?(?:给他|为其|向其|给\s*\S+)?(?:授权|开通|开放|授予|下放)[^\n]{0,24}(?:修改权限|写权限|读写权限|所申请权限|全部权限)|^(?:[A-E]\s*[.、:：]\s*)?(?:同意|批准)(?:授权|开通))",
     re.I,
 )
 _UNINVESTIGATED_STATUS_ASK_RE = re.compile(
@@ -551,7 +551,7 @@ _CICD_PROD_READY_EVIDENCE_RE = re.compile(
     re.I,
 )
 _EXISTING_VPS_SLOT_AVAILABLE_ASK_RE = re.compile(
-    r"(?=[\s\S]*申请[^\n。]{0,24}(?:Claude|VPS|CC|家宽)?[^\n。]{0,12}(?:专线|节点))(?:[\s\S]*(?:余\s*[1-9]\d*\s*(?:空额|空位|席)|空余\s*[1-9]\d*\s*(?:空额|空位|席)))",
+    r"\A(?=[\s\S]*申请[^\n。]{0,24}(?:Claude|VPS|CC|家宽)?[^\n。]{0,12}(?:专线|节点))(?=[\s\S]*(?:余\s*[1-9]\d*\s*(?:空额|空位|席)|空余\s*[1-9]\d*\s*(?:空额|空位|席)))",
     re.I,
 )
 _REGION_HARDCODE_OR_SUBFILTER_HOTFIX_ASK_RE = re.compile(
@@ -595,12 +595,12 @@ _TENCENT_SUBACCOUNT_OR_UIN_EVIDENCE_RE = re.compile(
     re.I,
 )
 _TENCENT_MAINLAND_FALLBACK_ON_LIMIT_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:境内主账号|国内腾讯云|\b1000\d{8}\b|境内账号)[^\n。]{0,40}(?:建|创建|新建|开辟|申请)[^\n。]{0,30}(?:子账号|账号|凭据|密钥|TMS|IMS|内容安全))"
+    r"\A(?=[\s\S]*(?:境内主账号|国内腾讯云|\b1000\d{8}\b|境内账号)[^\n。]{0,40}(?:建|创建|新建|开辟|申请)[^\n。]{0,30}(?:子账号|账号|凭据|密钥|TMS|IMS|内容安全))"
     r"(?=[\s\S]*(?:UnsupportedRegion|地域不支持|国际账号[^\n。]{0,24}(?:不支持|报错|受限)|TMS|IMS|内容安全))",
     re.I,
 )
 _URGENCY_AND_TENCENT_CONTACT_EVIDENCE_RE = re.compile(
-    r"(?=[\s\S]*(?:已(?:向|跟|与)?[^\n。]{0,16}确认[^\n。]{0,16}(?:着急|急需|紧急)|先问(?:一下)?[^\n。]{0,16}(?:是否)?着急|询问[^\n。]{0,16}是否着急))"
+    r"\A(?=[\s\S]*(?:已(?:向|跟|与)?[^\n。]{0,16}确认[^\n。]{0,16}(?:着急|急需|紧急)|先问(?:一下)?[^\n。]{0,16}(?:是否)?着急|询问[^\n。]{0,16}是否着急))"
     r"(?=[\s\S]*(?:问一下腾讯云|咨询腾讯云|联系腾讯云|找腾讯云(?:的人|接口人|架构师|客服)?))",
     re.I,
 )
@@ -626,13 +626,13 @@ _TAPNOW_TV_REUSE_EVIDENCE_RE = re.compile(
     re.I,
 )
 _TEST_ENV_NACOS_ACCOUNT_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:测试环境|tap-testing-env|测试\s*Nacos|tap-testing-nacos))"
+    r"\A(?=[\s\S]*(?:测试环境|tap-testing-env|测试\s*Nacos|tap-testing-nacos))"
     r"(?=[\s\S]*(?:申请|创建|开通)[^\n。]{0,28}Nacos[^\n。]{0,20}账号)"
     r"(?![\s\S]*(?:生产环境|taplabs-453508|tpn-prod|生产\s*Nacos))",
     re.I,
 )
 _DOMESTIC_TV_TO_OVERSEAS_GCP_ASK_RE = re.compile(
-    r"(?=[\s\S]*\b[a-z0-9-]+\.tapnow\.tv\b)"
+    r"\A(?=[\s\S]*\b[a-z0-9-]+\.tapnow\.tv\b)"
     r"(?=[\s\S]*(?:GCP\s*生产|taplabs-453508|\b(?:8|192)\.\d{1,3}\.\d{1,3}\.66\b|sgtm-https-proxy|GCP\s*代理))",
     re.I,
 )
@@ -645,7 +645,7 @@ _OWNER_ASKED_HISTORY_EXPLANATION_RE = re.compile(
     re.I,
 )
 _KEY_CHANGE_ROLLBACK_WITHOUT_GROUP_TIMELINE_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:COMMUNITY_API_KEY|API_KEY)[^\n。]{0,28}(?:双\s*Key\s*兼容|兼容恢复|兼容放行))"
+    r"\A(?=[\s\S]*(?:COMMUNITY_API_KEY|API_KEY)[^\n。]{0,28}(?:双\s*Key\s*兼容|兼容恢复|兼容放行))"
     r"(?=[\s\S]*(?:发版单|硬切为|硬换成))",
     re.I,
 )
@@ -666,7 +666,7 @@ _INTERNAL_DEV_REPO_PROXY_EDIT_RECOMMEND_RE = re.compile(
 )
 _DIRECT_CNB_GIT_PUSH_RE = re.compile(
     r"(?:git\s+push\s+(?:--[a-z0-9-]+\s+)*(?:cnb(?:\s|$)|https?://cnb\.build/)"
-    r"|(?=[\s\S]*cnb\.build/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?=[\s\S]*(?:添加\s*cnb\s*remote|git\s+remote\s+add\s+cnb\b|推送(?:代码|分支)[^\n。；]{0,24}至\s*CNB)))",
+    r"|\A(?=[\s\S]*cnb\.build/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?=[\s\S]*(?:添加\s*cnb\s*remote|git\s+remote\s+add\s+cnb\b|推送(?:代码|分支)[^\n。；]{0,24}至\s*CNB)))",
     re.I,
 )
 _CNB_MIRROR_SYNC_COMPLIANT_RE = re.compile(
@@ -706,15 +706,15 @@ _GENERIC_CONFIG_IDENTS = frozenset(
     }
 )
 _SAMMY_PARITY_AND_ENTRYPOINT_ASK_RE = re.compile(
-    r"(?=(?:[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b))"
-    r"(?:[\s\S]*(?:能否提供现有[^\n。]{0,24}(?:跳板机|TKE|集群|入口)"
+    r"\A(?=[\s\S]*\b(?:Sammy(?:\s*Shi)?|Sammi)\b)"
+    r"(?=[\s\S]*(?:能否提供现有[^\n。]{0,24}(?:跳板机|TKE|集群|入口)"
     r"|临时开启[^\n。]{0,24}(?:cls-[a-z0-9]+|TKE|集群)[^\n。]{0,16}公网访问"
     r"|在[^\n。]{0,24}(?:cls-[a-z0-9]+|tapnowprod|TKE)[^\n。]{0,24}新建\s*Secret[\s\S]{0,60}入口方案"
     r"|给\s*(?:Sammy|Sammi)[^\n。]{0,24}(?:开通|开放|提供)[^\n。]{0,24}(?:权限|跳板机|入口)))",
     re.I,
 )
 _VIP_OWN_PR_FOLLOWTHROUGH_SHIRK_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:谁来跟(?:完|进|到底)?|几点前完成|\.cnb\.yml|PR\s*构建修复))"
+    r"\A(?=[\s\S]*(?:谁来跟(?:完|进|到底)?|几点前完成|\.cnb\.yml|PR\s*构建修复))"
     r"(?=[\s\S]*由\s*(?:Sammy(?:\s*Shi)?|Sammi|老胡|Andy\s*Hu)\s*自己来(?:跟|合入|做|处理|接手))",
     re.I,
 )
@@ -725,10 +725,10 @@ _MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE = re.compile(
     r"(?=[\s\S]*\b(?:MySQL|ADB|AnalyticDB)\b)"
     r"(?=[\s\S]*\bRedis\b)"
     r"|"
-    r"(?=[\s\S]*第\s*1\s*组[\s\S]*第\s*2\s*组[\s\S]*第\s*3\s*组)"
-    r"(?=[\s\S]*(?:\b1A\b[\s\S]*\b2[AB]\b[\s\S]*\b3[AB]\b|生产环境[^\n。]{0,24}(?:深度体检|专项核实|资源治理|降配|缩容)))"
+    r"(?=[\s\S]*第\s*1\s*组)(?=[\s\S]*第\s*2\s*组)(?=[\s\S]*第\s*3\s*组)"
+    r"(?:(?=[\s\S]*\b1A\b)(?=[\s\S]*\b2[AB]\b)(?=[\s\S]*\b3[AB]\b)|(?=[\s\S]*生产环境[^\n。]{0,24}(?:深度体检|专项核实|资源治理|降配|缩容)))"
     r"|"
-    r"(?=[\s\S]*\b1\.\s*[^\n]+[\s\S]*\b2\.\s*[^\n]+[\s\S]*\b3\.\s*[^\n]+[\s\S]*\b4\.\s*[^\n]+)"
+    r"(?=[\s\S]*\b1\.\s*\S)(?=[\s\S]*\b2\.\s*\S)(?=[\s\S]*\b3\.\s*\S)(?=[\s\S]*\b4\.\s*\S)"
     r"(?=[\s\S]*(?:CoreDNS[\s\S]{0,120}(?:UpdateAddon|虚拟节点)|[0-9]{2,}\s*个(?:多副本)?(?:工作负载)?[^\n。]{0,16}\bPDB\b))"
     r")",
     re.I,
@@ -738,7 +738,7 @@ _LARK_DOC_LINK_EVIDENCE_RE = re.compile(
     re.I,
 )
 _MIDDLEWARE_PROVISION_WITHOUT_USAGE_PROOF_ASK_RE = re.compile(
-    r"(?=[\s\S]*\b(?:RabbitMQ|TDMQ|RocketMQ|ActiveMQ)\b)"
+    r"\A(?=[\s\S]*\b(?:RabbitMQ|TDMQ|RocketMQ|ActiveMQ)\b)"
     r"(?=[\s\S]*(?:开通|购买|新建|采购|部署)[^\n。]{0,36}(?:托管|专享版|3\s*节点|集群|cbs\s*云盘\s*PVC))"
     r"(?=[\s\S]*(?:选项|建议\s*[：:]?\s*(?:选\s*)?[AB]))",
     re.I,
@@ -776,8 +776,8 @@ _RAW_STDOUT_IN_ASK_OPTION_RE = re.compile(
     re.I,
 )
 _VIP_LOW_PERM_OR_PROXY_INSTEAD_OF_E2E_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:老胡|laohu|Andy\s*Hu|Sammy(?:\s*Shi)?|Sammi)[^\n。；]{0,36}申请[^\n。；]{0,60}(?:子账号|CAM|权限|kubeconfig|TKE|集群))"
-    r"(?=[\s\S]*(?:不外发[^\n。；]*(?:AK/SK|凭据|密钥|kubeconfig|权限)[^\n。；]*由[^\n。；]*(?:直接|代建|代跑|部署)[\s\S]{0,260}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?A"
+    r"\A(?=[\s\S]*(?:老胡|laohu|Andy\s*Hu|Sammy(?:\s*Shi)?|Sammi)[^\n。；]{0,36}申请[^\n。；]{0,60}(?:子账号|CAM|权限|kubeconfig|TKE|集群))"
+    r"(?=[\s\S]*(?:不外发[^\n。；]{0,40}(?:AK/SK|凭据|密钥|kubeconfig|权限)[^\n。；]{0,40}由[^\n。；]{0,40}(?:直接|代建|代跑|部署)[\s\S]{0,260}?(?:建议|推荐)\s*[：:]?\s*(?:选\s*)?A"
     r"|仅限[^\n。；]{0,40}单命名空间权限))",
     re.I,
 )
@@ -786,7 +786,7 @@ _VIP_HIGH_PERM_E2E_RECOMMEND_RE = re.compile(
     re.I,
 )
 _SINGLE_API_SUBPATH_CACHE_OR_CORS_PATCH_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:EdgeOne|CDN|缓存|NoCache|不缓存|CORS|跨域|串域))"
+    r"\A(?=[\s\S]*(?:EdgeOne|CDN|缓存|NoCache|不缓存|CORS|跨域|串域))"
     r"(?=[\s\S]*/api/[a-z0-9_-]+/[a-z0-9_/*-]+)"
     r"(?=[\s\S]*(?:设为\s*(?:NoCache|不缓存)|配置\s*/api/[a-z0-9_-]+/[a-z0-9_/*-]+\s*为\s*(?:NoCache|不缓存)|刷新(?:该(?:路径|目录))?缓存))",
     re.I,
@@ -796,7 +796,7 @@ _CLASS_WIDE_API_CACHE_AUDIT_EVIDENCE_RE = re.compile(
     re.I,
 )
 _STAGE_PROXY_RUN_INSTEAD_OF_SELF_ACCESS_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:Stage|测试环境)\s*(?:环境)?(?:机器|CVM|主机|跳板机|ins-[a-z0-9]+))"
+    r"\A(?=[\s\S]*(?:Stage|测试环境)\s*(?:环境)?(?:机器|CVM|主机|跳板机|ins-[a-z0-9]+))"
     r"(?=[\s\S]*(?:由专席在\s*Stage\s*代跑|同意在\s*Stage\s*机器代跑|在\s*Stage\s*机器代跑))",
     re.I,
 )
@@ -859,7 +859,7 @@ _P2P_OWNER_DELEGATE_ALREADY_CHECKED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _DOMESTIC_ZERO_BALANCE_PTS_ACTIVATE_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:国内(?:站)?主账号|境内(?:站)?主账号|\b1000\d{8}\b)[^\n。]{0,48}(?:未开通\s*PTS|余额为\s*0|开通\s*PTS))"
+    r"\A(?=[\s\S]*(?:国内(?:站)?主账号|境内(?:站)?主账号|\b1000\d{8}\b)[^\n。]{0,48}(?:未开通\s*PTS|余额为\s*0|开通\s*PTS))"
     r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:由你|主人|登录)[^\n]*开通\s*PTS)",
     re.I,
 )
@@ -868,7 +868,7 @@ _INTL_PTS_EVALUATED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _COLLEAGUE_PERSONAL_CRED_ROTATE_ASK_RE = re.compile(
-    r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:同意)?立即(?:轮换|重置)[^\n]*(?:个人账号|nicky_ye|子账号|专属账号)[^\n]*密码)"
+    r"\A(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:同意)?立即(?:轮换|重置)[^\n]*(?:个人账号|nicky_ye|子账号|专属账号)[^\n]*密码)"
     r"(?=[\s\S]*B\s*[\.、:：)\]]\s*[^\n]*暂不(?:轮换|重置)[^\n]*(?:先问|询问|确认)[^\n]*(?:是否正在跑|空闲再换|长耗时))",
     re.I,
 )
@@ -878,7 +878,7 @@ _COLLEAGUE_IDLE_CONFIRMED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _DUPLICATE_PURCHASE_OR_ORDER_PAY_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:待支付订单|请款|完成[^\n。]{0,20}订单支付|支付[^\n。]{0,20}订单))"
+    r"\A(?=[\s\S]*(?:待支付订单|请款|完成[^\n。]{0,20}订单支付|支付[^\n。]{0,20}订单))"
     r"(?=[\s\S]*(?:已开通的?(?:按量付费|资源包)|package-[a-z0-9]{6,}|已经买(?:了|好)|已购买))",
     re.I,
 )
@@ -888,7 +888,7 @@ _EXISTING_PACKAGE_UNUSABLE_VERIFIED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _UNVERIFIED_EXTERNAL_PROXY_CONSOLE_RECHARGE_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:Smartproxy|smartproxycn\.com|住宅代理)[^\n。]{0,60}(?:配额耗尽|流量耗尽|余额|充值|续订))"
+    r"\A(?=[\s\S]*(?:Smartproxy|smartproxycn\.com|住宅代理)[^\n。]{0,60}(?:配额耗尽|流量耗尽|余额|充值|续订))"
     r"(?=[\s\S]*(?:登录\s*(?:Smartproxy\s*)?控制台|确认余额[^\n。]{0,20}充值|充值续订|nebula\d+))",
     re.I,
 )
@@ -908,32 +908,32 @@ _STILL_ASKING_OWNER_ACTION_RE = re.compile(
     re.I,
 )
 _DBA_NICKY_WITHHOLD_WAN_OR_CRED_ASK_RE = re.compile(
-    r"(?=[\s\S]*Nicky(?:\s*Ye|\s*老师)?[^\n。]{0,48}申请[^\n。]{0,48}(?:开通外网|开公网|公网连接|账号密码))"
+    r"\A(?=[\s\S]*Nicky(?:\s*Ye|\s*老师)?[^\n。]{0,48}申请[^\n。]{0,48}(?:开通外网|开公网|公网连接|账号密码))"
     r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:保持纯内网|不开放公网|不分配公网)[^\n]*(?:不开放公网|密码外发|DMC|控制台))"
     r"(?=[\s\S]*B\s*[\.、:：)\]]\s*[^\n]*(?:同意|授权)?开通外网[^\n]*(?:28\s*个|白名单|安全组|交付凭据))"
     r"(?=[\s\S]*建议\s*[：:]?\s*(?:选\s*)?A\b)",
     re.I,
 )
 _PREFER_MANUAL_TERMINAL_OVER_SESSION_SCRIPT_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:选项\s*A|A\s*[\.、:：)\]])[^\n]*(?:你在本机终端直接跑|由你在本机[^\n]*执行)[^\n]*脚本)"
+    r"\A(?=[\s\S]*(?:选项\s*A|A\s*[\.、:：)\]])[^\n]*(?:你在本机终端直接跑|由你在本机[^\n]*执行)[^\n]*脚本)"
     r"(?=[\s\S]*(?:选项\s*B|B\s*[\.、:：)\]])[^\n]*(?:点名)?授权(?:父会话|专席|本会话)(?:直接)?(?:调用|执行)(?:该|收尾)?脚本)"
     r"(?=[\s\S]*(?:推荐\s*A|建议\s*[：:]?\s*(?:选\s*)?A\b|选项\s*A\s*[（(]\s*推荐\s*[）)]))",
     re.I,
 )
 _VPS_RECLAIM_BACKUP_SEAT_OVER_NEW_NODE_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:专线|3x-ui|lsg\d+|VPS))"
+    r"\A(?=[\s\S]*(?:专线|3x-ui|lsg\d+|VPS))"
     r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:零采购)?[^\n]*(?:回收|腾退|清理)[^\n]*(?:lsg\d+|备用席位|双占|备用二线))"
     r"(?=[\s\S]*(?:选项\s*B|B)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:合并进[^\n]*待购|新购|新买|采购)[^\n]*(?:lsg\d+|新机|VPS))"
     r"(?=[\s\S]*(?:建议\s*[：:]?\s*(?:选\s*)?A\b|(?:选项\s*A|A\.)[^\n]*[（(]\s*推荐\s*[）)]))",
     re.I,
 )
 _VPS_SEAT_ALLOC_OR_PURCHASE_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:开通(?:专属网络|专线)|专线开通|新专线|采购\s*lsg\d+|待购的?\s*lsg\d+))"
+    r"\A(?=[\s\S]*(?:开通(?:专属网络|专线)|专线开通|新专线|采购\s*lsg\d+|待购的?\s*lsg\d+))"
     r"(?=[\s\S]*(?:lsg\d+|3x-ui|tp_3x-ui-ops))",
     re.I,
 )
 _RIGID_PROXY_HOPS_BREAKING_ONE_HOP_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:TRUSTED_PROXY_HOPS|PROXY_HOPS)\s*(?:改为|设为|=)\s*[2-9]\b)"
+    r"\A(?=[\s\S]*(?:TRUSTED_PROXY_HOPS|PROXY_HOPS)\s*(?:改为|设为|=)\s*[2-9]\b)"
     r"(?=[\s\S]*(?:1\s*跳拒|仅\s*1\s*跳\s*XFF\s*请求返回\s*5\d\d|fewer\s+than\s+the\s+[2-9]\s+trusted\s+proxy\s+hops))",
     re.I,
 )
@@ -943,7 +943,7 @@ _MULTI_DOMAIN_ENTRY_HOPS_VERIFIED_EVIDENCE_RE = re.compile(
     re.I,
 )
 _EXPIRED_PIPELINE_TOKEN_MANUAL_RENEW_ASK_RE = re.compile(
-    r"(?=[\s\S]*(?:GITHUB_TOKEN|GitHub\s*PAT|密钥仓|流水线[^\n。]{0,20}(?:密钥|Token|PAT))[^\n。]{0,28}过期)"
+    r"\A(?=[\s\S]*(?:GITHUB_TOKEN|GitHub\s*PAT|密钥仓|流水线[^\n。]{0,20}(?:密钥|Token|PAT))[^\n。]{0,28}过期)"
     r"(?=[\s\S]*(?:网页端|控制台|后台)[^\n。]{0,24}(?:更新|粘贴|替换)[^\n。]{0,20}(?:PAT|Token|密钥))",
     re.I,
 )
