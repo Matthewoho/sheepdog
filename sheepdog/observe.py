@@ -292,43 +292,98 @@ def _is_waiting_batch(c: sqlite3.Connection, batch_id: str) -> bool:
 def ask_jumps(c: sqlite3.Connection, at: datetime) -> list[tuple[str, str]]:
     """L4 噪音剃刀版 ask_jumps：仅统计最近 24h 内未结案或超时/异常关闭的提问。
 
-    正常已答复结案（answered / resolved / closed_by_owner）的多轮密集对话不再误报。
-    当 24h 未结案提问数 d1_unsettled >= 4 且超过历史日均的 2 倍（无历史基线时 >= 5）触发告警。
+    正常已答复结案（answered / resolved / closed_by_owner）的多轮密集对话不再误报；
+    多单据巡检管家会话在等待期挂起 < 10 张带独立非空事项 key（sends.norm_key/key）、
+    尚未超时催办（expiry_reminded_at IS NULL 且距提问 < 12h）且未异常关闭（closed_at IS NULL）的在途决策卡时，
+    属于正常分单待批队列，不计入异常激增（同 key 重复发问、无 key 裸发问、已超时/异常关闭达阈值，或在途总未结数 >= 10 仍告警）。
     """
     out: list[tuple[str, str]] = []
     esc_cols = {r[1] for r in c.execute("PRAGMA table_info(escalations)")}
     if not esc_cols:
         return out
     if "asked_at" in esc_cols and "created_at" in esc_cols:
-        ts_col = "COALESCE(asked_at, created_at)"
+        ts_col = "COALESCE(e.asked_at, e.created_at)"
     elif "created_at" in esc_cols:
-        ts_col = "created_at"
+        ts_col = "e.created_at"
     else:
-        ts_col = "asked_at"
+        ts_col = "e.asked_at"
 
     if "close_reason" in esc_cols and "status" in esc_cols:
-        status_col = "COALESCE(close_reason, status, 'open')"
+        status_col = "COALESCE(e.close_reason, e.status, 'open')"
     elif "status" in esc_cols:
-        status_col = "COALESCE(status, 'open')"
+        status_col = "COALESCE(e.status, 'open')"
     else:
-        status_col = "COALESCE(close_reason, 'open')"
+        status_col = "COALESCE(e.close_reason, 'open')"
 
+    tabs = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    sends_cols = {r[1] for r in c.execute("PRAGMA table_info(sends)")} if "sends" in tabs else set()
+    if "norm_key" in sends_cols and "key" in sends_cols:
+        key_expr = "COALESCE(NULLIF(TRIM(s.norm_key), ''), NULLIF(TRIM(s.key), ''), '')"
+        sends_join = "LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'"
+    elif "key" in sends_cols:
+        key_expr = "COALESCE(NULLIF(TRIM(s.key), ''), '')"
+        sends_join = "LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'"
+    else:
+        key_expr = "''"
+        sends_join = ""
+
+    reminded_expr = "COALESCE(e.expiry_reminded_at, '')" if "expiry_reminded_at" in esc_cols else "''"
     cutoff_24h = iso(at - timedelta(days=1))
-    unsettled_cond = f"(closed_at IS NULL OR {status_col} NOT IN ('answered', 'resolved', 'closed_by_owner'))"
+    cutoff_12h = iso(at - timedelta(hours=12))
+    unsettled_cond = f"(e.closed_at IS NULL OR {status_col} NOT IN ('answered', 'resolved', 'closed_by_owner'))"
     sql = f"""
-        SELECT topic_id,
+        SELECT e.topic_id AS topic_id,
                SUM(CASE WHEN {ts_col} >= ? AND {unsettled_cond} THEN 1 ELSE 0 END) AS d1_unsettled,
                SUM(CASE WHEN {ts_col} <  ? AND {unsettled_cond} THEN 1 ELSE 0 END) AS prev_unsettled,
                MIN({ts_col}) AS first_at
-        FROM escalations
-        GROUP BY topic_id
+        FROM escalations e
+        GROUP BY e.topic_id
     """
     rows = c.execute(sql, (cutoff_24h, cutoff_24h)).fetchall()
+    d1_rows = c.execute(
+        f"""
+        SELECT e.topic_id AS topic_id,
+               {ts_col} AS asked_ts,
+               e.closed_at AS closed_at,
+               {reminded_expr} AS expiry_reminded_at,
+               {key_expr} AS ask_key
+        FROM escalations e
+        {sends_join}
+        WHERE {ts_col} >= ? AND {unsettled_cond}
+        """,
+        (cutoff_24h,),
+    ).fetchall()
+    by_topic_d1: dict[str, list[sqlite3.Row]] = {}
+    for dr in d1_rows:
+        by_topic_d1.setdefault(dr["topic_id"], []).append(dr)
+
     cutoff_dt = at - timedelta(days=1)
     for r in rows:
         tid = r["topic_id"]
-        d1 = int(r["d1_unsettled"] or 0)
+        d1_total = int(r["d1_unsettled"] or 0)
         prev = int(r["prev_unsettled"] or 0)
+        if d1_total < 4:
+            continue
+        t_items = by_topic_d1.get(tid) or []
+        key_counts: dict[str, int] = {}
+        for it in t_items:
+            k_norm = str(it["ask_key"] or "").strip().upper()
+            if k_norm:
+                key_counts[k_norm] = key_counts.get(k_norm, 0) + 1
+        d1_abnormal = 0
+        for it in t_items:
+            k_norm = str(it["ask_key"] or "").strip().upper()
+            asked_ts = str(it["asked_ts"] or "")
+            is_fresh_distinct = (
+                it["closed_at"] is None
+                and not str(it["expiry_reminded_at"] or "").strip()
+                and asked_ts >= cutoff_12h
+                and bool(k_norm)
+                and key_counts.get(k_norm, 0) == 1
+            )
+            if not is_fresh_distinct:
+                d1_abnormal += 1
+        d1 = d1_total if d1_total >= 10 else d1_abnormal
         if d1 < 4:
             continue
         first_dt = parse_iso(r["first_at"])

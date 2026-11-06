@@ -5047,6 +5047,10 @@ class Dispatcher:
                             and bool(_CLI_PASS_BANNER_RE.search(cur_sum))
                         )
                         or (
+                            "JSON(" not in cur_sum
+                            and bool(re.search(r"(?:^|\n)(?:SUCCESS|PASSED|VERIFIED|COMPLETED|OK|DONE|RESULT|SUMMARY|OUTPUT)\s*:\s*\{", cur_sum, re.I))
+                        )
+                        or (
                             "CalledProcessError" in cur_sum
                             and ">" in cur_sum
                             and "/tmp/" in cur_sum
@@ -7458,9 +7462,14 @@ _CLI_PASS_BANNER_RE = re.compile(
     r"|=== VERIFICATION PASSED ==="
     r"|=== ALL PASSED ==="
     r"|VERIFICATION PASSED"
+    r"|^(?:SUCCESS|PASSED|VERIFIED|COMPLETED|OK)\s*:\s*\{"
     r"|\"ok\"\s*:\s*true"
     r"| is live on )",
     re.I | re.M,
+)
+_LABELED_TRAILING_JSON_LINE_RE = re.compile(
+    r"^(?P<label>SUCCESS|PASSED|VERIFIED|COMPLETED|OK|DONE|RESULT|SUMMARY|OUTPUT)\s*:\s*(?P<json>\{.*\})\s*$",
+    re.I,
 )
 _REDIRECTED_TMP_LOG_RE = re.compile(
     r">\s*['\"]?(/(?:private/)?tmp/[A-Za-z0-9_./-]+\.(?:log|txt|out|err))['\"]?"
@@ -7517,8 +7526,17 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
         has_err = False
     stripped = raw_text.rstrip()
     if stripped.endswith("}"):
-        idx = stripped.rfind("\n{")
-        cand = stripped[idx + 1:] if idx != -1 else (stripped if stripped.startswith("{") else "")
+        last_nl = stripped.rfind("\n")
+        last_line = stripped[last_nl + 1:].strip() if last_nl != -1 else stripped.strip()
+        m_lbl_json = _LABELED_TRAILING_JSON_LINE_RE.match(last_line)
+        json_label = ""
+        if m_lbl_json is not None:
+            json_label = m_lbl_json.group("label").strip()
+            cand = m_lbl_json.group("json").strip()
+            idx = last_nl
+        else:
+            idx = stripped.rfind("\n{")
+            cand = stripped[idx + 1:] if idx != -1 else (stripped if stripped.startswith("{") else "")
         if cand:
             try:
                 obj = json.loads(cand)
@@ -7537,6 +7555,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                     elif (
                         obj.get("ok") is True
                         or st_val.upper() in ("SUCCESS", "OK", "DONE", "HANDLED")
+                        or json_label.upper() in ("SUCCESS", "PASSED", "VERIFIED", "COMPLETED", "OK", "DONE")
                         or ("RequestId" in obj and "Error" not in obj)
                         or not any(k in "\n".join(pre_non_empty[-15:]) for k in ("Traceback", "Fatal", "ERROR:"))
                     ):
@@ -7562,7 +7581,7 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                             and not re.match(r"^[~^]{2,}$", ln)
                             and not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):", ln)
                             and not _INTERMEDIATE_POLL_LINE_RE.search(ln)
-                            and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.match(ln)
+                            and not _GCLOUD_PROGRESS_OR_HINT_LINE_RE.search(ln)
                             and not _JSON_PROP_FRAGMENT_LINE_RE.match(ln)
                         ]
                     prefix_lines = raw_prefix[-1:] if not has_err else raw_prefix[-2:]
@@ -7586,6 +7605,8 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
                         elif isinstance(v, dict):
                             compact_parts.append(f"{k}={{{len(v)} keys}}")
                     json_summary = ", ".join(compact_parts[:8]) or json.dumps(obj, ensure_ascii=False)[:200]
+                    if json_label:
+                        return f"{json_label}: JSON({json_summary})", has_err
                     return ("\n".join([*prefix_lines, f"JSON({json_summary})"]) if prefix_lines else f"JSON({json_summary})"), has_err
             except Exception:
                 pass

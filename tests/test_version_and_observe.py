@@ -7483,6 +7483,104 @@ class VersionAndObserveTest(unittest.TestCase):
         four_step_no_doc = adv_body + "\n4. 为 websocket-service 补齐 preStop/liveness 与 HPA 温和缩容策略\n"
         self.assertIsNotNone(outbound._MULTI_COMPONENT_CAPACITY_PLAN_ASK_RE.search(four_step_no_doc))
 
+    def test_reg136_observe_ask_jumps_fresh_distinct_key_exemption_and_cli_lamb_labeled_json_pass(self) -> None:
+        """REG-136 (1.1.47):
+        1) observe.ask_jumps：多单据专席在等待期挂起 5 张独立非空 norm_key（如 SD-238/ENG-1165/SD-235/ENG-1018/FE-1951）、
+           距提问 <12h 且未催办/未异常关闭的在途决策卡时，不误报 ask_jumps；但同 key 重复提问 >=5、无 key 裸提问 >=5、
+           已超时催办 >=5 或总在途 >=10 时仍准确触发 ask_jumps 告警；
+        2) engine._summarize_cli_lamb_log & _scan_lambs：命令行子任务前序打印 'Waiting 25s to inspect live requests, 5xx, and ValueError on ...'
+           且末尾打印 'SUCCESS: {"service": "conversation-service", ...}' 时，识别为 has_err=False 并提取 'SUCCESS: JSON(...)'，
+           同时自动将存量误标为 failed 的记录自愈为 done。"""
+        from sheepdog import engine, observe
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(state_dir=root / "state")
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            st = Store(cfg.db_path)
+            ref_now = datetime(2026, 11, 7, 3, 51, 0, tzinfo=observe.TZ)
+
+            # 1) 5 张独立非空 norm_key、距提问 1~2 小时、closed_at IS NULL 的待批卡 -> 不触发 ask_jumps
+            distinct_keys = ["SD-238", "ENG-1165", "SD-235", "ENG-1018", "FE-1951"]
+            for idx, k in enumerate(distinct_keys):
+                mid = f"om_distinct_{idx}"
+                asked_ts = observe.iso(ref_now - timedelta(minutes=60 + idx * 10))
+                st.conn.execute(
+                    "INSERT INTO escalations (message_id, topic_id, chat_id, text, asked_at, closed_at, close_reason) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                    (mid, "tp_tapnow-prod-topology", "oc_test", f"需要你定 {k}", asked_ts),
+                )
+                st.conn.execute(
+                    "INSERT INTO sends (idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at) VALUES (?, 'ask', ?, ?, ?, ?, ?, ?)",
+                    (f"idem_{mid}", "tp_tapnow-prod-topology", mid, k, k, f"需要你定 {k}", asked_ts),
+                )
+            st.conn.commit()
+            jumps_distinct = observe.ask_jumps(st.conn, ref_now)
+            self.assertEqual(
+                jumps_distinct,
+                [],
+                f"5 fresh distinct-key open escalations should not trigger ask_jumps, got: {jumps_distinct}",
+            )
+
+            # 2) 若同 key 重复发问 5 次（如全部使用同一个 norm_key='DUP-KEY'），则计入异常未结并触发 ask_jumps
+            for idx in range(5):
+                mid = f"om_dup_{idx}"
+                asked_ts = observe.iso(ref_now - timedelta(minutes=30 + idx * 5))
+                st.conn.execute(
+                    "INSERT INTO escalations (message_id, topic_id, chat_id, text, asked_at, closed_at, close_reason) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                    (mid, "tp_dup-spam", "oc_test", f"重复追问 {idx}", asked_ts),
+                )
+                st.conn.execute(
+                    "INSERT INTO sends (idem_key, kind, topic_id, message_id, key, norm_key, text, sent_at) VALUES (?, 'ask', ?, ?, 'DUP-KEY', 'DUP-KEY', ?, ?)",
+                    (f"idem_{mid}", "tp_dup-spam", mid, f"重复追问 {idx}", asked_ts),
+                )
+            st.conn.commit()
+            jumps_dup = observe.ask_jumps(st.conn, ref_now)
+            self.assertTrue(
+                any(tid == "tp_dup-spam" and "5 次" in w for tid, w in jumps_dup),
+                f"5 duplicate-key open escalations must trigger ask_jumps, got: {jumps_dup}",
+            )
+
+            # 3) CLI 羔羊打印 ValueError 自检说明 + 尾行 SUCCESS: {...} JSON -> has_err=False 且自愈存量 failed 羔羊
+            raw_cli_log = (
+                "Stage 2 traffic check (should still be 100% on old rev): [{'percent': 100, 'revisionName': 'conversation-service-00378-v9b'}]\n"
+                "Running Stage 3 (100% traffic cutover): gcloud run services update-traffic conversation-service --to-revisions=conversation-service-00379-hxl=100\n"
+                "Updating traffic...\n"
+                "Waiting 25s to inspect live requests, 5xx, and ValueError on conversation-service-00379-hxl\n"
+                'SUCCESS: {"service": "conversation-service", "pre_revision": "conversation-service-00378-v9b", "post_revision": "conversation-service-00379-hxl", "sampled_5xx_count": 0, "value_error_count": 0}\n'
+            )
+            sum_txt, has_err = engine._summarize_cli_lamb_log(raw_cli_log)
+            self.assertFalse(has_err, f"SUCCESS: JSON line after ValueError inspection text must be has_err=False, got sum={sum_txt}")
+            self.assertTrue(sum_txt.startswith("SUCCESS: JSON("), f"Expected SUCCESS: JSON(...), got: {sum_txt}")
+            self.assertIn("service=conversation-service", sum_txt)
+            self.assertIn("value_error_count=0", sum_txt)
+
+            log_path = root / "lamb_74376f52.log"
+            log_path.write_text(raw_cli_log, encoding="utf-8")
+            st.upsert_topic("tp_release", title="发版专席", kind="adopted", conversation_id="cid-rel")
+            st.register_lamb(
+                "lamb_74376f52",
+                "tp_release",
+                kind="cli",
+                task_title="conversation-service 切流验证",
+                state="failed",
+                log_path=str(log_path),
+            )
+            st.update_lamb(
+                "lamb_74376f52",
+                result_summary=(
+                    "Waiting 25s to inspect live requests, 5xx, and ValueError on conversation-service-00379-hxl\n"
+                    'SUCCESS: {"service": "conversation-service", "pre_revision": "conversation-service-00378-v9b"...'
+                ),
+            )
+            disp = engine.Dispatcher(cfg, st, mock.MagicMock(), mock.MagicMock())
+            disp._scan_lambs()
+            healed_lb = st.get_lamb("lamb_74376f52")
+            self.assertEqual(healed_lb["state"], "done")
+            self.assertTrue(str(healed_lb["result_summary"]).startswith("SUCCESS: JSON("))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
