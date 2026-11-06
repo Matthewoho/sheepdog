@@ -462,6 +462,141 @@ duty = "负责 111 个服务迁移"
         )
         self.assertEqual(final_res.message_id, "om_rep_091_2")
 
+    def test_reg_137_loop_waiting_stage_deferral_and_external_payload_delta_wake(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        cst = timezone(timedelta(hours=8))
+        t0 = datetime(2026, 11, 7, 4, 0, 0, tzinfo=cst)
+
+        self.store.upsert_topic(
+            "tp_tapnow-prod-topology",
+            title="TapNow 生产拓扑与跨云迁移",
+            kind="adopted",
+            conversation_id="d0758da6-274e-4954-89fa-9507823ec9d8",
+        )
+        loops.init_loop(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            title="P-ENG-249 国内站上线验收巡检",
+            topic_id="tp_tapnow-prod-topology",
+            autonomy="confirm",
+            interval_minutes=15.0,
+            active_interval_minutes=10.0,
+            load_cmd="printf '[]\\n'",
+        )
+
+        # 1) Initial discovery at 04:00 dispatches the new issue
+        base_item = {
+            "issue_key": "SD-235",
+            "key": "SD-235",
+            "status": "Todo",
+            "updatedAt": "2026-11-06T16:38:34.817Z",
+            "assignee": "owner_test@example.com",
+            "bucket": "3_matthew_in_progress",
+            "stage": "claiming_and_diagnosing",
+            "title": "[Step2·>14h停滞] SD-235 (Todo): tv 源站能绕过 EO",
+        }
+        r0 = loops.run_loop_tick(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            force=False,
+            injected_items=[base_item],
+            now_dt=t0,
+        )
+        self.assertEqual(r0["status"], "dispatched")
+        self.assertEqual(r0["newly_added"], 1)
+        self.assertEqual(r0["due_items_count"], 1)
+
+        # 2) Session transitions SD-235 to waiting_owner_or_review WITHOUT passing next_minutes -> auto-defers >= 60m
+        u1 = loops.update_loop_item(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            "SD-235",
+            stage="waiting_owner_or_review",
+            note="已发起飞书决策卡等主人拍板",
+            now_dt=t0,
+        )
+        self.assertEqual(u1["stage"], "waiting_owner_or_review")
+        self.assertEqual(u1["next_check_at"], "2026-11-07T05:00:00+08:00")
+
+        # 3) Session sets --next-minutes 240 (08:00); a subsequent busy-deferral (+15m with keep_longer_next=True) must NOT shrink it
+        u2 = loops.update_loop_item(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            "SD-235",
+            stage="waiting_owner_or_review",
+            next_minutes=240.0,
+            now_dt=t0,
+        )
+        self.assertEqual(u2["next_check_at"], "2026-11-07T08:00:00+08:00")
+
+        u3 = loops.update_loop_item(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            "SD-235",
+            next_minutes=15.0,
+            keep_longer_next=True,
+            now_dt=t0 + timedelta(minutes=10),
+        )
+        self.assertEqual(u3["next_check_at"], "2026-11-07T08:00:00+08:00")
+
+        # 4) At 04:30 (within 08:00 window), unchanged external status/updatedAt/assignee (even if title's relative hours changed) -> 0 Token empty!
+        same_external_item = dict(
+            base_item,
+            title="[Step2·>15h停滞] SD-235 (Todo): tv 源站能绕过 EO",
+        )
+        r_idle = loops.run_loop_tick(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            force=False,
+            injected_items=[same_external_item],
+            now_dt=t0 + timedelta(minutes=30),
+        )
+        self.assertEqual(r_idle["status"], "empty")
+        self.assertEqual(r_idle["token_cost"], 0)
+        items_after_idle = loops.list_loop_items(self.store, "tv-launch-linear-steward", status="active")
+        self.assertEqual(items_after_idle[0]["next_check_at"], "2026-11-07T08:00:00+08:00")
+
+        # 5) At 04:45 (still before 08:00), remote Linear updatedAt/status changes -> clears next_check_at and wakes immediately!
+        changed_external_item = dict(
+            base_item,
+            status="In Review",
+            updatedAt="2026-11-06T20:45:00.000Z",
+        )
+        r_wake = loops.run_loop_tick(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            force=False,
+            injected_items=[changed_external_item],
+            now_dt=t0 + timedelta(minutes=45),
+        )
+        self.assertEqual(r_wake["status"], "dispatched")
+        self.assertEqual(r_wake["due_items_count"], 1)
+
+        # And because SD-235 is still in waiting_owner_or_review, dispatching it stamps last_run_id and bumps next_check_at (+60m -> 05:45)
+        items_after_wake = loops.list_loop_items(self.store, "tv-launch-linear-steward", status="active")
+        self.assertEqual(items_after_wake[0]["last_run_id"], r_wake["run_id"])
+        self.assertEqual(items_after_wake[0]["next_check_at"], "2026-11-07T05:45:00+08:00")
+
+        # 6) 10 minutes later at 04:55 with no further external change -> stays empty (0 Token), preventing 10m infinite spin!
+        r_post_wake_idle = loops.run_loop_tick(
+            self.cfg,
+            self.store,
+            "tv-launch-linear-steward",
+            force=False,
+            injected_items=[changed_external_item],
+            now_dt=t0 + timedelta(minutes=55),
+        )
+        self.assertEqual(r_post_wake_idle["status"], "empty")
+        self.assertEqual(r_post_wake_idle["token_cost"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

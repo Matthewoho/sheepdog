@@ -966,6 +966,58 @@ def list_loop_items(
     return out
 
 
+_WAITING_STAGE_PREFIXES = ("waiting_", "confirming")
+_STATE_IDENTITY_PAYLOAD_KEYS = (
+    "status",
+    "statusType",
+    "updatedAt",
+    "updated_at",
+    "assignee",
+    "state",
+    "task_id",
+    "revision",
+    "digest",
+    "pr_state",
+    "version",
+    "min_scale",
+    "days_left",
+)
+_NON_EXTERNAL_METADATA_KEYS = {
+    "title",
+    "stage",
+    "bucket",
+    "priority_val",
+    "defer_check_ready_at",
+    "defer_check_output",
+    "last_defer_check_rc",
+    "last_defer_check_at",
+    "deferred_at",
+}
+_VOLATILE_DEFER_KEYS = {
+    "defer_check_ready_at",
+    "defer_check_output",
+    "last_defer_check_rc",
+    "last_defer_check_at",
+    "deferred_at",
+}
+
+
+def _is_waiting_stage(stage: str | None) -> bool:
+    s = str(stage or "").strip().lower()
+    return bool(s and s.startswith(_WAITING_STAGE_PREFIXES))
+
+
+def _has_external_payload_changed(old_payload: Any, new_payload: Any) -> bool:
+    """判断外部探针返回的事项负载是否发生了实质状态变化（如 status / updatedAt / assignee 变更）。"""
+    if not isinstance(old_payload, dict) or not isinstance(new_payload, dict) or not old_payload:
+        return bool(old_payload != new_payload)
+    has_identity = any(k in old_payload or k in new_payload for k in _STATE_IDENTITY_PAYLOAD_KEYS)
+    ignore_keys = _NON_EXTERNAL_METADATA_KEYS if has_identity else _VOLATILE_DEFER_KEYS
+    old_clean = {k: v for k, v in old_payload.items() if k not in ignore_keys}
+    new_clean = {k: v for k, v in new_payload.items() if k not in ignore_keys}
+    return old_clean != new_clean
+
+
 def update_loop_item(
     cfg: Config,
     store: Store,
@@ -978,12 +1030,15 @@ def update_loop_item(
     note: str = "",
     next_minutes: float | None = None,
     payload: dict[str, Any] | None = None,
+    clear_next_check: bool = False,
+    keep_longer_next: bool = False,
+    now_dt: datetime | None = None,
 ) -> dict[str, Any]:
     """推进或更新单条跟进事项的阶段（stage）、状态（active|closed|exempted）及下次检查时间；豁免时自动写 MEMORY.md。"""
     loop_id = _validate_loop_id(loop_id)
     ensure_loop_tables(store)
     spec = get_loop_spec(cfg, store, loop_id)
-    now_dt = datetime.now(timezone.utc).astimezone()
+    now_dt = now_dt or datetime.now(timezone.utc).astimezone()
     now_s = now_dt.isoformat(timespec="seconds")
     next_s = (
         (now_dt + timedelta(minutes=float(next_minutes))).isoformat(timespec="seconds")
@@ -1023,7 +1078,16 @@ def update_loop_item(
     if note:
         ctx["last_note"] = note
 
+    default_wait_m = max(float(spec.interval_minutes if spec else 30.0), 60.0)
     if row is None:
+        if clear_next_check:
+            init_next = ""
+        elif next_s:
+            init_next = next_s
+        elif _is_waiting_stage(init_stage) and resolved_status == ITEM_ACTIVE:
+            init_next = (now_dt + timedelta(minutes=default_wait_m)).isoformat(timespec="seconds")
+        else:
+            init_next = ""
         store.conn.execute(
             """INSERT INTO loop_items
                (loop_id, item_key, title, stage, status, payload_json, context_json,
@@ -1037,7 +1101,7 @@ def update_loop_item(
                 resolved_status,
                 json.dumps(payload or {}, ensure_ascii=False),
                 json.dumps(ctx, ensure_ascii=False),
-                next_s,
+                init_next,
                 now_s,
                 now_s,
             ),
@@ -1046,7 +1110,15 @@ def update_loop_item(
         new_title = title if title is not None else row["title"]
         new_stage = stage if stage is not None else ("closed" if resolved_status == ITEM_CLOSED else row["stage"])
         new_payload = json.dumps(payload, ensure_ascii=False) if payload is not None else row["payload_json"]
-        new_next = next_s if next_minutes is not None else row["next_check_at"]
+        prev_next = str(row["next_check_at"] or "").strip()
+        if clear_next_check:
+            new_next = ""
+        elif next_minutes is not None:
+            new_next = prev_next if (keep_longer_next and prev_next > next_s) else next_s
+        elif stage is not None and _is_waiting_stage(stage) and resolved_status == ITEM_ACTIVE and (not prev_next or prev_next <= now_s):
+            new_next = (now_dt + timedelta(minutes=default_wait_m)).isoformat(timespec="seconds")
+        else:
+            new_next = prev_next
         store.conn.execute(
             """UPDATE loop_items
                SET title = ?, stage = ?, status = ?, payload_json = ?, context_json = ?,
@@ -1500,7 +1572,7 @@ def format_loop_execution_prompt(
         [
             "",
             "### 状态机推进命令（处理完每项后必须调用以更新阶段，防下次重复报警）",
-            f"- 推进到下一阶段：`sheepdog loop item {spec.id} --key <item_key> --stage <下一阶段> --note \"进展说明\"`",
+            f"- 推进到下一阶段：`sheepdog loop item {spec.id} --key <item_key> --stage <下一阶段> [--next-minutes <分钟>] --note \"进展说明\"`",
             f"- 彻底办结关单：`sheepdog loop item {spec.id} --key <item_key> --status closed --note \"结案说明\"`",
             f"- 标记长期豁免（自动写入 MEMORY.md）：`sheepdog loop item {spec.id} --key <item_key> --status exempted --note \"豁免原因\"`",
             "",
@@ -1642,9 +1714,15 @@ def run_loop_tick(
                 stage=spec.stages[0] if spec.stages else "detected",
                 status=ITEM_ACTIVE,
                 payload=cand["payload"],
+                now_dt=now,
             )
             newly_added += 1
         else:
+            try:
+                old_pl = json.loads(ex["payload_json"] or "{}")
+            except Exception:
+                old_pl = {}
+            ext_changed = _has_external_payload_changed(old_pl, cand["payload"])
             update_loop_item(
                 cfg,
                 store,
@@ -1652,6 +1730,8 @@ def run_loop_tick(
                 ikey,
                 title=cand["title"] or ex["title"],
                 payload=cand["payload"],
+                clear_next_check=ext_changed and bool(str(ex["next_check_at"] or "").strip() > now_s),
+                now_dt=now,
             )
 
     all_active = list_loop_items(store, loop_id, status=ITEM_ACTIVE)
@@ -1799,6 +1879,23 @@ def run_loop_tick(
             dispatcher.dispatch_once()
         except Exception as e:
             log.warning("派发循环消息异常 (%s): %s", loop_id, e)
+
+    wait_defer_s = (now + timedelta(minutes=max(float(spec.interval_minutes), 60.0))).isoformat(timespec="seconds")
+    for it in due_items:
+        ikey = str(it.get("item_key") or "").strip()
+        if not ikey:
+            continue
+        cur_next = str(it.get("next_check_at") or "").strip()
+        if not force and _is_waiting_stage(it.get("stage")) and (not cur_next or cur_next <= now_s):
+            store.conn.execute(
+                "UPDATE loop_items SET last_run_id = ?, next_check_at = ? WHERE loop_id = ? AND item_key = ?",
+                (run_id, wait_defer_s, loop_id, ikey),
+            )
+        else:
+            store.conn.execute(
+                "UPDATE loop_items SET last_run_id = ? WHERE loop_id = ? AND item_key = ?",
+                (run_id, loop_id, ikey),
+            )
 
     dur_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     summary_str = (
