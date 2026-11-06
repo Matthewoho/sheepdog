@@ -5841,6 +5841,47 @@ class Dispatcher:
                         "（账本记录，请结合群内最新进展处理，勿重复旧结论或漏看他人回复）：\n"
                         + "\n".join(items)
                     )
+        # 1.1.39 (REG-128): 当主人连续在多个会话的待拍板卡片上点选/回复（如先在 tp_3x-ui-ops 问『我看到那边有新加了需求 我需要买几台呢？』，
+        # 5 秒后在另一业务会话的『回收 lsg6 备用席位 vs 合并新购』卡回『暂不动』）时，自动附带近 15 分钟跨会话关联拍板回复，
+        # 杜绝专席孤立把『暂不动（不拆现有节点备用席位）』误读为『暂缓开通申请人专线』并对外错回。
+        if any(isinstance(tg, str) and tg.startswith("escalation:") for tg in tags):
+            cur_tid = (r["topic_id"] or "").strip() if "topic_id" in r.keys() else ""
+            ref_dt = _parse(r["create_time"] or "") or (
+                _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
+            ) or _now()
+            sib_rows = self.store.conn.execute(
+                "SELECT m.message_id, m.topic_id AS m_topic, m.create_time, m.first_seen, m.content, "
+                "m.reply_to, e.topic_id AS e_topic, e.text AS e_text, e.answered_at "
+                "FROM messages m LEFT JOIN escalations e ON e.message_id = m.reply_to "
+                "WHERE m.reason = 'owner_reply' AND COALESCE(m.deleted, 0) = 0 AND m.message_id != ? "
+                "ORDER BY m.create_time DESC, m.rowid DESC LIMIT 12",
+                (r["message_id"],),
+            ).fetchall()
+            sib_items: list[str] = []
+            for sb in sib_rows:
+                sb_tid = (sb["e_topic"] or sb["m_topic"] or "").strip()
+                if not sb_tid or (cur_tid and sb_tid == cur_tid):
+                    continue
+                sb_dt = (
+                    _parse(sb["create_time"] or "")
+                    or _parse(sb["answered_at"] or "")
+                    or _parse(sb["first_seen"] or "")
+                )
+                if sb_dt is None or ref_dt is None or abs((ref_dt - sb_dt).total_seconds()) > 900:
+                    continue
+                sb_txt = " ".join((sb["content"] or "").split())
+                if not sb_txt:
+                    continue
+                e_first = ((sb["e_text"] or "").splitlines()[0] if sb["e_text"] else "").strip()
+                e_label = f"「{e_first[:60]}」（`{sb['reply_to']}`）" if e_first else f"`{sb['reply_to'] or sb['message_id']}`"
+                sib_items.append(
+                    f"- {sb['create_time'] or sb['answered_at'] or '-'} [{sb_tid}] 针对{e_label}回复：{sb_txt[:180]}"
+                )
+            if sib_items:
+                notes.append(
+                    "🔗 主人近 15 分钟在其他会话的关联拍板回复（请结合跨会话上下文理解主人简短批复，勿孤立误读为取消需求）：\n"
+                    + "\n".join(sib_items[:5])
+                )
         return notes
 
     def _collision_notes(self, t, rows) -> dict[str, list[str]]:

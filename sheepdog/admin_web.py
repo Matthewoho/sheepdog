@@ -152,9 +152,14 @@ def diagnose_override_reason(
         r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽可能端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b|(?:能不能用|改用|用)[^\n。]{0,12}国际站"
         r"|修复这一类|这一类的东西|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
         r"|一般资源范围|一般都做什么|开发产研相关改动|网络这一些就不行|应该有所有数据库的最高权限|所有数据库的最高权限"
-        r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9]))",
+        r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
+        r"|暴力的?把跳数改为|跳数改为\s*\d+[^\n。]*有问题|从\s*media\s*进来多一条|走\s*ai\s*的话就没多这一跳"
+        r"|长期有效(?:的)?(?:办法|方案|解法)|有没有.{0,12}长期.{0,8}(?:办法|方案|解法)|一劳永逸)",
         s,
         re.I,
+    ) or (
+        re.search(r"^(?:暂不动|先不动|这个不动)$", s)
+        and re.search(r"回收[^\n]*(?:lsg\d+|备用席位|双占)", text or "", re.I)
     ):
         return ("arch_or_config_posture", "技术姿势纠偏")
     if re.search(
@@ -174,6 +179,7 @@ def diagnose_override_reason(
         r"给他授权|直接给.{0,6}授权|给.{0,8}开权限|给他(?:账号密码|账密)|还不能动|把来龙去脉在群里讲清楚|来龙去脉.{0,8}讲清楚|等澄清上下文|澄清上下文|暂时观望|你先排查|先排查一下|弄清楚.{0,12}(?:给我|再)|给我执行方案|"
         r"能具体讲讲|具体讲讲|讲讲前因后果|完整的方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]|"
         r"问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|先问一下腾讯云|问一下腾讯云的人|是给谁访问的|给谁访问的|"
+        r"新加了需求[^\n。]{0,16}(?:我)?需要买几台|(?:我)?需要买几台[呢吗嘛?？]|"
         r"给我一次.{0,24}(?:名单|列表|台账)|再发一次.{0,24}(?:名单|列表|台账)|总体.{0,16}(?:在使用|在用).{0,12}(?:人员)?名单)",
         s,
         re.I,
@@ -625,7 +631,27 @@ def classify_escalation(
         alignment_label = "待人类拍板"
     elif answered_at or close_reason == "answered":
         if chosen_code == "其他":
-            if _OVERRIDE_WORDS_RE.search(ans_body) or not _ACCEPT_WORDS_RE.search(ans_body):
+            rec_code = (recommended or "A").upper()
+            rec_label = next((str(o.get("label") or "") for o in options if o.get("code") == rec_code), "")
+            if not rec_label and text:
+                m_opt = re.search(rf"(?:^|\n)\s*{re.escape(rec_code)}\s*[\.、:：)\]]\s*([^\n]+)", text, re.I)
+                rec_label = m_opt.group(1) if m_opt else ""
+            _cn_num = {"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+            m_ans_buy = re.search(
+                r"^(?:那|好|好的|行|ok)?[，,\s]*(?:我)?(?:这就|先|现在)?去\s*(?:买|新买|新购|采购)\s*([一二两三四五六七八九十\d]+)\s*台",
+                (ans_body or "").strip(),
+                re.I,
+            )
+            m_rec_buy = re.search(r"(?:买|新买|新购|采购)\s*([一二两三四五六七八九十\d]+)\s*台", rec_label, re.I)
+            ans_cnt = _cn_num.get(m_ans_buy.group(1), m_ans_buy.group(1)) if m_ans_buy else ""
+            rec_cnt = _cn_num.get(m_rec_buy.group(1), m_rec_buy.group(1)) if m_rec_buy else ""
+            accepts_rec_purchase = bool(
+                not _OVERRIDE_WORDS_RE.search(ans_body)
+                and ans_cnt
+                and rec_cnt
+                and ans_cnt == rec_cnt
+            )
+            if _OVERRIDE_WORDS_RE.search(ans_body) or (not _ACCEPT_WORDS_RE.search(ans_body) and not accepts_rec_purchase):
                 alignment = "overridden"
                 override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
                 alignment_label = override_reason

@@ -902,6 +902,37 @@ _PREFER_MANUAL_TERMINAL_OVER_SESSION_SCRIPT_ASK_RE = re.compile(
     r"(?=[\s\S]*(?:推荐\s*A|建议\s*[：:]?\s*(?:选\s*)?A\b|选项\s*A\s*[（(]\s*推荐\s*[）)]))",
     re.I,
 )
+_VPS_RECLAIM_BACKUP_SEAT_OVER_NEW_NODE_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:专线|3x-ui|lsg\d+|VPS))"
+    r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:零采购)?[^\n]*(?:回收|腾退|清理)[^\n]*(?:lsg\d+|备用席位|双占|备用二线))"
+    r"(?=[\s\S]*(?:选项\s*B|B)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:合并进[^\n]*待购|新购|新买|采购)[^\n]*(?:lsg\d+|新机|VPS))"
+    r"(?=[\s\S]*(?:建议\s*[：:]?\s*(?:选\s*)?A\b|(?:选项\s*A|A\.)[^\n]*[（(]\s*推荐\s*[）)]))",
+    re.I,
+)
+_VPS_SEAT_ALLOC_OR_PURCHASE_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:开通(?:专属网络|专线)|专线开通|新专线|采购\s*lsg\d+|待购的?\s*lsg\d+))"
+    r"(?=[\s\S]*(?:lsg\d+|3x-ui|tp_3x-ui-ops))",
+    re.I,
+)
+_RIGID_PROXY_HOPS_BREAKING_ONE_HOP_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:TRUSTED_PROXY_HOPS|PROXY_HOPS)\s*(?:改为|设为|=)\s*[2-9]\b)"
+    r"(?=[\s\S]*(?:1\s*跳拒|仅\s*1\s*跳\s*XFF\s*请求返回\s*5\d\d|fewer\s+than\s+the\s+[2-9]\s+trusted\s+proxy\s+hops))",
+    re.I,
+)
+_MULTI_DOMAIN_ENTRY_HOPS_VERIFIED_EVIDENCE_RE = re.compile(
+    r"(?:已核实[^\n。]{0,36}(?:\.ai\s*与\s*\.media|多域名入口|不同域名入口)[^\n。]{0,36}跳数|"
+    r"按可信代理\s*CIDR|trusted_proxy_cidrs|兼容\s*1\s*跳与\s*2\s*跳)",
+    re.I,
+)
+_EXPIRED_PIPELINE_TOKEN_MANUAL_RENEW_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:GITHUB_TOKEN|GitHub\s*PAT|密钥仓|流水线[^\n。]{0,20}(?:密钥|Token|PAT))[^\n。]{0,28}过期)"
+    r"(?=[\s\S]*(?:网页端|控制台|后台)[^\n。]{0,24}(?:更新|粘贴|替换)[^\n。]{0,20}(?:PAT|Token|密钥))",
+    re.I,
+)
+_LONG_TERM_NON_EXPIRING_TOKEN_REMEDY_RE = re.compile(
+    r"(?:No\s+expiration|永不过期|长期有效|vendor\s*依赖|go\s+mod\s+vendor|GitHub\s*App|免\s*Token)",
+    re.I,
+)
 
 
 def check_source_peer_followup_and_proxy_guard(
@@ -1264,6 +1295,49 @@ def check_ask_pre_flight_guard(
             "严禁把『选项 A（推荐）：你在本机终端直接跑一遍脚本』作为首选推给主人手工跑，而把『选项 B：授权父会话直接调用该脚本完成切换』贬为次选"
             "（主人 2026-11-06 15:11 在 `tp_tapnow-prod-topology` 卡片直接推翻推荐 A、改选『B：授权父会话执行收尾脚本完成切换』，REG-127 授权会话自动执行合规脚本优先门禁）："
             "请将『授权父会话/专席直接调用合规脚本端到端完成并回读验证』作为首选建议（选项 A）后再发起请示（没有发送）",
+        )
+    if _VPS_RECLAIM_BACKUP_SEAT_OVER_NEW_NODE_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当全网 VPS 专线节点（3/3 编制）已满编时，主人的既定策略是统一新购 VPS 节点（或合并进 `tp_3x-ui-ops` 正在推进的新机采购池），"
+            "严禁将『A. 零采购回收 lsg6 等节点上现有同事的双占/备用席位』作为首选推荐（`建议：选 A`），而把『B. 合并进待购新机 / 新购 VPS』贬为次选"
+            "（主人 2026-11-06 16:38:48 在业务专席卡片 `[其他]` 批复『暂不动』拒绝回收现有 `lsg6` 席位，并于 16:40:35 在 `tp_3x-ui-ops` 拍板『那我去买两台吧』统一新购 `lsg16+lsg17`，REG-128 专线满编优先合并新购禁拆同事备用席位门禁）："
+            "① 若 `tp_3x-ui-ops` 当前已有在途新机采购请示，请直接通过 `sheepdog tell --to tp_3x-ui-ops` 汇总新增人数由 `tp_3x-ui-ops` 统一更新采购台数，勿在业务会话重复发第二张专线拍板卡；"
+            "② 若确需请示，必须将『合并进新购 VPS 节点（如 lsg16/lsg17）统一开通』作为首选建议（选项 A）（没有发送）",
+        )
+    if topic_id != "tp_3x-ui-ops" and _VPS_SEAT_ALLOC_OR_PURCHASE_ASK_RE.search(full_text):
+        open_3x = store.conn.execute(
+            "SELECT message_id, text FROM escalations WHERE topic_id='tp_3x-ui-ops' AND closed_at IS NULL AND answered_at IS NULL ORDER BY asked_at DESC LIMIT 1"
+        ).fetchone()
+        if open_3x is not None and re.search(r"(?:lsg\d+|专线|新机器|采购|购买)", str(open_3x["text"] or ""), re.I):
+            raise OutboundError(
+                EXIT_INVALID,
+                f"专线运维专席 `tp_3x-ui-ops` 当前已挂有未决的专线采购/席位拍板卡（`{open_3x['message_id']}`），"
+                "严禁在业务会话（`" + topic_id + "`）平行再发第二张专线席位/合并采购拍板卡，导致主人在两张卡片间来回核对『一共需要买几台』"
+                "（主人 2026-11-06 16:38:43 在 `tp_3x-ui-ops` 反问『我看到那边有新加了需求 我需要买几台呢？』并在业务专席批复『暂不动』，REG-128 跨会话专线需求统一归口 `tp_3x-ui-ops` 单一事实源门禁）："
+                "请直接通过 `sheepdog tell --topic " + topic_id + " --to tp_3x-ui-ops` 将新增申请人数与客户端类型同步给 `tp_3x-ui-ops`，由 `tp_3x-ui-ops` 原地更新其未决采购卡并统一向主人汇报需购台数，本会话先代回申请人『正在安排开通』并交 `handled`/`waiting` 回执（没有发送）",
+            )
+    if (
+        _RIGID_PROXY_HOPS_BREAKING_ONE_HOP_ASK_RE.search(full_text)
+        and not _MULTI_DOMAIN_ENTRY_HOPS_VERIFIED_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示将服务固定代理跳数（如 `EAS_TRUSTED_PROXY_HOPS`）直接改为 `2`（且测试呈现『1 跳拒 / 仅 1 跳 XFF 请求返回 503』）前，"
+            "严禁忽略多域名入口（如 `.media` 经 CDN+LB 为 2 跳、而 `.ai` 直连 Global ELB 仅为 1 跳）的跳数非对称性"
+            "（主人 2026-11-06 16:59:01 在网关专席卡片 `[其他]` 明确纠偏：『这个我觉得暴力的把跳数改为2是不是有问题 我从media进来多一条 走ai的话就没多这一跳诶』，REG-128 多入口代理跳数非对称防一刀切阻断门禁）："
+            "请先核查所有线上入口域名（`.ai` / `.media` / `.tv`）的真实 `X-Forwarded-For` 跳数差异，优先采用按可信代理 CIDR 剥离或兼容 1/2 跳的方案，并在正文中写明多域名入口兼容验证结论后再发起请示（没有发送）",
+        )
+    if (
+        _EXPIRED_PIPELINE_TOKEN_MANUAL_RENEW_ASK_RE.search(full_text)
+        and not _LONG_TERM_NON_EXPIRING_TOKEN_REMEDY_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当流水线或密钥仓中的构建凭据（如 `GITHUB_TOKEN` / `GitHub PAT`）过期导致拉取私有依赖失败时，"
+            "严禁只给出『去网页端粘贴更新一次临时 Token』的治标选项，而不一并给出让该类过期问题不再发生的简单长期根治方案"
+            "（主人 2026-11-06 17:33:02 在构建专席卡片 `[其他]` 追问：『这个有没有什么简单的长期有效的办法』，REG-128 凭证过期请示必带长期免过期根治方案门禁）："
+            "请在首选方案中直接写明简单长期有效的根治做法（例如签发 `No expiration / 永不过期` 的最小权限只读 PAT、接入 GitHub App 或开启 `go mod vendor` 免 Token 离线构建），避免每次过期重复人工救火（没有发送）",
         )
     if floor or floor_type:
         return

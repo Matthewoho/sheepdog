@@ -6347,6 +6347,273 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertIn("误触更正", pg_entry["alignment_label"])
             st.close()
 
+    def test_reg128_vps_reclaim_backup_seat_guard_sibling_callback_context_and_purchase_acceptance(self):
+        """1.1.39（REG-128）：
+        1. outbound.check_ask_pre_flight_guard 拦截把『A. 零采购回收 lsg6 等节点上同事的双占备用席位』作为推荐首选、而把『B. 合并进待购新机 / 新购 VPS』贬为次选的提问；
+        2. 当 tp_3x-ui-ops 已挂有未决的专线采购/席位拍板卡时，拦截非 tp_3x-ui-ops 会话（如 tp_vpn-req）平行再发第二张专线席位/合并采购拍板卡，强制归口 tp_3x-ui-ops 单一事实源；
+        3. outbound.check_ask_pre_flight_guard 拦截将固定代理跳数（如 EAS_TRUSTED_PROXY_HOPS）直接改为 2 且呈现『1 跳拒 / 仅 1 跳 XFF 请求返回 503』但未核实多域名入口（.ai 1跳 vs .media 2跳）兼容性的提问；
+        4. Dispatcher._escalation_source_followup_notes 在投递主人的卡片回调时，自动附带近 15 分钟内主人在其他会话的关联拍板回复（如 tp_3x-ui-ops 中问『我看到那边有新加了需求 我需要买几台呢？』），防止 tp_vpn-req 孤立将『暂不动』误读为暂缓开通需求；
+        5. admin_web.classify_escalation 与 diagnose_override_reason：当推荐选项本身就是『买 2 台』且主人在 [其他] 回复『那我去买两台吧』时判为 accepted；将『暂不动（针对回收备用席位）』与『暴力的把跳数改为2是不是有问题 我从media进来多一条 走ai的话就没多这一跳诶』归入 arch_or_config_posture，将『我看到那边有新加了需求 我需要买几台呢？』归入 context_incomplete。
+        """
+        from sheepdog import admin_web, outbound
+        from sheepdog.config import Config
+        from sheepdog.engine import Dispatcher
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = Path(tmp)
+            db = tpath / "sheepdog.sqlite3"
+            st = Store(db)
+            cfg = Config(state_dir=tpath, self_open_id="ou_test_owner")
+
+            # 1) Block recommending Option A "reclaim existing backup seats on lsg6" over Option B "merge into new node lsg16"
+            bad_reclaim_ask = (
+                "新增 2 名同事专线对齐出两套方案：A. 零采购回收 lsg6 备用席位腾给两人（推荐）；B. 合并进 T-20 待购的 lsg16。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 零采购即刻开通：回收 lsg6 上现有同事的双占备用席位，腾给两人\n"
+                "B. 合并进 T-20 待购的 lsg16：与排队中的同事共享 1 台新机\n\n"
+                "建议：选 A。零增量成本、即刻交付无需等新机。\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_reclaim:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_vpn-req",
+                    "专线开通两套优化方案",
+                    bad_reclaim_ask,
+                    key="vps-reclaim-128",
+                )
+            self.assertIn("REG-128", str(cm_reclaim.exception))
+
+            # 2) When tp_3x-ui-ops has an open VPS purchase escalation, block non-tp_3x-ui-ops topic from firing a parallel VPS ask
+            st.upsert_topic("tp_3x-ui-ops", title="3x-ui 专线运维", state="waiting_human", conversation_id="cid_3x_128")
+            st.upsert_topic("tp_vpn-req", title="业务专线对接", state="active", conversation_id="cid_sw_128")
+            st.add_escalation(
+                "om_test_3x_open_128",
+                "tp_3x-ui-ops",
+                "oc_test_tg_128",
+                "🐕 需要你定 · 新专线lsg16采购提醒 [tp_3x-ui-ops]\n距离上次说购买新机器已满 1 小时，买好 lsg16 发我即可。\n---more---\n选项：\nA. 已买好新机器 lsg16\nB. 稍后购买\n建议：选 A",
+                "2026-11-06T16:07:32+08:00",
+            )
+            parallel_vps_ask = (
+                "为团队 2 名新成员开通专线，请示合并进待购新机或单独新购。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 合并进 T-20 待购的 lsg16（与 tp_3x-ui-ops 统一开通）\n"
+                "B. 单独再新购 1 台 lsg17\n"
+                "建议：选 A\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_parallel:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_vpn-req",
+                    "新增2人专线合并采购确认",
+                    parallel_vps_ask,
+                    key="vps-parallel-128",
+                )
+            self.assertIn("REG-128", str(cm_parallel.exception))
+            self.assertIn("om_test_3x_open_128", str(cm_parallel.exception))
+
+            # 3) Block rigid EAS_TRUSTED_PROXY_HOPS=2 ask that rejects 1-hop requests without multi-domain (.ai vs .media) verification
+            bad_hops_ask = (
+                "测试环境已将 enterprise-admin-service 的 EAS_TRUSTED_PROXY_HOPS 改为 2 并完成真机验证（1 跳拒、2 跳通），请授权生产变更。\n"
+                "---more---\n"
+                "- 测试回执：仅 1 跳 XFF 请求返回 503（forwarded chain has 1 entries, fewer than the 2 trusted proxy hops）。\n"
+                "选项：\n"
+                "A. 同意执行生产 enterprise-admin-service EAS_TRUSTED_PROXY_HOPS=2 变更\n"
+                "B. 暂缓执行\n"
+                "建议：A\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_hops:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_gateway-ops",
+                    "生产EAS跳数变更授权",
+                    bad_hops_ask,
+                    key="eas-hops-128",
+                    floor="生产配置变更授权",
+                    floor_type="prod",
+                )
+            self.assertIn("REG-128", str(cm_hops.exception))
+
+            good_hops_ask = (
+                "已核实 .ai 与 .media 入口跳数差异（此前 EAS_TRUSTED_PROXY_HOPS=2 测试 1 跳拒），现改为按可信代理 CIDR 剥离兼容 1 跳与 2 跳请求，请授权生产变更。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意上线按可信代理 CIDR 剥离方案（兼容 .ai 1跳与 .media 2跳）\n"
+                "B. 暂缓执行\n"
+                "建议：A\n"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_gateway-ops",
+                "生产EAS可信代理CIDR变更授权",
+                good_hops_ask,
+                key="eas-hops-good-128",
+                floor="生产配置变更授权",
+                floor_type="prod",
+            )
+
+            # 4) Cross-topic sibling owner callback context injection in Dispatcher._escalation_source_followup_notes
+            st.add_escalation(
+                "om_test_sw_open_128",
+                "tp_vpn-req",
+                "oc_test_tg_128",
+                f"🐕 需要你定 · 专线开通两套优化方案 [tp_vpn-req]\n{bad_reclaim_ask}",
+                "2026-11-06T16:17:44+08:00",
+            )
+            cb_3x = Message(
+                message_id="sd_card_cb_3x_128",
+                chat_id="oc_test_tg_128",
+                chat_name="话题群",
+                chat_type="topic",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                reply_to="om_test_3x_open_128",
+                content="[卡片回调] 其他：我还没买 我看到那边有新加了需求 我需要买几台呢？",
+                msg_type="text",
+                create_time="2026-11-06T16:38:43+08:00",
+            )
+            st.upsert_message(
+                cb_3x,
+                "dispatch",
+                "owner_reply",
+                ["owner_verified", "card_callback", "escalation:om_test_3x_open_128"],
+                "tp_3x-ui-ops",
+                "acked",
+            )
+            st.answer_escalation("om_test_3x_open_128", "sd_card_cb_3x_128")
+
+            cb_sw = Message(
+                message_id="sd_card_cb_sw_128",
+                chat_id="oc_test_tg_128",
+                chat_name="话题群",
+                chat_type="topic",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                reply_to="om_test_sw_open_128",
+                content="[卡片回调] 其他：暂不动",
+                msg_type="text",
+                create_time="2026-11-06T16:38:48+08:00",
+            )
+            st.upsert_message(
+                cb_sw,
+                "dispatch",
+                "owner_reply",
+                ["owner_verified", "card_callback", "escalation:om_test_sw_open_128"],
+                "tp_vpn-req",
+                "pending",
+            )
+            disp = Dispatcher(cfg, st, None)
+            sw_row = st.get_message("sd_card_cb_sw_128")
+            sib_notes = disp._escalation_source_followup_notes(sw_row)
+            self.assertTrue(any("其他会话" in n and "tp_3x-ui-ops" in n and "我需要买几台呢" in n for n in sib_notes))
+
+            # 5) Verify classify_escalation & diagnose_override_reason on all 4 cases
+            buy2_row = {
+                "message_id": "om_test_buy2_128",
+                "answer_message_id": "sd_card_cb_buy2_128",
+                "topic_id": "tp_3x-ui-ops",
+                "text": (
+                    "🐕 需要你定 · 最少买1台够用，建议买2台留余量 [tp_3x-ui-ops]\n"
+                    "建议直接买 2 台。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 买 2 台（lsg16 + lsg17）：点「其他」发我 2 台的 IP、端口和密码\n"
+                    "B. 只买 1 台（lsg16）\n"
+                    "建议：A\n"
+                ),
+                "asked_at": "2026-11-06T16:39:17+08:00",
+                "answered_at": "2026-11-06T16:40:38+08:00",
+                "closed_at": "2026-11-06T16:40:35+08:00",
+                "close_reason": "answered",
+                "resolved_by": None,
+                "resolve_note": None,
+                "nudge_count": 0,
+            }
+            buy2_res = admin_web.classify_escalation(buy2_row, answer_content="[卡片回调] 其他：那我去买两台吧")
+            self.assertEqual(buy2_res["alignment"], "accepted")
+            buy1_diff_res = admin_web.classify_escalation(buy2_row, answer_content="[卡片回调] 其他：那我去买一台吧")
+            self.assertEqual(buy1_diff_res["alignment"], "overridden")
+
+            c_reclaim, l_reclaim = admin_web.diagnose_override_reason(
+                bad_reclaim_ask,
+                "暂不动",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_reclaim, l_reclaim), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            c_howmany, l_howmany = admin_web.diagnose_override_reason(
+                "🐕 需要你定 · 新专线lsg16采购提醒",
+                "我还没买 我看到另一边有新加了需求 我需要买几台呢？",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_howmany, l_howmany), ("context_incomplete", "缺环境/调用链反问"))
+
+            c_hops, l_hops = admin_web.diagnose_override_reason(
+                bad_hops_ask,
+                "这个我觉得暴力的把跳数改为2是不是有问题 我从media进来多一条 走ai的话就没多这一跳诶",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_hops, l_hops), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 6) Expired pipeline GITHUB_TOKEN / PAT ask without long-term non-expiring remedy is blocked,
+            #    and owner reply "这个有没有什么简单的长期有效的办法" is classified as arch_or_config_posture
+            bad_token_ask = (
+                "微服务构建挂死，已定位系流水线密钥仓 stage-github.yml 的 GITHUB_TOKEN 过期。建议在网页端更新该 Token 即可恢复。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 在网页端的 stage-github.yml 更新有效 GitHub PAT，专席跟进回测\n"
+                "B. 授权同事自行签发 GitHub PAT 并在网页端更新\n"
+                "建议：选 A\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_tok:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_build-ops",
+                    "流水线密钥过期需更新",
+                    bad_token_ask,
+                    key="pipeline-token-128",
+                )
+            self.assertIn("REG-128", str(cm_tok.exception))
+
+            good_token_ask = (
+                "微服务构建挂死系 stage-github.yml 的 GITHUB_TOKEN 过期，建议签发 No expiration（永不过期）只读 PAT 在网页端更新以长期根治。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 签发 No expiration（永不过期）只读 GitHub PAT 填入网页端（推荐）\n"
+                "B. 开启 go mod vendor 离线构建彻底免除 Token 依赖\n"
+                "建议：选 A\n"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_build-ops",
+                "流水线密钥过期长期根治方案",
+                good_token_ask,
+                key="pipeline-token-good-128",
+            )
+
+            c_longterm, l_longterm = admin_web.diagnose_override_reason(
+                bad_token_ask,
+                "这个有没有什么简单的长期有效的办法",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_longterm, l_longterm), ("arch_or_config_posture", "技术姿势纠偏"))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
