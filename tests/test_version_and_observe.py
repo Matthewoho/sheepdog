@@ -6614,6 +6614,98 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual((c_longterm, l_longterm), ("arch_or_config_posture", "技术姿势纠偏"))
             st.close()
 
+    def test_reg129_stage_db_tunnel_grant_guard_override_diagnosis_and_cli_lamb_dup_poll_dedup(self) -> None:
+        """REG-129:
+        1) Stage/test-env database or evaluation read-only connection ask that recommends
+           Option A ('不对外发连接串、不开隧道 / 本机闭环代跑') over Option B ('受限 SSH 隧道 / 无 Shell 端口转发交付')
+           must be blocked by check_ask_pre_flight_guard even when floor/floor_type is passed;
+           recommending the restricted SSH tunnel / read-only grant passes cleanly.
+        2) Owner overriding A -> B with '[B] 同意建受限SSH隧道交付申请人' is diagnosed as
+           ('arch_or_config_posture', '技术姿势纠偏').
+        3) _summarize_cli_lamb_log collapses consecutive identical poll lines (e.g.
+           '[gke-worker] poll <uuid>: WORKING') so the trailing exception stays within the
+           160-char evolve preview window.
+        """
+        from sheepdog import admin_web, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            st = Store(root / "sheepdog.sqlite3")
+            cfg = Config(state_dir=root, self_open_id="ou_test_owner")
+
+            bad_stage_tunnel_ask = (
+                "**申请开通中国站Stage数据库评测只读连接**\n"
+                "**现状：** 业务同学需要连接中国站 Stage 数据库跑离线评测分析。\n"
+                "**需拍板：** 是否同意按受限 SSH 隧道将中国站 Stage 脱敏只读视图开放给业务同学。\n"
+                "**建议：A**\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 按境内本机闭环合规方案执行：在 Stage 跳板机部署评测脚本跑评测，仅将汇总指标回传，不对外发连接串、不开跨境隧道\n"
+                "B. 同意按受限 SSH 隧道开通并交付业务同学：新建最小权限只读账号 eval_ro + 参照现网建无 Shell 端口转发账号 tunnel_eval 并将连接方式交付本人\n"
+                "建议：A\n"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_stage:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_eval-ops",
+                    "申请开通中国站Stage数据库评测只读连接",
+                    bad_stage_tunnel_ask,
+                    floor="outbound_credential_secret_key",
+                    floor_type="credential_out",
+                    key="stage-eval-ro-129",
+                )
+            self.assertIn("REG-129", str(cm_stage.exception))
+
+            good_stage_tunnel_ask = (
+                "**申请开通中国站Stage数据库评测只读连接**\n"
+                "**现状：** 业务同学需要连接中国站 Stage 数据库跑离线评测分析。\n"
+                "**需拍板：** 拟按受限 SSH 隧道将中国站 Stage 脱敏只读视图开通并交付业务同学。\n"
+                "**建议：A**\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意按受限 SSH 隧道开通并交付业务同学：新建最小权限只读账号 eval_ro + 建无 Shell 端口转发账号 tunnel_eval 交付本人（推荐）\n"
+                "B. 仅在 Stage 跳板机由专席代跑评测脚本，不对外发连接串\n"
+                "建议：A\n"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_eval-ops",
+                "申请开通中国站Stage数据库评测只读连接",
+                good_stage_tunnel_ask,
+                floor="outbound_credential_secret_key",
+                floor_type="credential_out",
+                key="stage-eval-ro-good-129",
+            )
+
+            cat, label = admin_web.diagnose_override_reason(
+                bad_stage_tunnel_ask,
+                "[B] 同意建受限SSH隧道交付业务同学",
+                chosen_code="B",
+                recommended="A",
+            )
+            self.assertEqual((cat, label), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            dup_poll_log = (
+                "[gke-worker] poll d87032a0-9e41-484e-8ac7-72fa0d8e62ee: WORKING\n"
+                "[gke-worker] poll d87032a0-9e41-484e-8ac7-72fa0d8e62ee: WORKING\n"
+                "[gke-worker] poll d87032a0-9e41-484e-8ac7-72fa0d8e62ee: WORKING\n"
+                "[gke-worker] poll d87032a0-9e41-484e-8ac7-72fa0d8e62ee: WORKING\n"
+                "urllib.error.URLError: <urlopen error EOF occurred in violation of protocol (_ssl.c:1129)>\n"
+            )
+            summary, has_err = engine._summarize_cli_lamb_log(dup_poll_log)
+            self.assertTrue(has_err)
+            self.assertEqual(
+                summary.count("[gke-worker] poll d87032a0-9e41-484e-8ac7-72fa0d8e62ee: WORKING"),
+                1,
+            )
+            self.assertIn("urllib.error.URLError", summary)
+            self.assertLessEqual(len(summary), 160)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

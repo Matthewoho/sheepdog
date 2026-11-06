@@ -933,6 +933,13 @@ _LONG_TERM_NON_EXPIRING_TOKEN_REMEDY_RE = re.compile(
     r"(?:No\s+expiration|永不过期|长期有效|vendor\s*依赖|go\s+mod\s+vendor|GitHub\s*App|免\s*Token)",
     re.I,
 )
+_STAGE_DB_OR_TUNNEL_WITHHOLD_OVER_GRANT_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:Stage|测试环境)[^\n。]{0,36}(?:Postgres|数据库|只读连接|只读账号|评测))"
+    r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:不对外发连接串|不开(?:跨境)?隧道|不开放[^\n]*连接))"
+    r"(?=[\s\S]*(?:选项\s*B|B)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:受限\s*SSH\s*隧道|无\s*Shell\s*端口转发)[^\n]*交付)"
+    r"(?=[\s\S]*(?:建议\s*[：:]?\s*(?:选\s*)?A\b|(?:选项\s*A|A\.)[^\n]*[（(]\s*推荐\s*[）)]))",
+    re.I,
+)
 
 
 def check_source_peer_followup_and_proxy_guard(
@@ -1338,6 +1345,14 @@ def check_ask_pre_flight_guard(
             "严禁只给出『去网页端粘贴更新一次临时 Token』的治标选项，而不一并给出让该类过期问题不再发生的简单长期根治方案"
             "（主人 2026-11-06 17:33:02 在构建专席卡片 `[其他]` 追问：『这个有没有什么简单的长期有效的办法』，REG-128 凭证过期请示必带长期免过期根治方案门禁）："
             "请在首选方案中直接写明简单长期有效的根治做法（例如签发 `No expiration / 永不过期` 的最小权限只读 PAT、接入 GitHub App 或开启 `go mod vendor` 免 Token 离线构建），避免每次过期重复人工救火（没有发送）",
+        )
+    if _STAGE_DB_OR_TUNNEL_WITHHOLD_OVER_GRANT_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "内部研发或业务域负责人在 Stage / 测试环境申请数据库脱敏只读连接（且现网已具备脱敏只读角色与无 Shell 白名单端口转发隧道模式）用于自助跑评测时，"
+            "严禁将『A. 不对外发连接串、不开隧道（仅限本机闭环）』作为首选建议，而把『B. 建受限 SSH 隧道并交付脱敏只读连接』贬为次选"
+            "（主人 2026-11-05 21:15 已立规『stage你就直接给他权限让他自己弄呗』，并于 2026-11-06 18:29:35 在业务专席卡片推翻推荐 A、改选『B：同意建受限SSH隧道交付』，REG-129 Stage 脱敏只读与受限隧道自助赋能优先门禁）："
+            "请将『按最小权限脱敏只读角色 + 受限白名单 SSH 隧道开通并交付申请人自助评测』作为首选建议（选项 A）后再发起请示（没有发送）",
         )
     if floor or floor_type:
         return

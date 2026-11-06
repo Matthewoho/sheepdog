@@ -5019,6 +5019,10 @@ class Dispatcher:
                             and len({m.group(1) for ln in cur_sum.splitlines() if (m := _ATTEMPT_POLL_PREFIX_RE.match(ln.strip()))})
                             < sum(1 for ln in cur_sum.splitlines() if _ATTEMPT_POLL_PREFIX_RE.match(ln.strip()))
                         )
+                        or any(
+                            a.strip() and a.strip() == b.strip()
+                            for a, b in zip(cur_sum.splitlines(), cur_sum.splitlines()[1:])
+                        )
                         or (cur_sum.lstrip().startswith('"') and not cur_sum.lstrip().startswith('"{'))
                         or (
                             "JSON(" in cur_sum
@@ -7473,6 +7477,8 @@ def _summarize_cli_lamb_log(raw_text: str, *, _depth: int = 0) -> tuple[str, boo
     if len(cand_lines) >= 2:
         deduped_cand: list[str] = []
         for idx_c, ln in enumerate(cand_lines):
+            if idx_c + 1 < len(cand_lines) and ln.strip() == cand_lines[idx_c + 1].strip():
+                continue
             m_cur = _ATTEMPT_POLL_PREFIX_RE.match(ln)
             m_nxt = _ATTEMPT_POLL_PREFIX_RE.match(cand_lines[idx_c + 1]) if idx_c + 1 < len(cand_lines) else None
             if m_cur and m_nxt and m_cur.group(1).strip() == m_nxt.group(1).strip():
