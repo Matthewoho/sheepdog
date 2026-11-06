@@ -454,24 +454,41 @@ def _plain_chinese_upgrade_text(text: str) -> str:
 
 
 def _extract_commit_body_notes(body_text: str) -> tuple[list[str], list[str]]:
-    """从 git log --format=%B 提交正文中提取显式编写的『更新了什么』与『解决了什么问题』行。"""
+    """从 git log --format=%B 提交正文中提取显式编写的『更新了什么』与『解决了什么问题』行（支持同行单行或换行列举 1./2./- 多行块）。"""
     updated: list[str] = []
     solved: list[str] = []
+    current_sec: str | None = None
     for raw_ln in (body_text or "").splitlines():
         ln = raw_ln.strip()
         if not ln:
             continue
-        mu = re.match(r"^(?:[-*•]\s*)?(?:📋\s*)?\*{0,2}更新了什么\*{0,2}\s*[：:]\s*(.+)$", ln)
-        if mu:
-            cleaned = _plain_chinese_upgrade_text(mu.group(1))
-            if cleaned and cleaned not in updated:
-                updated.append(cleaned)
+        mu = re.match(r"^(?:[-*•]\s*)?(?:📋\s*)?\*{0,2}更新了什么\*{0,2}\s*[：:]\s*(.*)$", ln)
+        if mu is not None:
+            current_sec = "updated"
+            inline = mu.group(1).strip()
+            if inline:
+                cleaned = _plain_chinese_upgrade_text(inline)
+                if cleaned and cleaned not in updated:
+                    updated.append(cleaned)
             continue
-        ms = re.match(r"^(?:[-*•]\s*)?(?:🎯\s*)?\*{0,2}解决了什么问题\*{0,2}\s*[：:]\s*(.+)$", ln)
-        if ms:
-            cleaned = _plain_chinese_upgrade_text(ms.group(1))
-            if cleaned and cleaned not in solved:
-                solved.append(cleaned)
+        ms = re.match(r"^(?:[-*•]\s*)?(?:🎯\s*)?\*{0,2}解决了什么问题\*{0,2}\s*[：:]\s*(.*)$", ln)
+        if ms is not None:
+            current_sec = "solved"
+            inline = ms.group(1).strip()
+            if inline:
+                cleaned = _plain_chinese_upgrade_text(inline)
+                if cleaned and cleaned not in solved:
+                    solved.append(cleaned)
+            continue
+        if current_sec in ("updated", "solved"):
+            m_item = re.match(r"^(?:[-*•]|\d+[\.、)\]])\s*(.+)$", ln)
+            if m_item:
+                cleaned = _plain_chinese_upgrade_text(m_item.group(1).strip())
+                target_list = updated if current_sec == "updated" else solved
+                if cleaned and cleaned not in target_list:
+                    target_list.append(cleaned)
+                continue
+            current_sec = None
     return updated, solved
 
 

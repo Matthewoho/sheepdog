@@ -7085,7 +7085,7 @@ _GCLOUD_PROGRESS_OR_HINT_LINE_RE = re.compile(
     re.I | re.M,
 )
 _JSON_PROP_FRAGMENT_LINE_RE = re.compile(
-    r'^"[^"]+"\s*:\s*(?:\{\s*\}?|\[\s*\]?|[-0-9.]+|true|false|null|"[^"]*")\s*,?\s*$',
+    r'^(?:"[^"]+"\s*:\s*(?:\{\s*\}?|\[\s*\]?|[-0-9.]+|true|false|null|"(?:[^"\\]|\\.)*")|"(?:[^"\\]|\\.)*")\s*,?\s*$',
     re.I,
 )
 _YAML_FRAGMENT_LINE_RE = re.compile(

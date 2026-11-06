@@ -5748,6 +5748,138 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual((c_pts, l_pts), ("arch_or_config_posture", "技术姿势纠偏"))
             st.close()
 
+    def test_reg126_colleague_cred_rotate_idle_check_and_duplicate_order_ask_guard(self) -> None:
+        """REG-126 (v1.1.37): 轮换同事个人账号必先确认空闲门禁、已购资源包防重复请款门禁、错题本归因及多行 JSON 数组元素过滤与多行 Commit Body 提取。"""
+        from sheepdog import admin_web, engine, outbound, version_watch
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root)
+            st = Store(cfg.db_path)
+
+            # 1) 轮换同事个人账号密码未先向本人确认是否空闲即建议立即轮换 -> 拦截
+            premature_rotate_ask = (
+                "Nicky 在群里发的截图露出了 nicky_ye 个人数据库账号密码，请示立即轮换。\n"
+                "---more---\n"
+                "事情：截图包含 nicky_ye 个人账号密码。\n"
+                "选项：\n"
+                "A. 同意立即轮换全部关联数据库实例上 nicky_ye 个人账号的密码，并私聊发给 Nicky\n"
+                "B. 暂不轮换（先问 Nicky 手头是否正在跑长耗时 SQL，等他确认空闲再换）\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_rot:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "轮换Nicky群截图露出的nicky_ye数据库密码",
+                    premature_rotate_ask,
+                    floor="生产数据库密码轮换",
+                    floor_type="credentials",
+                )
+            self.assertIn("REG-126", str(cm_rot.exception))
+
+            # 已向 Nicky 本人确认空闲后放行
+            confirmed_rotate_ask = premature_rotate_ask + "\n补充：已向 Nicky 确认空闲未在跑长耗时任务。"
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_infra-migration-ops",
+                "轮换Nicky群截图露出的nicky_ye数据库密码",
+                confirmed_rotate_ask,
+                floor="生产数据库密码轮换",
+                floor_type="credentials",
+            )
+
+            # 2) 已购买/开通资源包或按量付费（正文提及 package-xxx / 已开通的按量付费）却未经核实无法使用原因再次请款 -> 拦截
+            dup_pay_ask = (
+                "KC 在控制台创建了一笔 PTS 资源包待支付订单，发群请款。\n"
+                "---more---\n"
+                "事情：待支付订单号 202611060001。\n"
+                "选项：\n"
+                "A. 由你登录控制台完成该笔 PTS 资源包订单支付\n"
+                "B. 暂不支付该订单，通知 KC 使用凌晨已开通的按量付费（package-455zr9co）发压\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_pay:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kc",
+                    "KC创建云压测PTS资源包待支付订单请款",
+                    dup_pay_ask,
+                )
+            self.assertIn("REG-126", str(cm_pay.exception))
+
+            # 已核实已有资源包余额不足/规格不满足后放行
+            verified_pay_ask = dup_pay_ask + "\n已核实 package-455zr9co 并发规格不满足本次 5000 并发压测且余额不足无法使用。"
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kc",
+                "KC创建云压测PTS资源包待支付订单请款",
+                verified_pay_ask,
+            )
+
+            # 3) diagnose_override_reason 识别『奇怪 我不是买了吗 他没法用吗』及『那边用不了吗？』归入 stale_or_already_handled
+            c_stale, l_stale = admin_web.diagnose_override_reason(
+                dup_pay_ask,
+                "[卡片回调] 其他：奇怪  我不是买了吗  他没法用吗",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_stale, l_stale), ("stale_or_already_handled", "陈旧/已处理未重查"))
+            c_stale2, l_stale2 = admin_web.diagnose_override_reason(
+                dup_pay_ask,
+                "[卡片回调] 其他：那边用不了吗？",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_stale2, l_stale2), ("stale_or_already_handled", "陈旧/已处理未重查"))
+
+            # 4) CLI 羔羊日志含两个连续多行 JSON 对象（前一个含独立字符串数组元素行）时，不将数组字符串元素泄漏到摘要首行
+            two_json_log = (
+                "=== 1. Check recent builds ===\n"
+                "{\n"
+                '  "images": [\n'
+                '    "asia-northeast1-docker.pkg.dev/demo/repo/app:v1"\n'
+                "  ],\n"
+                '  "tags": [\n'
+                '    "trigger-demo-uuid"\n'
+                "  ]\n"
+                "}\n"
+                "=== 2. Check Cloud Run service ===\n"
+                "{\n"
+                '  "status": "SUCCESS",\n'
+                '  "latestReadyRevisionName": "demo-service-00060-abc"\n'
+                "}\n"
+            )
+            sum_txt, has_err = engine._summarize_cli_lamb_log(two_json_log)
+            self.assertFalse(has_err)
+            self.assertNotIn("trigger-demo-uuid", sum_txt)
+            self.assertNotIn("pkg.dev", sum_txt)
+            self.assertIn("=== 2. Check Cloud Run service ===", sum_txt)
+            self.assertIn("latestReadyRevisionName=demo-service-00060-abc", sum_txt)
+
+            # 5) _extract_commit_body_notes 支持多行编号/列表项提取
+            multi_body = (
+                "feat: release v1.1.37\n\n"
+                "更新了什么：\n"
+                "1. 新增同事个人账号密码轮换前必先确认空闲门禁；\n"
+                "2. 新增已购资源包防重复请款门禁与错题本归因。\n\n"
+                "解决了什么问题：\n"
+                "- 防止在同事跑长耗时 SQL 期间盲目轮换个人数据库密码打断在途任务；\n"
+                "- 防止主人已购买资源包后未核实可用性又重复发卡请款。\n"
+            )
+            u_items, s_items = version_watch._extract_commit_body_notes(multi_body)
+            self.assertEqual(len(u_items), 2)
+            self.assertEqual(len(s_items), 2)
+            self.assertIn("空闲", u_items[0])
+            self.assertIn("重复", s_items[1])
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

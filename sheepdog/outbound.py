@@ -849,6 +849,26 @@ _INTL_PTS_EVALUATED_EVIDENCE_RE = re.compile(
     r"(?:国际站[^\n。]{0,20}(?:PTS|压测)|腾讯云国际[^\n。]{0,20}(?:PTS|压测)|已(?:核查|评估|确认)[^\n。]{0,20}国际站[^\n。]{0,16}(?:PTS|压测))",
     re.I,
 )
+_COLLEAGUE_PERSONAL_CRED_ROTATE_ASK_RE = re.compile(
+    r"(?=[\s\S]*A\s*[\.、:：)\]]\s*[^\n]*(?:同意)?立即(?:轮换|重置)[^\n]*(?:个人账号|nicky_ye|子账号|专属账号)[^\n]*密码)"
+    r"(?=[\s\S]*B\s*[\.、:：)\]]\s*[^\n]*暂不(?:轮换|重置)[^\n]*(?:先问|询问|确认)[^\n]*(?:是否正在跑|空闲再换|长耗时))",
+    re.I,
+)
+_COLLEAGUE_IDLE_CONFIRMED_EVIDENCE_RE = re.compile(
+    r"(?:已(?:向|与|找)\s*(?:Nicky|对方|本人|同事)[^\n。]{0,24}确认(?:空闲|未在跑|当前无|可以轮换)|"
+    r"(?:Nicky|对方|本人)(?:已确认|反馈|回复)(?:空闲|可以轮换|没在跑|未在跑))",
+    re.I,
+)
+_DUPLICATE_PURCHASE_OR_ORDER_PAY_ASK_RE = re.compile(
+    r"(?=[\s\S]*(?:待支付订单|请款|完成[^\n。]{0,20}订单支付|支付[^\n。]{0,20}订单))"
+    r"(?=[\s\S]*(?:已开通的?(?:按量付费|资源包)|package-[a-z0-9]{6,}|已经买(?:了|好)|已购买))",
+    re.I,
+)
+_EXISTING_PACKAGE_UNUSABLE_VERIFIED_EVIDENCE_RE = re.compile(
+    r"(?:已核实[^\n。]{0,36}(?:无法使用|不能用|不可用|已耗尽|余额不足|额度不足|规格不满足)|"
+    r"实测[^\n。]{0,36}(?:已开通的?按量付费|package-[a-z0-9]{6,})[^\n。]{0,24}(?:无法|不能|报错|余量不足))",
+    re.I,
+)
 
 
 def _has_live_p2p_owner_conversation(
@@ -1065,6 +1085,22 @@ def check_ask_pre_flight_guard(
             "因历史遗留的腾讯云国内主账号余额为 0 且未开通 PTS 压测服务受阻时，严禁未经核查腾讯云国际站压测能力就直接请主人手工登录国内主账号控制台点开通"
             "（主人 2026-11-06 02:19:44 在 `tp_kc` 卡片 `[其他]` 明确纠偏：『看一下能不能用国际站的压测呢』，REG-125 压测优先核查腾讯云国际站门禁）："
             "请先核实能否直接使用腾讯云国际站子成员账号的 PTS / 压测服务并在正文中写明国际站压测可用性评估结论后再发起请示（没有发送）",
+        )
+    if _COLLEAGUE_PERSONAL_CRED_ROTATE_ASK_RE.search(full_text) and not _COLLEAGUE_IDLE_CONFIRMED_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "轮换或重置内部同事个人专属运维/数据库账号密码（如 `nicky_ye` 等）前，严禁尚未向账号持有人确认其手头是否正在跑长耗时 SQL/迁移任务，"
+            "就直接把『A. 同意立即轮换密码』作为首选建议、而把『B. 暂不轮换（先问本人手头是否正在跑长耗时 SQL，等他确认空闲再换）』贬为次选"
+            "（主人 2026-11-06 12:09:30 在 `tp_infra-migration-ops` 卡片直接改选 B：『暂不轮换（先问 Nicky 手头是否正在跑长耗时 SQL，等他确认空闲再换）』，REG-126 轮换同事个人账号必先确认空闲门禁）："
+            "请先通过 `sheepdog reply` 或 `sheepdog tell` 向该同事本人确认当前是否正在执行长耗时任务、确认空闲可轮换并在正文中写明确认结论后再发起请示（没有发送）",
+        )
+    if _DUPLICATE_PURCHASE_OR_ORDER_PAY_ASK_RE.search(full_text) and not _EXISTING_PACKAGE_UNUSABLE_VERIFIED_EVIDENCE_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当主人此前已购买/开通对应资源包或按量付费（如正文已提及『已开通的按量付费 / package-...』）时，"
+            "严禁未经核实已有资源包/按量付费为何无法使用，就再次向主人发卡请款支付新订单"
+            "（主人 2026-11-06 12:10:15 在 `tp_kc` 卡片 `[其他]` 明确纠偏：『奇怪  我不是买了吗  他没法用吗』，REG-126 已购资源包防重复请款门禁）："
+            "请先核实并指引需求方直接使用已购买的资源包或已开通的按量付费；若确因规格/地域/余量限制导致已购资源无法使用，必须在正文中写明『已核实...无法使用』的具体技术原因后再发起请示（没有发送）",
         )
     if floor or floor_type:
         return
