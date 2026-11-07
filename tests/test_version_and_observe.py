@@ -8421,6 +8421,370 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(label_half, "缺环境/调用链反问")
             st.close()
 
+    def test_reg142_prod_zero_traffic_dev_owner_bundled_multi_issues_658_account_guard_and_subagent_step_done_clock(
+        self,
+    ) -> None:
+        """REG-142 (v1.1.53):
+        1. 生产长周期 0 流量服务请示缩容 minScale=0 前未先向研发负责人（Leon / Ziyi / Zekai）确认该服务当前用途与状态时被拦截，且『这个还是要去问一下 Leon ziyi zekai看这个东西是什么情况』归入 peer_or_owner_delegate；
+        2. 将 ≥3 张不同 Linear 单号打包塞进同一张 ask 卡请示批量认领/推进时被拦截，引导按一单一 Subagent、一单一 ask 拆解并查清问题根因与上下游影响，且『这个东西需要拆解一下，一个一个跟我聊…把每个单子拆开来让 sub agent，然后每个 sub agent 都单独提一个 ask』归入 context_incomplete；
+        3. 请示在 tapnow.tv 域名持有者国内账号 658（1000xxxx6658）为他人直接开通/使用账号权限而未带『【特殊情况说明】』醒目提示时被拦截，引导改走公司主账号 698；
+        4. Subagent 羔羊在后台任务唤醒（SYSTEM_MESSAGE DONE）或长工具返回（GENERIC DONE Completed At）后，_tick_lambs 以该步骤完成时间作为 5 分钟静默计时起点（防止后台任务刚返回 94 秒即被误判超时），且 _scan_lambs 在超时羔羊 transcript 继续产生新步骤时自动复活为 running 并刷新工具输出摘要。
+        """
+        from datetime import datetime, timedelta
+        import shutil
+        from sheepdog import admin_web, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(state_dir=root)
+            st = Store(cfg.db_path)
+
+            # 1) 生产 0 流量服务缩容 minScale=0 未先问研发负责人 -> 拦截
+            zero_traffic_scale_ask = (
+                "生产tapnow-agent-node-placement连续7.8天0请求，常驻1实例（2C/4Gi）空跑。请选A（改min=0省$54/月，推荐）或B（不动）。\n"
+                "---more---\n"
+                "事情：生产 Cloud Run 服务 `tapnow-agent-node-placement` 连续 7.8 天 0 请求，当前 `minScale=1` 常驻 1 实例空跑。\n\n"
+                "选项：\n"
+                "A. 将 `tapnow-agent-node-placement` 的 `minScale` 从 `1` 改为 `0`\n"
+                "B. 保持 `minScale=1` 不动\n\n"
+                "建议：选 A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_zt:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_studio",
+                    "生产tapnow-agent-node-placement 0流量缩容min=0",
+                    zero_traffic_scale_ask,
+                )
+            self.assertIn("REG-142", str(ctx_zt.exception))
+
+            # 已向 Leon / Ziyi / Zekai 确认后再发卡 -> 放行
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_studio",
+                "生产tapnow-agent-node-placement 0流量缩容min=0",
+                zero_traffic_scale_ask
+                + "\n补充：已向 Leon 与 Ziyi 确认该服务当前无线上流量依赖，同意缩容至 minScale=0。",
+            )
+            c_zt, l_zt = admin_web.diagnose_override_reason(
+                zero_traffic_scale_ask,
+                "[卡片回调] 其他：这个还是要去问一下 Leon ziyi zekai看这个东西是什么情况。",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_zt, l_zt), ("peer_or_owner_delegate", "未先找专席或Owner"))
+
+            # 2) 将多张（≥3 张）Linear 单号打包塞进同一张 ask 卡请示批量认领/推进 -> 拦截
+            bundled_issues_ask = (
+                "17:00 复核汇报：7 张上线安全运维单均仍为 Todo 未认领。请拍板选 A（将 7 单全部认领到你名下，先执行 ENG-1155，同时推进其余 6 单）。\n"
+                "---more---\n"
+                "事情：7 张上线安全运维单（SD-231、SD-232、ENG-1155、ENG-1157、ENG-1158、ENG-1159、ENG-1160）均仍为 Todo 未指派。\n\n"
+                "选项：\n"
+                "A. 同意将 7 张单全部认领到你名下并改为 In Progress，先执行 ENG-1155，同时推进其余 6 单\n"
+                "B. 仅认领并执行 ENG-1155，其余 6 单暂保持 Todo\n"
+                "C. 7 张单暂缓认领\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_bundle:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "7张.tv上线审计运维安全单17:00认领与首波推进确认",
+                    bundled_issues_ask,
+                )
+            self.assertIn("REG-142", str(ctx_bundle.exception))
+
+            c_bd, l_bd = admin_web.diagnose_override_reason(
+                bundled_issues_ask,
+                "[卡片回调] 其他：这个东西需要拆解一下，一个一个跟我聊，我一个一个点确认。我一个一个来确认，不是点啊，因为我要看一下是什么问题，以及它影响的上下游，你都要查清楚。你可以拆，把每个单子拆开来让 sub agent，然后每个 sub agent 都单独提一个 ask。",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_bd, l_bd), ("context_incomplete", "缺环境/调用链反问"))
+
+            # 单张单独立请示（即使提及 1~2 个关联单号）正常放行
+            single_issue_ask = (
+                "ENG-1155（删除旧预发临时测试子账号）问题根因与上下游影响已查清：该账号近 30 天 0 调用，不影响任何 Stage/Prod 服务，请拍板是否认领并删除。\n"
+                "---more---\n"
+                "事情：单张拆解汇报 ENG-1155（关联前置单 SD-231）。\n"
+                "1. 是什么问题：历史联调遗留的临时测试子账号未回收；\n"
+                "2. 上下游影响：操作审计核实近 30 天 0 API 调用、0 关联 AK，删除零业务影响。\n\n"
+                "选项：\n"
+                "A. 同意认领 ENG-1155 并删除该临时测试子账号\n"
+                "B. 暂缓删除\n\n"
+                "建议：选 A。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_infra-migration-ops",
+                "ENG-1155 临时测试子账号回收确认",
+                single_issue_ask,
+            )
+
+            # 3) 请示在 658（tapnow.tv 持有者账号）给他人直接开子账号/赋权而无【特殊情况说明】-> 拦截
+            bad_658_grant_ask = (
+                "请示在 tapnow.tv 那个 658 的账号（100000006658）为 kaichi 直接开通子账号与压测权限。\n"
+                "---more---\n"
+                "事情：kaichi 需要国内站压测权限。\n\n"
+                "选项：\n"
+                "A. 在 658 的账号（100000006658）为 kaichi 创建子账号并授权\n"
+                "B. 暂不开通\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_658:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kc",
+                    "请示在658账号为kaichi开通子账号",
+                    bad_658_grant_ask,
+                )
+            self.assertIn("REG-142", str(ctx_658.exception))
+
+            # 带有【特殊情况说明】醒目提示时放行
+            special_658_grant_ask = (
+                "【特殊情况说明】因域名过户 API 仅限原持有者账号主體调用，特此醒目提示申请在 658 的账号（100000006658）临时授权执行一次。\n"
+                "---more---\n"
+                "【特殊情况说明】698 代理权限不支持跨主体过户接口，必须使用 658 原账号操作。\n\n"
+                "选项：\n"
+                "A. 批准在 658 的账号（100000006658）临时赋权执行后立即回收\n"
+                "B. 暂不执行\n\n"
+                "建议：选 A。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kc",
+                "特殊情况申请658账号临时授权",
+                special_658_grant_ask,
+            )
+
+            # 3b) 生产 CLB / Ingress 解开 modification-protection 防误改保护锁升配未确认业务方可动窗口 -> 拦截
+            clb_unlock_ask = (
+                "生产 CLB 原位升配时被 TKE 默认开启的防误改保护锁拦截，请拍板是否同意临时解开 Ingress 防误改注解十秒钟，将生产 CLB 升至 c3.medium 后当场重新上锁回读。\n"
+                "---more---\n"
+                "事情：执行 CLB 升配时被 OperateProtect 拦截（因 Ingress 带有 `ingress.cloud.tencent.com/modification-protection: \"true\"`）。\n\n"
+                "选项：\n"
+                "A. 同意临时将 Ingress 注解 `ingress.cloud.tencent.com/modification-protection` 设为 `\"false\"`，原位升至 `clb.c3.medium` 后当场恢复\n"
+                "B. 暂不触碰保护锁\n\n"
+                "建议：A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_clb:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "生产CLB临时解保护锁升配确认",
+                    clb_unlock_ask,
+                )
+            self.assertIn("REG-142", str(ctx_clb.exception))
+
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kaifeng",
+                "生产CLB临时解保护锁升配确认",
+                clb_unlock_ask + "\n补充：已向 Kai 确认当前时段线上能动。",
+            )
+            cls_kai_cond = admin_web.classify_escalation(
+                {
+                    "message_id": "om_clb_142",
+                    "topic_id": "tp_kaifeng",
+                    "chat_id": "oc_owner_dm",
+                    "text": clb_unlock_ask,
+                    "asked_at": "2026-11-07T18:08:04+08:00",
+                    "closed_at": "2026-11-07T18:14:53+08:00",
+                    "answered_at": "2026-11-07T18:14:56+08:00",
+                    "answer_message_id": "sd_card_cb_clb_142",
+                    "close_reason": "answered",
+                    "resolved_by": "",
+                    "resolve_note": "",
+                    "nudge_count": 0,
+                },
+                "[卡片回调] 其他：问一下kai现在能不能动 能的话再动",
+            )
+            self.assertEqual(cls_kai_cond["alignment"], "accepted")
+            c_kai_del, l_kai_del = admin_web.diagnose_override_reason(
+                clb_unlock_ask,
+                "[卡片回调] 其他：问一下kai现在能不能动",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_kai_del, l_kai_del), ("peer_or_owner_delegate", "未先找专席或Owner"))
+
+            # 3c) 生产 GA2 ModifyListener 未说明控制台具体选项及未显式锁定全部原字段时被拦截；
+            #     且『我想知道开这个有没有可能导致业务中断？ 具体开的是哪个选项？』归入 context_incomplete，
+            #     『我还是担心 今晚23点改吧 改完了一定要保持一个相对较长时间的监控和测试』归为 accepted
+            ga2_partial_ask = (
+                "只读查生产日志发现 .media 进来全是腾讯 GA2 的 IP！根因查明是生产 GA2（ga-demo001）443 监听器 lsr-demo001 的 XForwardedForRealIp 为 false，请示立即开启。\n"
+                "---more---\n"
+                "事情：生产 GA2 `ga-demo001` 443 监听器 `lsr-demo001` 未开 `XForwardedForRealIp`。\n"
+                "```bash\n"
+                "tccli ga2 ModifyListener --GlobalAcceleratorId ga-demo001 --ListenerId lsr-demo001 --XForwardedForRealIp true\n"
+                "```\n\n"
+                "选项：\n"
+                "A. 同意授权：立即执行上述 `tccli ga2 ModifyListener` 开启 `XForwardedForRealIp: true`\n"
+                "B. 暂不修改\n\n"
+                "建议：A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_ga2:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_andyxiao",
+                    "请示开启ga-demo001 443真实IP透传",
+                    ga2_partial_ask,
+                )
+            self.assertIn("REG-142", str(ctx_ga2.exception))
+
+            ga2_full_ask = (
+                ga2_partial_ask
+                + "\n补充：1. 具体开哪个选项：开启「七层获取源 IP 方式(X-Forwarded-For)」；"
+                "2. 命令已显式锁死全部原字段（`--IdleTimeout 60 --ServerCertificates`），不会中断业务。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_andyxiao",
+                "请示开启ga-demo001 443真实IP透传",
+                ga2_full_ask,
+            )
+            c_ga2_q, l_ga2_q = admin_web.diagnose_override_reason(
+                ga2_partial_ask,
+                "[卡片回调] 其他：我想知道开这个有没有可能导致业务中断？ 具体开的是哪个选项？",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_ga2_q, l_ga2_q), ("context_incomplete", "缺环境/调用链反问"))
+            cls_ga2_23 = admin_web.classify_escalation(
+                {
+                    "message_id": "om_ga2_142",
+                    "topic_id": "tp_andyxiao",
+                    "chat_id": "oc_owner_dm",
+                    "text": ga2_full_ask,
+                    "asked_at": "2026-11-07T18:20:04+08:00",
+                    "closed_at": "2026-11-07T18:20:35+08:00",
+                    "answered_at": "2026-11-07T18:20:37+08:00",
+                    "answer_message_id": "sd_card_cb_ga2_142",
+                    "close_reason": "answered",
+                    "resolved_by": "",
+                    "resolve_note": "",
+                    "nudge_count": 0,
+                },
+                "[卡片回调] 其他：我还是担心  今晚23点改吧 改完了一定要保持一个相对较长时间的监控和测试",
+            )
+            self.assertEqual(cls_ga2_23["alignment"], "accepted")
+
+            # 4) Subagent 后台任务唤醒（SYSTEM_MESSAGE DONE）与长工具 Completed At 计时及超时自动复活
+            now_dt = datetime.now().astimezone().replace(microsecond=0)
+            t_planner = (now_dt - timedelta(minutes=6)).isoformat()
+            t_sys_done = (now_dt - timedelta(seconds=90)).isoformat()
+            cid_sub = "a875e0d8-0000-4000-8000-000000000142"
+            tp_sub = engine.transcript_path(cid_sub)
+            tp_sub.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tp_sub.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "step_index": 1,
+                                    "type": "PLANNER_RESPONSE",
+                                    "status": "DONE",
+                                    "created_at": t_planner,
+                                    "thinking": "wait for background task",
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "step_index": 2,
+                                    "type": "SYSTEM_MESSAGE",
+                                    "status": "DONE",
+                                    "created_at": t_sys_done,
+                                    "content": "<SYSTEM_MESSAGE>[Background Task Execution Completed]\nCommand: verify\nCommand output:\nPHASE1_DONE_OK\n</SYSTEM_MESSAGE>",
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                step_done = engine._subagent_latest_transcript_step_done_at(tp_sub)
+                self.assertIsNotNone(step_done)
+                self.assertEqual(step_done, datetime.fromisoformat(t_sys_done))
+
+                st.upsert_topic(
+                    "tp_kaifeng",
+                    title="Kaifeng",
+                    kind="dynamic",
+                    state="active",
+                    conversation_id="cid_parent_kaifeng_142",
+                )
+                st.create_lamb(
+                    "lamb_step_clock_142",
+                    "tp_kaifeng",
+                    "subagent",
+                    "Canary verify",
+                    conversation_id=cid_sub,
+                    state="running",
+                    started_at=t_planner,
+                    last_act_at=t_planner,
+                )
+                disp = engine.Dispatcher(cfg, st, mock.MagicMock())
+                disp._tick_lambs()
+                lb_after_tick = st.get_lamb("lamb_step_clock_142")
+                # Because SYSTEM_MESSAGE DONE completed 90s ago (< 5m), lamb must stay running and NOT falsely timeout!
+                self.assertEqual(lb_after_tick["state"], "running")
+                self.assertEqual(
+                    lb_after_tick["last_act_at"],
+                    datetime.fromisoformat(t_sys_done).astimezone().isoformat(timespec="seconds"),
+                )
+
+                # Now simulate a lamb that was marked timeout at fin_dt (3m ago), then wrote a new GENERIC DONE step 30s ago
+                t_fin = (now_dt - timedelta(minutes=3)).isoformat(timespec="seconds")
+                t_new_done = (now_dt - timedelta(seconds=30)).isoformat(timespec="seconds")
+                st.update_lamb(
+                    "lamb_step_clock_142",
+                    state="timeout",
+                    finished_at=t_fin,
+                    result_summary="羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟（已自动提取最近工具输出）：OLD_OUT",
+                )
+                tp_sub.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "step_index": 3,
+                                    "type": "GENERIC",
+                                    "status": "DONE",
+                                    "created_at": t_fin,
+                                    "content": f"Created At: {t_fin}\nCompleted At: {t_new_done}\nCommand output:\nNEW_STEP_COMPLETED_OK\n",
+                                }
+                            )
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tp_parent = engine.transcript_path("cid_parent_kaifeng_142")
+                tp_parent.parent.mkdir(parents=True, exist_ok=True)
+                tp_parent.write_text("", encoding="utf-8")
+                disp._scan_lambs()
+                lb_revived = st.get_lamb("lamb_step_clock_142")
+                self.assertEqual(lb_revived["state"], "running")
+                self.assertIsNone(lb_revived["finished_at"])
+            finally:
+                shutil.rmtree(tp_sub.parent.parent, ignore_errors=True)
+                if "tp_parent" in locals():
+                    shutil.rmtree(tp_parent.parent.parent, ignore_errors=True)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

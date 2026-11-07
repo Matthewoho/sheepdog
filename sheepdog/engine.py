@@ -4975,19 +4975,27 @@ class Dispatcher:
                     )
                     tp_sub = transcript_path(lb["conversation_id"])
                     cur_sub_sum = str(lb["result_summary"] or "").strip()
-                    if cur_sub_sum == f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时":
+                    if (
+                        cur_sub_sum == f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时"
+                        or cur_sub_sum.startswith("羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟")
+                    ):
                         stalled_done, harvested_out = _harvest_subagent_stall_state(tp_sub)
                         if stalled_done and harvested_out:
-                            self.store.update_lamb(
-                                lb["lamb_id"],
-                                result_summary=f"羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟（已自动提取最近工具输出）：{harvested_out}",
-                            )
+                            new_stalled_sum = f"羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟（已自动提取最近工具输出）：{harvested_out}"
+                            if cur_sub_sum != new_stalled_sum:
+                                self.store.update_lamb(
+                                    lb["lamb_id"],
+                                    result_summary=new_stalled_sum,
+                                )
                     if has_newer_or_active:
                         continue
                     fin_dt = _parse(lb["finished_at"] or "")
                     if fin_dt and (_now() - fin_dt) > timedelta(minutes=self.cfg.lamb.timeout_minutes * 2):
                         continue
                     task_act = _subagent_latest_task_log_mtime(tp_sub)
+                    step_done_act = _subagent_latest_transcript_step_done_at(tp_sub)
+                    if step_done_act is not None and (task_act is None or step_done_act > task_act):
+                        task_act = step_done_act
                     revive_window = min(timedelta(minutes=self.cfg.lamb.timeout_minutes), timedelta(minutes=5))
                     if (
                         task_act is not None
@@ -5142,6 +5150,9 @@ class Dispatcher:
             if lb["conversation_id"]:
                 tp = transcript_path(lb["conversation_id"])
                 act = last_activity_at(ANTIGRAVITY, tp) if tp.exists() else None
+                step_done_act = _subagent_latest_transcript_step_done_at(tp) if tp.exists() else None
+                if step_done_act is not None and (act is None or step_done_act > act):
+                    act = step_done_act
                 task_act = _subagent_latest_task_log_mtime(tp)
                 if task_act is not None and (act is None or task_act > act):
                     act = task_act
@@ -7447,6 +7458,52 @@ def _subagent_latest_task_log_mtime(tp: Path) -> datetime | None:
     if latest_ts is None:
         return None
     return datetime.fromtimestamp(latest_ts).astimezone()
+
+
+_SUBAGENT_COMPLETED_AT_RE = re.compile(
+    r"Completed At:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))"
+)
+
+
+def _subagent_latest_transcript_step_done_at(tp: Path) -> datetime | None:
+    """REG-142：提取 subagent transcript 尾部最近步骤（含 SYSTEM_MESSAGE 后台任务唤醒与 GENERIC DONE Completed At）的完成时间戳，
+    防止后台任务刚返回（SYSTEM_MESSAGE DONE）或长工具刚结束时因沿用旧 PLANNER_RESPONSE 时间戳而在 <5 分钟内被误判超时，并支持超时后继续推进的步骤自动复活。"""
+    if not tp.exists():
+        return None
+    try:
+        size = tp.stat().st_size
+        start = max(0, size - 65536)
+        with tp.open("rb") as f:
+            if start > 0:
+                f.seek(start)
+                f.readline()
+            raw = f.read()
+    except OSError:
+        return None
+    latest: datetime | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        st_type = str(d.get("type") or "")
+        if st_type not in ("PLANNER_RESPONSE", "GENERIC", "SYSTEM_MESSAGE"):
+            continue
+        c_dt = _parse(str(d.get("created_at") or ""))
+        if c_dt is not None and (latest is None or c_dt > latest):
+            latest = c_dt
+        content = str(d.get("content") or "")
+        if "Completed At:" in content:
+            for m in _SUBAGENT_COMPLETED_AT_RE.finditer(content):
+                done_dt = _parse(m.group(1))
+                if done_dt is not None and (latest is None or done_dt > latest):
+                    latest = done_dt
+    return latest
 
 
 def _harvest_subagent_stall_state(tp: Path) -> tuple[bool, str]:

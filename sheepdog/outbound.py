@@ -1060,6 +1060,54 @@ _HALF_DONE_STALL_REASON_AND_E2E_CLIENT_IP_EVIDENCE_RE = re.compile(
     r"(?=[\s\S]*(?:\.media|\bmedia\b)[\s\S]{0,40}(?:\.ai|\bai\b)[\s\S]{0,60}(?:真实(?:的)?\s*client\s*ip|真实客户端\s*IP))",
     re.I,
 )
+_PROD_ZERO_TRAFFIC_SERVICE_SCALE_ZERO_WITHOUT_DEV_OWNER_CONFIRM_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*生产[^\n。；]{0,48}[a-z0-9]+-[a-z0-9-]+)"
+    r"(?=[\s\S]*(?:连续\s*[\d.]+\s*天\s*`?0`?\s*请求|零请求原因|连续[^\n。；]{0,20}(?:0\s*请求|零请求|零流量)))"
+    r"(?=[\s\S]*(?:A\s*[\.、:：)\]]\s*[^\n]*(?:minScale|minReplicas|--min|min)\s*[^\n]*(?:改为|设为|=)\s*`?0`?|请选\s*A\s*[（(]\s*改\s*min\s*=\s*0\s*[）)]))",
+    re.I,
+)
+_PROD_ZERO_TRAFFIC_DEV_OWNER_CONFIRMED_EVIDENCE_RE = re.compile(
+    r"(?:已(?:向|找|跟|与|联系)[^\n。；]{0,40}(?:Leon|Ziyi|Zekai|泽楷|研发|负责人|Owner)[^\n。；]{0,36}(?:确认|核实|沟通|反馈)|"
+    r"(?:Leon|Ziyi|Zekai|泽楷|研发负责人|服务负责人)[^\n。；]{0,28}(?:已确认|回复|表示|同意))",
+    re.I,
+)
+_BUNDLED_MULTI_LINEAR_ISSUES_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:[3-9]|\d{2,})\s*(?:张|个)\s*[^\n。；]{0,24}(?:安全|运维|审计|上线|验收|合规)?(?:单|工单|Issue)[^\n。；]{0,24}(?:认领|推进|确认|拍板))"
+    r"(?=[\s\S]*(?:A|选项\s*A)\s*[\.、:：)\]]\s*[^\n]*(?:将\s*(?:[3-9]|\d{2,})\s*(?:张)?单(?:全部)?认领|先认领\s*(?:[3-9]|\d{2,})\s*(?:张)?单|其余\s*[2-9]\d*\s*(?:张)?单))",
+    re.I,
+)
+_GRANT_658_TAPNOW_TV_HOLDER_ACCOUNT_TO_OTHERS_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:\b1000\d{4}6658\b|658\s*(?:的)?账号|tapnow\.tv[^\n。；]{0,16}持有(?:者)?账号))"
+    r"(?=[\s\S]*(?:开通子账号|新建子账号|创建子用户|分配子账号|给[^\n。；]{0,16}(?:开|开通|授权|使用)[^\n。；]{0,20}(?:\b1000\d{4}6658\b|658\s*(?:的)?账号)))"
+    r"(?![\s\S]*(?:严禁|禁止|不要|不再|不给|切勿)[^\n。；]{0,20}(?:使用|用|开|开通)[^\n。；]{0,16}(?:\b1000\d{4}6658\b|658))"
+    r"(?![\s\S]*(?:迁回|改在|改用|转到)[^\n。；]{0,24}(?:\b1000\d{4}0698\b|698)[^\n。；]{0,24}(?:开通子账号|新建子用户|开权限))",
+    re.I,
+)
+_SPECIAL_658_EXCEPTION_PROMINENT_NOTICE_RE = re.compile(
+    r"(?:【特殊情况说明】|⚠️\s*特殊情况|特殊情况必用\s*658)",
+    re.I,
+)
+_PROD_CLB_INGRESS_UNLOCK_MOD_WITHOUT_OWNER_WINDOW_CHECK_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*生产[^\n。；]{0,36}(?:CLB|Ingress|负载均衡))"
+    r"(?=[\s\S]*(?:modification-protection|OperateProtect|防误改(?:保护)?(?:锁|注解)|保护锁))"
+    r"(?=[\s\S]*(?:A|选项\s*A)\s*[\.、:：)\]]\s*[^\n]*(?:临时将|设为\s*`?\"?false\"?`?|解开|解锁))",
+    re.I,
+)
+_PROD_CLB_INGRESS_OWNER_WINDOW_CHECKED_OR_PLANNED_RE = re.compile(
+    r"(?:(?:已|先)(?:向|找|跟|与|联系)[^\n。；]{0,32}(?:Kai|凯锋|业务(?:方|负责人)|研发负责人|服务负责人)[^\n。；]{0,32}(?:确认|询问)[^\n。；]{0,24}(?:能不能动|能动|可否操作|操作窗口|可动|无影响)|"
+    r"(?:Kai|凯锋|业务负责人|服务负责人)[^\n。；]{0,24}(?:已确认|确认现在能动|同意当前窗口))",
+    re.I,
+)
+_PROD_GA2_LISTENER_MODIFY_WITHOUT_FULL_FIELDS_AND_OPTION_EXPLAIN_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*生产[^\n。；]{0,40}(?:GA2|ga-[a-z0-9]+|监听器|lsr-[a-z0-9]+))"
+    r"(?=[\s\S]*(?:ModifyListener|XForwardedForRealIp))",
+    re.I,
+)
+_PROD_GA2_LISTENER_FULL_FIELDS_AND_OPTION_EXPLAIN_EVIDENCE_RE = re.compile(
+    r"\A(?=[\s\S]*(?:具体开哪个选项|七层获取源\s*IP|获取客户端真实\s*IP|控制台[^\n。；]{0,20}选项))"
+    r"(?=[\s\S]*(?:--IdleTimeout|--ServerCertificates|锁定全部(?:现有)?(?:监听器)?(?:参数|原字段)|显式(?:带上|锁死)全部原字段))",
+    re.I,
+)
 _REPLY_ADDRESSES_OWNER_AS_BOSS_RE = re.compile(
     r"(?:老板\s*(?:已|刚|刚才|这边|那边)?\s*(?:批准|同意|拍板|确认|回复|指示|决定|定了|批复|选了|签字)|"
     r"(?:已|正|先|去|待|等|向|找|发给|请|跟|由)\s*老板\s*(?:确认|拍板|审批|请示|定夺|定|汇报|对齐|批复|同意|批准)|"
@@ -1884,6 +1932,57 @@ def check_ask_pre_flight_guard(
             "严禁只罗列内部 PR 编号与环境变量名而不交代 ① 之前卡在哪里/为什么没做完、以及 ② 第一性终局目标（从 `.media` 或 `.ai` 域名进入时是否正确暴露真实 `client IP`）的实测结论"
             "（主人 2026-11-07 17:05 在 `tp_andyxiao` 拍板卡 `[其他]` 明确追问：『这个事情之前卡在哪里 为啥没做完 我的目标就是 从.meida或者.ai进来的时候 要暴露真实的client ip 这个才是第一性』，REG-141 半途停滞事项必报卡点原因与第一性终局目标门禁）："
             "请在正文中明确说明此前停滞/未完成的具体原因（之前卡在哪里），并锚定『从 `.media` 与 `.ai` 进入时暴露真实 `client IP`』这一第一性目标给出端到端验证结论后再发起请示（没有发送）",
+        )
+    if (
+        _PROD_ZERO_TRAFFIC_SERVICE_SCALE_ZERO_WITHOUT_DEV_OWNER_CONFIRM_ASK_RE.search(full_text)
+        and not _PROD_ZERO_TRAFFIC_DEV_OWNER_CONFIRMED_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对生产环境业务微服务（如 `tapnow-agent-node-placement` 等）因『连续 N 天 0 请求 / 零流量』请示将常驻实例 `minScale / min` 改为 `0`（缩零或下线）前，"
+            "严禁仅凭监控指标与静态代码调用链推断就直接发卡让主人拍板改 `min=0`"
+            "（主人 2026-11-07 17:41 在 `tp_studio` 拍板卡 `[其他]` 明确纠偏：『这个还是要去问一下 Leon ziyi zekai看这个东西是什么情况。』，REG-142 生产零流量服务缩零必先向业务研发负责人核实门禁）："
+            "请先找该业务服务对应领域的研发负责人（如 `Leon / Ziyi / Zekai` 等）核实零请求的具体情况、是否仍有兜底用途或能否缩零，拿到研发侧确认结论并写入正文后再发起请示（没有发送）",
+        )
+    if _BUNDLED_MULTI_LINEAR_ISSUES_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "严禁将多张（≥3 张）独立工单（如『7张.tv上线审计运维安全单认领与首波推进确认 / 将 N 张单全部认领』）打包塞进同一张 `sheepdog ask` 卡片一揽子请示"
+            "（主人 2026-11-07 17:43 在 `tp_infra-migration-ops` 拍板卡 `[其他]` 明确立规：『这个东西需要拆解一下，一个一个跟我聊，我一个一个点确认。我一个一个来确认，不是点啊，因为我要看一下是什么问题，以及它影响的上下游，你都要查清楚。你可以拆，把每个单子拆开来让 sub agent，然后每个 sub agent 都单独提一个 ask。』，REG-142 多工单拆解一单一议必查清问题与上下游门禁）："
+            "请把每张单拆开交由独立 Subagent 查清具体是什么问题及影响的上下游，每张单使用独立 `--key <单号>` 单独发一张 `sheepdog ask` 卡片供主人逐个审视确认（没有发送）",
+        )
+    if (
+        _GRANT_658_TAPNOW_TV_HOLDER_ACCOUNT_TO_OTHERS_ASK_RE.search(full_text)
+        and not _SPECIAL_658_EXCEPTION_PROMINENT_NOTICE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "严禁直接为其他同事开通或分配 `tapnow.tv` 域名持有者国内账号（尾号 `658`）的子账号或使用权限"
+            "（主人 2026-11-07 17:13 明确立规：『记住不要给其他人直接用tapnow.tv的那个658的账号了 要用也是698 除非有什么特殊情况 需要用明显的东西提示我』，REG-142 域名持有者 658 账号禁对他人赋权门禁）："
+            "国内站确需使用腾讯云时请一律走公司国内主账号（尾号 `698`）；若确属极特殊情况必须使用 `658` 账号，必须在卡片首屏与正文加上醒目提示（如『`【特殊情况说明】`』或『`⚠️ 特殊情况`』）写明非用不可的原因后再发起请示（没有发送）",
+        )
+    if (
+        _PROD_CLB_INGRESS_UNLOCK_MOD_WITHOUT_OWNER_WINDOW_CHECK_ASK_RE.search(full_text)
+        and not _PROD_CLB_INGRESS_OWNER_WINDOW_CHECKED_OR_PLANNED_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示临时解开生产 CLB / Ingress 防误改保护锁（`modification-protection` / `OperateProtect`）执行线上升配或变更时，"
+            "必须在正文中写明已向对应业务域负责人（如 `Kai / 凯锋` 等）确认当前时段线上能不能动（或在选项 A 中明确声明『批准后先向业务负责人确认现在能不能动、确认能动再解锁执行』）"
+            "（主人 2026-11-07 18:14 在 `tp_kaifeng` 生产 CLB 解保护锁升配卡 `[其他]` 批复：『问一下kai现在能不能动 能的话再动』，REG-142 生产网关/CLB 变更前必核业务方当前可动窗口门禁）："
+            "请先向业务负责人核实当前时段能否操作或在选项 A 中补齐『先向业务方确认当前窗口能动后再执行』说明后再发起请示（没有发送）",
+        )
+    if (
+        _PROD_GA2_LISTENER_MODIFY_WITHOUT_FULL_FIELDS_AND_OPTION_EXPLAIN_ASK_RE.search(full_text)
+        and not _PROD_GA2_LISTENER_FULL_FIELDS_AND_OPTION_EXPLAIN_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示修改生产全球应用加速（GA2）监听器配置（如 `tccli ga2 ModifyListener` 开启 `XForwardedForRealIp`）时，"
+            "严禁只给仅带单个布尔参数的裸 CLI 命令而不说明 ① 控制台具体对应哪个选项名称与路径（如『七层获取源 IP 方式 / 获取客户端真实 IP』）、"
+            "② 是否会导致业务中断及如何在命令中显式锁死全部现有监听器原字段（`--IdleTimeout` / `--ServerCertificates` 等防局部传参重置）"
+            "（主人 2026-11-07 18:15 在 `tp_andyxiao` 生产 GA2 443 监听器请示卡 `[其他]` 明确追问：『我想知道开这个有没有可能导致业务中断？ 具体开的是哪个选项？』，并在 18:20 批示『今晚23点改吧 改完了一定要保持一个相对较长时间的监控和测试』，REG-142 生产 GA2 监听器变更必明示控制台选项与全字段防中断门禁）："
+            "请在正文中写明控制台对应选项路径、业务零中断机制、带全量原字段保护的完整命令及低峰窗口长时监控方案后再发起请示（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

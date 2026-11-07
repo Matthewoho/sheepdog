@@ -35,7 +35,7 @@ PATTERNS = {
     "企业与真实项目服务账号邮箱": re.compile(
         r"[A-Za-z0-9._%+-]+@(?:tamaredge\.ai|tapnow\.ai|tap-testing-env\.iam\.gserviceaccount\.com|taplabs-453508\.iam\.gserviceaccount\.com|tpn-prod-506507\.iam\.gserviceaccount\.com)"
     ),
-    "真实腾讯云 UIN": re.compile(r"\b(?:200053747\d{3}|200045686254|100048360698|100050321779)\b"),
+    "真实腾讯云 UIN": re.compile(r"\b(?:200053747\d{3}|200045686254|100048360698|100050321779|100050326\d{3})\b"),
     "真实云资源 ID": re.compile(r"\b(?:cls-gnui5plk|ins-mu1sqp1i|ins-cey0hf6s|zone-3wzk608w22ku|am-gs5l37e19m92e2wff)\b"),
     "真实专线/CLB 公网 IP": re.compile(r"\b(?:192\.220\.\d+\.\d+|103\.118\.244\.142|129\.211\.237\.172|8\.233\.219\.66)\b"),
     "私有知识库与保密代号": re.compile(r"(?i)\b(?:MatthewNote|meru-[a-z0-9_-]+)\b"),
