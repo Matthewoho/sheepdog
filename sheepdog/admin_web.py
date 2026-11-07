@@ -242,6 +242,9 @@ def diagnose_override_reason(
                 chosen_full,
                 re.I,
             )
+        ) or (
+            re.search(r"全部批准[^\n]*(?:最小命名空间|命名空间|kubeconfig)", chosen_full, re.I)
+            and re.search(r"部分批准[^\n]*不直发[^\n]*kubeconfig", text or "", re.I)
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
@@ -781,12 +784,12 @@ class WorkbenchService:
             # 统计各阶段耗时分位数（T0->T1 采集，T1->T2 点表情，T1->T3 投递，T3->T4 会话内执行，T0->T5 端到端回复）
             rows = conn.execute(
                 """WITH page AS (
-                       SELECT m.message_id, m.create_time, m.first_seen, m.route, m.reason, m.topic_id, m.batch_id
+                       SELECT m.message_id, m.create_time, m.first_seen, m.received_by, m.route, m.reason, m.topic_id, m.batch_id
                        FROM messages m
                        WHERE m.chat_type != 'sheepdog' AND m.first_seen >= ?
                        ORDER BY m.first_seen DESC LIMIT 600
                    )
-                   SELECT m.message_id, m.create_time, m.first_seen, m.route, m.reason, m.topic_id, m.batch_id,
+                   SELECT m.message_id, m.create_time, m.first_seen, m.received_by, m.route, m.reason, m.topic_id, m.batch_id,
                           a.added_at AS ack_added_at,
                           d.sent_at AS dispatch_sent_at, d.acked_at AS dispatch_acked_at,
                           (SELECT MIN(s.sent_at) FROM sends s WHERE s.target_message_id = m.message_id AND s.kind='reply') AS reply_sent_at
@@ -796,21 +799,39 @@ class WorkbenchService:
                 (cutoff,),
             ).fetchall()
 
-            t0_t1, t1_t2, t1_t3, t3_t4, t0_t5 = [], [], [], [], []
+            def _is_minute_truncated_t0(create_ts: Any, first_seen_ts: Any, received_by: Any) -> bool:
+                s = str(create_ts or "").strip()
+                if not (s.endswith(":00+08:00") or s.endswith(":00Z") or (len(s) >= 19 and s[16:19] == ":00")):
+                    return False
+                if received_by in ("user", None, ""):
+                    return True
+                d_ms = diff_ms(str(create_ts or ""), str(first_seen_ts or ""))
+                return d_ms is not None and d_ms >= 5000
+
+            t0_t1_precise, t0_t1_all, t1_t2, t1_t3, t3_t4, t0_t5 = [], [], [], [], [], []
             route_counts = {"dispatch": 0, "inbox": 0, "drop": 0}
             for r in rows:
                 rt = r["route"] or "drop"
                 route_counts[rt] = route_counts.get(rt, 0) + 1
+                min_trunc = _is_minute_truncated_t0(r["create_time"], r["first_seen"], r["received_by"])
                 if (v := diff_ms(r["create_time"], r["first_seen"])) is not None and v <= 300_000:
-                    t0_t1.append(v)
+                    t0_t1_all.append(v)
+                    if not min_trunc:
+                        t0_t1_precise.append(v)
                 if (v := diff_ms(r["first_seen"], r["ack_added_at"])) is not None and v <= 300_000:
                     t1_t2.append(v)
                 if (v := diff_ms(r["first_seen"], r["dispatch_sent_at"])) is not None and v <= 1_800_000:
                     t1_t3.append(v)
                 if (v := diff_ms(r["dispatch_sent_at"], r["dispatch_acked_at"])) is not None and 0 < v <= 3_600_000:
                     t3_t4.append(v)
-                if (v := diff_ms(r["create_time"], r["reply_sent_at"])) is not None and 0 < v <= 3_600_000:
+                e2e_start = (
+                    r["first_seen"]
+                    if min_trunc and (diff_ms(r["create_time"], r["first_seen"]) or 0) <= 120_000
+                    else r["create_time"]
+                )
+                if (v := diff_ms(e2e_start, r["reply_sent_at"])) is not None and 0 < v <= 3_600_000:
                     t0_t5.append(v)
+            t0_t1 = t0_t1_precise if t0_t1_precise else t0_t1_all
 
             def _qpack(arr: list[int], label: str) -> dict:
                 return {

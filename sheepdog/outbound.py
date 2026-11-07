@@ -995,6 +995,17 @@ _TENCENT_CN_UNUSABLE_BLOCKER_EVIDENCE_RE = re.compile(
     r"已确认必须切换阿里云的硬性原因)",
     re.I,
 )
+_HEDGED_DUAL_RECOMMENDATION_ASK_RE = re.compile(
+    r"建议[ \t:：]*(?:优先|先)?选?\s*([A-E])[ \t]*(?:[（(][ \t]*或(?:者)?[ \t]*选?[ \t]*([A-E])[ \t]*[）)]|(?:或|或者|/)[ \t]*选?[ \t]*([A-E])(?![a-zA-Z0-9]))",
+    re.I,
+)
+_PARTIAL_APPROVAL_OVER_ISOLATED_NAMESPACE_OWNER_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*负责人[^\n。；]{0,48}申请[^\n。；]{0,60}(?:全套|自主)?(?:发版|运维)[^\n。；]{0,24}权限)"
+    r"(?=[\s\S]*(?:命名空间\s*RBAC|最小命名空间)[^\n。；]{0,48}kubeconfig)"
+    r"(?=[\s\S]*B[ \t.、:：)\]]+部分批准[^\n]*不直发[^\n。；]*kubeconfig)"
+    r"(?=[\s\S]*(?:(?:建议|推荐)[ \t:：]*(?:优先)?(?:选\s*)?B\b|B[ \t.、:：)\]]+部分批准[（(][^\n）)]*推荐))",
+    re.I,
+)
 _REPLY_ADDRESSES_OWNER_AS_BOSS_RE = re.compile(
     r"(?:老板\s*(?:已|刚|刚才|这边|那边)?\s*(?:批准|同意|拍板|确认|回复|指示|决定|定了|批复|选了|签字)|"
     r"(?:已|正|先|去|待|等|向|找|发给|请|跟|由)\s*老板\s*(?:确认|拍板|审批|请示|定夺|定|汇报|对齐|批复|同意|批准)|"
@@ -1746,6 +1757,23 @@ def check_ask_pre_flight_guard(
             "严禁将『在尚未上线该功能的腾讯云国际站尝试开通』或『改接第三方云厂商（阿里云 IQS）并放开 media_egress 第三方图片下载白名单』列为首选推荐项 A"
             "（主人 2026-11-07 13:20 在 `tp_infra-migration-ops` 拍板卡 `[其他]` 明确纠偏：『如果腾讯云那个可以用吧，只要是境内的就行。因为我问了腾讯云的人，他们那边说腾讯云国际还没有这个功能，所以只能连腾讯云中国站的。然后我们中国站如果还有钱还能用的话，就直接用中国站的就好了。除非他们有其他必要去连阿里云的，再去连。』，REG-139 腾讯云中国站境内可用服务优先与严控外连白名单门禁）："
             "请直接沿用已验证可用的腾讯云中国站境内服务（不放开第三方任意 URL 下载白名单），或在群内向提问方确认是否存在腾讯云中国站无法满足的硬性原因后再议（没有发送）",
+        )
+    if _PARTIAL_APPROVAL_OVER_ISOLATED_NAMESPACE_OWNER_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "服务负责人（Owner）申请本服务独立命名空间（如最小命名空间 RBAC + kubeconfig、独立迁移账号与镜像推拉）以实现端到端自主发版、减少他人代发瓶颈时，"
+            "严禁保守首推『B. 部分批准（不直发 kubeconfig / 仍由他人配合）』"
+            "（主人 2026-11-07 14:08 明确推翻建议 B 改选『A. 全部批准。由专席严格按最小命名空间与迁移账号范围逐项开通权限、分配跳板机并下发 kubeconfig』，REG-140 服务负责人最小命名空间闭环授权优先门禁）："
+            "请将『全部批准（严格按该服务最小命名空间与迁移账号范围逐项开通并下发 kubeconfig）』作为唯一首选推荐（建议：选 A），支持服务负责人在隔离命名空间内端到端闭环（没有发送）",
+        )
+    if (m_hedge := _HEDGED_DUAL_RECOMMENDATION_ASK_RE.search(full_text)) and (
+        m_hedge.group(1).upper() != (m_hedge.group(2) or m_hedge.group(3) or "").upper()
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            f"检测到骑墙双选建议（`{m_hedge.group(0).strip()}`）："
+            "`sheepdog ask` 必须给出唯一明确的首推选项（如『建议：选 A』），以便主人一键回复『按你的建议』直接拍板，"
+            "严禁写『建议选 B（或选 A）』等模棱两可的双选骑墙建议（REG-140 唯一明确首推建议门禁，没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

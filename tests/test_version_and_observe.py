@@ -7903,6 +7903,150 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual((c_iqs, l_iqs), ("arch_or_config_posture", "技术姿势纠偏"))
             st.close()
 
+    def test_reg140_isolated_namespace_owner_full_approval_no_hedged_recommendation_and_precise_t1_ingest(self):
+        """REG-140（1.1.51）：
+        1) check_ask_pre_flight_guard 拦截服务负责人申请独立最小命名空间隔离权限（RBAC + kubeconfig + 迁移账号）以实现自主发版时，保守首推『部分批准（不直发 kubeconfig）』的请示；
+        2) check_ask_pre_flight_guard 拦截『建议选 B（或选 A）』等骑墙双选建议，强制给出唯一明确的首推选项；
+        3) diagnose_override_reason 将改选『全部批准（按最小命名空间与迁移账号范围开通并下发 kubeconfig）』归入 arch_or_config_posture（技术姿势纠偏）；
+        4) WorkbenchService.get_overview 在计算 t0_t1_ingest 与 t0_t5_e2e_reply 时剔除飞书搜索/mget 仅精确到分钟（:00 秒）造成的 0~59s 截断伪延迟。
+        """
+        from sheepdog import admin_web, outbound
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                self_open_id="ou_test_owner",
+                state_dir=state_dir,
+                config_path=state_dir / "config.toml",
+                sink="dryrun",
+            )
+            st = Store(cfg.db_path)
+
+            # 1) 拦截服务负责人申请独立最小命名空间闭环发版权限时保守首推『部分批准（不直发 kubeconfig）』
+            bad_partial_ask = (
+                "申请人申请南京生产环境 voice-service 自主发版与排查全套权限（TKE voice 命名空间 RBAC + kubeconfig、TCR 镜像推拉、PG 迁移账号），建议选 B。\n"
+                "---more---\n"
+                "事情：申请人（voice-service 负责人）申请南京生产环境全套运维权限，以便自主完成国内发版、改配置和 DB 迁移，减少依赖他人：① TKE 的 voice 命名空间 RBAC 及下发 kubeconfig；② TCR 镜像推送/拉取；③ PG 迁移账号。\n\n"
+                "选项：\n"
+                "A. 全部批准。由专席严格按 voice 最小命名空间与迁移账号范围逐项开通权限、分配跳板机并下发 kubeconfig。\n"
+                "B. 部分批准（推荐：流水线发版 + 本地排查）。开通 TCR 镜像推拉、跳板机 SSH；TKE 与 DB 变更仍收敛通过 CI/CD 流水线执行，不直发生产集群写权限 kubeconfig。\n"
+                "C. 暂缓开通生产写权限。\n\n"
+                "建议：选 B。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_part:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_voice_owner",
+                    "申请南京生产voice全套发版运维权限",
+                    bad_partial_ask,
+                    key="voice-prod-ops-perm",
+                )
+            self.assertIn("REG-140", str(cm_part.exception))
+
+            # 2) 拦截『建议：选 B（或选 A）』等骑墙双选建议
+            bad_hedged_ask = (
+                "事情：常规配置方案确认。\n"
+                "选项：\n"
+                "A. 方案一\n"
+                "B. 方案二\n"
+                "建议：选 B（或选 A）。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_hedge:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_voice_owner",
+                    "常规配置方案确认",
+                    bad_hedged_ask,
+                    key="cfg-choice",
+                )
+            self.assertIn("REG-140", str(cm_hedge.exception))
+            self.assertIn("骑墙双选建议", str(cm_hedge.exception))
+
+            # 唯一首推 A（全部批准最小命名空间范围）正常放行
+            good_full_ask = (
+                "申请人（voice-service 负责人）申请南京生产环境 voice-service 自主发版与排查权限（TKE voice 命名空间 RBAC + kubeconfig、TCR 镜像推拉、PG 迁移账号），建议选 A。\n"
+                "---more---\n"
+                "事情：申请人（voice-service 负责人）申请南京生产环境 voice 命名空间最小隔离权限，以便自主完成发版与迁移。\n\n"
+                "选项：\n"
+                "A. 全部批准（推荐）。由专席严格按 voice 最小命名空间与迁移账号范围逐项开通权限、分配跳板机并下发 kubeconfig。\n"
+                "B. 部分批准。不直发生产集群写权限 kubeconfig。\n\n"
+                "建议：选 A。"
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_voice_owner",
+                "申请南京生产voice全套发版运维权限",
+                good_full_ask,
+                key="voice-prod-ops-perm",
+            )
+
+            # 3) diagnose_override_reason 将改选 A（全部批准最小命名空间 kubeconfig）归入 arch_or_config_posture
+            c_ovr, l_ovr = admin_web.diagnose_override_reason(
+                bad_partial_ask,
+                "全部批准。由专席严格按 voice 最小命名空间与迁移账号范围逐项开通权限、分配跳板机并下发 kubeconfig",
+                "A",
+                "B",
+            )
+            self.assertEqual((c_ovr, l_ovr), ("arch_or_config_posture", "技术姿势纠偏"))
+
+            # 4) WorkbenchService.get_overview 剔除飞书搜索仅精确到分钟（:00 秒）造成的 0~59s 截断伪延迟
+            now_dt = datetime.now().astimezone().replace(second=50, microsecond=0)
+            min_floor_iso = now_dt.replace(second=0).isoformat(timespec="seconds")
+            precise_t0_iso = (now_dt - timedelta(seconds=2)).isoformat(timespec="seconds")
+            first_seen_iso = now_dt.isoformat(timespec="seconds")
+
+            for i in range(5):
+                m_u = Message(
+                    message_id=f"om_test_user_min_{i}",
+                    chat_id="oc_test_g",
+                    chat_name="G",
+                    chat_type="group",
+                    sender_id="ou_test_u",
+                    sender_name="U",
+                    sender_type="user",
+                    content="hello",
+                    msg_type="text",
+                    create_time=min_floor_iso,
+                )
+                st.upsert_message(m_u, "inbox", "group", [], None, received_by="user")
+                st.conn.execute(
+                    "UPDATE messages SET first_seen = ? WHERE message_id = ?",
+                    (first_seen_iso, m_u.message_id),
+                )
+
+            m_b = Message(
+                message_id="om_test_bot_sec_1",
+                chat_id="oc_test_g",
+                chat_name="G",
+                chat_type="group",
+                sender_id="ou_test_u",
+                sender_name="U",
+                sender_type="user",
+                content="ping",
+                msg_type="text",
+                create_time=precise_t0_iso,
+            )
+            st.upsert_message(m_b, "dispatch", "at_me", [], "tp_voice_owner", received_by="bot")
+            st.conn.execute(
+                "UPDATE messages SET first_seen = ? WHERE message_id = ?",
+                (first_seen_iso, m_b.message_id),
+            )
+            st.conn.commit()
+
+            wb = admin_web.WorkbenchService(cfg)
+            ov = wb.get_overview(minutes=60)
+            t1_stat = ov["latencies"]["t0_t1_ingest"]
+            self.assertEqual(t1_stat["count"], 1)
+            self.assertEqual(t1_stat["p50_ms"], 2000)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
