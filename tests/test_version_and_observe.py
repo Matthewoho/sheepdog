@@ -8785,6 +8785,230 @@ class VersionAndObserveTest(unittest.TestCase):
                     shutil.rmtree(tp_parent.parent.parent, ignore_errors=True)
             st.close()
 
+    def test_reg143_dissolved_pr_review_group_peer_agent_pitfall_guard_and_parallel_subagent_lifecycle(self):
+        import shutil
+        from datetime import datetime, timedelta
+        from unittest import mock
+        from sheepdog import admin_web, duty, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root)
+            st = Store(cfg.db_path)
+
+            # 1) Dissolved 前后端 PR Review group ask is blocked (including exact real card wording 'A. 推荐：...发至飞书「`前后端 PR Review`」')
+            with self.assertRaises(outbound.OutboundError) as cm_dissolved:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "SD-232 Phase1完工：确认canvas-service#364发评审群并过审合入",
+                    "Matthew，SD-232 第一步已完成：canvas-service#364 去明文与守卫 PR 检查全绿（人工评审 0/1 待审）。建议选 A：把 #364 发前后端 PR Review 群并在拿到人工 APPROVED 后合入 cn-stage 验证。\n"
+                    "---more---\n"
+                    "选项：\n"
+                    "A. 推荐：同意立即将 `canvas-service#364` 按下方四行文案发至飞书「`前后端 PR Review`」（`oc_test_review_group`）发起人工评审\n"
+                    "B. 仅同意将 `canvas-service#364` 发至「`前后端 PR Review`」群完成人工评审\n"
+                    "C. 不发评审群，由你直接审阅决定\n"
+                    "建议：选 A。",
+                )
+            self.assertIn("REG-143", str(cm_dissolved.exception))
+
+            # 2) Unreviewed PR direct merge ask without checking pitfalls with Lao Hu's agent is blocked (exact real card wording '由你点 A 视同审阅放行，我立即执行 `gh pr merge`'), then passes with evidence
+            unreviewed_merge_body = (
+                "Matthew，刚投递时实查发现旧「前后端 PR Review」群已解散（0 人）且旧规范文档已删。因 canvas-service#364 零业务代码改动且 2 项 CI 全绿（人工 Review 0/1），建议选 A 由你直接点选放行合入 cn-stage 验证，或选 B 改发迁移群请同事点 Approve。\n"
+                "---more---\n"
+                "事情：旧「`前后端 PR Review`」话题群状态已是 `chat_status: dissolved`（`user_count: 0` 已解散）。目前 `Tamar-Edge-AI/canvas-service#364`（https://github.com/Tamar-Edge-AI/canvas-service/pull/364 ）人工 Code Review 状态：`0/1 未过`。\n\n"
+                "选项：\n"
+                "A. 推荐：既然旧评审群已解散且 `#364` 零业务代码改动，由你点 A 视同审阅放行，我立即执行 `gh pr merge 364 --repo Tamar-Edge-AI/canvas-service --squash` 合入 `cn-stage`\n"
+                "B. 改发到「`Infra 迁移改造`」群请同事在 GitHub 点 `APPROVED` 后再合入 `cn-stage`\n"
+                "C. 暂不合入\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_unreviewed:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_infra-migration-ops",
+                    "SD-232 旧前后端PR评审群已解散：确认直接合入#364或改发迁移群过审",
+                    unreviewed_merge_body,
+                )
+            self.assertIn("REG-143", str(cm_unreviewed.exception))
+
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_infra-migration-ops",
+                "SD-232 旧前后端PR评审群已解散：确认直接合入#364或改发迁移群过审",
+                unreviewed_merge_body + "\n已先跟老胡的 agent（老胡 Lark cli）碰一下排查暗雷与坑，老胡的 agent 已确认无暗雷。",
+            )
+
+            # 3) Conditional peer-agent check + greenlight ('或者直接跟老胡的 agent 碰一下...如果没有的话，我觉得你就看着来喽') is accepted
+            cls_laohu_agent = admin_web.classify_escalation(
+                {
+                    "message_id": "om_sd232_143",
+                    "topic_id": "tp_infra-migration-ops",
+                    "chat_id": "oc_owner_dm",
+                    "text": f"SD-232 旧前后端PR评审群已解散\n{unreviewed_merge_body}",
+                    "asked_at": "2026-11-07T18:59:11+08:00",
+                    "closed_at": "2026-11-07T19:00:31+08:00",
+                    "answered_at": "2026-11-07T19:00:32+08:00",
+                    "answer_message_id": "sd_card_cb_sd232_143",
+                    "close_reason": "answered",
+                    "resolved_by": "",
+                    "resolve_note": "",
+                    "nudge_count": 0,
+                },
+                "[卡片回调] 其他：或者直接跟老胡的 agent 碰一下，看一下有没有什么坑或者什么暗雷要小心。如果没有的话，我觉得你就看着来喽。",
+            )
+            self.assertEqual(cls_laohu_agent["alignment"], "accepted")
+            c_del, l_del = admin_web.diagnose_override_reason(
+                f"SD-232 旧前后端PR评审群已解散\n{unreviewed_merge_body}",
+                "先跟老胡的 agent 碰一下看看有没有坑",
+                chosen_code="其他",
+                recommended="A",
+            )
+            self.assertEqual((c_del, l_del), ("peer_or_owner_delegate", "未先找专席或Owner"))
+
+            # 4) Parallel sibling subagents are NOT falsely closed by _auto_close_superseded_subagents or needs_decision receipt,
+            #    and subagents resumed via send_message or falsely closed with superseded_by_new_lamb_anchors are healed/revived
+            now_dt = datetime.now().astimezone().replace(microsecond=0)
+            t_start = (now_dt - timedelta(minutes=8)).isoformat(timespec="seconds")
+            t_batch = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+            cid_parent_143 = "a875e0d8-0000-4000-8000-000000000140"
+            cid_p1_143 = "a875e0d8-0000-4000-8000-000000000141"
+            cid_p2_143 = "a875e0d8-0000-4000-8000-000000000142"
+            st.upsert_topic(
+                "tp_infra-migration-ops",
+                title="Infra Migration",
+                kind="adopted",
+                state="running",
+                conversation_id=cid_parent_143,
+                pending_batch_id="b20261107190032-infra",
+                dispatched_at=t_batch,
+            )
+            st.record_dispatch("b20261107190032-infra", "tp_infra-migration-ops", ["m_143"])
+            st.conn.execute(
+                "UPDATE dispatches SET sent_at=? WHERE batch_id=?",
+                (t_batch, "b20261107190032-infra"),
+            )
+            st.conn.commit()
+
+            st.create_lamb("lamb_p1", "tp_infra-migration-ops", "subagent", "Issue 1", conversation_id=cid_p1_143, state="running", started_at=t_start, last_act_at=t_start)
+            st.create_lamb("lamb_p2", "tp_infra-migration-ops", "subagent", "Issue 2", conversation_id=cid_p2_143, state="running", started_at=t_start, last_act_at=t_start)
+            duty.set_work(st, "tp_infra-migration-ops", "lamb:lamb_p1", title="Issue 1", state=duty.WAITING_OTHER, waiting_on="羔羊 lamb_p1")
+            duty.set_work(st, "tp_infra-migration-ops", "lamb:lamb_p2", title="Issue 2", state=duty.WAITING_OTHER, waiting_on="羔羊 lamb_p2")
+
+            # Submitting waiting receipt with only pre-existing lamb_p1 in anchors must NOT close active sibling lamb_p2
+            engine._auto_close_superseded_subagents(
+                st,
+                "tp_infra-migration-ops",
+                "b20261107190032-infra",
+                ["lamb:lamb_p1"],
+            )
+            self.assertEqual(st.get_lamb("lamb_p2")["state"], "running")
+
+            # Submitting needs_decision receipt with lamb_p1 in anchors must keep work_item lamb:lamb_p1 WAITING_OTHER (not DONE)
+            duty.apply_receipt_work(
+                st,
+                "tp_infra-migration-ops",
+                {
+                    "status": "needs_decision",
+                    "summary": "SD-231 待拍板，其余羔羊推进中",
+                    "anchors": ["lamb:lamb_p1"],
+                },
+            )
+            w_p1 = st.get_work("tp_infra-migration-ops", duty.norm_key("lamb:lamb_p1"))
+            self.assertEqual(w_p1["state"], duty.WAITING_OTHER)
+            self.assertIsNone(w_p1["closed_at"])
+
+            # Simulate a lamb falsely closed with superseded_by_new_lamb_anchors that later returned a SYSTEM_MESSAGE,
+            # and another lamb falsely closed that is still actively writing steps in its own transcript
+            t_false_close = (now_dt - timedelta(minutes=4)).isoformat(timespec="seconds")
+            t_sys_ret = (now_dt - timedelta(minutes=1)).isoformat(timespec="seconds")
+            t_live_step = (now_dt - timedelta(seconds=20)).isoformat(timespec="seconds")
+            st.update_lamb(
+                "lamb_p1",
+                state="done",
+                finished_at=t_false_close,
+                reported_at=t_false_close,
+                report_msg_id="superseded_by_new_lamb_anchors",
+                result_summary="随母羊新回执切换等待新羔羊自动收口",
+            )
+            st.update_lamb(
+                "lamb_p2",
+                state="done",
+                finished_at=t_false_close,
+                reported_at=t_false_close,
+                report_msg_id="superseded_by_new_lamb_anchors",
+                result_summary="随母羊新回执切换等待新羔羊自动收口",
+            )
+            tp_parent = engine.transcript_path(cid_parent_143)
+            tp_p1 = engine.transcript_path(cid_p1_143)
+            tp_p2 = engine.transcript_path(cid_p2_143)
+            for p in (tp_parent, tp_p1, tp_p2):
+                p.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tp_parent.write_text(
+                    json.dumps(
+                        {
+                            "step_index": 10,
+                            "type": "SYSTEM_MESSAGE",
+                            "status": "DONE",
+                            "created_at": t_sys_ret,
+                            "content": f"<SYSTEM_MESSAGE>[Message] timestamp={t_sys_ret} sender={cid_p1_143} content=ENG-1157 生产审计与验收全部完成</SYSTEM_MESSAGE>",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tp_p1.write_text(
+                    json.dumps(
+                        {
+                            "step_index": 5,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": t_sys_ret,
+                            "content": "ENG-1157 生产审计与验收全部完成",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tp_p2.write_text(
+                    json.dumps(
+                        {
+                            "step_index": 6,
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "created_at": t_live_step,
+                            "content": f"Created At: {t_live_step}\nCompleted At: {t_live_step}\nCommand output:\nSTILL_RUNNING_OK\n",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                disp = engine.Dispatcher(cfg, st, mock.MagicMock())
+                disp._scan_lambs()
+
+                lb1 = st.get_lamb("lamb_p1")
+                self.assertEqual(lb1["state"], "done")
+                self.assertEqual(lb1["report_msg_id"], "native_system_message")
+                self.assertIn("ENG-1157 生产审计与验收全部完成", lb1["result_summary"])
+
+                lb2 = st.get_lamb("lamb_p2")
+                self.assertEqual(lb2["state"], "running")
+                self.assertIsNone(lb2["finished_at"])
+                self.assertIsNone(lb2["report_msg_id"])
+            finally:
+                for p in (tp_parent, tp_p1, tp_p2):
+                    shutil.rmtree(p.parent.parent, ignore_errors=True)
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

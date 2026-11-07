@@ -227,7 +227,9 @@ def apply_receipt_work(store: Store, topic_id: str, receipt: dict, log=None) -> 
                     lb = store.find_lamb_by_cid(lid)
                     if lb is not None:
                         lid = lb["lamb_id"]
-                if (lb is not None and lb["state"] != "running") or (rcp_status and rcp_status != "waiting"):
+                if (lb is not None and lb["state"] != "running") or (
+                    rcp_status and rcp_status not in ("waiting", "needs_decision", "waiting_external")
+                ):
                     if (w := store.get_work(topic_id, norm_key(f"lamb:{lid}"))) is not None and not w["closed_at"]:
                         ts = (lb["finished_at"] if lb and lb["finished_at"] else None) or now_iso()
                         res = (lb["result_summary"] if lb and lb["result_summary"] else None) or w["result"] or str(receipt.get("summary") or "羔羊已完成")

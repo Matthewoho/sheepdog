@@ -1108,6 +1108,23 @@ _PROD_GA2_LISTENER_FULL_FIELDS_AND_OPTION_EXPLAIN_EVIDENCE_RE = re.compile(
     r"(?=[\s\S]*(?:--IdleTimeout|--ServerCertificates|锁定全部(?:现有)?(?:监听器)?(?:参数|原字段)|显式(?:带上|锁死)全部原字段))",
     re.I,
 )
+_DISSOLVED_FE_BE_PR_REVIEW_GROUP_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:前后端\s*PR\s*(?:Review|评审群)|tap-pr-review-submit))"
+    r"(?=[\s\S]*(?:A|选项\s*A)(?:\s*[（(][^)）]{0,12}[)）])?\s*[\.、:：)\]]\s*[^\n]*(?:发送|发往|发至|发到|提交|同步|发一条|发(?=[「『\s]*`?前后端))[^\n]*(?:前后端\s*PR\s*(?:Review|评审群)|PR\s*Review\s*消息))"
+    r"(?![\s\S]*(?:已解散|chat_status\s*:\s*dissolved|群已解散))",
+    re.I,
+)
+_UNREVIEWED_PR_DIRECT_MERGE_WITHOUT_PEER_AGENT_CHECK_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:PR\s*#\d+|pull/\d+|[a-z0-9_-]+#\d+))"
+    r"(?=[\s\S]*(?:人工\s*(?:Code\s*)?Review\s*(?:状态\s*(?:为|:|：)?\s*)?`?0/1|评审群已解散|chat_status:\s*dissolved|尚未经过人工\s*Review))"
+    r"(?=[\s\S]*(?:A|选项\s*A)(?:\s*[（(][^)）]{0,12}[)）])?\s*[\.、:：)\]]\s*[^\n]*(?:你点\s*A\s*(?:即)?视同|(?:直接)?作为\s*Reviewer\s*放行|(?:直接|立即)执行\s*`?gh\s+pr\s+merge|直接合入\s*#?\d+))",
+    re.I,
+)
+_PEER_OR_LAOHU_AGENT_PITFALL_CHECKED_EVIDENCE_RE = re.compile(
+    r"(?:(?:已|先)(?:跟|找|向|与)[^\n。；]{0,28}(?:老胡(?:的)?\s*agent|老胡\s*Lark\s*cli|tp_laohu|模块负责人|Owner)[^\n。；]{0,28}(?:碰一下|核对|确认|排查)[^\n。；]{0,24}(?:坑|暗雷|风险|没问题)|"
+    r"(?:老胡(?:的)?\s*agent|老胡\s*Lark\s*cli|tp_laohu)[^\n。；]{0,28}(?:已确认|回复|无暗雷|没坑))",
+    re.I,
+)
 _REPLY_ADDRESSES_OWNER_AS_BOSS_RE = re.compile(
     r"(?:老板\s*(?:已|刚|刚才|这边|那边)?\s*(?:批准|同意|拍板|确认|回复|指示|决定|定了|批复|选了|签字)|"
     r"(?:已|正|先|去|待|等|向|找|发给|请|跟|由)\s*老板\s*(?:确认|拍板|审批|请示|定夺|定|汇报|对齐|批复|同意|批准)|"
@@ -1983,6 +2000,25 @@ def check_ask_pre_flight_guard(
             "② 是否会导致业务中断及如何在命令中显式锁死全部现有监听器原字段（`--IdleTimeout` / `--ServerCertificates` 等防局部传参重置）"
             "（主人 2026-11-07 18:15 在 `tp_andyxiao` 生产 GA2 443 监听器请示卡 `[其他]` 明确追问：『我想知道开这个有没有可能导致业务中断？ 具体开的是哪个选项？』，并在 18:20 批示『今晚23点改吧 改完了一定要保持一个相对较长时间的监控和测试』，REG-142 生产 GA2 监听器变更必明示控制台选项与全字段防中断门禁）："
             "请在正文中写明控制台对应选项路径、业务零中断机制、带全量原字段保护的完整命令及低峰窗口长时监控方案后再发起请示（没有发送）",
+        )
+    if _DISSOLVED_FE_BE_PR_REVIEW_GROUP_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "原『前后端 PR Review』话题群已解散（`chat_status: dissolved`，群成员数为 0）且旧规范文档已删除，"
+            "严禁未经只读核实目标飞书群存活状态就发卡请示『以主人身份发送 4 行 PR Review 消息到「前后端 PR Review」群』"
+            "（`tp_infra-migration-ops` 2026-11-07 18:51 先请示发往该已解散群，获批后实测才发现群已解散并连发第 2 张卡，REG-143 已解散前后端评审群防盲发与老胡 Agent 暗雷联检门禁）："
+            "请勿向已解散的『前后端 PR Review』群发起发送请示；针对待合入 PR，请先自行排查潜在暗雷并直接与老胡的 Agent（`老胡 Lark cli` / `tp_laohu`）或模块负责人碰一下确认有无坑或暗雷后再推进（没有发送）",
+        )
+    if (
+        _UNREVIEWED_PR_DIRECT_MERGE_WITHOUT_PEER_AGENT_CHECK_ASK_RE.search(full_text)
+        and not _PEER_OR_LAOHU_AGENT_PITFALL_CHECKED_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当待合入 PR 尚未完成人工 Code Review（如『人工 Review 0/1』或『前后端 PR Review 群已解散』）时，"
+            "严禁未先与老胡的 Agent（`老胡 Lark cli` / `tp_laohu`）或模块负责人碰一下排查潜在坑与暗雷，就直接发卡把『A. 由你点 A 视同已完成人工审阅，立即直接执行 gh pr merge』推给主人当人肉 Reviewer"
+            "（主人 2026-11-07 19:00 在 `tp_infra-migration-ops` 拍板卡 `[其他]` 明确指示：『或者直接跟老胡的 agent 碰一下，看一下有没有什么坑或者什么暗雷要小心。如果没有的话，我觉得你就看着来喽。』，REG-143 待合入 PR 先找老胡 Agent 排雷门禁）："
+            "请先自行核查改动上下游并直接跟老胡的 Agent（`老胡 Lark cli` / `tp_laohu`）或模块负责人碰一下确认有无坑或暗雷要小心，确认无暗雷后再自治处理或附上已联检结论发起请示（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

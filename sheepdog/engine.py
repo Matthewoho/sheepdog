@@ -2700,7 +2700,7 @@ class Dispatcher:
             self.store.update_topic(t["topic_id"], **fields)
             if status != "needs_decision":
                 self._auto_settle_open_escalations_on_owner_batch(t["topic_id"], batch, receipt=receipt)
-            if status != "waiting":
+            if status not in ("waiting", "needs_decision", "waiting_external"):
                 _auto_close_topic_subagents(self.store, t["topic_id"])
             else:
                 _auto_close_superseded_subagents(self.store, t["topic_id"], batch, receipt.get("anchors") or [])
@@ -4638,13 +4638,16 @@ class Dispatcher:
         key = (self.topic_host(t), cid)
         if key in self._record_cache:
             return self._record_cache[key]
-        sink = self.sinks.get(self.topic_host(t))
-        files_fn = getattr(sink, "record_files", None)
-        if files_fn is not None:
-            files = files_fn(cid)
-            path = Path(files[-1]) if files else None
+        if self.topic_host(t) == ANTIGRAVITY:
+            path = transcript_path(cid)
         else:
-            path = transcript_path(cid) if self.topic_host(t) == ANTIGRAVITY else None
+            sink = self.sinks.get(self.topic_host(t))
+            files_fn = getattr(sink, "record_files", None)
+            if files_fn is not None:
+                files = files_fn(cid)
+                path = Path(files[-1]) if files else None
+            else:
+                path = None
         self._record_cache[key] = path
         return path
 
@@ -4840,6 +4843,7 @@ class Dispatcher:
                     discovered.append(lid)
                     log.info("topic %s: 从 GENERIC 自动补建 subagent -> %s (%s)", tid, lid, cid)
         parent_cid = (t["conversation_id"] or "") if (t := self.store.get_topic(tid)) is not None else ""
+        direct_sent_cids = set(subagent_reused_cids_in(host, d, parent_cid=parent_cid, include_conv_links=False))
         for cid in subagent_reused_cids_in(host, d, parent_cid=parent_cid):
             if any((lb["conversation_id"] or "").strip() == cid for lb in self.store.get_active_lambs(tid)):
                 continue
@@ -4850,6 +4854,33 @@ class Dispatcher:
                 self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
                 log.info("topic %s: 从 send_message/引用 关联复用 subagent conversation_id %s -> %s (%s)",
                          tid, cid, matched["lamb_id"], matched["task_title"])
+                continue
+            if cid in direct_sent_cids and (ex_re := self.store.find_lamb_by_cid(cid)) is not None:
+                if (
+                    ex_re["parent_topic_id"] == tid
+                    and ex_re["state"] != "running"
+                    and str(ex_re["report_msg_id"] or "") != "killed_by_parent"
+                ):
+                    ts_raw = str(d.get("created_at") or d.get("timestamp") or "")
+                    ts_dt = _parse(ts_raw)
+                    fin_dt = _parse(ex_re["finished_at"] or "")
+                    if ts_dt is not None and (fin_dt is None or ts_dt > fin_dt + timedelta(seconds=2)):
+                        ts_iso = ts_dt.astimezone().isoformat(timespec="seconds")
+                        clear_sum = (
+                            ex_re["state"] == "timeout"
+                            or str(ex_re["report_msg_id"] or "") in ("superseded_by_new_lamb_anchors", "parent_receipt_auto_close")
+                            or str(ex_re["result_summary"] or "").strip() in ("随母羊新回执切换等待新羔羊自动收口", "随母羊本轮回执自动收口")
+                        )
+                        self.store.update_lamb(
+                            ex_re["lamb_id"],
+                            state="running",
+                            finished_at=None,
+                            reported_at=None,
+                            report_msg_id=None,
+                            result_summary=None if clear_sum else ex_re["result_summary"],
+                            last_act_at=ts_iso,
+                        )
+                        log.info("topic %s: 从 send_message 续跑唤醒已完成 subagent 羔羊 %s (%s)", tid, ex_re["lamb_id"], cid)
 
     def _handle_lamb_line(self, tid: str, host: str, off: int, d: dict, discovered: list[str]) -> None:
         new_lids_in_line: set[str] = set()
@@ -4888,6 +4919,7 @@ class Dispatcher:
                 for lb in self.store.get_active_lambs(tid):
                     if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip():
                         complete_lamb(self.store, lb["lamb_id"], summary="子代理启动被宿主安全策略拦截或报错", state="failed", report_msg_id="subagent_spawn_error")
+        ret_dt = _parse(str(d.get("created_at") or d.get("timestamp") or ""))
         for ret in subagent_returns_in(host, d):
             from . import guard as _g_sub
             cands = (
@@ -4902,6 +4934,13 @@ class Dispatcher:
                             and (
                                 str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
                                 or bool(_g_sub._SUBAGENT_META_LINE_RE.match(str(lb["result_summary"] or "").replace("`", "").strip()))
+                                or str(lb["report_msg_id"] or "") in ("superseded_by_new_lamb_anchors", "parent_receipt_auto_close")
+                                or str(lb["result_summary"] or "").strip() in ("随母羊新回执切换等待新羔羊自动收口", "随母羊本轮回执自动收口")
+                                or (
+                                    ret_dt is not None
+                                    and (fin_dt := _parse(lb["finished_at"] or "")) is not None
+                                    and ret_dt > fin_dt + timedelta(seconds=2)
+                                )
                             )
                         )
                     )
@@ -4909,7 +4948,11 @@ class Dispatcher:
             )
             for matched in cands:
                 lid = matched["lamb_id"]
+                was_running = matched["state"] == "running"
                 complete_lamb(self.store, lid, summary=ret.summary or matched["result_summary"] or f"羔羊 {lid} 已完成", state="done", report_msg_id="native_system_message")
+                if not was_running and ret_dt is not None:
+                    fin_iso = ret_dt.astimezone().isoformat(timespec="seconds")
+                    self.store.update_lamb(lid, finished_at=fin_iso, reported_at=fin_iso, last_act_at=fin_iso, report_msg_id="native_system_message")
                 log.info("topic %s: 从 SYSTEM_MESSAGE 自动结案 subagent 羔羊 %s (%s)", tid, lid, ret.conversation_id)
         kill_all, killed_cids = subagent_kills_in(host, d)
         if kill_all or killed_cids:
@@ -4922,11 +4965,12 @@ class Dispatcher:
                 log.info("topic %s: 从 manage_subagents 自动结案 subagent 羔羊 %s (%s)", tid, lb["lamb_id"], cid)
 
     def _scan_lambs(self) -> list[str]:
-        """7.63 / 7.106 / 1.1.25（REG-114）：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案，并自愈存量占位/grep/元信息摘要。"""
+        """7.63 / 7.106 / 1.1.25 / 1.1.54（REG-114 / REG-143）：增量扫描母羊 transcript 中的 invoke_subagent 工具调用、GENERIC 子代理创建回写/报错与 SYSTEM_MESSAGE 子代理回传结案，并自愈存量占位/被新锚点误关/续跑二期回传摘要与仍在活跃的并行羔羊。"""
         from . import guard as _g
         if b"pre-tool hook" not in _g._NEEDLES[LAMB_DISCOVERY]:
             _g._NEEDLES[LAMB_DISCOVERY] = (*_g._NEEDLES[LAMB_DISCOVERY], b"pre-tool hook", b"Encountered error", b'"ERROR"')
         discovered: list[str] = []
+        now_scan = _now()
         for t in self.store.list_topics():
             if (t["topic_id"] != BUS_TOPIC_ID and t["kind"] not in MANAGED_KINDS) or t["state"] == sm.CLOSED \
                     or not t["conversation_id"]:
@@ -4943,6 +4987,14 @@ class Dispatcher:
                 and (
                     str(lb["result_summary"] or "").strip().startswith(("[lamb:", "# "))
                     or bool(_g._SUBAGENT_META_LINE_RE.match(str(lb["result_summary"] or "").replace("`", "").strip()))
+                    or str(lb["report_msg_id"] or "") in ("superseded_by_new_lamb_anchors", "parent_receipt_auto_close")
+                    or str(lb["result_summary"] or "").strip() in ("随母羊新回执切换等待新羔羊自动收口", "随母羊本轮回执自动收口")
+                    or (
+                        (fin_dt_h := _parse(lb["finished_at"] or "")) is not None
+                        and (now_scan - fin_dt_h) < timedelta(hours=2)
+                        and (sub_done_h := _subagent_latest_transcript_step_done_at(transcript_path((lb["conversation_id"] or "").strip()))) is not None
+                        and sub_done_h > fin_dt_h + timedelta(seconds=2)
+                    )
                 )
             ]
             if need_sub_heal and (tp_file := self._record_file(t)) is not None and tp_file.exists():
@@ -4961,9 +5013,11 @@ class Dispatcher:
                         if fallback_sum.startswith("[lamb:") or _g._SUBAGENT_META_LINE_RE.match(fallback_sum.replace("`", "").strip()):
                             fallback_sum = after_lb["task_title"] or f"羔羊 {lb['lamb_id']} 已完成"
                         self.store.update_lamb(lb["lamb_id"], result_summary=fallback_sum)
+                topic_lambs = self.store.list_lambs(tid, include_finished=True)
             for lb in topic_lambs:
                 if (
-                    lb["state"] == "timeout"
+                    lb["state"] in ("timeout", "done")
+                    and str(lb["report_msg_id"] or "") != "killed_by_parent"
                     and lb["kind"] in ("subagent", "native_subagent")
                     and (lb["conversation_id"] or "").strip()
                 ):
@@ -4975,7 +5029,7 @@ class Dispatcher:
                     )
                     tp_sub = transcript_path(lb["conversation_id"])
                     cur_sub_sum = str(lb["result_summary"] or "").strip()
-                    if (
+                    if lb["state"] == "timeout" and (
                         cur_sub_sum == f"超过 {self.cfg.lamb.timeout_minutes} 分钟无心跳，已超时"
                         or cur_sub_sum.startswith("羔羊在工具返回（GENERIC DONE）后模型回合静默中断超 5 分钟")
                     ):
@@ -4996,18 +5050,27 @@ class Dispatcher:
                     step_done_act = _subagent_latest_transcript_step_done_at(tp_sub)
                     if step_done_act is not None and (task_act is None or step_done_act > task_act):
                         task_act = step_done_act
+                    act_at = last_activity_at(ANTIGRAVITY, tp_sub) if tp_sub.exists() else None
+                    if act_at is not None and (task_act is None or act_at > task_act):
+                        task_act = act_at
                     revive_window = min(timedelta(minutes=self.cfg.lamb.timeout_minutes), timedelta(minutes=5))
                     if (
                         task_act is not None
-                        and (fin_dt is None or task_act > fin_dt)
+                        and (fin_dt is None or task_act > fin_dt + timedelta(seconds=2))
                         and (_now() - task_act) < revive_window
                     ):
+                        clear_sum = (
+                            lb["state"] == "timeout"
+                            or str(lb["report_msg_id"] or "") in ("superseded_by_new_lamb_anchors", "parent_receipt_auto_close")
+                            or cur_sub_sum in ("随母羊新回执切换等待新羔羊自动收口", "随母羊本轮回执自动收口")
+                        )
                         self.store.update_lamb(
                             lb["lamb_id"],
                             state="running",
                             finished_at=None,
                             reported_at=None,
-                            result_summary=None,
+                            report_msg_id=None,
+                            result_summary=None if clear_sum else lb["result_summary"],
                             last_act_at=task_act.astimezone().isoformat(timespec="seconds"),
                         )
                         continue
@@ -6894,9 +6957,10 @@ def _auto_close_superseded_subagents(
     anchors: list,
     summary: str = "随母羊新回执切换等待新羔羊自动收口",
 ) -> None:
-    """REG-121：当母羊在新批次交回 waiting 回执且显式声明了新的 lamb:<id> 锚点时，
-    自动将本批次之前启动、且已不在最新 anchors 等待集合中的旧在途 subagent 羔羊收口为 done，
-    防止已被母羊换代接管的旧批次残留 subagent 在 20 分钟后触发虚假超时唤醒。
+    """REG-121 / REG-143：当母羊在新批次交回 waiting 回执且显式声明了本批次新派生的 lamb:<id> 锚点时，
+    自动将本批次之前启动、已超过 15 分钟无新进展且已不在最新 anchors 等待集合中的旧在途 subagent 羔羊收口为 done，
+    防止已被母羊换代接管的旧批次残留 subagent 在 20 分钟后触发虚假超时唤醒；
+    同时保护多工单并行仍在活跃推进的兄弟 subagent 不被误杀。
     """
     declared_lids = {
         a.removeprefix("lamb:").strip()
@@ -6907,9 +6971,22 @@ def _auto_close_superseded_subagents(
         return
     d_row = store.get_dispatch(batch_id) if batch_id else None
     sent_dt = _parse(d_row["sent_at"]) if d_row is not None and d_row["sent_at"] else None
-    for lb in store.get_active_lambs(topic_id):
-        if lb["kind"] not in ("subagent", "native_subagent") or lb["state"] != "running":
-            continue
+    active_subagents = [
+        lb
+        for lb in store.get_active_lambs(topic_id)
+        if lb["kind"] in ("subagent", "native_subagent") and lb["state"] == "running"
+    ]
+    if sent_dt is not None:
+        has_post_batch_declared = any(
+            (lb["lamb_id"] in declared_lids or ((lb["conversation_id"] or "").strip() in declared_lids))
+            and (st_dt := _parse(lb["started_at"])) is not None
+            and st_dt >= sent_dt - timedelta(seconds=5)
+            for lb in active_subagents
+        )
+        if not has_post_batch_declared:
+            return
+    now_dt = _now()
+    for lb in active_subagents:
         lid = lb["lamb_id"]
         cid = (lb["conversation_id"] or "").strip()
         if lid in declared_lids or (cid and cid in declared_lids):
@@ -6918,6 +6995,18 @@ def _auto_close_superseded_subagents(
             started_dt = _parse(lb["started_at"])
             if started_dt is None or started_dt >= sent_dt - timedelta(seconds=5):
                 continue
+        latest_act = _parse(lb["last_act_at"] or "") or _parse(lb["started_at"] or "")
+        if cid:
+            tp_sub = transcript_path(cid)
+            for cand_dt in (
+                last_activity_at(ANTIGRAVITY, tp_sub) if tp_sub.exists() else None,
+                _subagent_latest_transcript_step_done_at(tp_sub),
+                _subagent_latest_task_log_mtime(tp_sub),
+            ):
+                if cand_dt is not None and (latest_act is None or cand_dt > latest_act):
+                    latest_act = cand_dt
+        if latest_act is not None and (now_dt - latest_act) < timedelta(minutes=15):
+            continue
         complete_lamb(store, lid, summary=summary, state="done", report_msg_id="superseded_by_new_lamb_anchors")
 
 
@@ -7294,9 +7383,9 @@ def write_receipt(
         hook.clear_stop_state(cfg.state_dir, topic_id)
         anchors = receipt.get("anchors") if isinstance(receipt.get("anchors"), list) else []
         has_lamb_anchor = any(isinstance(a, str) and a.startswith("lamb:") for a in anchors)
-        if store is not None and status != "waiting":
+        if store is not None and status not in ("waiting", "needs_decision", "waiting_external"):
             _auto_close_topic_subagents(store, topic_id)
-        elif store is not None and status == "waiting" and has_lamb_anchor:
+        elif store is not None and status in ("waiting", "needs_decision", "waiting_external") and has_lamb_anchor:
             _auto_close_superseded_subagents(store, topic_id, batch_id, anchors)
         if store is not None and status in ("handled", "done"):
             im = LarkCliSource(tz=cfg.timezone_offset, max_pages=cfg.max_pages) if cfg.source.enabled else None
@@ -7894,7 +7983,10 @@ def complete_lamb(store: Store, lamb_id: str, summary: str = "", state: str = "d
     upd_fields = dict(state=final_state, finished_at=lb["finished_at"] or ts, last_act_at=ts,
                       result_summary=summary, reported_at=lb["reported_at"] or ts)
     if report_msg_id or existing_rep_mid:
-        upd_fields["report_msg_id"] = lb["report_msg_id"] or report_msg_id or existing_rep_mid
+        if report_msg_id and lb["report_msg_id"] in (None, "", "superseded_by_new_lamb_anchors", "parent_receipt_auto_close"):
+            upd_fields["report_msg_id"] = report_msg_id
+        else:
+            upd_fields["report_msg_id"] = lb["report_msg_id"] or report_msg_id or existing_rep_mid
     store.update_lamb(lid, **upd_fields)
     close_why = "羔羊已由母羊销毁" if report_msg_id == "killed_by_parent" else "羔羊已完成"
     for wk_id in filter(None, {lid, (lb["conversation_id"] or "").strip()}):
