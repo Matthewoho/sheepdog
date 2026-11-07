@@ -124,8 +124,13 @@ _SYMBOLIC_CRITIQUE_RE = re.compile(
     re.I,
 )
 _OWNER_MISCLICK_CORRECTION_RE = re.compile(
-    r"(?:搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
-    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:搞错了|点错了|选错了|按错了|手滑了?)",
+    r"(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
+    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)",
+    re.I,
+)
+_TEXT_EXPLICIT_CHOICE_RE = re.compile(
+    r"(?:^\s*(?:选\s*)?([A-E])(?:\s*$|[。，,！!：:.、\s])"
+    r"|(?:这个问题|这题|这个|这里|方案|选项)\s*(?:我要选|改选|改成|选|应该选)\s*([A-E])(?![a-zA-Z0-9]))",
     re.I,
 )
 
@@ -159,12 +164,20 @@ def diagnose_override_reason(
         r"|长期有效(?:的)?(?:办法|方案|解法)|有没有.{0,12}长期.{0,8}(?:办法|方案|解法)|一劳永逸"
         r"|同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,16}交付"
         r"|stage\s*环境暂不处理|生产\s*(?:Pod|服务|实例|环境)?\s*暂保持现状不动|暂缓执行[^\n。；]*等冲刺期后再处理"
-        r"|只要是境内的就行|腾讯云国际还没有这个功能|只能连腾讯云中国站|直接用中国站的就好了|除非他们有其他必要去连阿里云)",
+        r"|只要是境内的就行|腾讯云国际还没有这个功能|只能连腾讯云中国站|直接用中国站的就好了|除非他们有其他必要去连阿里云"
+        r"|是不是\s*tapnow\.tv\s*的持有者|给\s*\S+\s*开\s*\d+\s*的账号的权限)",
         s,
         re.I,
     ) or (
         re.search(r"^(?:暂不动|先不动|这个不动)$", s)
         and re.search(r"回收[^\n]*(?:lsg\d+|备用席位|双占)", text or "", re.I)
+    ) or (
+        re.search(r"给[他她]授权|同意开通[^\n]*(?:按申请授予|权限)", s, re.I)
+        and re.search(
+            r"A[ \t.、:：)\]]+[^\n]*(?:代其执行|代跑|免提权)[\s\S]{0,280}B[ \t.、:：)\]]+[^\n]*(?:同意开通|同意授权|按申请授予)",
+            text or "",
+            re.I,
+        )
     ):
         return ("arch_or_config_posture", "技术姿势纠偏")
     if (
@@ -174,7 +187,7 @@ def diagnose_override_reason(
             re.I,
         )
         and not re.search(
-            r"(?:整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下)",
+            r"(?:整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|是不是同一个(?:账号|环境|集群|项目))",
             s,
             re.I,
         )
@@ -186,11 +199,12 @@ def diagnose_override_reason(
     if re.search(
         r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|为啥没有选项|为什么没有选项|选项呢|"
         r"有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我|"
-        r"测试还是生产|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号|问题)|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
+        r"测试还是生产|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|是不是同一个(?:账号|环境|集群|项目)|什么(?:环境|账号|子账号|问题)|卡在哪里|为啥没做完|为什么没做完|这个才是第一性|暴露真实的?\s*client\s*ip|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
         r"会不会有.{0,6}影响|有什么影响|有没有影响|有办法看|最高.{0,12}用了多少|"
         r"给他授权|直接给.{0,6}授权|给.{0,8}开权限|给他(?:账号密码|账密)|还不能动|把来龙去脉在群里讲清楚|来龙去脉.{0,8}讲清楚|等澄清上下文|澄清上下文|暂时观望|你先排查|先排查一下|弄清楚.{0,12}(?:给我|再)|给我执行方案|"
         r"能具体讲讲|具体讲讲|讲讲前因后果|完整的方案|完整给我.{0,16}方案|各资源.{0,8}(?:处理)?方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下(?:这个问题)?|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]|"
         r"是干嘛的|干嘛用的|有没有用|没有人(?:在)?用|没人(?:在)?用|"
+        r"都有哪些\s*(?:pg|mysql|redis|db|数据库|实例)|和\s*\S+\s*(?:其他的\s*\S+\s*)?(?:都是)?一起(?:在)?用[吗嘛呢?？]|共用(?:的)?[吗嘛呢?？]|"
         r"问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|先问一下腾讯云|问一下腾讯云的人|是给谁访问的|给谁访问的|"
         r"新加了需求[^\n。]{0,16}(?:我)?需要买几台|(?:我)?需要买几台[呢吗嘛?？]|"
         r"给我一次.{0,24}(?:名单|列表|台账)|再发一次.{0,24}(?:名单|列表|台账)|总体.{0,16}(?:在使用|在用).{0,12}(?:人员)?名单)",
@@ -245,6 +259,9 @@ def diagnose_override_reason(
         ) or (
             re.search(r"全部批准[^\n]*(?:最小命名空间|命名空间|kubeconfig)", chosen_full, re.I)
             and re.search(r"部分批准[^\n]*不直发[^\n]*kubeconfig", text or "", re.I)
+        ) or (
+            re.search(r"同意开通[^\n]*(?:按申请授予|权限)", chosen_full, re.I)
+            and re.search(r"A[ \t.、:：)\]]+[^\n]*(?:代其执行|代跑|免提权)", text or "", re.I)
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
@@ -647,8 +664,15 @@ def classify_escalation(
         chosen_code = cb_match.group(1).upper()
         ans_body = clean_ui_text(cb_match.group(2), 140)
         ans_clean = f"[{chosen_code}] {ans_body}"
+        if chosen_code == "其他":
+            m_other_choice = _TEXT_EXPLICIT_CHOICE_RE.search(ans_body)
+            if m_other_choice:
+                chosen_code = (m_other_choice.group(1) or m_other_choice.group(2) or "").upper()
     else:
         ans_body = _CHOICE_PREFIX_RE.sub("", ans_clean).strip()
+        m_txt_choice = _TEXT_EXPLICIT_CHOICE_RE.search(ans_body)
+        if m_txt_choice:
+            chosen_code = (m_txt_choice.group(1) or m_txt_choice.group(2) or "").upper()
 
     override_code = ""
     override_reason = ""
@@ -687,13 +711,21 @@ def classify_escalation(
         elif chosen_code in ("A", "B", "C", "D", "E"):
             misclick_corrected = False
             m_corr = _OWNER_MISCLICK_CORRECTION_RE.search(critique_clean) if critique_clean else None
-            if m_corr:
-                corr_code = (m_corr.group(1) or m_corr.group(2) or "").upper()
-                if corr_code in ("A", "B", "C", "D", "E") and corr_code != chosen_code:
-                    orig_chosen = chosen_code
-                    chosen_code = corr_code
-                    ans_clean = f"[{chosen_code}] (误触 {orig_chosen} 后更正) {critique_clean}"
-                    misclick_corrected = True
+            corr_code = ((m_corr.group(1) or m_corr.group(2) or "").upper() if m_corr else "")
+            if not corr_code and critique_clean and re.search(r"看错了|搞错了|点错了|选错了|按错了|手滑了?", critique_clean, re.I):
+                if re.search(r"给[他她]授权|直接给.{0,6}授权|给.{0,8}开权限|同意开通|同意授权", critique_clean, re.I):
+                    for o in options:
+                        oc = str(o.get("code") or "").upper()
+                        ol = str(o.get("label") or "")
+                        if oc and oc != chosen_code and re.search(r"同意开通|同意授权|按申请授予|批准开通", ol, re.I):
+                            corr_code = oc
+                            break
+            if corr_code in ("A", "B", "C", "D", "E") and corr_code != chosen_code:
+                orig_chosen = chosen_code
+                chosen_code = corr_code
+                ans_body = next((str(o.get("label") or "") for o in options if o.get("code") == chosen_code), ans_body)
+                ans_clean = f"[{chosen_code}] (误触 {orig_chosen} 后更正) {critique_clean}"
+                misclick_corrected = True
             if critique_clean and _SYMBOLIC_CRITIQUE_RE.search(critique_clean):
                 alignment = "overridden"
                 override_code, override_reason = diagnose_override_reason(
@@ -1436,7 +1468,7 @@ class WorkbenchService:
                              AND e.answered_at IS NOT NULL
                              AND unixepoch(fm.create_time) BETWEEN unixepoch(e.answered_at) - 60 AND unixepoch(e.answered_at) + 600
                              AND (fm.content LIKE '%决策点%' OR fm.content LIKE '%还需要问我%' OR fm.content LIKE '%象征性问问%' OR fm.content LIKE '%不用问我%'
-                                  OR fm.content LIKE '%搞错%' OR fm.content LIKE '%点错%' OR fm.content LIKE '%选错%' OR fm.content LIKE '%按错%' OR fm.content LIKE '%手滑%' OR fm.content LIKE '%改选%')
+                                  OR fm.content LIKE '%看错%' OR fm.content LIKE '%搞错%' OR fm.content LIKE '%点错%' OR fm.content LIKE '%选错%' OR fm.content LIKE '%按错%' OR fm.content LIKE '%手滑%' OR fm.content LIKE '%改选%')
                            ORDER BY fm.create_time ASC LIMIT 1) AS followup_critique
                    FROM escalations e
                    LEFT JOIN messages am ON am.message_id = e.answer_message_id

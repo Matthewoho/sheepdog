@@ -796,10 +796,50 @@ def is_hub_message(store, m) -> bool:
     return bool(reply_to and (esc := store.get_escalation(reply_to)) is not None and "hub_message_id" in esc.keys() and esc["hub_message_id"] == reply_to)
 
 _OWNER_MISCLICK_CORRECTION_RE = re.compile(
-    r"(?:搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
-    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:搞错了|点错了|选错了|按错了|手滑了?)",
+    r"(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
+    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)",
     re.I,
 )
+_OWNER_MISCLICK_NATURAL_RE = re.compile(
+    r"(?:(?:我)?(?:刚刚|刚才)?(?:看错了|搞错了|点错了|选错了|按错了|手滑了?))",
+    re.I,
+)
+_HUB_EXPLICIT_OPTION_RE = re.compile(
+    r"(?:^\s*(?:选\s*)?([A-E])(?:\s*$|[。，,！!：:.、\s])"
+    r"|(?:这个问题|这题|这个|这里|方案|选项)\s*(?:我要选|改选|改成|选|应该选)\s*([A-E])(?![a-zA-Z0-9]))",
+    re.I,
+)
+
+
+def _infer_natural_misclick_option(ask_text: str, raw_txt: str, prev_code: str) -> str:
+    """当主人发送『给他授权给他授权 我刚刚看错了』等自然语言误触更正而未直接写字母时，从卡片其它选项推断目标选项字母。"""
+    if not ask_text or not raw_txt:
+        return ""
+    from .card_callback import parse_ask_options
+
+    wants_grant = bool(re.search(r"给[他她]授权|直接给.{0,6}授权|给.{0,8}开权限|同意开通|同意授权", raw_txt, re.I))
+    for opt in parse_ask_options(ask_text):
+        code = (opt.key or "").upper()
+        if not code or code == prev_code:
+            continue
+        lbl = f"{opt.label} {opt.reply_text}"
+        if wants_grant and re.search(r"同意开通|同意授权|按申请授予|批准开通", lbl, re.I):
+            return code
+    return ""
+
+
+def _mentions_escalation(raw_content: str, esc_row) -> bool:
+    """判断拍板总台消息是否显式点名了某张提问单（message_id、[topic_id] 或清洗后的标题）。"""
+    if not raw_content or esc_row is None:
+        return False
+    mid = str(esc_row["message_id"] or "")
+    tid = str(esc_row["topic_id"] or "")
+    if (mid and mid in raw_content) or (tid and tid in raw_content):
+        return True
+    cleaned_title = _clean_ask_title(str(esc_row["text"] or ""), tid)
+    if len(cleaned_title) >= 4 and cleaned_title.lower() in raw_content.lower():
+        return True
+    return False
 
 
 def find_misclick_target_escalation(
@@ -809,8 +849,8 @@ def find_misclick_target_escalation(
     topic_id: str = "",
     origin_root_id: str = "",
 ):
-    """REG-127：当主人在点选拍板按钮后 10 分钟内发送『这个我搞错了 我要选B』等误触更正时，
-    定位刚刚被误触拍板的那张提问单（answered_at 在 600s 内且原选项 != 更正选项），避免张冠李戴关掉同话题其他未决提问。"""
+    """REG-127 / REG-141：当主人在点选拍板按钮后 10 分钟内发送『这个我搞错了 我要选B』或『给他授权给他授权 我刚刚看错了』等误触更正时，
+    定位刚刚被误触拍板的那张提问单（answered_at 在 600s 内），避免张冠李戴关掉同话题或总台其他未决提问。"""
     def _v(k: str) -> str:
         if hasattr(m, "keys") and k in m.keys():
             return str(m[k] or "")
@@ -818,10 +858,11 @@ def find_misclick_target_escalation(
 
     raw_txt = plain_text(_v("content"))
     m_corr = _OWNER_MISCLICK_CORRECTION_RE.search(raw_txt)
-    if not m_corr or store is None or not hasattr(store, "conn"):
+    has_natural_misclick = bool(_OWNER_MISCLICK_NATURAL_RE.search(raw_txt))
+    if (not m_corr and not has_natural_misclick) or store is None or not hasattr(store, "conn"):
         return None, ""
-    corr_code = (m_corr.group(1) or m_corr.group(2) or "").upper()
-    if corr_code not in ("A", "B", "C", "D", "E"):
+    corr_code = ((m_corr.group(1) or m_corr.group(2) or "").upper() if m_corr else "")
+    if corr_code and corr_code not in ("A", "B", "C", "D", "E"):
         return None, ""
     ref_ts = _v("first_seen") or _v("create_time") or now_iso()
     try:
@@ -852,22 +893,35 @@ def find_misclick_target_escalation(
         ans_c = str(r["ans_content"] or "")
         m_cb = re.search(r"\[卡片回调\]\s*([A-E]|其他)\b", ans_c, re.I)
         prev_code = m_cb.group(1).upper() if m_cb else ""
-        if prev_code and prev_code != corr_code:
-            return r, corr_code
+        if not prev_code:
+            continue
+        eff_code = corr_code or _infer_natural_misclick_option(str(r["text"] or ""), raw_txt, prev_code)
+        if eff_code and eff_code != prev_code:
+            return r, eff_code
+        if not corr_code and has_natural_misclick:
+            return r, ""
     return None, corr_code
 
 
 def handle_hub_text_reply(collector, m) -> bool:
-    """7.81 / 7.118 (REG-036 / REG-086): 处理主人在『🐕 拍板总台』话题内的文字/图片回复：
-    1. 若显式引用某张待拍板子卡或当前仅 1 项未决提问，直接作答该提问并双端变绿；
-    2. 若未引用具体子卡但正文提及某提问/会话，或距最近一次拍板 <= 300s（如点完按钮后追加截图/追问『这玩意有啥决策点吗』），
-       自动作为 owner_instruction 投递给对应会话（带 escalation_followup:<mid> 标签）；
-    3. 其余在拍板总台内的主人发言兜底投递给中枢 tp_bus（decision_hub_general），严禁 DROP 丢弃或弹窗说教主人。"""
+    """7.81 / 7.118 (REG-036 / REG-086 / REG-141): 处理主人在『🐕 拍板总台』话题内的文字/图片回复：
+    1. 若显式引用某张待拍板子卡，或正文显式点名某张未决提问，直接作答该提问并双端变绿；
+    2. 若命中刚点完卡片按钮后的误触更正（如『给他授权给他授权 我刚刚看错了』），优先投递给刚刚点选的那张提问单，严禁被后续新弹出的单条未决提问截胡；
+    3. 若正文显式点名某张近期已拍板提问（如『不对 不对 FE-1951 ... [tp_tapnow-prod-topology]这个问题选A』），自动修正该单拍板答案与绿卡并投递给对应会话；
+    4. 若当前仅 1 项未决提问且非上述误触/点名已结单，直接作答该唯一未决提问；
+    5. 其余在拍板总台内的主人发言按 300s 最近拍板关联或兜底投递给中枢 tp_bus（decision_hub_general）。"""
     store, cfg, source = collector.store, collector.cfg, getattr(collector, "source", None)
     if not is_hub_message(store, m):
         return False
     reply_to = getattr(m, "reply_to", "") or ""
+    raw_content = getattr(m, "content", "") or ""
     esc = store.get_escalation(reply_to) if reply_to else None
+    opens = _open_escalation_rows(store)
+    if esc is None and opens:
+        for cand in opens:
+            if _mentions_escalation(raw_content, cand):
+                esc = cand
+                break
     if esc is None:
         mis_esc, _ = find_misclick_target_escalation(store, m)
         if mis_esc is not None:
@@ -880,17 +934,39 @@ def handle_hub_text_reply(collector, m) -> bool:
                 topic_id=str(mis_esc["topic_id"]),
             )
             return True
-    opens = _open_escalation_rows(store)
+    recent_rows = store.conn.execute(
+        "SELECT * FROM escalations WHERE answered_at IS NOT NULL ORDER BY answered_at DESC, rowid DESC LIMIT 5"
+    ).fetchall()
+    if esc is None and recent_rows:
+        for r_esc in recent_rows:
+            if _mentions_escalation(raw_content, r_esc):
+                rmid = str(r_esc["message_id"] or "")
+                rtid = str(r_esc["topic_id"] or "")
+                m_opt = _HUB_EXPLICIT_OPTION_RE.search(plain_text(raw_content))
+                if m_opt:
+                    chosen_letter = (m_opt.group(1) or m_opt.group(2) or "").upper()
+                    chosen_disp = " ".join(plain_text(raw_content).split())[:60] or f"选 {chosen_letter}"
+                    sync_escalation_dual_cards(
+                        cfg,
+                        store,
+                        source,
+                        rmid,
+                        chosen_display=chosen_disp,
+                        topic_id=rtid,
+                        answered_at=m.create_time or now_iso(),
+                        orig_text=r_esc["text"] or "",
+                        answer_mid=m.message_id,
+                    )
+                store.upsert_message(
+                    m,
+                    "dispatch",
+                    "owner_instruction",
+                    ["owner_verified", f"escalation_followup:{rmid}"],
+                    topic_id=rtid,
+                )
+                return True
     if esc is None and len(opens) == 1:
         esc = opens[0]
-    raw_content = getattr(m, "content", "") or ""
-    if esc is None and opens:
-        for cand in opens:
-            cmid = str(cand["message_id"] or "")
-            ctid = str(cand["topic_id"] or "")
-            if (cmid and cmid in raw_content) or (ctid and ctid in raw_content):
-                esc = cand
-                break
     if esc is not None:
         canon_mid = str(esc["message_id"])
         if esc["answered_at"] or esc["closed_at"]:
@@ -923,21 +999,6 @@ def handle_hub_text_reply(collector, m) -> bool:
         )
         return True
 
-    recent_rows = store.conn.execute(
-        "SELECT * FROM escalations WHERE answered_at IS NOT NULL ORDER BY answered_at DESC, rowid DESC LIMIT 5"
-    ).fetchall()
-    for r_esc in recent_rows:
-        rmid = str(r_esc["message_id"] or "")
-        rtid = str(r_esc["topic_id"] or "")
-        if (rmid and rmid in raw_content) or (rtid and rtid in raw_content):
-            store.upsert_message(
-                m,
-                "dispatch",
-                "owner_instruction",
-                ["owner_verified", f"escalation_followup:{rmid}"],
-                topic_id=rtid,
-            )
-            return True
     if recent_rows:
         r_latest = recent_rows[0]
         try:

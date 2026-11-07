@@ -586,7 +586,7 @@ def send_mail(store: Store, cfg, from_topic: str, to_topic: str, text: str, key:
         raise DutyError("纯礼貌收到/结单致谢无需回传 tell 唤醒对方会话，请在回执 summary 中说明即可")
     ok = is_target or (lambda tid: store.get_topic(tid) is not None)
     for tid, who in ((from_topic, "--topic"), (to_topic, "--to")):
-        if not ok(tid) and not (who == "--to" and is_brain_mail_target(store, tid)):
+        if not ok(tid) and not is_brain_mail_target(store, tid):
             raise DutyError(f"{who} {tid} 不是在投递的会话（总线、名册 managed、总线新开的）")
     if _REDUNDANT_FORWARD_TELL_RE.search(text):
         f_mids = re.findall(r"\bom_[A-Za-z0-9_]+\b", text)

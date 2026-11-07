@@ -362,6 +362,14 @@ def is_short_message(text: str, *, for_reply: bool = False) -> bool:
 
 
 _DEFERRED_LOOP_BADGE_LINE_RE = re.compile(r"^\s*⏳\s*在途收尾项（已挂入\s*Loop\b[^\n]*$", re.M)
+_SHELL_VAR_EXPANSION_CORRUPTION_RE = re.compile(
+    r"(?:"
+    r"[（(~≈+][ \t]*(?:-|/bin/)?zsh(?=[）)\s，,、；;。/]|无需|免费|零成本|元|美金|美元|$)"
+    r"|(?:\b|(?<=[\u4e00-\u9fff]))(?:-|/bin/)?zsh[ \t]*(?:无需|免费|零成本|/[ \t]*(?:月|年|天|小时|h\b))"
+    r"|(?<!\d)\.\d+[ \t]*/[ \t]*(?:月|年|天|小时|h\b|Pod\b)"
+    r")",
+    re.I,
+)
 
 
 def validate_summary(summary: str, *, for_reply: bool = True) -> str:
@@ -371,6 +379,11 @@ def validate_summary(summary: str, *, for_reply: bool = True) -> str:
         raise ValueError(f"白话总结为空。{SUMMARY_REQUIRED_GUIDE}")
     if _CODE_FENCE_RE.search(s):
         raise ValueError(f"白话总结不能含代码块（代码块请留在原文里，会自动收进 more 折叠区）。{SUMMARY_REQUIRED_GUIDE}")
+    if (m_sh := _SHELL_VAR_EXPANSION_CORRUPTION_RE.search(s)) is not None:
+        raise ValueError(
+            f"白话总结疑似发生 Shell 双引号变量展开吞字（命中 {m_sh.group(0)!r}，如双引号内 '$0' 被展开为 'zsh'，或 '+$167.9/月' 的 '$167' 被吞成 '+.9/月'，REG-141 门禁）："
+            "请将 --summary 改用单引号 '...' 包裹（或把 '$0' 写为 '0美元'、用 '\\$' 转义），正文改用 --stdin 传入。"
+        )
     s_for_check = _DEFERRED_LOOP_BADGE_LINE_RE.sub("", s).strip("\n") or s
     is_deliv = for_reply and is_deliverable_payload(s_for_check)
     max_lines = DELIVERABLE_MAX_LINES if is_deliv else (REPLY_SUMMARY_MAX_LINES if for_reply else SUMMARY_MAX_LINES)

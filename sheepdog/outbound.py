@@ -1006,6 +1006,60 @@ _PARTIAL_APPROVAL_OVER_ISOLATED_NAMESPACE_OWNER_ASK_RE = re.compile(
     r"(?=[\s\S]*(?:(?:建议|推荐)[ \t:：]*(?:优先)?(?:选\s*)?B\b|B[ \t.、:：)\]]+部分批准[（(][^\n）)]*推荐))",
     re.I,
 )
+_PROD_DB_SCALE_WITHOUT_SHARED_INVENTORY_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*Cinemap[^\n。；]{0,40}(?:中国站|南京|生产))"
+    r"(?=[\s\S]*(?:PG\d*|PostgreSQL|postgres-[a-z0-9]+)[^\n。；]{0,80}(?:升配|升\s*\d+\s*C|扩容|只读实例))"
+    r"(?=[\s\S]*(?:tapnow\.tv|TapNow))",
+    re.I,
+)
+_PROD_DB_SHARED_ISOLATION_EVIDENCE_RE = re.compile(
+    r"(?:(?:生产|现网|账号下)[^\n。；]{0,20}(?:共有|共计|全部|所有|有哪些)\s*\d*\s*(?:台|个)?\s*(?:PG|PostgreSQL|数据库)\s*实例|"
+    r"(?:与|和)\s*TapNow[^\n。；]{0,24}(?:共用|混用|同实例|物理隔离|独立实例|不共用|分开使用)|"
+    r"(?:Cinemap\s*独享|TapNow\s*主站\s*PG))",
+    re.I,
+)
+_CONSOLE_EYEBALL_PACKAGE_BALANCE_WITHOUT_CLI_OR_SAMMY_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:资源包|基础包|套餐|VUM)[^\n。；]{0,40}(?:跑完|耗尽|剩余用量|余量))"
+    r"(?=[\s\S]*(?:在控制台看一眼|看一眼控制台|请核看主账号后台余量))",
+    re.I,
+)
+_CLI_BILLING_OR_SAMMY_DELEGATION_EVIDENCE_RE = re.compile(
+    r"(?:DescribeAccountBalance|DescribeBillDetail|DescribeJobs|Sammy)",
+    re.I,
+)
+_INVERTED_PERM_ASK_PROXY_OVER_GRANT_RE = re.compile(
+    r"\A(?=[\s\S]*申请[^\n。；]{0,48}权限)"
+    r"(?=[\s\S]*A[ \t.、:：)\]]+(?![^\n]*拒绝)[^\n]*(?:转由专席|由专席|SRE)[^\n]*(?:代其执行|代跑|代配|免提权))"
+    r"(?=[\s\S]*B[ \t.、:：)\]]+[^\n]*(?:同意开通|同意授权|按申请授予))"
+    r"(?=[\s\S]*(?:建议|推荐)[ \t:：]*(?:优先)?(?:选\s*)?A\b)",
+    re.I,
+)
+_CLOUD_ACCOUNT_RECHARGE_WITHOUT_UIN_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:国内(?:站)?主账号|国际(?:站)?(?:主|母|子)?账号|主账号|母账号))"
+    r"(?=[\s\S]*(?:充值[^\n。；]{0,16}平账|平账|提请支付[^\n。；]{0,20}欠费|欠费[^\n。；]{0,40}充值))",
+    re.I,
+)
+_CLOUD_ACCOUNT_EXPLICIT_UIN_EVIDENCE_RE = re.compile(
+    r"\b(?:1000|2000)\d{8}\b|(?:账号\s*ID|UIN)\s*[：:=]?\s*\d{8,14}\b",
+    re.I,
+)
+_PREFER_RECHARGE_ARREARS_OVER_FUNDED_MAIN_ACCOUNT_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:有\s*[\d.]+\s*万(?:元)?(?:现金)?余额|余额充足)[^\n]*主账号)"
+    r"(?=[\s\S]*A[ \t.、:：)\]]+[^\n]*(?:直接往|继续在|维持在)[^\n]*充值[^\n]*平账)"
+    r"(?=[\s\S]*B[ \t.、:：)\]]+[^\n]*(?:迁回|在)[^\n]*主账号[^\n]*(?:开通子账号|开子账号|开权限))"
+    r"(?=[\s\S]*(?:建议|推荐)[ \t:：]*(?:优先)?(?:选\s*)?A\b)",
+    re.I,
+)
+_HALF_DONE_ROLLOUT_WITHOUT_STALL_REASON_AND_E2E_GOAL_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:TRUSTED_PROXY_CIDRS|IP\s*判断(?:错误)?改造))"
+    r"(?=[\s\S]*(?:已上线[^\n。；]{0,28}仅剩[^\n。；]{0,36}(?:还在旧版|未发生产)|已合入\s*`?main`?[，,\s]*生产尚未发布))",
+    re.I,
+)
+_HALF_DONE_STALL_REASON_AND_E2E_CLIENT_IP_EVIDENCE_RE = re.compile(
+    r"\A(?=[\s\S]*(?:之前卡在|此前卡在|未完成原因|此前因[^\n。；]{0,24}未发|卡点说明))"
+    r"(?=[\s\S]*(?:\.media|\bmedia\b)[\s\S]{0,40}(?:\.ai|\bai\b)[\s\S]{0,60}(?:真实(?:的)?\s*client\s*ip|真实客户端\s*IP))",
+    re.I,
+)
 _REPLY_ADDRESSES_OWNER_AS_BOSS_RE = re.compile(
     r"(?:老板\s*(?:已|刚|刚才|这边|那边)?\s*(?:批准|同意|拍板|确认|回复|指示|决定|定了|批复|选了|签字)|"
     r"(?:已|正|先|去|待|等|向|找|发给|请|跟|由)\s*老板\s*(?:确认|拍板|审批|请示|定夺|定|汇报|对齐|批复|同意|批准)|"
@@ -1774,6 +1828,62 @@ def check_ask_pre_flight_guard(
             f"检测到骑墙双选建议（`{m_hedge.group(0).strip()}`）："
             "`sheepdog ask` 必须给出唯一明确的首推选项（如『建议：选 A』），以便主人一键回复『按你的建议』直接拍板，"
             "严禁写『建议选 B（或选 A）』等模棱两可的双选骑墙建议（REG-140 唯一明确首推建议门禁，没有发送）",
+        )
+    if (
+        _PROD_DB_SCALE_WITHOUT_SHARED_INVENTORY_ASK_RE.search(full_text)
+        and not _PROD_DB_SHARED_ISOLATION_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示对生产数据库（PG / PostgreSQL）执行升配、扩容或新建只读实例时，严禁只写单台实例 ID 而未交代全量生产 PG 实例清单及跨业务线（Cinemap vs TapNow）共用/隔离关系"
+            "（主人 2026-11-07 16:04 在 `tp_kaifeng` 拍板卡 `[其他]` 明确反问：『咱们生产都有哪些pg cinemap的pg和tapnow其他的pg都是一起在用吗』，REG-141 生产数据库扩容必报全量实例清单与共用隔离边界门禁）："
+            "请先只读盘点当前生产账号下共有哪几台 PG 实例、各自承载哪些库表/服务，并在正文中明确说明目标 PG 实例是 Cinemap 独立实例还是与 TapNow 其他服务共用后再发起请示（没有发送）",
+        )
+    if (
+        _CONSOLE_EYEBALL_PACKAGE_BALANCE_WITHOUT_CLI_OR_SAMMY_ASK_RE.search(full_text)
+        and not _CLI_BILLING_OR_SAMMY_DELEGATION_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当同事怀疑云资源包/基础包/VUM 额度耗尽时，严禁在未调用本机云 CLI（如 `tccli --profile tapnow-tv-profile` 的 `pts DescribeJobs`、`billing DescribeAccountBalance`、`billing DescribeBillDetail`）实测查账的情况下，直接发卡让主人『抽空在控制台看一眼剩余用量』"
+            "（主人 2026-11-07 14:37 在 `tp_kc` 拍板卡 `[其他]` 批复：『问一下他着急吗 如果着急能不能让 sammy 帮忙买 我现在有点事不在电脑边』，REG-141 云资源包余量 CLI 实测自理与 Sammy 代购协同门禁）："
+            "请先用本机 `~/.tccli/` 凭据实测回读真实消耗与账户余额（若无需请示即可破案则直接 `reply` + `report`），确需加购/充值时须先核实对方紧急度并提供由 Sammy 协助处理的选项（没有发送）",
+        )
+    if _INVERTED_PERM_ASK_PROXY_OVER_GRANT_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对同事申请云项目/服务权限（如 `XX申请...权限`）发起 `sheepdog ask` 时，严禁把『A. 转由专席/SRE 代其执行（免提权/不给权限）』放在第 1 个主按钮（选项 A）并首推选 A、而把『B. 同意开通/按申请授予权限』倒置在选项 B"
+            "（主人 2026-11-07 16:06 在 `tp_leon` 拍板卡误点 A 后立即纠偏：『给他授权给他授权 我刚刚看错了 / 按错了』，REG-141 权限请示卡正向授权选项置顶与维护者赋权门禁）："
+            "请将『A. 同意开通，按申请授予对应服务/项目权限』作为选项 A（对负责维护该服务的研发同学优先推荐选 A），把『B. 暂不直接开通权限，转由专席代执行』放在选项 B 后再发起请示（没有发送）",
+        )
+    if (
+        _CLOUD_ACCOUNT_RECHARGE_WITHOUT_UIN_ASK_RE.search(full_text)
+        and not _CLOUD_ACCOUNT_EXPLICIT_UIN_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "请示对云主账号/母账号执行充值平账或支付欠费订单时，严禁只笼统写『主账号 / 国内主账号』而不在 `---more---` 中写明精准的 12 位账号 ID / UIN（如 `1000xxxxxxxx`）"
+            "（主人 2026-11-07 16:45 在 `tp_kc` 拍板卡 `[其他]` 明确反问：『到底是哪个账号啊 我和kaichi说的是不是同一个账号啊 我一直看的是主账号 ID：1000...』，REG-141 云账号充值平账必附精准主账号 UIN 门禁）："
+            "由于团队存在多个云主账号，请在 `---more---` 详情区明确写出目标主账号的 12 位账号 ID / UIN，并交代已与提问人确认其子账号/订单归属同一主账号后再发起请示（没有发送）",
+        )
+    if _PREFER_RECHARGE_ARREARS_OVER_FUNDED_MAIN_ACCOUNT_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当公司已有余额充足的主账号（如数万元现金余额的主账号）且专席可直接通过 CLI 为同事开通子账号与权限时，"
+            "严禁在选项 A 首推让主人去给另一个欠费/仅挂域名的账号手动充值平账"
+            "（主人 2026-11-07 16:48 在 `tp_kc` 拍板卡 `[其他]` 明确纠偏：『1000...是不是tapnow.tv的持有者那个账号 给kc开698的账号的权限』，REG-141 优先复用有余额主账号免人工充值门禁）："
+            "请直接首推或自治在有充足余额的公司主账号下为同事开通子账号与对应权限，避免在仅做域名持有/备案的欠费账号上继续堆业务与人工充值（没有发送）",
+        )
+    if (
+        _HALF_DONE_ROLLOUT_WITHOUT_STALL_REASON_AND_E2E_GOAL_ASK_RE.search(full_text)
+        and not _HALF_DONE_STALL_REASON_AND_E2E_CLIENT_IP_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "针对跨日/半途停滞的改造（如客户端真实 IP 识别改造 `TRUSTED_PROXY_CIDRS` 一半已上生产、另一半合入后长时间未发生产）发起请示时，"
+            "严禁只罗列内部 PR 编号与环境变量名而不交代 ① 之前卡在哪里/为什么没做完、以及 ② 第一性终局目标（从 `.media` 或 `.ai` 域名进入时是否正确暴露真实 `client IP`）的实测结论"
+            "（主人 2026-11-07 17:05 在 `tp_andyxiao` 拍板卡 `[其他]` 明确追问：『这个事情之前卡在哪里 为啥没做完 我的目标就是 从.meida或者.ai进来的时候 要暴露真实的client ip 这个才是第一性』，REG-141 半途停滞事项必报卡点原因与第一性终局目标门禁）："
+            "请在正文中明确说明此前停滞/未完成的具体原因（之前卡在哪里），并锚定『从 `.media` 与 `.ai` 进入时暴露真实 `client IP`』这一第一性目标给出端到端验证结论后再发起请示（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID

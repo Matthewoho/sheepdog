@@ -8047,6 +8047,380 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(t1_stat["p50_ms"], 2000)
             st.close()
 
+    def test_reg141_shell_var_corruption_prod_pg_inventory_console_eyeball_subagent_meta_and_brain_tell(self):
+        """REG-141: 1) card.validate_summary 拦截 Shell 双引号变量展开吞字（$0 -> zsh、+$167.9/月 -> +.9/月）；
+        2) outbound.check_ask_pre_flight_guard 拦截未报全量生产 PG 实例清单与共用/独享隔离关系的 Cinemap 生产 PG 扩容请示，以及未用 CLI 查账就让主人去控制台看资源包余量的请示；
+        3) admin_web.diagnose_override_reason 将『咱们生产都有哪些pg cinemap的pg和tapnow其他的pg都是一起在用吗』归入 context_incomplete；
+        4) guard._summarize_subagent_return 过滤英文 Boundary Compliance / Full Report / Raw ... Receipt 头；
+        5) duty.send_mail 允许 tp_sheepdog 作为 --topic 发件方发送巡检留言。"""
+        from sheepdog import admin_web, card as card_mod, duty as duty_mod, guard as guard_mod, outbound
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        # 1. Shell 双引号变量展开吞字拦截
+        with self.assertRaises(ValueError) as ctx_zsh:
+            card_mod.validate_summary(
+                "实测节点池已有双可用区虚拟节点（zsh无需加节点），PG17主备升8C32G（+.9/月），CLB升c3.medium（zsh）。建议选A。",
+                for_reply=False,
+            )
+        self.assertIn("REG-141", str(ctx_zsh.exception))
+
+        with self.assertRaises(ValueError) as ctx_dec:
+            card_mod.validate_summary(
+                "主备升配折后 +.9/月，建议选 A。",
+                for_reply=False,
+            )
+        self.assertIn("REG-141", str(ctx_dec.exception))
+
+        # 正常写法放行
+        ok_sum = card_mod.validate_summary(
+            "实测节点池已有双可用区虚拟节点（0美元无需加节点），PG17主备升8C32G（+167.9美元/月）。建议选A。",
+            for_reply=False,
+        )
+        self.assertIn("167.9美元/月", ok_sum)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            cfg = Config(state_dir=state_dir)
+            cfg.self_open_id = "ou_owner_test"
+            st = Store(cfg.db_path)
+            st.upsert_topic("tp_kaifeng", title="Kai", kind="adopted", conversation_id="cid-kf")
+            st.upsert_topic("tp_kc", title="kc", kind="adopted", conversation_id="cid-kc")
+
+            # 2a. Cinemap 生产 PG 扩容未交代全量 PG 实例清单与 TapNow 共用/隔离关系 -> 拦截
+            pg_ask_body = (
+                "Kai提交Cinemap南京生产1万活跃用户扩容清单。建议选A。\n"
+                "---more---\n"
+                "事情：Kai 提交了 Cinemap 中国站（南京生产 cinemapprod）扩容请求：PG17（postgres-nmp9lirn）主备升 8C32G，"
+                "共享 EdgeOne 影响 20 个 *.tapnow.tv 域名。\n\n"
+                "选项：\n"
+                "A. 同意 PG17 主备升 8C32G\n"
+                "B. 暂不扩容\n\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_pg:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kaifeng",
+                    "审批Cinemap中国站1万活跃用户生产扩容方案",
+                    pg_ask_body,
+                    key="cinemap-scale",
+                )
+            self.assertIn("REG-141", str(ctx_pg.exception))
+
+            # 交代了全量 PG 实例清单与 TapNow 隔离关系后放行
+            pg_ask_ok = pg_ask_body.replace(
+                "主备升 8C32G，",
+                "主备升 8C32G（生产账号下共有 2 台 PG 实例，本实例与 TapNow 主站物理隔离不共用），",
+            )
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kaifeng",
+                "审批Cinemap中国站1万活跃用户生产扩容方案",
+                pg_ask_ok,
+                key="cinemap-scale",
+            )
+
+            # 2b. 未调 CLI 查账就让主人去控制台看资源包余量 -> 拦截
+            pts_ask_body = (
+                "kc反馈子账号看不到主账号资源包，怀疑10万VUM基础包已跑完。请核看主账号后台余量及是否需补购。\n"
+                "---more---\n"
+                "事情：kc 怀疑 10 万 VUM 基础包已耗尽。\n\n"
+                "选项：\n"
+                "A. 抽空在控制台看一眼剩余用量\n"
+                "B. 先等 kc 回复压测报告消耗\n\n"
+                "建议：选 A"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_pts:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_kc",
+                    "kc反馈PTS基础包疑似跑完需核查余量",
+                    pts_ask_body,
+                    key="pts-pkg",
+                )
+            self.assertIn("REG-141", str(ctx_pts.exception))
+
+            # 2c. 权限申请请示将『代其执行（免提权）』放在选项 A、把『同意开通』倒置在选项 B -> 拦截
+            st.upsert_topic("tp_leon", title="Leon", kind="adopted", conversation_id="cid-leon")
+            st.upsert_topic("tp_tapnow-prod-topology", title="Topology", kind="adopted", conversation_id="cid-topo")
+            inverted_perm_ask = (
+                "Leon 申请生产项目项目级 run.developer 与 chat-service 的 SA 权限。\n"
+                "---more---\n"
+                "事情：Leon 申请生产项目 roles/run.developer 与 chat-service SA 权限。\n\n"
+                "选项：\n"
+                "A. 转由专席/SRE 代其执行该一次性任务或代写 Nacos 令牌配置（生产最小权限，免提权）\n"
+                "B. 同意开通，按申请授予项目级 run.developer 与 chat-service SA 使用权限\n"
+                "C. 暂不授权\n\n"
+                "建议：选 A。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_inv_perm:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_leon",
+                    "Leon申请生产项目与SA权限",
+                    inverted_perm_ask,
+                    key="leon-perm",
+                )
+            self.assertIn("REG-141", str(ctx_inv_perm.exception))
+
+            # 3. 错题本归因：生产有哪些 PG / 是否一起在用 -> context_incomplete
+            code, label = admin_web.diagnose_override_reason(
+                pg_ask_body,
+                "[卡片回调] 其他：咱们生产都有哪些pg  cinemap的pg和tapnow其他的pg都是一起在用吗",
+                "A",
+            )
+            self.assertEqual((code, label), ("context_incomplete", "缺环境/调用链反问"))
+
+            # 4. Subagent 完工摘要跳过英文元信息头 Boundary Compliance / Full Report / Raw ... Receipt
+            raw_sub = (
+                "## `FE-1907` Live Blind Verification Receipt\n\n"
+                "- **Boundary Compliance**: `0` `sheepdog` CLI calls, `0` cloud mutations.\n"
+                "- **Full Report**: `/tmp/fe1907_verify.md`\n"
+                "- **Raw Chrome Playwright Receipt**: `/tmp/fe1907_live_chrome_receipt.json`\n\n"
+                "---\n\n"
+                "1. **Upstream PR `#9924` Verified**: `getWebSocketOrigin()` returns `wss://api.tapnow.tv` with 0 errors.\n"
+            )
+            sub_sum = guard_mod._summarize_subagent_return(raw_sub, 120)
+            self.assertNotIn("Boundary Compliance", sub_sum)
+            self.assertNotIn("Full Report", sub_sum)
+            self.assertIn("Upstream PR", sub_sum)
+
+            # 5. tp_sheepdog 双向 tell 发件权限放行
+            st.upsert_topic("tp_sheepdog", title="Sheepdog Steward", kind="adopted", conversation_id="c6677355-test-conv")
+            mid_no = duty_mod.send_mail(
+                st,
+                cfg,
+                "tp_sheepdog",
+                "tp_kc",
+                "巡检实测：10万 VUM 基础包余量 98.5%，实为昨日按量日结欠费 143.36 元",
+                key="pts-pkg",
+                is_target=lambda tid: tid == "tp_kc",
+            )
+            self.assertGreater(mid_no, 0)
+
+            # 6. 拍板总台自然语言误触更正（『给他授权给他授权 我刚刚看错了』）命中刚点按钮的 tp_leon 提问单，不被后续单条未决 FE-1951 截胡；
+            #    且显式点名『不对 不对 FE-1951 ... [tp_tapnow-prod-topology]这个问题选A』归类为 accepted(A)
+            from sheepdog import decision_hub
+            from sheepdog.models import Message
+
+            st.set_meta(
+                decision_hub.META_DECISION_HUB,
+                json.dumps({"chat_id": "oc_hub_chat", "root_message_id": "om_hub_root", "thread_id": "omt_hub_thr"}),
+            )
+            st.add_escalation(
+                "om_test_leon_ask",
+                "tp_leon",
+                "oc_hub_chat",
+                "🐕 需要你定 · Leon申请生产项目与SA权限 [tp_leon]\n" + inverted_perm_ask,
+                "2026-11-07T16:04:04+08:00",
+            )
+            cb_msg = Message(
+                message_id="sd_card_cb_leon_a",
+                chat_id="oc_hub_chat",
+                chat_name="Hub",
+                chat_type="topic",
+                sender_id="ou_owner_test",
+                sender_name="Matthew Hong",
+                sender_type="user",
+                content="[卡片回调] A：转由专席/SRE 代其执行该一次性任务或代写 Nacos 令牌配置（生产最小权限，免提权）",
+                msg_type="text",
+                create_time="2026-11-07T16:05:53+08:00",
+                reply_to="om_test_leon_ask",
+            )
+            st.upsert_message(cb_msg, "dispatch", "owner_reply", ["owner_verified", "card_callback"], "tp_leon")
+            st.answer_escalation("om_test_leon_ask", "sd_card_cb_leon_a")
+            st.conn.execute(
+                "UPDATE escalations SET answered_at='2026-11-07T16:05:56+08:00', closed_at='2026-11-07T16:05:56+08:00' WHERE message_id='om_test_leon_ask'"
+            )
+            fe_ask_txt = (
+                "🐕 需要你定 · FE-1951 桌面端下载域名草稿 PR #9928 改向 main 分支 [tp_tapnow-prod-topology]\n"
+                "本地已改基于最新 main 测通，选 A 就把 PR #9928 目标分支改到 main。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意把 PR #9928 目标分支从 cn-stage 改为 main\n"
+                "B. 暂不改 PR #9928\n\n"
+                "建议：选 A 。"
+            )
+            st.add_escalation(
+                "om_test_fe1951_ask",
+                "tp_tapnow-prod-topology",
+                "oc_hub_chat",
+                fe_ask_txt,
+                "2026-11-07T16:06:37+08:00",
+            )
+            st.conn.commit()
+
+            mis_msg = Message(
+                message_id="om_test_misclick_grant",
+                chat_id="oc_hub_chat",
+                chat_name="Hub",
+                chat_type="topic",
+                sender_id="ou_owner_test",
+                sender_name="Matthew Hong",
+                sender_type="user",
+                content="给他授权给他授权 我刚刚看错了",
+                msg_type="text",
+                create_time="2026-11-07T16:06:00+08:00",
+                reply_to="om_hub_root",
+                thread_id="omt_hub_thr",
+            )
+            mis_esc, corr_letter = decision_hub.find_misclick_target_escalation(st, mis_msg)
+            self.assertIsNotNone(mis_esc)
+            self.assertEqual(mis_esc["message_id"], "om_test_leon_ask")
+            self.assertEqual(corr_letter, "B")
+
+            fake_collector = type("C", (), {"store": st, "cfg": cfg, "source": None})()
+            handled = decision_hub.handle_hub_text_reply(fake_collector, mis_msg)
+            self.assertTrue(handled)
+            # FE-1951 绝不能被『给他授权给他授权 我刚刚看错了』误关！
+            fe_esc_after = st.get_escalation("om_test_fe1951_ask")
+            self.assertIsNone(fe_esc_after["answered_at"])
+            routed_mis = st.get_message("om_test_misclick_grant")
+            self.assertEqual(routed_mis["topic_id"], "tp_leon")
+            self.assertIn("escalation_followup:om_test_leon_ask", routed_mis["tags_json"])
+
+            # 随后主人点名回答 FE-1951『不对 不对 FE-1951 ... 这个问题选A』，归类为 accepted(A)
+            fe_ans_msg = Message(
+                message_id="om_test_fe1951_ans_a",
+                chat_id="oc_hub_chat",
+                chat_name="Hub",
+                chat_type="topic",
+                sender_id="ou_owner_test",
+                sender_name="Matthew Hong",
+                sender_type="user",
+                content="不对 不对 FE-1951 桌面端下载域名草稿 PR #9928 改向 main 分支 [tp_tapnow-prod-topology]这个问题选A",
+                msg_type="text",
+                create_time="2026-11-07T16:07:02+08:00",
+                reply_to="om_hub_root",
+                thread_id="omt_hub_thr",
+            )
+            decision_hub.handle_hub_text_reply(fake_collector, fe_ans_msg)
+            fe_esc_closed = st.get_escalation("om_test_fe1951_ask")
+            self.assertEqual(fe_esc_closed["answer_message_id"], "om_test_fe1951_ans_a")
+            fe_cls = admin_web.classify_escalation(fe_esc_closed, fe_ans_msg.content)
+            self.assertEqual(fe_cls["alignment"], "accepted")
+            self.assertEqual(fe_cls["chosen_code"], "A")
+
+            leon_cls = admin_web.classify_escalation(
+                st.get_escalation("om_test_leon_ask"),
+                cb_msg.content,
+                followup_critique="给他授权给他授权 我刚刚看错了",
+            )
+            self.assertEqual(leon_cls["alignment"], "overridden")
+            self.assertEqual(leon_cls["chosen_code"], "B")
+            self.assertEqual(leon_cls["override_code"], "arch_or_config_posture")
+
+            # 7. 云主账号充值平账未在 ---more--- 附上 12 位账号 UIN 被拦截；且『到底是哪个账号啊 我和kaichi说的是不是同一个账号啊』归入 context_incomplete
+            no_uin_recharge_ask = (
+                "kc 发来一笔 199 元的腾讯云压测包新订单提请支付。实查主账号现有的 10 万 VUM 基础包仍剩 98%+，当前被拦纯粹是昨日按量欠费 143.36 元所致。\n"
+                "---more---\n"
+                "事情：kc 发来腾讯云订单提请支付。实查主账号已有 10 万额度包仍剩 98%+，被拦只是欠费 143.36 元。\n\n"
+                "选项：\n"
+                "A. 不付这笔 199 元新包，直接往国内主账号充值 200 元平账（推荐）\n"
+                "B. 同意支付这笔 199 元新包\n\n"
+                "建议：选 A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_uin:
+                outbound.check_ask_pre_flight_guard(
+                    cfg, st, "tp_kc", "kc提请支付199元压测新包订单", no_uin_recharge_ask
+                )
+            self.assertIn("REG-141", str(ctx_uin.exception))
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_kc",
+                "kc提请支付199元压测新包订单",
+                no_uin_recharge_ask + "\n补充：目标国内主账号 UIN 为 100000000001（非另一主账号 100000000002），已与 kc 确认其子账号归属该主账号。",
+            )
+            code_uin, label_uin = admin_web.diagnose_override_reason(
+                no_uin_recharge_ask,
+                "[卡片回调] 其他：到底是哪个账号啊 我和kaichi说的是不是同一个账号啊 我一直看的是主账号 ID：100000000002",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code_uin, "context_incomplete")
+            self.assertEqual(label_uin, "缺环境/调用链反问")
+
+            # 8. 已有数万元余额主账号可开子账号时，拦截首推给欠费/域名持有账号手动充值平账；
+            #    且在『[卡片回调] 其他：A』中输入单字母选项 A 精准识别为 accepted(A)，按钮标签剥离内联 ** 与 `
+            from sheepdog.card_callback import parse_ask_options
+
+            prefer_arrears_ask = (
+                "698（100000000698）确实是公司那个有 4.1 万元现金余额的主账号！建议选 A 直接给 100000000658 充 200 平账继续测。\n"
+                "---more---\n"
+                "1. 账号归属确认：\n"
+                "- 698（100000000698）确实是公司那个国内主账号（有 4.1 万元现金余额）；\n"
+                "- 100000000658 是当初为 tapnow.tv 独立建的国内账号。\n\n"
+                "2. 后续走向选项：\n"
+                "A. **维持在 100000000658 跑完压测（推荐）**：直接往 `100000000658` 充值 200 元平账\n"
+                "B. **迁回 698 公司主账号**：专席立刻在 `100000000698` 为 kaichi 开通子账号与 PTS 全权限\n\n"
+                "建议：选 A。"
+            )
+            parsed_md_opts = parse_ask_options(prefer_arrears_ask)
+            self.assertEqual(len(parsed_md_opts), 2)
+            self.assertNotIn("**", parsed_md_opts[0].label)
+            self.assertNotIn("`", parsed_md_opts[0].reply_text)
+            with self.assertRaises(outbound.OutboundError) as ctx_arrears:
+                outbound.check_ask_pre_flight_guard(
+                    cfg, st, "tp_kc", "确认698归属与kc压测账号走向决断", prefer_arrears_ask
+                )
+            self.assertIn("REG-141", str(ctx_arrears.exception))
+            code_arr, label_arr = admin_web.diagnose_override_reason(
+                prefer_arrears_ask,
+                "[卡片回调] 其他：100000000658是不是tapnow.tv的持有者那个账号 给kc开698的账号的权限",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code_arr, "arch_or_config_posture")
+            self.assertEqual(label_arr, "技术姿势纠偏")
+
+            other_a_cls = admin_web.classify_escalation(
+                st.get_escalation("om_test_fe1951_ask"),
+                "[卡片回调] 其他：A",
+            )
+            self.assertEqual(other_a_cls["alignment"], "accepted")
+            self.assertEqual(other_a_cls["chosen_code"], "A")
+
+            # 9. 半途停滞的 IP 判断改造请示未交代『之前卡在哪里』与『从 .media 或 .ai 进来暴露真实 client ip』第一性目标时被拦截，
+            #    且主人追问『这个事情之前卡在哪里 为啥没做完 我的目标就是 从.meida或者.ai进来的时候 要暴露真实的client ip 这个才是第一性』归入 context_incomplete
+            half_done_ip_ask = (
+                "汇报进展：两个仓库 PR 凌晨均已合入 main。生产环境中 conversation-service 已上线并开启 TRUSTED_PROXY_CIDRS 生效；仅剩 enterprise-admin-service 还在旧版未发生产，请示是否立即发布上线。\n"
+                "---more---\n"
+                "事情：汇报客户端 IP 判断错误改造当前进度，enterprise-admin-service 已合入 main，生产尚未发布。\n\n"
+                "选项：\n"
+                "A. 授权立即执行 enterprise-admin-service 生产发布与 TRUSTED_PROXY_CIDRS 配置对齐\n"
+                "B. 暂不发布\n\n"
+                "建议：A 。"
+            )
+            with self.assertRaises(outbound.OutboundError) as ctx_half:
+                outbound.check_ask_pre_flight_guard(
+                    cfg, st, "tp_andyxiao", "IP判断改造进度：conv已上生产·请示发布eas生产", half_done_ip_ask
+                )
+            self.assertIn("REG-141", str(ctx_half.exception))
+            outbound.check_ask_pre_flight_guard(
+                cfg,
+                st,
+                "tp_andyxiao",
+                "IP判断改造进度：conv已上生产·请示发布eas生产",
+                half_done_ip_ask
+                + "\n之前卡在：凌晨合入后等待生产常规发布审批窗口；第一性目标验证：从 .media 与 .ai 域名进入时暴露真实的 client IP 已在已上线服务验证通过。",
+            )
+            code_half, label_half = admin_web.diagnose_override_reason(
+                half_done_ip_ask,
+                "[卡片回调] 其他：这个事情之前卡在哪里 为啥没做完  我的目标就是  从.meida或者.ai进来的时候 要暴露真实的client ip  这个才是第一性",
+                "其他",
+                "A",
+            )
+            self.assertEqual(code_half, "context_incomplete")
+            self.assertEqual(label_half, "缺环境/调用链反问")
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()

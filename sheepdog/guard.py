@@ -612,7 +612,8 @@ _SUBAGENT_LEADIN_SUFFIX_RE = re.compile(
     r"[，,；;]?\s*(?:核心结论与证据如下|结论与证据如下|核心结论如下|结论如下|汇总大盘如下|汇总如下|详情如下|具体如下)[：:]?\s*$"
 )
 _SUBAGENT_META_LINE_RE = re.compile(
-    r"^(?:任务单号|任务编号|羔羊编号|子代理编号|lamb_id|派发母羊|所属母羊|母羊会话|执行角色|执行羔羊|核验时间|汇报时间|完成时间|执行时间|授权凭证|日志路径|工作目录)\s*[：:]",
+    r"^(?:任务单号|任务编号|羔羊编号|子代理编号|lamb_id|派发母羊|所属母羊|母羊会话|执行角色|执行羔羊|核验时间|汇报时间|完成时间|执行时间|授权凭证|日志路径|工作目录|"
+    r"Boundary\s+Compliance|边界合规|合规边界|Full\s+Report|完整报告|报告路径|Raw\s+[A-Za-z0-9 _-]{0,36}Receipt|验证回执|证据路径|Task\s+ID|Lamb\s+ID|Parent\s+Session|Role|Timestamp)\s*[：:]",
     re.I,
 )
 

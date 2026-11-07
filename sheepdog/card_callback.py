@@ -38,8 +38,8 @@ class AskOption:
 
 
 def _clean_opt_desc(raw: str) -> str:
-    s = re.sub(r"^(?:\*\*|__)+|(?:\*\*|__)+$", "", (raw or "").strip()).strip()
-    return " ".join(s.strip("`'\"“”「」『』").rstrip("。；;，,！!？? ").split())
+    s = re.sub(r"(?:\*\*|__)+", "", (raw or "").strip()).replace("`", "").strip()
+    return " ".join(s.strip("'\"“”「」『』").rstrip("。；;，,！!？? ").split())
 
 
 def _make_option(key: str, raw_desc: str, *, full_reply: str = "") -> AskOption | None:
