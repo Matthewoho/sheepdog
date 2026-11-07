@@ -252,18 +252,42 @@ def check_bus_not_forwarded_reply(store: Store, topic_id: str, target_id: str) -
         raise OutboundError(EXIT_INVALID, f"总线 tp_bus 不能对已 forward 转交的消息调用 sheepdog reply（{target_id} 已转交给 {forwarded[target_id]}）：请交由承接该消息的专属会话处理与回复，没有发送")
 
 
+def is_self_sent_message(cfg: Config, store: Store, target, target_id: str = "") -> bool:
+    """7.136（REG-144）：判断目标消息是否由本机主人或本机器人发出（route=self / reason in (self, self_bot) / sends / bot_outbox）。
+    专席在群里主动发卡催办同事（带 🐕SheepDog 落款且 @ 同事）后，在 watch 提醒下对自己的根消息调用 sheepdog reply --to <own_om_id> 跟进催办，
+    绝不能被误判为「回复同事的 AI 助理」或「插话旁人对话」而拦截。"""
+    keys = target.keys() if target is not None and hasattr(target, "keys") else ()
+    mid = (target_id or ((target["message_id"] if "message_id" in keys else "") or "")).strip()
+    if target is not None:
+        t_route = ((target["route"] if "route" in keys else "") or "").strip()
+        t_reason = ((target["reason"] if "reason" in keys else "") or "").strip()
+        t_sender = ((target["sender_id"] if "sender_id" in keys else "") or "").strip()
+        if t_route == "self" or t_reason in ("self", "self_bot"):
+            return True
+        bot_ids = ident.bot_ids(cfg, store) if hasattr(ident, "bot_ids") else frozenset()
+        if t_sender and ((cfg.self_open_id and t_sender == cfg.self_open_id) or (bot_ids and t_sender in bot_ids)):
+            return True
+    if mid and store is not None:
+        if hasattr(store, "send_by_message") and store.send_by_message(mid) is not None:
+            return True
+        if hasattr(store, "get_bot_outbox") and store.get_bot_outbox(mid) is not None:
+            return True
+    return False
+
+
 def check_group_reply_allowed(
     cfg: Config,
     store: Store,
     topic_id: str,
-    target: sqlite3.Row | None,
+    target: sqlite3.Row | dict | None,
     *,
     even_if_owner_replied: bool = False,
 ) -> None:
-    """7.103（REG-071）：多人大群代回门禁：
+    """7.103 / 7.136（REG-071 / REG-144）：多人大群代回门禁：
     1. 非总线会话严禁对停留在 tp_bus 未 forward 转交的被动群消息（keyword/group/watched_chat/vip_sender 或仅 @ 他人）调用 reply 越权抢答；
     2. 严禁在多人大群里直接对仅 @ 其他同事（未 @ 主人/机器人/所有人且未 forward 转交）的消息调用 reply；
-    3. 严禁在多人大群里直接 reply 同事个人账号代发的 AI 助理消息（防跨 Agent 群聊乒乓死循环；主人确需回复时可加 --even-if-owner-replied）。"""
+    3. 严禁在多人大群里直接 reply 同事个人账号代发的 AI 助理消息（防跨 Agent 群聊乒乓死循环；主人确需回复时可加 --even-if-owner-replied）；
+    4. 豁免本机自己发出的群根消息（is_self_sent_message），允许专席在自己发出的催办/送审根卡片话题下继续 reply 跟进催办。"""
     if target is None:
         return
     from .prompts import is_agent_proxy_content, is_group_directed_to_others
@@ -273,6 +297,8 @@ def check_group_reply_allowed(
     chat_type = ((target["chat_type"] if "chat_type" in keys else "") or "").strip()
     chat_id = ((target["chat_id"] if "chat_id" in keys else "") or "").strip()
     if chat_type in ("p2p", SYSTEM_CHAT, "") or chat_id in cfg.owner_side_chat_ids:
+        return
+    if is_self_sent_message(cfg, store, target):
         return
     t_topic = ((target["topic_id"] if "topic_id" in keys else "") or "").strip()
     t_reason = ((target["reason"] if "reason" in keys else "") or "").strip()
@@ -1110,6 +1136,7 @@ _PROD_GA2_LISTENER_FULL_FIELDS_AND_OPTION_EXPLAIN_EVIDENCE_RE = re.compile(
 )
 _DISSOLVED_FE_BE_PR_REVIEW_GROUP_ASK_RE = re.compile(
     r"\A(?=[\s\S]*(?:前后端\s*PR\s*(?:Review|评审群)|tap-pr-review-submit))"
+    r"(?=[\s\S]*(?:tap-pr-review-submit|4\s*行|四行|PR\s*Review\s*消息|以(?:你|主人)(?:的)?身份))"
     r"(?=[\s\S]*(?:A|选项\s*A)(?:\s*[（(][^)）]{0,12}[)）])?\s*[\.、:：)\]]\s*[^\n]*(?:发送|发往|发至|发到|提交|同步|发一条|发(?=[「『\s]*`?前后端))[^\n]*(?:前后端\s*PR\s*(?:Review|评审群)|PR\s*Review\s*消息))"
     r"(?![\s\S]*(?:已解散|chat_status\s*:\s*dissolved|群已解散))",
     re.I,
@@ -2907,6 +2934,47 @@ def _send_reply(source, target_id: str, ik: str, shown: str, card: dict | None, 
         raise OutboundError(EXIT_SEND_FAILED, f"发送超时，不确定发出去没有（{e}）：用同样的参数重试，防重编号保证只发一条")
 
 
+def _resolve_reply_target_row(store: Store, target_id: str):
+    """7.136（REG-144）：优先从 messages 表取要回复的目标行；若专席刚通过 sheepdog reply 发出群根卡、守护进程尚未回采入 messages，
+    则从 sends 表回填合成目标上下文，确保对本机刚发出的 om_ 根消息跟进催办不因尚未回采而报「账本里没有」。"""
+    if not target_id or target_id.startswith("oc_"):
+        return None
+    row = store.get_message(target_id)
+    if row is not None or not hasattr(store, "send_by_message"):
+        return row
+    s_row = store.send_by_message(target_id)
+    if s_row is None:
+        return None
+    s_keys = s_row.keys() if hasattr(s_row, "keys") else ()
+    t_mid = ((s_row["target_message_id"] if "target_message_id" in s_keys else "") or "").strip()
+    chat_id = t_mid if t_mid.startswith("oc_") else ""
+    if not chat_id and t_mid.startswith("om_"):
+        parent = store.get_message(t_mid)
+        chat_id = ((parent["chat_id"] if parent is not None else "") or "").strip()
+    if not chat_id:
+        return None
+    ident_val = ((s_row["identity"] if "identity" in s_keys else "") or "").strip()
+    is_bot = ident_val == "bot"
+    return {
+        "message_id": target_id,
+        "chat_id": chat_id,
+        "chat_name": store.known_chat_name(chat_id) if hasattr(store, "known_chat_name") else "",
+        "chat_type": "group",
+        "sender_id": "",
+        "sender_name": "",
+        "sender_type": "app" if is_bot else "user",
+        "content": (s_row["text"] if "text" in s_keys else "") or "",
+        "create_time": (s_row["sent_at"] if "sent_at" in s_keys else "") or "",
+        "message_position": None,
+        "batch_id": None,
+        "route": "self",
+        "reason": "self_bot" if is_bot else "self",
+        "tags_json": "[]",
+        "mentions_json": "[]",
+        "topic_id": (s_row["topic_id"] if "topic_id" in s_keys else "") or "",
+    }
+
+
 def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, text: str = "", card_text: str = "",
           summary: str = "", even_if_owner_replied: bool = False) -> ReplyResult:
     """代回：先查重，再发前检查（om_ 消息号），支持 om_ 消息回复与 oc_ 群顶层主动发话（Bot 优先，230002 自动退回 user）。"""
@@ -2918,7 +2986,7 @@ def reply(cfg: Config, store: Store, source, topic_id: str, target_id: str, *, t
     if not (target_id.startswith("om_") or is_chat):
         raise OutboundError(EXIT_INVALID, f"--to 要给 om_ 开头的消息号或 oc_ 开头的群 chat_id，收到 {target_id!r}")
     check_bus_not_forwarded_reply(store, topic_id, target_id)
-    enabled, target = cfg.identity.enabled, (None if is_chat else store.get_message(target_id))
+    enabled, target = cfg.identity.enabled, (None if is_chat else _resolve_reply_target_row(store, target_id))
     chat_id = target_id if is_chat else (target["chat_id"] if target is not None else "")
     if chat_id and ((text or "").strip() or (card_text or "").strip()):
         reject_owner_chat(cfg, topic_id, chat_id)

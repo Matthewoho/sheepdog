@@ -142,21 +142,34 @@ def is_agent_proxy_content(text: str) -> bool:
     return bool(text and _AGENT_PROXY_CONTENT_RE.search(text))
 
 
-_DIRECT_CALL_REASONS = ("at_me", "at_bot", "at_all", "reply_to_me", "owner_instruction", "owner_reply", "owner_context")
+_DIRECT_CALL_REASONS = (
+    "at_me",
+    "at_bot",
+    "at_all",
+    "reply_to_me",
+    "owner_instruction",
+    "owner_reply",
+    "owner_context",
+    "self",
+    "self_bot",
+)
 
 
 def is_group_directed_to_others(row_or_msg, self_open_id: str = "", bot_ids=()) -> bool:
-    """7.103（REG-071）：判断群消息是否明确只 @ 了其他同事/机器人（未 @ 主人/本机器人/@所有人，非回复主人/本机器人，且未经 forward 转交）。"""
+    """7.103 / 7.136（REG-071 / REG-144）：判断群消息是否明确只 @ 了其他同事/机器人（未 @ 主人/本机器人/@所有人，非回复主人/本机器人，非本机发出，且未经 forward 转交）。"""
     if row_or_msg is None:
         return False
+    bot_set = set(bot_ids or ())
     if hasattr(row_or_msg, "chat_type") and not hasattr(row_or_msg, "keys"):
         chat_type = (row_or_msg.chat_type or "").strip()
         if chat_type in ("p2p", SYSTEM_CHAT, ""):
             return False
+        sender_id = (getattr(row_or_msg, "sender_id", "") or "").strip()
+        if sender_id and ((self_open_id and sender_id == self_open_id) or (bot_set and sender_id in bot_set)):
+            return False
         mentions = row_or_msg.mentions or []
         if not mentions:
             return False
-        bot_set = set(bot_ids or ())
         for m in mentions:
             if getattr(m, "is_all", False):
                 return False
@@ -168,8 +181,12 @@ def is_group_directed_to_others(row_or_msg, self_open_id: str = "", bot_ids=()) 
     chat_type = ((row_or_msg["chat_type"] if "chat_type" in keys else "") or "").strip()
     if chat_type in ("p2p", SYSTEM_CHAT, ""):
         return False
+    route_val = ((row_or_msg["route"] if "route" in keys else "") or "").strip()
     reason = ((row_or_msg["reason"] if "reason" in keys else "") or "").strip()
-    if reason in _DIRECT_CALL_REASONS:
+    if route_val == "self" or reason in _DIRECT_CALL_REASONS:
+        return False
+    sender_id = ((row_or_msg["sender_id"] if "sender_id" in keys else "") or "").strip()
+    if sender_id and ((self_open_id and sender_id == self_open_id) or (bot_set and sender_id in bot_set)):
         return False
     tags_raw = (row_or_msg["tags_json"] if "tags_json" in keys else "") or ""
     if "forwarded_from:" in tags_raw:
@@ -183,7 +200,6 @@ def is_group_directed_to_others(row_or_msg, self_open_id: str = "", bot_ids=()) 
         return False
     if not mentions or not isinstance(mentions, list):
         return False
-    bot_set = set(bot_ids or ())
     for m in mentions:
         if not isinstance(m, dict):
             continue

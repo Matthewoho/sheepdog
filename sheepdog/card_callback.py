@@ -26,7 +26,7 @@ _LINE_OPTION_RE = re.compile(
 )
 _INLINE_PREFIXED_RE = re.compile(r"(?:回(?:复)?|选|选项|方案)\s*[\(\[（]?([A-E])[\)\]）]?\s*(?:[:：.、=·\-—]\s*|\s+)([^，,；;\n。！!？?]{1,48})")
 _INLINE_COLON_RE = re.compile(r"(?<![A-Za-z0-9_])([A-E])\s*[:：.、]\s*([^，,；;\n。！!？?]{1,48})")
-_QUOTE_CMD_RE = re.compile(r"(?:请\s*)?(?:回(?:复)?|发)\s*[「『“\"]([^」』”\"\n]{2,60})[」』”\"]")
+_QUOTE_CMD_RE = re.compile(r"(?<![拟群转下外代已派触重补误未不])(?:请\s*)?(?:回(?:复)?|发(?:送)?)\s*[「『“\"]([^」』”\"\n]{2,60})[」』”\"](?![群频话卡文])")
 _TOPIC_TAG_RE = re.compile(r"\[(tp_[A-Za-z0-9_.#-]+)\]")
 
 

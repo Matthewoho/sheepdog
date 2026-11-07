@@ -484,6 +484,8 @@ def _truncate_hub_more(shown: str, max_detail_chars: int = 1600) -> str:
                         bottom_part = opt_tail[m_bottom_opt.start() :]
                         keep_top = max(200, max_detail_chars - len(bottom_part) - 40)
                         opt_tail = f"{opt_tail[:keep_top].rstrip()}\n…\n{bottom_part}"
+                    elif m_bottom_opt and m_bottom_opt.start() == 0:
+                        opt_tail = f"{opt_tail[:max_detail_chars].rstrip()}\n…（详情已截断，完整原文见来源业务话题）"
                     else:
                         opt_tail = opt_tail[-max_detail_chars:]
                 lead_budget = max(200, max_detail_chars - len(opt_tail))
@@ -655,7 +657,7 @@ def mirror_ask_to_hub(cfg, store, source, *, origin_mid: str, origin_root_id: st
     try: meta = ensure_hub_topic(cfg, store, source); hub_root = meta.get("root_message_id") or ""
     except Exception as e: log.warning("初始化待拍板聚合台失败: %s", e); meta, hub_root = {}, ""
     if not hub_root: store.set_escalation_hub(origin_mid, "", origin_root_id); return ""
-    mirror_text, hub_card = _build_hub_mirror_card(cfg, _truncate_hub_more(shown), origin_mid=origin_mid, topic_id=topic_id, key=key, title=title, options_spec=options_spec, item_no=item_no)
+    mirror_text, hub_card = _build_hub_mirror_card(cfg, shown, origin_mid=origin_mid, topic_id=topic_id, key=key, title=title, options_spec=options_spec, item_no=item_no)
     ik, res = f"hub_mirror:{origin_mid}"[:50], {}
     try: res = source.reply_to(hub_root, identity="bot", idem_key=ik, text="" if hub_card else mirror_text, in_thread=True, **({"card": hub_card} if hub_card else {}))
     except Exception as e: log.warning("镜像提问卡片到聚合台失败（%s），将退回纯文本重试: %s", origin_mid, e); res = {}

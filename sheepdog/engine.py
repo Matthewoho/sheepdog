@@ -4845,15 +4845,19 @@ class Dispatcher:
         parent_cid = (t["conversation_id"] or "") if (t := self.store.get_topic(tid)) is not None else ""
         direct_sent_cids = set(subagent_reused_cids_in(host, d, parent_cid=parent_cid, include_conv_links=False))
         for cid in subagent_reused_cids_in(host, d, parent_cid=parent_cid):
-            if any((lb["conversation_id"] or "").strip() == cid for lb in self.store.get_active_lambs(tid)):
-                continue
-            matched = next((lb for lb in self.store.get_active_lambs(tid)
+            active_lambs = self.store.get_active_lambs(tid)
+            matched = next((lb for lb in active_lambs
                             if lb["kind"] in ("subagent", "native_subagent") and not (lb["conversation_id"] or "").strip()), None)
             if matched is not None:
                 ts = str(d.get("created_at") or d.get("timestamp") or "") or now_iso()
+                for dup_lb in active_lambs:
+                    if dup_lb["lamb_id"] != matched["lamb_id"] and (dup_lb["conversation_id"] or "").strip() == cid:
+                        self.store.update_lamb(dup_lb["lamb_id"], state="done", finished_at=dup_lb["last_act_at"] or ts)
                 self.store.update_lamb(matched["lamb_id"], conversation_id=cid, last_act_at=ts)
                 log.info("topic %s: 从 send_message/引用 关联复用 subagent conversation_id %s -> %s (%s)",
                          tid, cid, matched["lamb_id"], matched["task_title"])
+                continue
+            if any((lb["conversation_id"] or "").strip() == cid for lb in active_lambs):
                 continue
             if cid in direct_sent_cids and (ex_re := self.store.find_lamb_by_cid(cid)) is not None:
                 if (
@@ -5196,13 +5200,30 @@ class Dispatcher:
                     start_dt = _parse(lb["started_at"] or "")
                     window_iso = (start_dt - timedelta(seconds=120)).isoformat() if start_dt else ""
                     ref_iso = (start_dt - timedelta(seconds=5)).isoformat() if start_dt else ""
-                    busy_cids = {(x["conversation_id"] or "").strip() for x in self.store.get_active_lambs(tid)
-                                 if x["lamb_id"] != lid and (x["conversation_id"] or "").strip()}
+                    busy_cids = {
+                        (x["conversation_id"] or "").strip()
+                        for x in self.store.get_active_lambs(tid)
+                        if x["lamb_id"] != lid
+                        and (x["conversation_id"] or "").strip()
+                        and (not window_iso or (x["started_at"] or "") >= window_iso)
+                    }
                     cands = [c for c in recent_subagent_cids_since(self.topic_host(pt), pt_tp, window_iso,
                                                                    parent_cid=pt["conversation_id"], ref_since_iso=ref_iso)
                              if c[0] not in busy_cids]
                     if cands:
                         cid, cid_ts = cands[-1]
+                        for old_x in self.store.get_active_lambs(tid):
+                            if (
+                                old_x["lamb_id"] != lid
+                                and (old_x["conversation_id"] or "").strip() == cid
+                                and window_iso
+                                and (old_x["started_at"] or "") < window_iso
+                            ):
+                                self.store.update_lamb(
+                                    old_x["lamb_id"],
+                                    state="done",
+                                    finished_at=old_x["last_act_at"] or cid_ts or now_iso(),
+                                )
                         lb["conversation_id"] = cid
                         self.store.update_lamb(lid, conversation_id=cid, last_act_at=cid_ts or lb["last_act_at"] or now_iso())
                         log.info("topic %s: 从母羊近期 transcript 自动补绑 subagent conversation_id %s -> %s (%s)",

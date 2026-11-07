@@ -9009,6 +9009,151 @@ class VersionAndObserveTest(unittest.TestCase):
                     shutil.rmtree(p.parent.parent, ignore_errors=True)
             st.close()
 
+    def test_reg144_self_sent_group_card_watch_reply_unblock_and_hub_mirror_option_preserve(self):
+        from sheepdog import __version__, card_callback, decision_hub, outbound, parse_version_tuple, prompts
+        from sheepdog.config import Config
+        from sheepdog.models import Mention, Message
+        from sheepdog.store import Store
+
+        self.assertGreaterEqual(parse_version_tuple(__version__), (1, 1, 55))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(sink="dryrun")
+            cfg.self_open_id = "ou_owner_reg144"
+            cfg.state_dir = root / "state"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            st = Store(cfg.db_path)
+            st.upsert_topic("tp_tapnow-prod-topology", title="TapNow 生产拓扑专席", state="active")
+
+            # 1) 专席在群内主动发出的送审/催办根卡片（带 🐕SheepDog 落款且 @ 同事，route='self', reason='self_bot'）：
+            #    is_group_directed_to_others 必须为 False，且 check_group_reply_allowed 必须放行专席在原卡片下继续 reply 催办
+            grp_chat = "oc_laohu_agent_grp"
+            self_card_mid = "om_self_sent_card_144"
+            m_self_card = Message(
+                message_id=self_card_mid,
+                chat_id=grp_chat,
+                chat_name="Laohu & Matthew's Agent",
+                chat_type="group",
+                sender_id="cli_self_bot_144",
+                sender_name="Mattheuu",
+                sender_type="app",
+                content=(
+                    "<card>\n<at user_id=\"ou_peer_andy\">Andy Hu</at> FE-1952 PR #9837 已转正送审，烦请审阅合入。\n"
+                    f"🐕SheepDog v{__version__}\n</card>"
+                ),
+                msg_type="interactive",
+                create_time="2026-11-07T20:29:00+08:00",
+                mentions=[Mention("ou_peer_andy", "Andy Hu")],
+            )
+            st.upsert_message(m_self_card, "self", "self_bot", [], "tp_tapnow-prod-topology")
+            st.add_send(
+                "ik_self_card_144",
+                "reply",
+                "tp_tapnow-prod-topology",
+                self_card_mid,
+                m_self_card.content,
+                target_message_id=grp_chat,
+                identity="bot",
+            )
+            r_self_card = st.get_message(self_card_mid)
+            self.assertFalse(
+                prompts.is_group_directed_to_others(
+                    r_self_card, cfg.self_open_id, ("cli_self_bot_144",)
+                )
+            )
+            self.assertFalse(
+                prompts.is_group_directed_to_others(
+                    m_self_card, cfg.self_open_id, ("cli_self_bot_144",)
+                )
+            )
+            self.assertTrue(outbound.is_self_sent_message(cfg, st, r_self_card))
+            # 不抛 OutboundError
+            outbound.check_group_reply_allowed(cfg, st, "tp_tapnow-prod-topology", r_self_card)
+
+            # 即使守护进程尚未将刚发出的卡片回采入 messages 表，_resolve_reply_target_row 仍可从 sends 表合成目标行并放行
+            unpolled_mid = "om_self_unpolled_144"
+            st.add_send(
+                "ik_self_unpolled_144",
+                "reply",
+                "tp_tapnow-prod-topology",
+                unpolled_mid,
+                m_self_card.content,
+                target_message_id=grp_chat,
+                identity="bot",
+            )
+            synth_row = outbound._resolve_reply_target_row(st, unpolled_mid)
+            self.assertIsNotNone(synth_row)
+            self.assertEqual(synth_row["chat_id"], grp_chat)
+            self.assertTrue(outbound.is_self_sent_message(cfg, st, synth_row, unpolled_mid))
+            outbound.check_group_reply_allowed(cfg, st, "tp_tapnow-prod-topology", synth_row)
+
+            # 反向对照组：同事的 AI 助理在群内代发消息（route='dispatch', reason='thread_owner'）仍必须被拦截
+            m_peer_ai = Message(
+                message_id="om_peer_ai_144",
+                chat_id=grp_chat,
+                chat_name="Laohu & Matthew's Agent",
+                chat_type="group",
+                sender_id="ou_peer_andy",
+                sender_name="Andy Hu",
+                sender_type="user",
+                content="<card>\n**[✦ 老胡的AI助理]** 收到，稍后看。\n</card>",
+                msg_type="interactive",
+                create_time="2026-11-07T20:30:00+08:00",
+                mentions=[Mention("ou_other_colleague", "Other")],
+            )
+            st.upsert_message(m_peer_ai, "dispatch", "thread_owner", [], "tp_tapnow-prod-topology")
+            r_peer_ai = st.get_message("om_peer_ai_144")
+            self.assertFalse(outbound.is_self_sent_message(cfg, st, r_peer_ai))
+            self.assertTrue(prompts.is_group_directed_to_others(r_peer_ai, cfg.self_open_id))
+            with self.assertRaises(outbound.OutboundError) as ctx_peer_ai:
+                outbound.check_group_reply_allowed(cfg, st, "tp_tapnow-prod-topology", r_peer_ai)
+            self.assertIn("来自同事的 AI 助理代发", str(ctx_peer_ai.exception))
+
+            # 2) 当 ask 卡片在 ---more--- 上部写有『选项：\nA. ...\nB. ...』、下部附有超长『### 拟发「Infra 迁移改造」群卡片预览』时，
+            #    _truncate_hub_more 与 _build_hub_mirror_card 必须保留头部 A/B 选项，且 _QUOTE_CMD_RE 绝不能把『拟发「Infra 迁移改造」群』误判为回复口令
+            long_broadcast_ask = (
+                "🐕 需要你定 · 11/07 20:00 Infra 迁移改造群每日进展与卡点播报确认 [tp_infra-migration-ops]\n"
+                "已汇总今日南京生产上线成果与待协同卡点，请确认是否按草案发往 Infra 迁移改造群（选 B 则今晚暂不同步）。\n"
+                "---more---\n"
+                "事情：Matthew，到每日 **20:00「Infra 迁移改造」群项目进度与阻塞卡点播报** 门禁时间（confirm 模式）。"
+                + ("已按极简不刷屏、零内部敏感地址、不 @ 高管、附 Linear 单号链接原则拟好今晚播报草案，请确认是否发出。" * 3)
+                + "\n\n选项：\n"
+                "A. 按草案向「Infra 迁移改造」群发出今晚 20:00 进度与卡点播报\n"
+                "B. 今晚暂不同步群播报\n\n"
+                "建议：选 A。\n\n"
+                "### 拟发「Infra 迁移改造」群卡片预览\n\n"
+                + ("- **今日已上线验通**：智能体附件读取、语音服务及五项底座安全扩容改造已全部上线验通。\n" * 45)
+            )
+            trunc_text = decision_hub._truncate_hub_more(long_broadcast_ask)
+            opts_trunc = card_callback.parse_ask_options(trunc_text, "auto")
+            self.assertEqual([o.key for o in opts_trunc], ["A", "B"])
+            self.assertIn("按草案向「Infra 迁移改造」群发出今晚 20:00", opts_trunc[0].label)
+            self.assertNotEqual(opts_trunc[0].reply_text, "Infra 迁移改造")
+
+            _, hub_card = decision_hub._build_hub_mirror_card(
+                cfg,
+                long_broadcast_ask,
+                origin_mid="om_origin_ask_144",
+                topic_id="tp_infra-migration-ops",
+                key="loop-infra-migration-daily-steward",
+                title="11/07 20:00 Infra 迁移改造群每日进展与卡点播报确认",
+                options_spec="auto",
+                item_no=12,
+            )
+            self.assertIsNotNone(hub_card)
+            hub_json = json.dumps(hub_card, ensure_ascii=False)
+            self.assertIn("A：按草案向「Infra 迁移改造」群发出今晚 20:00", hub_json)
+            self.assertNotIn('"reply_text": "Infra 迁移改造"', hub_json)
+
+            # 单独校验 _QUOTE_CMD_RE：不匹配『拟发「Infra 迁移改造」群卡片预览』，正常匹配『请回「同意发布 model-manager」』
+            self.assertIsNone(card_callback._QUOTE_CMD_RE.search("### 拟发「Infra 迁移改造」群卡片预览"))
+            m_valid_quote = card_callback._QUOTE_CMD_RE.search("若确认无误，请回「同意发布 model-manager」")
+            self.assertIsNotNone(m_valid_quote)
+            self.assertEqual(m_valid_quote.group(1), "同意发布 model-manager")
+
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
