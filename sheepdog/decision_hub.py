@@ -715,9 +715,26 @@ def sync_escalation_dual_cards(cfg, store, source, any_mid: str, *, chosen_displ
                     )
                     if same_clean or _ASK_CORRECTION_MARKER_RE.search(f"{text_to_use}\n{sib_txt}"):
                         sib_cands.append(sib)
+        s_canon = store.send_by_message(canon_mid)
+        raw_nk_canon = ((s_canon["norm_key"] or s_canon["key"] or "") if s_canon is not None else "").strip()
+        nk_canon = duty.norm_key(raw_nk_canon) if raw_nk_canon else ""
+        canon_default_nk = duty.norm_key(base_topic_id(tid).removeprefix("tp_") or tid) if tid else ""
         for sib in sib_cands:
             sib_mid = str(sib["message_id"] or "")
             if not sib_mid or sib_mid == canon_mid or sib["topic_id"] != tid or sib["closed_at"] or sib["answered_at"]:
+                continue
+            s_sib = store.send_by_message(sib_mid)
+            raw_nk_sib = ((s_sib["norm_key"] or s_sib["key"] or "") if s_sib is not None else "").strip()
+            nk_sib = duty.norm_key(raw_nk_sib) if raw_nk_sib else ""
+            if (
+                nk_canon
+                and nk_sib
+                and tg.parse_item_no(nk_canon) is None
+                and tg.parse_item_no(nk_sib) is None
+                and nk_canon != canon_default_nk
+                and nk_sib != canon_default_nk
+                and nk_canon != nk_sib
+            ):
                 continue
             if _titles_same_subject(text_to_use, sib["text"] or "", topic_id=tid):
                 why_dup = f"同源重复提问已随主卡 {canon_mid} 一并拍板（{chosen_display}）"

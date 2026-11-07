@@ -964,6 +964,25 @@ _FE_REPO_SELF_PR_WITHOUT_OWNER_FEEDBACK_ASK_RE = re.compile(
     r"(?![\s\S]*(?:老胡|laohu|前端负责人)[^\n。]{0,36}(?:没空|忙|暂无法|来不及|委托我们|让我们代|已反馈))",
     re.I,
 )
+_BUNDLE_STAGE_CLEANUP_WITH_PROD_SCALE_ZERO_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:销毁|退订|释放)[^\n]*Stage[^\n]*(?:并将|同时将)?[^\n]*生产[^\n]*(?:缩为|缩容至|改为)\s*0\s*副本)"
+    r"(?=[\s\S]*(?:选项\s*B|B)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*仅(?:销毁|退订|清理)[^\n]*Stage[^\n]*生产[^\n]*(?:暂)?保持现状不动)"
+    r"(?=[\s\S]*(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选\s*)?A\b)",
+    re.I,
+)
+_DORMANT_ZERO_REPLICA_BATCH_MUTATE_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:现网活跃[^\n。；]{0,28}已清零\s*[（(]?0\s*个|正在跑的服务[^\n。；]{0,28}已全改到生产))"
+    r"(?=[\s\S]*(?<![0-9])[1-9]\d+\s*个\s*(?:0\s*副本\s*Deployment|没开机的?服务|未开机的?服务))"
+    r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:同意|批准|保持\s*0\s*副本)[^\n]*(?:同步|改掉|拷进生产|切生产|搬运|生产\s*TCR|tcr-prod))"
+    r"(?=[\s\S]*(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选\s*)?A\b)",
+    re.I,
+)
+_REPORT_TELLS_OWNER_CLICK_OBSOLETE_ASK_RE = re.compile(
+    r"(?:(?:上面|此前|之前|刚才|那张)[^\n。；]{0,28}卡[^\n。；]{0,16}点(?:选)?\s*[A-E]\s*即可"
+    r"|点(?:选)?\s*[A-E]\s*即可[^\n。；]{0,24}(?:不用|无需)(?:我们|再)?(?:代切|代操作|执行)"
+    r"|(?:由他们自己|对方已自行|已由对方自行)(?:切|切换|执行|处理|操作)[^\n。；]{0,28}(?:不用|无需)(?:我们|你)(?:代切|代操作|执行)[了啦]?)",
+    re.I,
+)
 
 
 def check_source_peer_followup_and_proxy_guard(
@@ -1683,6 +1702,22 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-05 00:50 在 `[其他]` 明确立规：『邮箱来的消息吗 暂时不管』，REG-107 邮件助手自动权限申请静默门禁）："
             "凡仅从邮箱/邮件助手收到的自动申请通知、申请人未在飞书私聊或群内主动提出诉求的，请直接静默归档并交 `handled` 回执，严禁发 `sheepdog ask` 打扰主人或主动私聊当事人（没有发送）",
         )
+    if _BUNDLE_STAGE_CLEANUP_WITH_PROD_SCALE_ZERO_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "清理/退订 Stage 空跑计费实例（零生产风险）时，严禁在首选推荐项 A 中强行捆绑『将生产 Pod/Deployment 缩为 0 副本』"
+            "（主人 2026-11-07 11:44 在 `tp_tapnow-prod-topology` ENG-1018 拍板卡上推翻建议 A，改选『B. 仅销毁退订 Stage 空跑实例，生产 Pod 暂保持现状不动』，REG-138 Stage 退订禁捆绑生产缩 0 门禁）："
+            "请将零生产风险的『仅销毁退订 Stage 空跑实例，生产暂保持现状不动』作为首选推荐（建议选 A），避免在上线冲刺期顺带改动生产运行工作负载（没有发送）",
+        )
+    if _DORMANT_ZERO_REPLICA_BATCH_MUTATE_ASK_RE.search(full_text):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当现网活跃（replicas > 0）拉取测试镜像的工作负载已 100% 清零（0 个），仅剩数十个未开机的 0 副本休眠 Deployment 与挂起 CronJob 时，"
+            "严禁在首屏堆砌底层 K8s 术语或将『立即批量修改数十个未开机休眠服务』作为首选推荐项 A 打扰主人"
+            "（主人 2026-11-07 11:40 & 11:44 在 `tp_tapnow-prod-topology` ENG-1150 拍板卡上先后批复『这个是啥问题 没看懂』『stage环境暂不处理』，REG-138 零活跃未开机休眠负载免打扰门禁）："
+            "未开机的 0 副本历史遗留模板在上线冲刺期零流量零风险，请直接保持暂不处理（或将『暂不处理未开机休眠服务，待后续需要开机时再按需迁移』作为结论用 `sheepdog report --ball done` 收尾），"
+            "严禁为 0 副本休眠死负载连发 ask 打扰主人（没有发送）",
+        )
     if (
         topic_id == BUS_TOPIC_ID
         and (m_spec := _BUS_PROXY_SPECIALIST_ASK_RE.search(full_text))
@@ -2023,6 +2058,19 @@ def send_to_owner(cfg: Config, store: Store, source, kind: str, topic_id: str, t
             cfg, store, topic_id, title, summary, body,
             defer_item=defer_item, ball=ball, fyi=fyi, transcript_text=transcript_text,
         )
+        if not fyi and getattr(store, "conn", None) is not None and _REPORT_TELLS_OWNER_CLICK_OBSOLETE_ASK_RE.search(f"{title or ''}\n{combined_for_check}"):
+            open_for_key = _filter_by_submatter_key(
+                store, open_escalations(store, cfg.escalation.open_hours, topic_id), key, topic_id
+            )
+            if open_for_key:
+                mids_str = ", ".join(r["message_id"] for r in open_for_key[:3])
+                raise OutboundError(
+                    EXIT_INVALID,
+                    f"report 拒绝（REG-138 事项已由对方自行处理/无需代操作时必调 resolve 关单门禁）："
+                    f"检测到对方已确认自行处理/无需我们代操作，但当前名下仍有未结『需要你定』卡片（{mids_str}），"
+                    "严禁在 report 里让主人手动去点旧卡片『点 B 即可』（主人 2026-11-07 11:43 被迫手动去点 9 小时前已由 Kai 团队自切的生产代切旧卡）！\n"
+                    f"请先调用 `sheepdog resolve --topic {topic_id} --key {key or '<key>'} --why \"对方已确认自行处理，无需我方代操作\"`（或传 `--quote <对方消息ID>`）将旧提问卡自动结案变绿，再发送汇报（没有发送）。",
+                )
     try: _, _, resolved_body = resolve_summary_and_body(body, summary, require_summary=cfg.notify.require_summary, hoist_at=False)
     except ValueError as e: raise OutboundError(EXIT_INVALID, str(e))
     if kind == REPORT and (defer_item or "").strip():
@@ -2198,6 +2246,41 @@ class ResolveResult:
     text: str = ""
 
 
+def _filter_by_submatter_key(store: Store, rows: list, key: str, topic_id: str) -> list:
+    """1.1.49 (REG-138): 在单会话共享主帖（canon_mode）下，按子事项 --key 结案或匹配时，
+    不得将同主帖下显式带有其他子事项 norm_key 的独立未决提问一并卷入结案。"""
+    if not rows or getattr(store, "conn", None) is None:
+        return rows
+    from . import decision_hub as _dh, topicgroup as _tg
+    nk = duty.norm_key(key) if key else ""
+    if not nk or _tg.parse_item_no(key) is not None:
+        return rows
+    canon_nk = duty.norm_key(_dh.base_topic_id(topic_id).removeprefix("tp_") or topic_id)
+    if nk == canon_nk:
+        return rows
+    exact: list = []
+    compatible: list = []
+    for r in rows:
+        s_row = store.send_by_message(r["message_id"])
+        raw_s_nk = ((s_row["norm_key"] or s_row["key"] or "") if s_row is not None else "").strip()
+        s_nk = duty.norm_key(raw_s_nk) if raw_s_nk else ""
+        if s_nk == nk:
+            exact.append(r)
+            compatible.append(r)
+        elif not s_nk or _tg.parse_item_no(s_nk) is not None or s_nk == canon_nk:
+            compatible.append(r)
+    if exact:
+        return exact
+    has_prior_ask_for_nk = (
+        store.conn.execute(
+            "SELECT 1 FROM sends WHERE kind='ask' AND (UPPER(norm_key)=? OR UPPER(key)=?) LIMIT 1",
+            (nk, nk),
+        ).fetchone()
+        is not None
+    )
+    return [] if has_prior_ask_for_nk else compatible
+
+
 def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, key: str) -> tuple[list, str, str]:
     """要结的提问（这个会话或同羊圈兄弟槽位名下、还开着的）、那句话回到哪条下面、话题开头那条。"""
     from .roster import primary_topic_id
@@ -2224,13 +2307,18 @@ def _resolve_targets(cfg: Config, store: Store, topic_id: str, message_id: str, 
         if item is not None and item["root_message_id"]:
             root = item["root_message_id"]
             in_thread = {s["message_id"] for s in store.sends_in_thread(root)} | {root}
-            mine = [r for r in open_rows if r["message_id"] in in_thread]
+            mine = _filter_by_submatter_key(
+                store, [r for r in open_rows if r["message_id"] in in_thread], key, topic_id
+            )
             if mine or not roots:
                 return mine, root, root
         if not roots:
             raise OutboundError(EXIT_INVALID, f"{topic_id} 名下没有钥匙 {key!r} 的话题（ask 带这把 --key 发过才有）")
         in_thread = set(roots) | {s["message_id"] for r in roots for s in store.sends_in_thread(r)}
-        return [r for r in open_rows if r["message_id"] in in_thread], roots[0], roots[0]
+        mine = _filter_by_submatter_key(
+            store, [r for r in open_rows if r["message_id"] in in_thread], key, topic_id
+        )
+        return mine, roots[0], roots[0]
     message_id = (message_id or "").strip()
     if not message_id.startswith("om_"):
         raise OutboundError(EXIT_INVALID, f"--message-id 要给 om_ 开头的提问消息号，收到 {message_id!r}")

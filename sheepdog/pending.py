@@ -501,6 +501,10 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
                        _short(m["content"] if m is not None else "", 80), emoji=r["emoji_type"] or "")
     # 3. 同来源的另一条提问被主人答复或被会话结案
     if srcs and about:
+        from . import duty as _duty
+        s_self = store.send_by_message(e["message_id"])
+        raw_nk_self = ((s_self["norm_key"] or s_self["key"] or "") if s_self is not None else "").strip()
+        nk_self = _duty.norm_key(raw_nk_self) if raw_nk_self else ""
         for other in dict.fromkeys(r["ask_message_id"] for r in store.sources_about(about)):
             if other == e["message_id"]:
                 continue
@@ -509,6 +513,18 @@ def detect(cfg, store: Store, e, until: datetime | None = None, sources: list | 
                 continue
             if not same_matter(e["topic_id"], srcs, o["topic_id"], store.escalation_sources(other)):
                 continue
+            if e["topic_id"] and e["topic_id"] == o["topic_id"]:
+                from . import decision_hub as _dh, topicgroup as _tg
+                s_other = store.send_by_message(other)
+                raw_nk_other = ((s_other["norm_key"] or s_other["key"] or "") if s_other is not None else "").strip()
+                nk_other = _duty.norm_key(raw_nk_other) if raw_nk_other else ""
+                canon_nk = _duty.norm_key(_dh.base_topic_id(e["topic_id"]).removeprefix("tp_") or e["topic_id"])
+                self_has_subkey = bool(nk_self and _tg.parse_item_no(nk_self) is None and nk_self != canon_nk)
+                other_has_subkey = bool(nk_other and _tg.parse_item_no(nk_other) is None and nk_other != canon_nk)
+                if self_has_subkey and other_has_subkey and nk_self != nk_other:
+                    continue
+                if not _dh._titles_same_subject(e["text"] or "", o["text"] or "", topic_id=e["topic_id"]):
+                    continue
             at = _parse(o["closed_at"])
             if at is None or at <= asked or not _before(at, until):
                 continue

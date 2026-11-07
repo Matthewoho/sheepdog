@@ -6111,6 +6111,7 @@ class VersionAndObserveTest(unittest.TestCase):
             decision_hub.verify_resolve_allowed(cfg, st, [st.get_escalation("om_test_ask_proxy_127")])
 
             # followup_round 排入 escalation_check 系统提醒，正文带出 Sammy 在原群的回复
+            cfg.escalation.open_hours = 24 * 3650
             f_res = pending.followup_round(cfg, st, disp.playbook)
             self.assertEqual(f_res["checked"], 1)
             pend_rows = st.pending_dispatch()
@@ -7579,6 +7580,189 @@ class VersionAndObserveTest(unittest.TestCase):
             healed_lb = st.get_lamb("lamb_74376f52")
             self.assertEqual(healed_lb["state"], "done")
             self.assertTrue(str(healed_lb["result_summary"]).startswith("SUCCESS: JSON("))
+            st.close()
+
+    def test_reg138_submatter_key_isolation_in_sibling_and_resolve_and_obsolete_ask_report_and_stage_prod_bundle_guards(self) -> None:
+        """REG-138 (1.1.49):
+        1) pending.detect & outbound._resolve_targets & decision_hub.auto_resolve_handled_escalations：
+           同一专席针对同一条复合来源消息（--about）拆出两个独立子事项钥匙（如 kai-stage-tripo-key 与 cinemap-prod-cutover）且挂在同一话题群主帖（T-52）下时，
+           主人回答或专席办结其中一个子事项（work done --key cinemap-prod-cutover），绝不能将另一个不同 norm_key 的独立未决提问误标为 sibling_answered 或顺带自动结案；
+        2) outbound.send_to_owner(kind=REPORT)：当名下仍有未结 ask 卡，而专席发 report 写『由他们自己切，不用我们代切了（上面那张生产代切卡点 B 即可）』时，
+           当场拒绝并要求先调用 sheepdog resolve 自动将旧卡结案变绿；
+        3) outbound.check_ask_pre_flight_guard：拦截将『销毁退订 Stage 空跑实例 + 生产缩为 0 副本』捆绑为首选推荐 A，以及在现网活跃问题负载已清零（0 个）时推荐立即批量修改数十个 0 副本未开机休眠服务的 ask；
+        4) admin_web.diagnose_override_reason & classify_escalation：『这个是啥问题 没看懂』归入 context_incomplete，『stage环境暂不处理 / 仅销毁退订 Stage 空跑实例，生产 Pod 暂保持现状不动 / 暂缓执行...等冲刺期后再处理』归入 arch_or_config_posture，『不由我们执行生产变更，交由...自行执行切换』识别为 accepted。"""
+        from sheepdog import admin_web, decision_hub, outbound, pending as pend
+        from sheepdog.config import Config
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Config(state_dir=root / "state")
+            cfg.self_open_id = "ou_test_owner"
+            cfg.topic_group.enabled = True
+            cfg.topic_group.chat_id = "oc_test_tg"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            st = Store(cfg.db_path)
+            st.upsert_topic("tp_kaifeng", title="Kai 协作", kind="adopted", conversation_id="cid-kf")
+
+            # 创建话题群共享主帖 T-52，并把两个子事项 key 都绑到 T-52
+            it_no = st.add_item(
+                title="Kai 协作主帖",
+                owner_topic="tp_kaifeng",
+                opened_by="tp_kaifeng",
+                origin="ask",
+                chat_id="oc_test_tg",
+                root_message_id="om_test_t52_root",
+            )
+            st.add_item_key(it_no, "cinemap-prod-cutover", "CINEMAP-PROD-CUTOVER", "alias", topic_id="tp_kaifeng")
+            st.add_item_key(it_no, "kai-stage-tripo-key", "KAI-STAGE-TRIPO-KEY", "alias", topic_id="tp_kaifeng")
+
+            # 1) 同一来源消息 om_test_composite 下发出两张不同子事项 key 的 ask 卡，共用 root_message_id = om_test_t52_root
+            ask1_mid = "om_test_ask_tripo"
+            ask1_txt = "🐕 需要你定 · 将生产Tripo中国站钥匙注入Stage测试环境web.env [tp_kaifeng]\n请确认是否注入Stage"
+            st.add_send(
+                "idem_ask1",
+                "ask",
+                "tp_kaifeng",
+                ask1_mid,
+                ask1_txt,
+                root_message_id="om_test_t52_root",
+                key="kai-stage-tripo-key",
+                norm_key="KAI-STAGE-TRIPO-KEY",
+                title="将生产Tripo中国站钥匙注入Stage测试环境web.env",
+            )
+            st.add_escalation(ask1_mid, "tp_kaifeng", "oc_test_tg", ask1_txt, "2026-11-07T02:20:56+08:00")
+            st.add_escalation_sources(ask1_mid, "tp_kaifeng", [("om_test_composite", "oc_test_src")], pend.ORIGIN_ABOUT)
+
+            ask2_mid = "om_test_ask_prod_cut"
+            ask2_txt = "🐕 需要你定 · 授权南京生产cinemapprod切换新版镜像并开两项缓存开关 [tp_kaifeng]\n请确认是否代切生产"
+            st.add_send(
+                "idem_ask2",
+                "ask",
+                "tp_kaifeng",
+                ask2_mid,
+                ask2_txt,
+                root_message_id="om_test_t52_root",
+                key="cinemap-prod-cutover",
+                norm_key="CINEMAP-PROD-CUTOVER",
+                title="授权南京生产cinemapprod切换新版镜像并开两项缓存开关",
+            )
+            st.add_escalation(ask2_mid, "tp_kaifeng", "oc_test_tg", ask2_txt, "2026-11-07T02:31:36+08:00")
+            st.add_escalation_sources(ask2_mid, "tp_kaifeng", [("om_test_composite", "oc_test_src")], pend.ORIGIN_ABOUT)
+
+            # 2) 当 ask2 仍未结时，专席若发 report 说『由他们自己切，不用我们代切了（上面那张生产代切卡点 B 即可）』，必须拦截要求先 resolve
+            with self.assertRaises(outbound.OutboundError) as cm_rep:
+                outbound.send_to_owner(
+                    cfg,
+                    st,
+                    mock.MagicMock(),
+                    outbound.REPORT,
+                    "tp_kaifeng",
+                    "Kai反馈跳板机已通并自切生产，生产代切卡点B即可",
+                    "Kai 刚确认跳板机已通，新版生产镜像由他们自己切，不用我们代切了（上面那张生产代切卡点 B 即可）。",
+                    key="cinemap-prod-cutover",
+                    ball="doing",
+                )
+            self.assertIn("REG-138", str(cm_rep.exception))
+            self.assertIn("sheepdog resolve", str(cm_rep.exception))
+
+            # 3) 主人回答了 ask2（cinemap-prod-cutover），检测 ask1（kai-stage-tripo-key）绝不能被标为 sibling_answered
+            st.conn.execute(
+                "UPDATE escalations SET answered_at='2026-11-07T11:43:40+08:00', answer_message_id='sd_card_cb_test_b', closed_at='2026-11-07T11:43:40+08:00', close_reason='answered' WHERE message_id=?",
+                (ask2_mid,),
+            )
+            st.conn.commit()
+            hit = pend.detect(cfg, st, st.get_escalation(ask1_mid))
+            self.assertIsNone(hit, f"Distinct sub-matter key ask1 must not be marked sibling_answered by ask2, got: {hit}")
+
+            # 即使 ask1 曾被历史版本误标了 possibly_handled_reason='sibling_answered'，执行 work done --key cinemap-prod-cutover 也绝不能把 ask1 顺带关掉
+            st.conn.execute(
+                "UPDATE escalations SET possibly_handled_at='2026-11-07T11:44:03+08:00', possibly_handled_message_id=?, possibly_handled_reason=? WHERE message_id=?",
+                (ask2_mid, pend.PH_SIBLING_ANSWERED, ask1_mid),
+            )
+            st.conn.commit()
+            auto_closed = decision_hub.auto_resolve_handled_escalations(
+                cfg,
+                st,
+                "tp_kaifeng",
+                "cinemap-prod-cutover",
+                "Matthew 已点 B 确认不由我们代切生产",
+                source=None,
+            )
+            self.assertEqual(auto_closed, [])
+            self.assertIsNone(st.get_escalation(ask1_mid)["closed_at"])
+
+            # 4) check_ask_pre_flight_guard：拦截将 Stage 空跑实例退订与生产缩为 0 副本捆绑为推荐 A，以及拦截对 0 副本未开机休眠服务发卡推荐立即批量改
+            bundled_stage_prod_ask = (
+                "已核实 RabbitMQ 0 业务在用。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 销毁退订 Stage 空跑 TDMQ RabbitMQ 实例（立省 $454.80/月），并将生产 tapnowprod 的 rabbitmq Deployment 缩为 0 副本后关单\n"
+                "B. 仅销毁退订 Stage 空跑实例（立省 $454.80/月），生产 Pod 暂保持现状不动，直接关单\n"
+                "建议：A"
+            )
+            with self.assertRaises(outbound.OutboundError) as cm_bundle:
+                outbound.check_ask_pre_flight_guard(
+                    cfg,
+                    st,
+                    "tp_tapnow-prod-topology",
+                    "ENG-1018 核实结果：RabbitMQ 确实 0 业务在用",
+                    bundled_stage_prod_ask,
+                    key="ENG-1018",
+                )
+            self.assertIn("REG-138", str(cm_bundle.exception))
+
+            dormant_zero_rep_ask_1 = (
+                "现网活跃拉Stage镜像的工作负载已清零(0个)，仅剩45个0副本Deployment和3个挂起CronJob仍指Stage仓。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意由本专席执行 ENG-1150 Phase 2A（保持 replicas=0 / suspend=True 不变，搬运去重镜像至南京生产 TCR 锁死 @sha256 并切 tcr-prod-secret，全量 JSON 回读结单）\n"
+                "B. 暂不处理这 48 个未运行的休眠负载\n"
+                "建议：A"
+            )
+            dormant_zero_rep_ask = (
+                "大白话讲：建南京生产集群时是从测试环境整包复制的。正在跑的服务昨天已全改到生产镜像库了；但集群里还躺着45个没开机的服务和3个暂停的定时任务，配置里写的还是测试库地址。\n"
+                "---more---\n"
+                "选项：\n"
+                "A. 同意改掉：保持这些服务关机不动，把镜像拷进生产仓库并改好配置地址\n"
+                "B. 暂不处理这 48 个未运行的休眠负载\n"
+                "建议：A"
+            )
+            for d_ask in (dormant_zero_rep_ask_1, dormant_zero_rep_ask):
+                with self.assertRaises(outbound.OutboundError) as cm_dormant:
+                    outbound.check_ask_pre_flight_guard(
+                        cfg,
+                        st,
+                        "tp_tapnow-prod-topology",
+                        "ENG-1150 南京生产休眠负载Stage镜像清零",
+                        d_ask,
+                        key="ENG-1150",
+                    )
+                self.assertIn("REG-138", str(cm_dormant.exception))
+
+            # 5) 错题本归因与对方自切采纳识别
+            self.assertEqual(
+                admin_web.diagnose_override_reason(dormant_zero_rep_ask, "这个是啥问题 没看懂", "其他", "A"),
+                ("context_incomplete", "缺环境/调用链反问"),
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason(dormant_zero_rep_ask, "stage环境暂不处理", "其他", "A"),
+                ("arch_or_config_posture", "技术姿势纠偏"),
+            )
+            self.assertEqual(
+                admin_web.diagnose_override_reason(
+                    bundled_stage_prod_ask,
+                    "仅销毁退订 Stage 空跑实例（立省 $454.80/月），生产 Pod 暂保持现状不动，直接关单",
+                    "B",
+                    "A",
+                ),
+                ("arch_or_config_posture", "技术姿势纠偏"),
+            )
+            cls_self_cut = admin_web.classify_escalation(
+                st.get_escalation(ask2_mid),
+                answer_content="[卡片回调] B：不由我们执行生产变更，交由 Kai 团队通过已确认连通的跳板机自行执行切换",
+            )
+            self.assertEqual(cls_self_cut["alignment"], "accepted")
             st.close()
 
 

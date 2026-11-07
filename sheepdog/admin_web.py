@@ -116,7 +116,7 @@ _OVERRIDE_WORDS_RE = re.compile(
     r"|问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|先问一下腾讯云|问一下腾讯云的人|是给谁访问的|给谁访问的"
     r"|问一下能不能用|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?tapnow\.tv\b|(?:能不能用|改用|用)[^\n。]{0,12}国际站"
     r"|给他(?:账号密码|账密)|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|还不能动|把来龙去脉在群里讲清楚|来龙去脉.{0,8}讲清楚|已经在.{0,20}群里(?:在)?讨论|讨论的事情是同一个|统一转交给同一个\s*session|等澄清上下文|澄清上下文|暂时观望|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
-    r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号)|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
+    r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号|问题)|测试还是生产|调用链|前因后果|经过说一下|怎么测的|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|已经处理了|先限制|等我|等明天|再看看|我也不知道)",
     re.I,
 )
 _SYMBOLIC_CRITIQUE_RE = re.compile(
@@ -157,7 +157,8 @@ def diagnose_override_reason(
         r"|有没有合规问题|数据(?:是)?不能出境|腾讯云国际这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
         r"|暴力的?把跳数改为|跳数改为\s*\d+[^\n。]*有问题|从\s*media\s*进来多一条|走\s*ai\s*的话就没多这一跳"
         r"|长期有效(?:的)?(?:办法|方案|解法)|有没有.{0,12}长期.{0,8}(?:办法|方案|解法)|一劳永逸"
-        r"|同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,16}交付)",
+        r"|同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,16}交付"
+        r"|stage\s*环境暂不处理|生产\s*(?:Pod|服务|实例|环境)?\s*暂保持现状不动|暂缓执行[^\n。；]*等冲刺期后再处理)",
         s,
         re.I,
     ) or (
@@ -184,7 +185,7 @@ def diagnose_override_reason(
     if re.search(
         r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|为啥没有选项|为什么没有选项|选项呢|"
         r"有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我|"
-        r"测试还是生产|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号)|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
+        r"测试还是生产|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|什么(?:环境|账号|子账号|问题)|调用链|前因后果|经过说一下|怎么测的|测试过了吗|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
         r"会不会有.{0,6}影响|有什么影响|有没有影响|有办法看|最高.{0,12}用了多少|"
         r"给他授权|直接给.{0,6}授权|给.{0,8}开权限|给他(?:账号密码|账密)|还不能动|把来龙去脉在群里讲清楚|来龙去脉.{0,8}讲清楚|等澄清上下文|澄清上下文|暂时观望|你先排查|先排查一下|弄清楚.{0,12}(?:给我|再)|给我执行方案|"
         r"能具体讲讲|具体讲讲|讲讲前因后果|完整的方案|完整给我.{0,16}方案|各资源.{0,8}(?:处理)?方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下(?:这个问题)?|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]|"
@@ -233,6 +234,13 @@ def diagnose_override_reason(
         ) or (
             re.search(r"同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,24}交付", chosen_full, re.I)
             and re.search(r"不对外发连接串|不开(?:跨境)?隧道", text or "", re.I)
+        ) or (
+            re.search(
+                r"仅(?:销毁|退订|清理)[^\n。；]*Stage[^\n。；]*生产[^\n。；]*(?:暂)?保持现状不动"
+                r"|暂缓执行[^\n。；]*等冲刺期后再处理",
+                chosen_full,
+                re.I,
+            )
         ):
             return ("arch_or_config_posture", "技术姿势纠偏")
         return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
@@ -690,9 +698,13 @@ def classify_escalation(
                 alignment_label = f"{override_reason}（点选 {chosen_code} 后追问纠偏）"
                 ans_clean = f"{ans_clean} · 追问：{critique_clean}"
             elif recommended and chosen_code != recommended:
-                alignment = "overridden"
-                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
-                alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
+                if re.search(r"不由我们执行生产变更[，,\s]*交由[^\n]*自行执行切换", ans_body or "", re.I):
+                    alignment = "accepted"
+                    alignment_label = f"采纳建议 ({chosen_code} · 对方团队自切)"
+                else:
+                    alignment = "overridden"
+                    override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                    alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
             else:
                 alignment = "accepted"
                 alignment_label = f"采纳建议 ({chosen_code} · 误触更正)" if misclick_corrected else f"采纳建议 ({chosen_code})"
