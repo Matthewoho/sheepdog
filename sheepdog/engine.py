@@ -7128,17 +7128,60 @@ def auto_settle_open_escalations_on_owner_batch(
                 if not pend.is_owner_busy_or_defer_text(row_ctx["content"] or ""):
                     cand_msgs.append(row_ctx)
         matched_r = None
+        allowed_e = {m.strip() for m in (e_mid, e_hub) if (m or "").strip()}
         for r in reversed(cand_msgs):
             if msg_targets_other_escalation(store, r, e_mid, e_hub):
                 continue
+            r_keys = set(r.keys()) if hasattr(r, "keys") else set()
+            rep_to = str((r["reply_to"] if "reply_to" in r_keys else "") or "").strip()
+            tags_raw = str((r["tags_json"] if "tags_json" in r_keys else "") or "[]")
+            try:
+                r_tags = json.loads(tags_raw) if tags_raw else []
+            except Exception:
+                r_tags = []
+            if not isinstance(r_tags, list):
+                r_tags = []
+            bound_escs = {
+                t.split(":", 1)[1].strip()
+                for t in r_tags
+                if isinstance(t, str)
+                and t.startswith(("escalation:", "escalation_followup:"))
+                and ":" in t
+                and t.split(":", 1)[1].strip()
+            }
+            explicitly_bound = bool((bound_escs & allowed_e) or (rep_to and rep_to in allowed_e))
+            r_txt = str(r["content"] or "")
+            if not explicitly_bound and re.search(
+                r"(?:为啥|为什么|怎么)[^\n。]{0,16}(?:老是|一直|总)?叫我\s*老板|叫(?:我)?名字就行|(?:以后)?(?:别|不要)叫我\s*老板",
+                r_txt,
+                re.I,
+            ):
+                continue
             c_dt = _parse(r["create_time"] or "")
-            f_dt = _parse(r["first_seen"] or "") if "first_seen" in r.keys() else None
+            f_dt = _parse(r["first_seen"] or "") if "first_seen" in r_keys else None
             dts = [x for x in (c_dt, f_dt) if x is not None]
             r_dt = max(dts) if dts else None
             if asked is not None and r_dt is not None and r_dt < asked - timedelta(seconds=90):
                 continue
-            same_source_chat = not src_chats or (r["chat_id"] in src_chats)
-            recent_on_topic = asked is not None and r_dt is not None and (r_dt - asked) <= timedelta(minutes=30)
+            if explicitly_bound:
+                matched_r = r
+                break
+            is_unlinked_bus_forward = ("forwarded_from:tp_bus" in r_tags) and not bound_escs
+            shares_topic = decision_hub._titles_same_subject(
+                e["text"] or "", r_txt, topic_id=topic_id
+            ) or decision_hub._titles_same_subject(
+                e["text"] or "", rcpt_summary, topic_id=topic_id
+            )
+            same_source_chat = (not src_chats or (r["chat_id"] in src_chats)) and (
+                not is_unlinked_bus_forward or shares_topic
+            )
+            recent_on_topic = bool(
+                asked is not None
+                and r_dt is not None
+                and (r_dt - asked) <= timedelta(minutes=30)
+                and shares_topic
+                and not is_unlinked_bus_forward
+            )
             if same_source_chat or recent_on_topic:
                 matched_r = r
                 break

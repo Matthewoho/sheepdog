@@ -1393,6 +1393,35 @@ class Store:
         where = "" if include_closed else "WHERE closed_at IS NULL"
         return self.conn.execute(f"SELECT * FROM escalations {where} ORDER BY asked_at DESC LIMIT ?", (limit,)).fetchall()
 
+    def _ack_pending_escalation_reminders(self, c: sqlite3.Connection, message_id: str) -> None:
+        """1.1.50 (REG-139): 当某张「需要你定」卡片已结案（answered / resolved / expired）时，
+        自动将账本里仍处于 pending、专门针对该卡的 escalation_check / escalation_expiring 提醒消息标为 acked，
+        防止主人刚点完卡结案、几秒后又把过期的『可能已处理/快到期』提醒单独派成一个冗余慢批次。"""
+        mid = (message_id or "").strip()
+        if not mid:
+            return
+        rows = c.execute(
+            "SELECT message_id, COALESCE(hub_message_id, '') AS hub_message_id FROM escalations WHERE message_id=? OR hub_message_id=?",
+            (mid, mid),
+        ).fetchall()
+        esc_ids = {mid}
+        for r in rows:
+            if r["message_id"]:
+                esc_ids.add(str(r["message_id"]).strip())
+            if r["hub_message_id"]:
+                esc_ids.add(str(r["hub_message_id"]).strip())
+        for eid in esc_ids:
+            if not eid:
+                continue
+            c.execute(
+                """UPDATE messages
+                   SET dispatch_state='acked', note=COALESCE(note, 'target_escalation_already_closed')
+                   WHERE dispatch_state IN ('pending', 'pending_dispatch')
+                     AND reason IN ('escalation_check', 'escalation_expiring')
+                     AND (tags_json LIKE ? OR tags_json LIKE ?)""",
+                (f'%"escalation_check:{eid}"%', f'%"escalation_expiring:{eid}"%'),
+            )
+
     def answer_escalation(self, message_id: str, answer_message_id: str, *, allow_update: bool = False) -> bool:
         ts = now_iso()
         cond = "" if allow_update else " AND answered_at IS NULL"
@@ -1402,21 +1431,29 @@ class Store:
                            close_reason=COALESCE(close_reason, 'answered')
                     WHERE (message_id=? OR (hub_message_id IS NOT NULL AND hub_message_id != '' AND hub_message_id=?)){cond}""",
                 (ts, answer_message_id, ts, message_id, message_id))
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+            if ok:
+                self._ack_pending_escalation_reminders(c, message_id)
+            return ok
 
     def expire_escalation(self, message_id: str) -> None:
         with self.tx() as c:
-            c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
-                      (now_iso(), message_id))
+            cur = c.execute("UPDATE escalations SET closed_at=?, close_reason='expired' WHERE message_id=? AND closed_at IS NULL",
+                            (now_iso(), message_id))
+            if cur.rowcount > 0:
+                self._ack_pending_escalation_reminders(c, message_id)
 
     def resolve_escalation(self, message_id: str, topic_id: str, note: str, resolved_by: str = "") -> bool:
         """会话结案（7.36）：只结 topic_id（提问的会话）名下、还开着的。resolved_by：谁结的，默认就是提问的会话；
         原会话已收掉时总线替它结，记总线（7.38）。返回是否结了。"""
         ts = now_iso()
         with self.tx() as c:
-            return c.execute("""UPDATE escalations SET closed_at=?, close_reason='resolved', resolved_by=?, resolve_note=?
-                                WHERE message_id=? AND topic_id=? AND closed_at IS NULL""",
-                             (ts, resolved_by or topic_id, note, message_id, topic_id)).rowcount > 0
+            ok = c.execute("""UPDATE escalations SET closed_at=?, close_reason='resolved', resolved_by=?, resolve_note=?
+                              WHERE message_id=? AND topic_id=? AND closed_at IS NULL""",
+                           (ts, resolved_by or topic_id, note, message_id, topic_id)).rowcount > 0
+            if ok:
+                self._ack_pending_escalation_reminders(c, message_id)
+            return ok
 
     def mark_possibly_handled(self, message_id: str, trigger_message_id: str, reason: str, at: str = "") -> bool:
         """标「可能已处理」（7.36）：只标还开着、没标过的。返回是否标了。"""

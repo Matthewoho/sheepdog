@@ -983,6 +983,24 @@ _REPORT_TELLS_OWNER_CLICK_OBSOLETE_ASK_RE = re.compile(
     r"|(?:由他们自己|对方已自行|已由对方自行)(?:切|切换|执行|处理|操作)[^\n。；]{0,28}(?:不用|无需)(?:我们|你)(?:代切|代操作|执行)[了啦]?)",
     re.I,
 )
+_PREFER_NEW_CLOUD_VENDOR_OR_OPEN_EGRESS_OVER_WORKING_TENCENT_CN_ASK_RE = re.compile(
+    r"\A(?=[\s\S]*(?:WIMGS|搜图|通晓|IQS))"
+    r"(?=[\s\S]*(?:(?:腾讯云|中国站)[^\n。；]{0,36}(?:已恢复|恢复正常|200\s*OK|实测返回\s*200|可用|余额|缩略图)|(?:恢复中|继续用|继续使用)[^\n。；]{0,16}腾讯(?:云)?[^\n。；]{0,16}`?WIMGS`?))"
+    r"(?=[\s\S]*(?:选项\s*A|A)\s*(?:[（(]\s*推荐\s*[）)])?\s*[\.、:：)\]]\s*[^\n]*(?:同意[^\n]*(?:阿里云|IQS)|改走[^\n]*(?:阿里云|IQS)|在腾讯云国际站[^\n]*开通\s*WIMGS))"
+    r"(?=[\s\S]*(?:(?:建议|推荐)\s*[：:]?\s*(?:优先)?(?:选\s*)?A\b|(?:选项\s*A|A)\s*[（(]\s*推荐\s*[）)]))",
+    re.I,
+)
+_TENCENT_CN_UNUSABLE_BLOCKER_EVIDENCE_RE = re.compile(
+    r"(?:腾讯云(?:中国站)?\s*WIMGS\s*(?:实测|确认)?(?:不可用|已停服|欠费停机|无法满足)|"
+    r"已确认必须切换阿里云的硬性原因)",
+    re.I,
+)
+_REPLY_ADDRESSES_OWNER_AS_BOSS_RE = re.compile(
+    r"(?:老板\s*(?:已|刚|刚才|这边|那边)?\s*(?:批准|同意|拍板|确认|回复|指示|决定|定了|批复|选了|签字)|"
+    r"(?:已|正|先|去|待|等|向|找|发给|请|跟|由)\s*老板\s*(?:确认|拍板|审批|请示|定夺|定|汇报|对齐|批复|同意|批准)|"
+    r"(?:收到|好的|好嘞|明白|ok)\s*[，,、!！~～]*\s*老板)",
+    re.I,
+)
 
 
 def check_source_peer_followup_and_proxy_guard(
@@ -1717,6 +1735,17 @@ def check_ask_pre_flight_guard(
             "（主人 2026-11-07 11:40 & 11:44 在 `tp_tapnow-prod-topology` ENG-1150 拍板卡上先后批复『这个是啥问题 没看懂』『stage环境暂不处理』，REG-138 零活跃未开机休眠负载免打扰门禁）："
             "未开机的 0 副本历史遗留模板在上线冲刺期零流量零风险，请直接保持暂不处理（或将『暂不处理未开机休眠服务，待后续需要开机时再按需迁移』作为结论用 `sheepdog report --ball done` 收尾），"
             "严禁为 0 副本休眠死负载连发 ask 打扰主人（没有发送）",
+        )
+    if (
+        _PREFER_NEW_CLOUD_VENDOR_OR_OPEN_EGRESS_OVER_WORKING_TENCENT_CN_ASK_RE.search(full_text)
+        and not _TENCENT_CN_UNUSABLE_BLOCKER_EVIDENCE_RE.search(full_text)
+    ):
+        raise OutboundError(
+            EXIT_INVALID,
+            "当现有腾讯云中国站境内服务（如 `ap-nanjing` WIMGS 图像搜索，且腾讯云国际站尚未上线该产品）已实测可用（HTTP 200）且账户有充足余额时，"
+            "严禁将『在尚未上线该功能的腾讯云国际站尝试开通』或『改接第三方云厂商（阿里云 IQS）并放开 media_egress 第三方图片下载白名单』列为首选推荐项 A"
+            "（主人 2026-11-07 13:20 在 `tp_infra-migration-ops` 拍板卡 `[其他]` 明确纠偏：『如果腾讯云那个可以用吧，只要是境内的就行。因为我问了腾讯云的人，他们那边说腾讯云国际还没有这个功能，所以只能连腾讯云中国站的。然后我们中国站如果还有钱还能用的话，就直接用中国站的就好了。除非他们有其他必要去连阿里云的，再去连。』，REG-139 腾讯云中国站境内可用服务优先与严控外连白名单门禁）："
+            "请直接沿用已验证可用的腾讯云中国站境内服务（不放开第三方任意 URL 下载白名单），或在群内向提问方确认是否存在腾讯云中国站无法满足的硬性原因后再议（没有发送）",
         )
     if (
         topic_id == BUS_TOPIC_ID
@@ -2566,6 +2595,11 @@ def reply_body(cfg: Config, text: str = "", card_text: str = "", summary: str = 
     if not (raw or "").strip():
         raise ValueError("正文为空")
     _, _, combined = resolve_summary_and_body(raw, summary, require_summary=cfg.notify.require_summary)
+    if _REPLY_ADDRESSES_OWNER_AS_BOSS_RE.search(combined):
+        raise ValueError(
+            "代回正文中请直接称呼名字 `Matthew`，严禁称呼或指代为『老板』"
+            "（主人 2026-11-07 12:26 明确立规：『为啥老是叫我老板 叫名字就行 matthew』，7.70 首屏大白话门禁允许正常使用英文人名 `Matthew`，REG-139 称呼铁律门禁，没有发送）"
+        )
     card = build_reply_card(combined, suffix, cfg.session.reply_card_width)  # 空正文抛 ValueError
     return combined, card
 

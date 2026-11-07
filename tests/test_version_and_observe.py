@@ -7765,6 +7765,144 @@ class VersionAndObserveTest(unittest.TestCase):
             self.assertEqual(cls_self_cut["alignment"], "accepted")
             st.close()
 
+    def test_reg139_unlinked_bus_forward_no_false_settle_ack_stale_esc_check_and_tencent_cn_and_boss_guards(self):
+        """REG-139 (v1.1.50):
+        1. auto_settle_open_escalations_on_owner_batch 严禁将 tp_bus 未带 --answers 转交的跨聊天无引用指令或称呼/人设纠偏指令（如『为啥老是叫我老板 叫名字就行 matthew』）误当作同会话未决拍板卡的回答自动结案；
+        2. store.answer_escalation / resolve_escalation / expire_escalation 在拍板卡结案时，自动将账本里仍处于 pending_dispatch、针对该卡的 escalation_check / escalation_expiring 提醒消息标为 acked，防止主人刚点完卡几秒后又派发过期的『可能已处理』冗余慢批次；
+        3. outbound.check_ask_pre_flight_guard 拦截在腾讯云中国站境内服务（如 WIMGS）已实测可用且有余额时，仍将『改走阿里云 IQS 并放开第三方下载白名单』或『在未上线该产品的腾讯云国际站开通』列为推荐项 A 的提问，且 outbound.reply_body 拦截把主人称为『老板』的代回；
+        4. admin_web.diagnose_override_reason 将『只要是境内的就行...直接用中国站的就好了』精准归入 arch_or_config_posture（技术姿势纠偏）。
+        """
+        from sheepdog import admin_web, engine, outbound
+        from sheepdog.config import Config
+        from sheepdog.models import Message
+        from sheepdog.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config(state_dir=root / "state")
+            cfg.self_open_id = "ou_test_owner"
+            cfg.topic_group.enabled = True
+            cfg.topic_group.chat_id = "oc_test_tg"
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            st = Store(cfg.db_path)
+            st.upsert_topic("tp_infra-migration-ops", title="Infra 迁移", kind="adopted", conversation_id="cid-infra")
+
+            # 1) 挂起一张 ENG-1071 WIMGS 拍板卡（来源群为 oc_test_infra_grp）
+            esc_wimgs = "om_test_esc_wimgs"
+            esc_txt = "🐕 需要你定 · ENG-1071 国内站生产agent-tools搜图WIMGS密钥恢复方案确认 [tp_infra-migration-ops]\n请确认搜图密钥切换方案"
+            st.add_escalation(esc_wimgs, "tp_infra-migration-ops", "oc_test_tg", esc_txt, "2026-11-07T12:17:21+08:00")
+            st.add_escalation_sources(esc_wimgs, "tp_infra-migration-ops", [("om_test_src_wimgs", "oc_test_infra_grp")], "explicit")
+
+            # 主人在私聊 oc_test_owner_dm 发送无引用称呼纠偏，由 tp_bus 不带 --answers 转交给 tp_infra-migration-ops
+            m_boss = Message(
+                message_id="om_test_call_me_matthew",
+                chat_id="oc_test_owner_dm",
+                chat_name="Bot DM",
+                chat_type="p2p",
+                sender_id="ou_test_owner",
+                sender_name="Matthew",
+                sender_type="user",
+                content="看一下 infra 迁移群那个 session 为啥老是叫我老板  叫名字就行 matthew",
+                msg_type="text",
+                create_time="2026-11-07T12:26:00+08:00",
+            )
+            st.upsert_message(
+                m_boss,
+                "dispatch",
+                "owner_instruction",
+                ["owner_verified", "owner_instruction", "owner_at:private", "owner:infra-migration-ops", "forwarded_from:tp_bus"],
+                "tp_infra-migration-ops",
+            )
+            st.record_dispatch("b20261107122708-infra-migration-ops", "tp_infra-migration-ops", ["om_test_call_me_matthew"], state="sent")
+
+            settled = engine.auto_settle_open_escalations_on_owner_batch(
+                cfg,
+                st,
+                None,
+                "tp_infra-migration-ops",
+                "b20261107122708-infra-migration-ops",
+                {"status": "handled", "summary": "已将称呼铁律固化到长期记忆，后续一律直呼 Matthew"},
+            )
+            self.assertEqual(settled, [])
+            self.assertIsNone(st.get_escalation(esc_wimgs)["closed_at"])
+
+            # 2) 当拍板卡产生 pending 的 sd_escalation_check_* 提醒后，主人先一步点卡结案，提醒必须自动标为 acked
+            esc_iqs = "om_test_esc_iqs"
+            st.add_escalation(esc_iqs, "tp_infra-migration-ops", "oc_test_tg", "🐕 需要你定 · 搜图边界确认 [tp_infra-migration-ops]", "2026-11-07T13:18:55+08:00")
+            chk_mid = st.add_system_message(
+                "tp_infra-migration-ops",
+                "escalation_check",
+                "🔎 你名下的「需要你定」可能已经处理了",
+                [f"escalation_check:{esc_iqs}"],
+            )
+            self.assertEqual(st.get_message(chk_mid)["dispatch_state"], "pending")
+            st.answer_escalation(esc_iqs, "sd_card_cb_test_iqs")
+            chk_after = st.get_message(chk_mid)
+            self.assertEqual(chk_after["dispatch_state"], "acked")
+            self.assertEqual(chk_after["note"], "target_escalation_already_closed")
+
+            # 3a) check_ask_pre_flight_guard 拦截在腾讯云中国站 WIMGS 可用且有余额（或已有恢复中的腾讯云 WIMGS 缩略图方案）时推荐改接阿里云 IQS 并放开下载白名单
+            bad_iqs_ask_1 = (
+                "团队提议将国内站搜图从腾讯云 WIMGS 改走阿里云通晓 IQS，并对搜图图片 URL 放开 media_egress 下载白名单。\n"
+                "---more---\n"
+                "事情：腾讯云中国站 WIMGS（ap-nanjing）已恢复正常（HTTP 200 OK，账户余额充足），但团队提请评估改走阿里云 IQS。\n"
+                "选项：\n"
+                "A. 有条件同意接阿里云 IQS 并放开下载（推荐）\n"
+                "B. 仅同意搜图 API 改走阿里云 IQS，不放开第三方任意图片源站直连下载\n"
+                "C. 维持现状不改：要求继续使用刚恢复正常的腾讯云 WIMGS，不放开第三方任意 URL 下载白名单\n"
+                "建议：选 A"
+            )
+            bad_iqs_ask = (
+                "团队提议国内站搜图改走阿里云通晓IQS（境内外网调境内API），并对搜图结果图片URL放开media_egress下载白名单（否则只能用腾讯五百像素缩略图）。建议选A：有条件同意（锁死超时与体积上限，禁止连外境域名）。\n"
+                "---more---\n"
+                "事情：如果不对搜图结果里的第三方图片 URL 放开下载白名单，参考图就只能继续用刚在恢复中的腾讯 `WIMGS` 约 `500px` 缩略图。\n"
+                "选项：\n"
+                "A. 有条件同意接阿里云 IQS 并放开下载（推荐）\n"
+                "B. 仅同意搜图 API 改走阿里云 IQS，不放开第三方任意图片源站直连下载\n"
+                "C. 不同意放开白名单：维持 `media_egress` 仅放行 `*.tapnow.tv` 自有域名不变，搜图继续使用腾讯云 `WIMGS` 缩略图方案\n"
+                "建议：选 A"
+            )
+            for iqs_sample in (bad_iqs_ask_1, bad_iqs_ask):
+                with self.assertRaises(outbound.OutboundError) as cm_iqs:
+                    outbound.check_ask_pre_flight_guard(
+                        cfg,
+                        st,
+                        "tp_infra-migration-ops",
+                        "国内站搜图改走阿里云IQS并放开第三方图片下载白名单边界确认",
+                        iqs_sample,
+                        key="ENG-1071",
+                    )
+                self.assertIn("REG-139", str(cm_iqs.exception))
+
+            # 3b) reply_body 拦截把 Matthew 称为『老板』的群内代回
+            with self.assertRaises(ValueError) as cm_boss:
+                outbound.reply_body(
+                    cfg,
+                    text="老板已批准切换搜图密钥，Stage 和生产均已生效。",
+                    summary="老板已批准切换搜图密钥，Stage 和生产均已生效。",
+                )
+            self.assertIn("REG-139", str(cm_boss.exception))
+            self.assertIn("Matthew", str(cm_boss.exception))
+
+            # 直呼 Matthew 正常放行
+            ok_txt, ok_card = outbound.reply_body(
+                cfg,
+                text="Matthew 已批准切换搜图密钥，Stage 和生产均已生效。",
+                summary="Matthew 已批准切换搜图密钥，Stage 和生产均已生效。",
+            )
+            self.assertIn("Matthew", ok_txt)
+            self.assertIsNotNone(ok_card)
+
+            # 4) diagnose_override_reason 将『只要是境内的就行...直接用中国站的就好了』归入 arch_or_config_posture
+            c_iqs, l_iqs = admin_web.diagnose_override_reason(
+                bad_iqs_ask,
+                "如果腾讯云那个可以用吧，只要是境内的就行。因为我问了腾讯云的人，他们那边说腾讯云国际还没有这个功能，所以只能连腾讯云中国站的。然后我们中国站如果还有钱还能用的话，就直接用中国站的就好了。除非他们有其他必要去连阿里云的，再去连。",
+                "其他",
+                "A",
+            )
+            self.assertEqual((c_iqs, l_iqs), ("arch_or_config_posture", "技术姿势纠偏"))
+            st.close()
+
 
 if __name__ == "__main__":
     unittest.main()
