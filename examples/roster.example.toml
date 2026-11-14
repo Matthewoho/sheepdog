@@ -1,0 +1,87 @@
+# sheepdog 名册示例
+# 复制到 ~/.config/sheepdog/roster.toml 后改成你自己的会话。真实名册不要提交到仓库。
+#
+# 每个 [[session]] 是一个已经在工作的 Agent 会话：
+#   mode = "managed"：sheepdog 按聊天归属把 IM 消息推给它（永远不新建会话、不改标题）
+#   mode = "known"  ：只登记给总线看，从不投递；总线遇到相关的事只建议你去那里处理
+# 校验（一旦失败就报错退出）：key 唯一且只含 [a-z0-9_-]、不能是 bus；同一个 chat_id 只能属于一个会话；
+# managed 必须有 conversation_id；known 不能有 chats；不认识的字段一律报错。
+
+[[session]]
+key = "demo_requests"                       # topic_id = "tp_demo_requests"
+mode = "managed"
+conversation_id = "00000000-0000-4000-8000-000000000001"
+title = "示例：需求对接"                       # 现有标题，仅展示
+host = "antigravity"                         # 会话宿主：antigravity（默认）| codex | claude；建好后不能换
+duty = "跟进同事提来的需求：整理要点、起草回复。不负责审批和生产操作。"
+authority = ""                               # 主人在该会话里给过的授权原话；空 = 未明确授权，对外只起草
+self_polling = "每 10 分钟自己巡检一次需求私聊"   # 该会话自己的 IM 巡检，没有就留空
+retire_self_polling = true                   # true：onboarding 时请它停掉自己的巡检，以 sheepdog 推送为准
+# 7.57 定时巡检（可选，0 = 关）：到了间隔、会话空闲且没有待投信号时，排一条系统巡检消息
+# patrol_every_minutes = 60
+# patrol_hours = ""                        # 留空 = 0-23 全天；支持多段如 "0-2,"
+# patrol_prompt = "巡检一下名下还没结的需求，有进展就更新，没事回执 handled。"
+
+[[session.chats]]
+chat_id = "oc_test_demo_p2p"
+name = "示例同事私聊"
+all_messages = true                          # 除自己发的以外全部推给本会话（覆盖 Inbox 和免打扰）
+
+[[session.chats]]
+chat_id = "oc_test_demo_group"
+name = "示例需求群"
+all_messages = false                         # 只推 dispatch 级消息（@我、回复我、关键词等）
+
+# 只负责某个群里的一个话题（7.45，PR #1 的格式）：这个话题里的回复一律送本会话，覆盖自动归属、不过期；同一个群的其他消息不受影响
+# [[session.chats]]
+# chat_id = "oc_test_demo_ops_group"
+# name = "运维群·某个话题"
+# thread_id = "omt_test_demo_thread"
+
+[[session]]
+key = "demo_ops"
+mode = "known"
+conversation_id = "00000000-0000-4000-8000-000000000002"
+title = "示例：发布值守"
+duty = "发布与回滚的值守会话，主人直接在里面操作。"
+
+# 接手旧会话（7.2）：conversation_id 写成空字符串 = 由 sheepdog 新建（sheepdog spawn / init），
+# 新 id 只记在账本里，不回写本文件（sheepdog sessions 会显示两者差异）。
+# 有前任且 retire_predecessor = true：先给前任发退休通知（停巡检、不再对外发、提交交接回执），再新建接手会话；
+# 接手会话先完整读完前任 transcript 并回执，sheepdog 再把前任的交接回执原样转给它。
+[[session]]
+key = "demo_handover"
+mode = "managed"
+conversation_id = ""
+predecessor_conversation_id = "00000000-0000-4000-8000-000000000003"
+retire_predecessor = true
+title = "示例：周报整理（接手）"
+duty = "接手周报整理：汇总各群进展，周五起草周报。不负责对外发送。"
+
+[[session.chats]]
+chat_id = "oc_test_demo_weekly"
+name = "示例周报群"
+all_messages = false
+
+# Codex / Claude 会话（7.18）：host 写 codex 或 claude，配置里对应的 [hosts.*] 要先 enabled = true，否则名册报错。
+# model / effort 留空 = 用配置里这个宿主的默认值。conversation_id 留空由 sheepdog 新建，也可以填一个现有的
+# Codex 线程编号 / Claude 会话编号来接管它。要换宿主：退休旧会话、新开一个（predecessor_conversation_id）。
+# [[session]]
+# key = "demo_design"
+# mode = "managed"
+# conversation_id = ""
+# host = "codex"
+# model = ""                                 # 留空 = [hosts.codex] model
+# effort = "xhigh"                           # 这个会话单独用更高的推理档位
+# title = "示例：架构设计"
+# duty = "复杂代码和架构设计：读代码、出方案。不负责对外发送。"
+
+# 名册里的「人」（7.61）：授权跟着人走，不跟着会话走，路由不变。tier = vip 的人本人发来的消息投递时盖 👑 章、
+# 这一批末尾附 playbook 的 vip.md；会话为他们的请求 `sheepdog ask` 时必须带 --floor（碰到哪条底线）。
+# open_id 必填（ou_ 开头，不能重复）；authority 是主人原话，要看得出哪天说的（写上 YYYY-MM-DD 或 MM-DD）。
+# 和 config 的 [routing] vip_sender_ids 不是一回事：那个只管「关键人发言进会话」（路由）。
+[[person]]
+open_id = "ou_test_vip_demo"
+name = "示例 VIP"
+tier = "vip"
+authority = "2025-04-23 主人原话（示例）：「这位的需求尽量满足，不用等我批；不合理就给方案让他选，坚持就报备后配合」"

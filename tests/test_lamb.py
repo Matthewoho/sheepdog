@@ -1,0 +1,882 @@
+"""7.63 羔羊（Subagent / Lamb）纳管 + 母羊 30 秒卸锁：
+1. lamb register / transcript 自动发现与 sheepdog board 缩进展示；
+2. lamb spawn 后台 CLI 子进程、日志落盘、lamb done 与 lamb list 生命周期；
+3. 母羊交 waiting 回执（带 lamb:<id> 锚点）立即释放 pending_batch_id 锁，期间新消息不阻塞，羔羊完工后自动回流 lamb_report 并关掉 work_item；
+4. 羔羊越权硬拦截（reply / reply-card / ask / report / forward / receipt / resolve / watch 均返回退出码 2）；
+5. 活跃羔羊心跳透传防母羊误报 stalled / lost 失联告警，以及羔羊危险命令审计归属母羊。
+"""
+
+import io
+import json
+import os
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from sheepdog import cli, duty
+from sheepdog import session as sm
+from sheepdog.config import DEFAULT_DANGER_PATTERNS
+from sheepdog.engine import BUS_TOPIC_ID, complete_lamb, register_lamb, write_receipt
+from sheepdog.prompts import interface_section
+from sheepdog.sink.agentapi import transcript_path
+
+from test_duty import DutyBase, ago, tool, utc
+from test_guardrails import run_command
+from test_roster import msg
+
+
+def invoke_subagent_line(at: datetime, title: str, cid: str = "", step: int = 20) -> dict:
+    args = {
+        "TaskTitle": json.dumps(title),
+        "ConversationId": json.dumps(cid),
+        "toolSummary": json.dumps(f"Subagent: {title}"),
+    }
+    return {
+        "step_index": step,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "created_at": utc(at),
+        "thinking": "spawn subagent",
+        "content": "",
+        "tool_calls": [{"name": "invoke_subagent", "args": args}],
+    }
+
+
+class LambTest(DutyBase):
+    def test_763_lamb_register_and_board_display(self):
+        # 1. 显式 CLI 注册一只 subagent 羔羊
+        rc, out = self.cli(
+            "lamb", "register",
+            "--topic", "tp_alpha",
+            "--title", "核验 PR #101 与 Tag",
+            "--cid", "conv_test_lamb_sub1",
+            "--lamb-id", "lamb_sub01",
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("lamb_sub01", out)
+
+        # 2. 母羊 transcript 中出现 invoke_subagent 调用时自动发现补建
+        self.append("conv_test_alpha", invoke_subagent_line(ago(1), "并发核查 Cloud Run 流量", cid="conv_test_lamb_sub2"))
+        self.d.dispatch_once()
+
+        active = self.store.get_active_lambs("tp_alpha")
+        self.assertEqual(len(active), 2)
+        ids = {lb["lamb_id"] for lb in active}
+        self.assertIn("lamb_sub01", ids)
+
+        # 3. sheepdog board 文本模式在母羊卡片下缩进展示 ↳ 🐑
+        rc_b, board_txt = self.cli("board")
+        self.assertEqual(rc_b, 0, board_txt)
+        self.assertIn("    ↳ 🐑 lamb_sub01 [subagent] 核验 PR #101 与 Tag · running · 心跳", board_txt)
+        self.assertIn("[subagent] 并发核查 Cloud Run 流量 · running · 心跳", board_txt)
+
+        # 4. sheepdog board --json 包含 lambs 列表
+        rc_j, board_json = self.cli("board", "--json")
+        self.assertEqual(rc_j, 0, board_json)
+        cards = json.loads(board_json)
+        alpha_card = next(c for c in cards if c["topic_id"] == "tp_alpha")
+        self.assertIn("lambs", alpha_card)
+        self.assertEqual(len(alpha_card["lambs"]), 2)
+        sub01 = next(x for x in alpha_card["lambs"] if x["lamb_id"] == "lamb_sub01")
+        self.assertEqual(sub01["kind"], "subagent")
+        self.assertEqual(sub01["task_title"], "核验 PR #101 与 Tag")
+        self.assertEqual(sub01["state"], "running")
+        self.assertEqual(sub01["conversation_id"], "conv_test_lamb_sub1")
+
+    def test_763_lamb_spawn_cli_and_done_lifecycle(self):
+        # 1. lamb spawn 启动后台 CLI 命令并重定向日志到 <state_dir>/lambs/<lamb_id>.log
+        rc, out = self.cli(
+            "lamb", "spawn",
+            "--topic", "tp_alpha",
+            "--title", "监听 Cloud Build 构建 b-99",
+            "--cmd", "echo build_ok_test_763",
+            "--lamb-id", "lamb_cli01",
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("lamb_cli01", out)
+
+        lb = self.store.get_lamb("lamb_cli01")
+        self.assertIsNotNone(lb)
+        self.assertEqual(lb["kind"], "cli")
+        self.assertEqual(lb["state"], "running")
+        self.assertTrue(lb["pid"] and lb["pid"] > 0)
+        log_file = Path(lb["log_path"])
+        self.assertTrue(log_file.exists())
+        self.assertIn("build_ok_test_763", log_file.read_text(encoding="utf-8"))
+
+        # 2. lamb list 默认列出运行中的羔羊
+        rc_l1, list_running = self.cli("lamb", "list", "--topic", "tp_alpha")
+        self.assertEqual(rc_l1, 0, list_running)
+        self.assertIn("lamb_cli01", list_running)
+        self.assertIn("[running]", list_running)
+
+        # 3. lamb done 标记完工并写入摘要
+        rc_d, out_d = self.cli(
+            "lamb", "done",
+            "--lamb-id", "lamb_cli01",
+            "--summary", "构建 b-99 成功，Revision 流量 100%",
+        )
+        self.assertEqual(rc_d, 0, out_d)
+        lb_after = self.store.get_lamb("lamb_cli01")
+        self.assertEqual(lb_after["state"], "done")
+        self.assertEqual(lb_after["result_summary"], "构建 b-99 成功，Revision 流量 100%")
+        self.assertTrue(bool(lb_after["finished_at"]))
+
+        # 4. lamb list 默认过滤掉已结束羔羊，--all 包含已结束羔羊
+        rc_l2, list_after = self.cli("lamb", "list", "--topic", "tp_alpha")
+        self.assertEqual(rc_l2, 0, list_after)
+        self.assertNotIn("lamb_cli01", list_after)
+
+        rc_all, list_all = self.cli("lamb", "list", "--topic", "tp_alpha", "--all")
+        self.assertEqual(rc_all, 0, list_all)
+        self.assertIn("lamb_cli01", list_all)
+        self.assertIn("[done]", list_all)
+        self.assertIn("构建 b-99 成功，Revision 流量 100%", list_all)
+
+    def test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back(self):
+        # 1. 给母羊投递第一批消息 b1，此时母羊处于 running 且持有 pending_batch_id
+        self.poll([msg(message_id="om_test_ticket_1", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="请发版 209900000012")])
+        self.d.dispatch_once()
+        t_running = self.store.get_topic("tp_alpha")
+        b1 = t_running["pending_batch_id"]
+        self.assertTrue(bool(b1))
+        self.assertEqual(t_running["state"], sm.RUNNING)
+
+        # 2. 母羊登记羔羊并在 30 秒内交 status="waiting" 回执（带 anchors: ["lamb:lamb_w01"]）
+        register_lamb(self.store, "tp_alpha", "核验 PR 与线上版本", kind="subagent", lamb_id="lamb_w01")
+        rc, out = self.cli(
+            "receipt",
+            "--topic", "tp_alpha",
+            "--batch", b1,
+            "--json", json.dumps({
+                "status": "waiting",
+                "summary": "已派羔羊 lamb_w01 核验单据，等待结果回流",
+                "anchors": ["lamb:lamb_w01"],
+            }, ensure_ascii=False),
+        )
+        self.assertEqual(rc, 0, out)
+
+        # 3. 立即验证：母羊 pending_batch_id 已释放为 None，状态回到 active，work_items 登记了 lamb:lamb_w01 (waiting_other)
+        t_unlocked = self.store.get_topic("tp_alpha")
+        self.assertIsNone(t_unlocked["pending_batch_id"])
+        self.assertEqual(t_unlocked["state"], sm.ACTIVE)
+        w = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_w01"))
+        self.assertIsNotNone(w)
+        self.assertEqual(w["state"], duty.WAITING_OTHER)
+        self.assertIn("lamb_w01", w["waiting_on"])
+        self.assertIsNone(w["closed_at"])
+
+        # 4. 羔羊运行期间，新消息可以立即投递给母羊，完全不阻塞
+        self.poll([msg(message_id="om_test_urgent_ping", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="顺便问下进度")])
+        self.d.dispatch_once()
+        sent_to_alpha = self.sink.to("conv_test_alpha")[-1]
+        self.assertIn("om_test_urgent_ping", sent_to_alpha)
+        self.ack("tp_alpha")
+        self.d.dispatch_once()
+
+        # 5. 羔羊完工：lamb done 触发 lamb_report 系统消息入队并关掉 work_items 中的 lamb:lamb_w01
+        complete_lamb(self.store, "lamb_w01", summary="PR 已合入，线上 v1.2 < 待发 v1.3，可安全发布", state="done")
+        w_closed = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_w01"))
+        self.assertEqual(w_closed["state"], duty.DONE)
+        self.assertIsNotNone(w_closed["closed_at"])
+        self.assertIn("可安全发布", w_closed["result"])
+
+        # 下一轮 dispatch_once 将【系统提示 · 羔羊完工汇报】作为批次投递给母羊
+        self.d.dispatch_once()
+        report_batch = self.sink.to("conv_test_alpha")[-1]
+        self.assertIn("【系统提示 · 羔羊完工汇报】", report_batch)
+        self.assertIn("lamb_w01", report_batch)
+        self.assertIn("PR 已合入，线上 v1.2 < 待发 v1.3，可安全发布", report_batch)
+
+    def test_763_lamb_permission_block_outbound_and_receipt(self):
+        self.cfg.source.enabled = False
+        self.cfg.notify.file = str(Path(self.tmp.name) / "notify.log")
+        # 登记一只属于 tp_alpha 的羔羊
+        register_lamb(
+            self.store,
+            "tp_alpha",
+            "只读核查羔羊",
+            kind="subagent",
+            conversation_id="conv_test_lamb_only",
+            lamb_id="lamb_blk01",
+        )
+        self.poll([msg(message_id="om_test_in_1", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="测试消息")])
+        self.d.dispatch_once()
+        b_id = self.store.get_topic("tp_alpha")["pending_batch_id"]
+
+        commands = [
+            ("reply", ["--topic", "tp_alpha", "--to", "om_test_in_1", "--text", "越权代回"]),
+            ("reply-card", ["--topic", "tp_alpha", "--text", "越权卡片"]),
+            ("ask", ["--topic", "tp_alpha", "--title", "越权提问", "--text", "能发吗"]),
+            ("report", ["--topic", "tp_alpha", "--title", "越权汇报", "--text", "发完了"]),
+            ("forward", ["--topic", "tp_alpha", "--note", "越权转交"]),
+            ("receipt", ["--topic", "tp_alpha", "--batch", b_id, "--json", '{"status":"handled","summary":"越权回执"}']),
+            ("resolve", ["--topic", "tp_alpha", "--key", "k1", "--why", "越权结案"]),
+            ("watch", ["--topic", "tp_alpha", "--person", "ou_test_other", "--note", "越权等待"]),
+        ]
+
+        # 方式 A：环境变量 SHEEPDOG_LAMB_ID 命中拦截
+        with mock.patch.dict(os.environ, {"SHEEPDOG_LAMB_ID": "lamb_blk01"}):
+            for cmd_name, argv in commands:
+                rc, out = self.cli(cmd_name, *argv)
+                self.assertEqual(rc, 2, f"{cmd_name} should exit with 2, got {rc}: {out}")
+                self.assertIn("禁止越权：当前执行体是羔羊", out)
+                self.assertIn("lamb_blk01", out)
+                self.assertIn("tp_alpha", out)
+
+        # 方式 B：会话 conversation_id 匹配 lambs 表拦截
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_CONVERSATION_ID": "conv_test_lamb_only"}, clear=False):
+            rc_r, out_r = self.cli("reply", "--topic", "tp_alpha", "--to", "om_test_in_1", "--text", "越权代回")
+            self.assertEqual(rc_r, 2, out_r)
+            self.assertIn("禁止越权：当前执行体是羔羊", out_r)
+
+        # 母羊批次依然保持原状态，未被羔羊篡改
+        self.assertEqual(self.store.get_topic("tp_alpha")["pending_batch_id"], b_id)
+
+    def test_763_active_lamb_prevents_parent_stalled_alert(self):
+        # 1. 母羊 35 分钟前收到批次并做了最后一次动作，之后一直沉默等待羔羊
+        self.append("conv_test_alpha", tool(ago(35), "Spawn subagent", "Spawning subagent", cmd="echo start"))
+        self.sent_batch("tp_alpha", 35)
+        self.set_mtime("conv_test_alpha", ago(35))
+
+        # 2. 名下有一只心跳新鲜（2 分钟前刚活动）的活跃羔羊
+        register_lamb(
+            self.store,
+            "tp_alpha",
+            "Cloud Build 20 分钟构建",
+            kind="subagent",
+            conversation_id="conv_test_lamb_fresh",
+            lamb_id="lamb_fresh01",
+        )
+        self.append("conv_test_lamb_fresh", tool(ago(2), "Polling Cloud Build", "Polling build", cmd="gcloud builds list"))
+        self.d._tick_lambs()
+
+        # 3. 跑在岗表巡检：母羊已有 35 分钟无动作（超过 stall_minutes=15 和 lost_minutes=30），
+        #    但因名下有未超时的活跃羔羊，母羊状态必须保持 waiting，绝不判 stalled / lost，也不给主人发报警
+        self.notices.clear()
+        self.round()
+        c = self.card("tp_alpha")
+        self.assertEqual(c["run_state"], duty.WAITING)
+        self.assertIn("等待羔羊 lamb_fresh01", c["detail"])
+        self.assertEqual(self.notices, [])
+
+        # 4. 羔羊在自己的 transcript 中执行了危险命令，审计必须归属到母羊 tp_alpha 并注明（由羔羊 lamb_fresh01 执行）
+        self.cfg.audit.topics = ["tp_alpha"]
+        self.cfg.audit.danger_patterns = list(DEFAULT_DANGER_PATTERNS)
+        self.append(
+            "conv_test_lamb_fresh",
+            run_command("gcloud builds triggers run prod-api --tag=v1.0.0", step=88, at=utc(ago(1))),
+        )
+        self.d._audit_commands()
+        self.assertTrue(any("由羔羊 lamb_fresh01 执行" in n and "tp_alpha" in n for n in self.notices), self.notices)
+
+    def test_763_real_antigravity_transcript_subagent_lifecycle(self):
+        cid1 = "aaaa0005-0000-4000-8000-0000000a0005"
+        cid2 = "aaaa0006-0000-4000-8000-0000000a0006"
+
+        # Step 1: 真实 Antigravity PLANNER_RESPONSE（Subagents 是 JSON 字符串，且此时尚无 conversationId）
+        step1 = {
+            "step_index": 30,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(5)),
+            "thinking": "launch two subagents",
+            "content": "",
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": json.dumps([
+                            {
+                                "Model": "inherit",
+                                "Prompt": "Implement 7.63 lamb lifecycle",
+                                "Role": "Phase 1 Lamb Implementer",
+                                "TypeName": "sheepdog-implement",
+                            },
+                            {
+                                "Model": "inherit",
+                                "Prompt": "Design 7.49 session group",
+                                "Role": "Phase 2 Group Designer",
+                                "TypeName": "sheepdog-design",
+                            },
+                        ]),
+                        "toolSummary": "Launch two subagents",
+                    },
+                }
+            ],
+        }
+        # Step 2: 真实 Antigravity GENERIC（Created the following subagents: 块带出真实 conversationId）
+        step2 = {
+            "step_index": 31,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2025-01-18T05:55:57+08:00\n"
+                "Completed At: 2025-01-18T05:55:58+08:00\n"
+                "Created the following subagents:\n"
+                "{\n"
+                f'  "conversationId": "{cid1}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/test_home/.gemini/antigravity/brain/{cid1}/.system_generated/logs/transcript.jsonl",\n'
+                '  "workspaceUris": []\n'
+                "}\n"
+                "{\n"
+                f'  "conversationId": "{cid2}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/test_home/.gemini/antigravity/brain/{cid2}/.system_generated/logs/transcript.jsonl",\n'
+                '  "workspaceUris": []\n'
+                "}"
+            ),
+        }
+        self.append("conv_test_alpha", step1, step2)
+
+        # 子代理在各自 transcript 中活动（一个更新心跳，一个触发危险命令审计）
+        self.cfg.audit.topics = ["tp_alpha"]
+        self.cfg.audit.danger_patterns = list(DEFAULT_DANGER_PATTERNS)
+        self.append(cid1, tool(ago(1), "Running unit tests", "Running tests", cmd="python3 -m unittest"))
+        self.append(cid2, run_command("gcloud builds triggers run prod-api --tag=v2.0.0", step=12, at=utc(ago(1))))
+
+        self.d.dispatch_once()
+
+        active = self.store.get_active_lambs("tp_alpha")
+        self.assertEqual(len(active), 2)
+        by_cid = {lb["conversation_id"]: lb for lb in active}
+        self.assertIn(cid1, by_cid)
+        self.assertIn(cid2, by_cid)
+        self.assertEqual(by_cid[cid1]["task_title"], "Phase 1 Lamb Implementer")
+        self.assertEqual(by_cid[cid2]["task_title"], "Phase 2 Group Designer")
+        # 心跳已从子代理 transcript 刷新，且危险命令审计已归属到母羊 tp_alpha
+        self.assertTrue(any(f"由羔羊 {by_cid[cid2]['lamb_id']} 执行" in n and "tp_alpha" in n for n in self.notices), self.notices)
+
+        # Step 3: 真实 Antigravity SYSTEM_MESSAGE（子代理回信，自动将对应羔羊标为 done）
+        step3 = {
+            "step_index": 32,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(0)),
+            "content": f"[Message] timestamp=2025-01-17T22:02:22Z sender={cid2} priority=MESSAGE_PRIORITY_HIGH content=# Done report",
+        }
+        self.append("conv_test_alpha", step3)
+        self.d.dispatch_once()
+
+        lb1 = self.store.find_lamb_by_cid(cid1)
+        lb2 = self.store.find_lamb_by_cid(cid2)
+        self.assertEqual(lb1["state"], "running")
+        self.assertEqual(lb2["state"], "done")
+        self.assertIn("Done report", lb2["result_summary"])
+        self.assertEqual(lb2["report_msg_id"], "native_system_message")
+
+    def test_763_real_transcript_edge_cases_singular_truncated_cron_and_kill(self):
+        cid_single = "aaaa0007-0000-4000-8000-0000000a0007"
+        cid_other = "aaaa0008-0000-4000-8000-0000000a0008"
+
+        # 1. Truncated Subagents JSON string + run_command stdout noise + singular "Created the following subagent:"
+        truncated_step = {
+            "step_index": 40,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(5)),
+            "truncated_fields": ["thinking", "tool_calls"],
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": '[{"Model":"inherit","Role":"Real Transcript Fixer","Prompt":"Very long prompt...\n<truncated 5134 bytes>',
+                        "toolSummary": "Launch fixer",
+                    },
+                }
+            ],
+        }
+        noise_cmd_step = {
+            "step_index": 41,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2025-01-18T15:35:46+08:00\n"
+                "Completed At: 2025-01-18T15:35:48+08:00\n"
+                "Command exited with code 0.\n\n"
+                "Command output:\n"
+                "Created the following subagents:\n"
+                '{\n  "conversationId": "deadbeef-dead-beef-dead-beefdeadbeef"\n}'
+            ),
+        }
+        singular_created_step = {
+            "step_index": 42,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "content": (
+                "Created At: 2025-01-18T15:37:50+08:00\n"
+                "Completed At: 2025-01-18T15:37:52+08:00\n"
+                "Created the following subagent:\n"
+                "{\n"
+                f'  "conversationId": "{cid_single}",\n'
+                f'  "logAbsoluteUri": "file:///tmp/.gemini/antigravity/brain/{cid_single}/.system_generated/logs/transcript.jsonl"\n'
+                "}"
+            ),
+        }
+        # 2. Second subagent + cron /task-133 and markdown prose in SYSTEM_MESSAGE (must NOT trigger subagent return)
+        second_invoke_step = {
+            "step_index": 43,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(3)),
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Role": json.dumps("Phase 2 Independent Verifier"),
+                    },
+                }
+            ],
+        }
+        second_created_step = {
+            "step_index": 44,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(3)),
+            "content": (
+                "Created At: 2025-01-18T15:38:00+08:00\n"
+                "Completed At: 2025-01-18T15:38:01+08:00\n"
+                "Created the following subagent:\n"
+                "{\n"
+                f'  "conversationId": "{cid_other}"\n'
+                "}"
+            ),
+        }
+        cron_and_prose_msg = {
+            "step_index": 45,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(2)),
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2025-01-18T07:41:00Z sender={cid_single}/task-133 "
+                "priority=MESSAGE_PRIORITY_HIGH content=Cron wakeup\n"
+                "Also note in markdown prose: [Message] timestamp=2025-01-18T07:41:00Z sender=<cid> content=example\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }
+        self.append(
+            "conv_test_alpha",
+            truncated_step,
+            noise_cmd_step,
+            singular_created_step,
+            second_invoke_step,
+            second_created_step,
+            cron_and_prose_msg,
+        )
+        self.d.dispatch_once()
+
+        # Verify: deadbeef from run_command was ignored; both real subagents are running; cron /task-133 did NOT close cid_single
+        self.assertIsNone(self.store.find_lamb_by_cid("deadbeef-dead-beef-dead-beefdeadbeef"))
+        lb_single = self.store.find_lamb_by_cid(cid_single)
+        lb_other = self.store.find_lamb_by_cid(cid_other)
+        self.assertIsNotNone(lb_single)
+        self.assertIsNotNone(lb_other)
+        self.assertEqual(lb_single["task_title"], "Real Transcript Fixer")
+        self.assertEqual(lb_single["state"], "running")
+        self.assertEqual(lb_other["task_title"], "Phase 2 Independent Verifier")
+        self.assertEqual(lb_other["state"], "running")
+
+        # Register open work_item on tp_alpha for lb_other to verify manage_subagents kill closes it
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "waiting", "summary": "等待羔羊", "anchors": [f"lamb:{lb_other['lamb_id']}"]},
+        )
+
+        # 3. Real <SYSTEM_MESSAGE> return for cid_single + manage_subagents kill for cid_other
+        real_return_step = {
+            "step_index": 46,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(1)),
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2025-01-18T07:51:00Z sender={cid_single} "
+                "priority=MESSAGE_PRIORITY_HIGH content=All edge cases fixed.\n</SYSTEM_MESSAGE>"
+            ),
+        }
+        kill_step = {
+            "step_index": 47,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(0)),
+            "tool_calls": [
+                {
+                    "name": "manage_subagents",
+                    "args": {
+                        "Action": json.dumps("kill"),
+                        "ConversationIds": json.dumps([cid_other]),
+                    },
+                }
+            ],
+        }
+        self.append("conv_test_alpha", real_return_step, kill_step)
+        self.d.dispatch_once()
+
+        lb_single_after = self.store.find_lamb_by_cid(cid_single)
+        lb_other_after = self.store.find_lamb_by_cid(cid_other)
+        self.assertEqual(lb_single_after["state"], "done")
+        self.assertIn("All edge cases fixed", lb_single_after["result_summary"])
+        self.assertEqual(lb_single_after["report_msg_id"], "native_system_message")
+
+        self.assertEqual(lb_other_after["state"], "done")
+        self.assertEqual(lb_other_after["result_summary"], "已由母羊销毁")
+        self.assertEqual(lb_other_after["report_msg_id"], "killed_by_parent")
+        w_other = self.store.get_work("tp_alpha", duty.norm_key(f"lamb:{lb_other['lamb_id']}"))
+        self.assertEqual(w_other["state"], duty.DONE)
+        self.assertIsNotNone(w_other["closed_at"])
+
+    def test_763_lamb_interface_in_standing_rules(self):
+        managed_if = interface_section("tp_alpha", bus=False, remind=[15], expire=60)
+        self.assertIn("### 羔羊（重活后台并发与 30 秒卸锁）", managed_if)
+        self.assertIn("45 秒", managed_if)
+        self.assertIn("sheepdog lamb spawn", managed_if)
+        self.assertIn('"anchors":["lamb:<lamb_id>"]', managed_if)
+
+        bus_if = interface_section("tp_bus", bus=True, remind=[15], expire=60)
+        self.assertNotIn("sheepdog lamb spawn", bus_if)
+
+    def test_763_lamb_register_and_auto_discover_from_transcript(self):
+        self.test_763_lamb_register_and_board_display()
+
+    def test_763_lamb_outbound_commands_hard_blocked(self):
+        self.test_763_lamb_permission_block_outbound_and_receipt()
+
+    def test_763_parent_waiting_lamb_releases_batch_lock(self):
+        self.test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back()
+
+    def test_763_lamb_heartbeat_prevents_parent_stalled(self):
+        self.test_763_active_lamb_prevents_parent_stalled_alert()
+
+    def test_763_lamb_completion_delivers_report_batch(self):
+        self.test_763_parent_waiting_receipt_releases_lock_and_lamb_done_reports_back()
+
+    def test_763_reply_text_always_builds_card(self):
+        from sheepdog import outbound
+
+        plain, card = outbound.reply_body(
+            self.cfg,
+            text="简短纯文本代回",
+            card_text="",
+            summary="",
+        )
+        self.assertIsNotNone(card)
+        self.assertEqual(card["schema"], "2.0")
+        self.assertIn("简短纯文本代回", plain)
+
+        # outbound.reply 传 text=... 也必须向 source.reply_to 传非空 card 且 text=""
+        self.poll([msg(message_id="om_test_card_in", chat_type="p2p", chat_id="oc_test_alpha_p2p", content="帮我看下配置")])
+        self.d.dispatch_once()
+        sent_calls = []
+
+        class FakeReplySource:
+            def chat_messages_since(self, chat_id, me, since):
+                return []
+
+            def reply_to(self, target_id, *, identity="user", idem_key="", text="", card=None):
+                sent_calls.append({"target_id": target_id, "identity": identity, "text": text, "card": card})
+                return {"message_id": "om_test_card_out"}
+
+        res = outbound.reply(
+            self.cfg,
+            self.store,
+            FakeReplySource(),
+            "tp_alpha",
+            "om_test_card_in",
+            text="配置已核对无误",
+        )
+        self.assertEqual(res.message_id, "om_test_card_out")
+        self.assertEqual(len(sent_calls), 1)
+        self.assertEqual(sent_calls[0]["text"], "")
+        self.assertIsNotNone(sent_calls[0]["card"])
+        self.assertEqual(sent_calls[0]["card"]["schema"], "2.0")
+
+    def test_763_waiting_receipt_binds_owner_echo_and_settles_watch_and_echo_sync_heals(self):
+        self.cfg.session.owner_receipt_relay = True
+        self.cfg.session.owner_relay_after_minutes = 0
+        self.cfg.escalation.chat_ids = ["oc_test_esc"]
+
+        # 1. 准备一条 replied 状态的 watch，以及一条主人在找主人聊天引用提问的回复（产生 owner_echoes 欠账）
+        wid = self.store.add_watch(
+            "tp_alpha",
+            "ou_test_colleague",
+            "oc_test_alpha_p2p",
+            "等同事确认窗口",
+        )
+        self.store.add_escalation(
+            "om_test_esc_q1",
+            "tp_alpha",
+            "oc_test_esc",
+            "需要你定：今晚发版吗",
+            utc(ago(5)),
+        )
+        self.poll([
+            msg(
+                message_id="om_test_colleague_rep",
+                chat_type="p2p",
+                chat_id="oc_test_alpha_p2p",
+                sender_id="ou_test_colleague",
+                content="窗口可以，今晚 22 点",
+            ),
+            msg(
+                message_id="om_test_owner_cmd",
+                chat_type="p2p",
+                chat_id="oc_test_esc",
+                sender_id="ou_test_me",
+                reply_to="om_test_esc_q1",
+                content="好，请用羔羊跑一下构建并确认窗口",
+            ),
+        ])
+        self.d.dispatch_once()
+
+        t_run = self.store.get_topic("tp_alpha")
+        b1 = t_run["pending_batch_id"]
+        self.assertTrue(bool(b1))
+        self.assertEqual(self.store.get_watch(wid)["status"], "replied")
+        self.assertIsNone(self.store.get_watch(wid)["closed_at"])
+
+        # 2. 在下一轮 dispatch_once() 跑 _echo_sync() 之前，会话当场提交 status="waiting" 回执（含 lamb 与 watch_done 锚点）
+        register_lamb(self.store, "tp_alpha", "后台构建", kind="subagent", lamb_id="lamb_echo01")
+        rc, out = self.cli(
+            "receipt",
+            "--topic", "tp_alpha",
+            "--batch", b1,
+            "--json", json.dumps({
+                "status": "waiting",
+                "summary": "已登记羔羊 lamb_echo01 跑构建，同时确认同事窗口",
+                "anchors": ["lamb:lamb_echo01", f"watch_done:{wid}"],
+            }, ensure_ascii=False),
+        )
+        self.assertEqual(rc, 0, out)
+
+        # 立即断言（还没跑下一轮 dispatch_once）：watch 已结清关闭，owner_echoes 已绑定 relay_batch
+        w_after = self.store.get_watch(wid)
+        self.assertIsNotNone(w_after["closed_at"])
+        self.assertEqual(w_after["close_reason"], "done")
+        echo_row = self.store.echo_get("om_test_owner_cmd")
+        self.assertIsNotNone(echo_row)
+        self.assertEqual(echo_row["stage"], "delivered")
+        self.assertEqual(echo_row["relay_batch"], b1)
+        self.assertEqual(echo_row["relay_status"], "waiting")
+        self.assertEqual(echo_row["relay_summary"], "已登记羔羊 lamb_echo01 跑构建，同时确认同事窗口")
+
+        # 3. 模拟历史遗留：delivered 但 relay_batch 为空、而 dispatches 已 acked 的记录，验证 _echo_sync 自愈兜底
+        self.store.echo_update(
+            "om_test_owner_cmd",
+            relay_batch=None,
+            relay_at=None,
+            relay_status=None,
+            relay_summary=None,
+        )
+        self.assertIsNone(self.store.echo_get("om_test_owner_cmd")["relay_batch"])
+
+        self.d._echo_sync()
+        healed = self.store.echo_get("om_test_owner_cmd")
+        self.assertEqual(healed["relay_batch"], b1)
+        self.assertEqual(healed["relay_status"], "waiting")
+        self.assertEqual(healed["relay_summary"], "已登记羔羊 lamb_echo01 跑构建，同时确认同事窗口")
+
+    def test_763_cli_lamb_stdin_devnull_and_auto_reap_done_and_failed(self):
+        import sys
+        import time
+
+        # 1. 启动读取 sys.stdin 的 CLI 羔羊：验证 stdin=DEVNULL 立即读到 EOF 正常退出，且 _tick_lambs 自动收割为 done
+        cmd_ok = f"{sys.executable} -c 'import sys; d = sys.stdin.read(); print(\"stdin_eof_ok:\", len(d))'"
+        rc1, out1 = self.cli(
+            "lamb", "spawn",
+            "--topic", "tp_alpha",
+            "--title", "测试 stdin DEVNULL 与正常收割",
+            "--cmd", cmd_ok,
+            "--lamb-id", "lamb_reap_ok",
+        )
+        self.assertEqual(rc1, 0, out1)
+        lb_ok = self.store.get_lamb("lamb_reap_ok")
+        log_ok = Path(lb_ok["log_path"])
+        for _ in range(40):
+            if log_ok.exists() and "stdin_eof_ok: 0" in log_ok.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.05)
+        time.sleep(0.05)
+
+        self.d._tick_lambs()
+        lb_ok_after = self.store.get_lamb("lamb_reap_ok")
+        self.assertEqual(lb_ok_after["state"], "done")
+        self.assertTrue(bool(lb_ok_after["finished_at"]))
+        self.assertIn("stdin_eof_ok: 0", lb_ok_after["result_summary"])
+        self.assertNotIn("Bad file descriptor", log_ok.read_text(encoding="utf-8"))
+
+        # 2. 启动抛异常退出的 CLI 羔羊：验证 _tick_lambs 识别 Traceback/Error 自动收割为 failed
+        cmd_err = f"{sys.executable} -c 'raise RuntimeError(\"Fatal crash in CLI lamb\")'"
+        rc2, out2 = self.cli(
+            "lamb", "spawn",
+            "--topic", "tp_alpha",
+            "--title", "测试异常退出收割",
+            "--cmd", cmd_err,
+            "--lamb-id", "lamb_reap_err",
+        )
+        self.assertEqual(rc2, 0, out2)
+        lb_err = self.store.get_lamb("lamb_reap_err")
+        log_err = Path(lb_err["log_path"])
+        for _ in range(40):
+            if log_err.exists() and "RuntimeError" in log_err.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.05)
+        time.sleep(0.05)
+
+        self.d._tick_lambs()
+        lb_err_after = self.store.get_lamb("lamb_reap_err")
+        self.assertEqual(lb_err_after["state"], "failed")
+        self.assertTrue(bool(lb_err_after["finished_at"]))
+        self.assertIn("RuntimeError: Fatal crash in CLI lamb", lb_err_after["result_summary"])
+
+    def test_763_subagent_dedup_and_cid_anchor_closes_work_item(self):
+        cid = "99999999-1111-2222-3333-444444444444"
+
+        # 1. 母羊在 transcript 中调用 invoke_subagent（先产生无 cid 的记录），随后母羊又手动跑 lamb register --cid
+        step_invoke = {
+            "step_index": 60,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": utc(ago(4)),
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {"Role": json.dumps("Dedup Subagent Worker")},
+                }
+            ],
+        }
+        self.append("conv_test_alpha", step_invoke)
+        self.d.dispatch_once()
+
+        active_initial = self.store.get_active_lambs("tp_alpha")
+        self.assertEqual(len(active_initial), 1)
+        initial_lamb_id = active_initial[0]["lamb_id"]
+        self.assertIsNone(active_initial[0]["conversation_id"])
+
+        # 母羊手动调用 sheepdog lamb register --cid <cid>，必须复用已有的无 cid 羔羊记录而非新增第二条
+        rc_reg, out_reg = self.cli(
+            "lamb", "register",
+            "--topic", "tp_alpha",
+            "--title", "手动补充注册同一只子代理",
+            "--cid", cid,
+        )
+        self.assertEqual(rc_reg, 0, out_reg)
+        active_after_reg = self.store.get_active_lambs("tp_alpha")
+        self.assertEqual(len(active_after_reg), 1)
+        self.assertEqual(active_after_reg[0]["lamb_id"], initial_lamb_id)
+        self.assertEqual(active_after_reg[0]["conversation_id"], cid)
+
+        # 随后 transcript 出现 Created the following subagent: 块，同样幂等不产生重复
+        step_created = {
+            "step_index": 61,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": utc(ago(3)),
+            "content": (
+                "Created At: 2025-01-18T15:41:00+08:00\n"
+                "Completed At: 2025-01-18T15:41:01+08:00\n"
+                "Created the following subagent:\n"
+                f'{{\n  "conversationId": "{cid}"\n}}'
+            ),
+        }
+        self.append("conv_test_alpha", step_created)
+        self.d.dispatch_once()
+        self.assertEqual(len(self.store.get_active_lambs("tp_alpha")), 1)
+
+        # 2. 母羊交 waiting 回执时在 anchors 里传了 lamb:<cid>（UUID），apply_receipt_work 必须归一为 lamb:<lamb_id>
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "waiting", "summary": "等待子代理返回", "anchors": [f"lamb:{cid}"]},
+        )
+        w_open = self.store.get_work("tp_alpha", duty.norm_key(f"lamb:{initial_lamb_id}"))
+        self.assertIsNotNone(w_open)
+        self.assertEqual(w_open["state"], duty.WAITING_OTHER)
+        self.assertIsNone(w_open["closed_at"])
+
+        # 3. 子代理通过原生 <SYSTEM_MESSAGE> 回信结案，必须同时关闭 lamb 记录与 work_items 中的事项
+        step_return = {
+            "step_index": 62,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": utc(ago(1)),
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2025-01-18T08:01:00Z sender={cid} "
+                "priority=MESSAGE_PRIORITY_HIGH content=Subagent dedup and work item closed.\n</SYSTEM_MESSAGE>"
+            ),
+        }
+        self.append("conv_test_alpha", step_return)
+        self.d.dispatch_once()
+
+        lb_done = self.store.get_lamb(initial_lamb_id)
+        self.assertEqual(lb_done["state"], "done")
+        w_closed = self.store.get_work("tp_alpha", duty.norm_key(f"lamb:{initial_lamb_id}"))
+        self.assertEqual(w_closed["state"], duty.DONE)
+        self.assertIsNotNone(w_closed["closed_at"])
+
+    def test_reg_066_lamb_work_item_no_reopen_on_handled_receipt_and_reconcile(self):
+        """规格 7.98（REG-066）：
+        1. 母羊在 waiting 回执传入带括号后缀的脏锚点（如 'lamb:lamb_0000a001（母羊'）时，clean_lamb_anchor_id 自动归一为 'lamb:lamb_0000a001'；
+        2. 羔羊完工收口（done）后，母羊处理 lamb_report 批次提交非 waiting 结案回执（status='handled'/'needs_decision'）且仍带 'anchors': ['lamb:lamb_0000a001'] 时，
+           apply_receipt_work 绝不将已完结的 lamb 在办项反向重开为 waiting_other；
+        3. reconcile_lamb_work 自动将权威 lambs 表已完结（done/failed/timeout）或超时孤儿的未关闭 lamb:* work_items 收口为 done。
+        """
+        from sheepdog.engine import register_lamb, complete_lamb
+
+        lid = register_lamb(self.store, "tp_alpha", "执行 209900000013 构建审批与切流", kind="cli", lamb_id="lamb_0000a001", pid=12345)
+        self.assertEqual(lid, "lamb_0000a001")
+
+        # 1. 母羊交 waiting 回执时锚点粘连了中文括号 'lamb:lamb_0000a001（母羊'
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "waiting", "summary": "已派后台羔羊", "anchors": ["lamb:lamb_0000a001（母羊"]},
+        )
+        self.assertIsNone(self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_0000a001（母羊")))
+        w_wait = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_0000a001"))
+        self.assertIsNotNone(w_wait)
+        self.assertEqual(w_wait["state"], duty.WAITING_OTHER)
+        self.assertIsNone(w_wait["closed_at"])
+
+        # 2. 羔羊完工收口 -> work_items 中的 lamb:lamb_0000a001 变为 done
+        complete_lamb(self.store, "lamb_0000a001", summary="构建与切流 100% 完成", state="done")
+        w_done = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_0000a001"))
+        self.assertEqual(w_done["state"], duty.DONE)
+        self.assertIsNotNone(w_done["closed_at"])
+
+        # 3. 母羊随后处理 lamb_report 批次，提交 status='handled' 回执并顺带附了 anchors: ['lamb:lamb_0000a001']
+        duty.apply_receipt_work(
+            self.store,
+            "tp_alpha",
+            {"status": "handled", "summary": "已核对切流并办结审批单", "anchors": ["lamb:lamb_0000a001"]},
+        )
+        w_after_rcp = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_0000a001"))
+        self.assertEqual(w_after_rcp["state"], duty.DONE)
+        self.assertIsNotNone(w_after_rcp["closed_at"])
+
+        # 4. 模拟历史存量僵尸项（work_items 仍为 waiting_other / closed_at=None，但 lambs 表已 done）
+        self.store.update_work(w_after_rcp["id"], state=duty.WAITING_OTHER, closed_at=None)
+        closed_ids = duty.reconcile_lamb_work(self.store)
+        self.assertIn(w_after_rcp["id"], closed_ids)
+        w_reconciled = self.store.get_work("tp_alpha", duty.norm_key("lamb:lamb_0000a001"))
+        self.assertEqual(w_reconciled["state"], duty.DONE)
+        self.assertIsNotNone(w_reconciled["closed_at"])
+
+

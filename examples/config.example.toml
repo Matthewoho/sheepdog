@@ -1,0 +1,333 @@
+# sheepdog 配置示例
+# 复制到 ~/.config/sheepdog/config.toml 后修改。真实配置不要提交到仓库。
+
+# 「我」的 open_id（lark-cli auth status 可查）
+self_open_id = "ou_test_replace_me"
+
+# 会话在自己终端里敲的 sheepdog 命令：提示词里所有「去跑 sheepdog …」的命令文字、playbook 里的 {{cli}} 都用它。
+# 测试环境改成一个只连测试配置的包装脚本的绝对路径（带空格也行，会自动加引号）。下一轮生效
+cli_name = "sheepdog"
+
+poll_interval_seconds = 60
+# 每次拉取向前重叠的秒数（防止搜索索引延迟漏消息，按 message_id 去重）
+overlap_seconds = 180
+# 每轮最多翻几页（每页 50 条）；拉不完不推进水位线，下一轮重拉
+max_pages = 100
+# 首次启动回看多久
+initial_lookback_minutes = 10
+timezone_offset = "+08:00"
+# agentapi（Antigravity App）| dryrun
+sink = "agentapi"
+retention_days = 7
+# 个人化 Prompt 覆盖层（相对本配置文件所在目录），例如告诉 session 遵循你的知识库协议
+prompt_overlay_path = "prompts/overlay.md"
+# 名册（相对本配置文件所在目录）：登记现有会话、按聊天归属推送。留空 = roster.toml，不存在时所有信号进总线
+roster_path = "roster.toml"
+# 业务规则 md 目录（相对本配置文件所在目录），从 examples/playbook/ 拷贝改写；每次组装 prompt 时现读
+playbook_dir = "playbook"
+# 安全规则（相对本配置文件所在目录），从 examples/security.example.toml 拷贝改写；不存在 = 没有规则
+security_path = "security.toml"
+
+[routing]
+keywords = ["生产", "prod", "故障", "告警", "回滚", "审批"]
+vip_sender_ids = []          # 关键人发言也送进会话（路由）；和名册 [[person]] 的 VIP（授权，7.61）不是一回事
+ignore_muted_chats = true
+dispatch_at_all = true
+dispatch_bot_p2p = false
+# 「机器人 ↔ 你」的私聊不要放这里，放到下面 [escalation] chat_ids，由 sheepdog 接管
+ignore_chat_ids = []
+# 机器人/应用发的消息正文以其中任一前缀开头就丢弃（reason = self_escalation）。
+# [escalation] 接管找你的聊天后已不需要它防回环，保留作其他聊天的兜底
+drop_bot_message_prefixes = ["🐕 需要你定 ·", "🐕 汇报 ·", "🐕 回复 ·", "🐕 [sheepdog·"]
+watch_chat_ids = []
+# 群里机器人/应用/系统发的消息不参与关键词匹配（机器人私聊的关键词规则不变）
+keyword_skip_bot_senders = true
+# 你本人在群里 @ 机器人（7.45，要开 [identity]）= 给助理的指令：按话题 / 引用归属 → 名册负责这个群的会话 → 总线送去，
+# 会话在忙就插队。关掉（false）：照旧当你的发言背景（owner_context）。热加载
+owner_at_assistant = true
+
+[session]
+title_prefix = "[managed]"
+# flash_lite | flash | pro，留空使用 App 默认模型
+model = ""
+bus_title = "Lark 信号·总线"
+human_attach_minutes = 15
+# 每条消息送进会话时最多带多少行正文，超过的末尾提示用 sheepdog show 看全文
+max_message_lines = 200
+receipt_timeout_minutes = 20
+# 7.50#6：批次记了 sent 但 Antigravity 会话记录里超过这么多分钟找不到批次号、且送出后会话记录没动静，改标 uncertain 并放开会话排队。0 = 关
+verify_transcript_minutes = 5
+# 代回以卡片发出：正文 + 右下角灰色小字标记（sheepdog reply-card 生成；playbook 里的 {{reply_suffix}}；默认动态取 🐕SheepDog v<版本号>）
+# reply_suffix = "🐕SheepDog v0.7.69"
+reply_card_width = "compact"   # compact（400px）| default（≤600px）| fill（撑满）
+# 会话在跑上一批（等回执）时，你在找主人聊天里的回复当轮单独插队送到（7.37）。
+# 关掉（false）：回到原来的排队，你的回复要等那个会话交了手上那批的回执（或回执超时，见 receipt_timeout_minutes）才随下一批送到；
+# 省掉的是插队那一批（每次插话多送一次、会话多读一段）。改完常驻进程下一轮生效，不用重启
+owner_priority = true
+# 插话送到后这么多分钟内，那个会话没给你发 ask / report，私聊你一次（7.52 起收进回音账本：每句最多一次；
+# 会话收掉 / 移出名册的不提醒）。0 = 关。改完常驻进程下一轮生效，不用重启
+owner_priority_followup_minutes = 10
+# 7.52 你的话一定有回音（都热加载）：
+# 一批里有你需要回应的话（找主人聊天里的回复、改口 / 撤回，群里 @ 机器人的指令），会话交这批回执时，要是从送到起它没给你发过
+# ask / report，牧羊犬把回执 summary 做成卡片替它回你（回到你那句话 / 它的话题里；群里 @ 的发到找主人聊天）。每批最多一次
+owner_receipt_relay = true
+# 带回最早在送到以后多少分钟发：这期间会话自己回了你就不带回。0 = 收到回执当轮就带回
+owner_relay_after_minutes = 0
+# 回音账本按卡住的环节私聊你，每句每个阶段最多一次：没送进任何会话当场报；排队超过这么多分钟报；送到以后这么多分钟没回音报
+# （插话送到的按上面 owner_priority_followup_minutes）。分钟数 0 = 这一项不报
+owner_undelivered_alert = true
+owner_queue_alert_minutes = 10
+owner_reply_alert_minutes = 15
+# 旧的代回前缀：playbook 里的 {{reply_prefix}}，保留兼容
+reply_prefix = "🐕 [Agent 代回] "
+
+[escalation]
+# 「找你」用的聊天（机器人与你的私聊）。其中：机器人带头的提问登记为「需要你定」；你的回复投回提问的会话；其他丢弃
+chat_ids = []
+# 从机器人提问正文里提取 topic_id，必须有命名分组 topic；和 playbook/common.md 里约定的开头保持一致
+# 新格式第一行：🐕 需要你定 · <短标题> [tp_xxx]；同时兼容旧格式 🐕 [sheepdog·<标题>·tp_xxx] 需要你定：
+header_regex = '^🐕 (?=.*需要你定).*?\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'
+# 机器人发给你的任何消息（问题、汇报、回复）：第一行里 [… tp_xxx] 认出来自哪个会话；你引用回复它时按这个送回
+attribution_regex = '\[[^\[\]]*?(?P<topic>tp_[a-z0-9_.-]+)\]'
+# 一条「需要你定」多久内算未结，超时自动关闭
+open_hours = 24
+# 离到期还剩这么多小时还开着，提醒负责会话核实一次（7.36）；0 = 不提醒
+remind_before_hours = 2
+# 会话结案（sheepdog resolve）后机器人在话题里补的那句「已结案」要不要 @ 你；默认不 @
+resolve_notice_at = false
+# 「需要你定」的跟进（7.36 / 7.38）：每轮判「可能已处理」（你后来在来源聊天说过话、点过表情、同一件事另一条已答 / 已结），
+# 给负责会话发一次核实提醒；快到期提醒一次；原会话已收掉的这两种提醒发给总线。
+# 关掉（false）：这些都不做，会话不会因为这个多收消息、多跑一轮；提问照旧 open_hours 后到期关闭，
+# resolve、来源记录、pending 清单照常（清单里不再写「↳ 你几点在哪说过」那一行）。改完下一轮生效
+followup = true
+# 你在找主人聊天里单独发「待办」，机器人当轮直接回清单，不经过总线（7.36）。
+# 关掉（false）：「待办」不拦截，照旧当一句普通回复（只有一个会话有未结提问时送给它，否则送总线）。改完下一轮生效
+owner_shortcut = true
+
+[escalation.aliases]
+# 第一行没有 topic_id、只有 [..·名字] 时，按名字认会话；认不出再和各会话标题比（唯一命中才算）
+"总线" = "tp_bus"
+
+[threads]
+# 一事一串（7.22）：会话用 sheepdog ask / report 找你，sheepdog 在正文前加的开头一行。{title} = 短标题，{topic} = topic_id。
+# ask 的这一行要能被上面的 header_regex 认出来（sheepdog doctor 会核对）
+ask_header = "🐕 需要你定 · {title} [{topic}]"
+report_header = "🐕 汇报 · {title} [{topic}]"
+# 你在话题里回复时送回会话的内容：话题里除了开头那条已经有 complex_min_replies 条（含你这一条）就算复杂，
+# 再附最近 recent_replies 条；开头那条、最近几条各截到多少字
+complex_min_replies = 3
+recent_replies = 5
+root_chars = 300
+reply_chars = 120
+# 只给飞书测试用，运行环境不要设：ask / report 发进这个群、这个群当成找主人聊天（要在 [source] only_chat_ids 里）
+# owner_chat_id = "oc_xxx"
+# 群话题归属（7.45，思路来自 PR #1 @Jerry030-1）：群里的话题回复 / 引用按话题开头那条（或被引用的那条）当初送到了哪个会话、
+# 是哪个会话代发的，直接送那个会话。名册里可以用 [[session.chats]] 的 thread_id = "omt_…" 显式绑定一个话题（覆盖自动判断、
+# 不过期）。关掉（false）：回到只按整群归属、watch、@ 和「最近处理过」分。热加载
+group_owner = true
+# 话题最近一次有人说话超过这么多小时就不再自动归属
+group_owner_hours = 72
+
+[topic_group]
+# 长期跟踪的主题放进专门的话题群（7.51）：一件事一个话题（事项，编号 T-<数字>），群里置顶一张索引卡。
+# chat_id 留空 = 不用话题群，和以前一模一样。群用 `sheepdog topic-group create` 建（--dry-run 先看要调的命令）：
+# 群主是你、机器人当管理员、只有群主和管理员能拉人。全部热加载
+enabled = true
+# chat_id = "oc_xxx"
+# 索引卡多久按证据对账一次（分钟）；没办完、多少天没动静算「沉睡」；办完以后多少小时没动静归档
+index_refresh_minutes = 10
+stale_after_days = 7
+archive_after_hours = 72
+# 索引卡满 13 天重发一张以后要不要取消旧卡的置顶（lark-cli 把取消置顶标成高风险，要 --yes）。默认不取消，旧卡改成「已停用」
+unpin_old_index = false
+# 索引卡「建议放进群」：私聊里还没进群的话题，最近 suggest_active_hours 小时内有动静，并且拖过 suggest_after_hours 小时、
+# 或你在里面回过 suggest_owner_replies 次以上；最多列 suggest_max 件（最近的在前），多的写「另有 N 件」
+suggest_after_hours = 8
+suggest_owner_replies = 2
+suggest_active_hours = 24
+suggest_max = 10
+
+[owner_context]
+# 你本人在聊天里的发言（以及编辑、撤回、点的表情）作为背景送给负责这个聊天的会话；不要回执、不点表情、不改会话状态
+enabled = true
+follow_hours = 24              # 聊天没有会话负责时，送给这么久内最近处理过它的会话（含总线）；都没有就不送
+skip_prefixes = ["🐕 [Agent 代回] "]   # 正文以这些开头的是会话代回的（旧的代回前缀）
+agent_markers = ["🐕SheepDog v", "[🐕Sheepdog Reply]"]   # 正文任意位置包含这些的也是会话代回（代回卡片右下角的标记）；两者任一命中即算
+reaction_lookback_hours = 24   # 查你对多久内投递过的消息点了表情
+reaction_check_minutes = 5     # 多久查一次表情；0 = 不查（查询只读）
+
+[loop_guard]
+# 防止会话和 Agent 机器人来回循环（不配也按下面的缺省值生效）
+agent_sender_names = ["agent-bot-a", "agent-bot-b"]  # 发送人名字包含其一（不分大小写）即视为 Agent，填你那边会自动回话的机器人
+agent_sender_ids = []                                 # 也可以按 open_id / app_id 精确指定
+treat_all_bots_as_agents = true                       # 机器人 / 应用发的一律按 Agent：照常投递，加一行标注（文字在 playbook 的 agent_sender_label.md）
+max_agent_replies = 4    # 同一聊天 window_minutes 内会话代回（按 owner_context 的 skip_prefixes / agent_markers 识别）超过这么多次、且对方是 Agent → 熔断
+window_minutes = 10
+cooldown_minutes = 30    # 冷却期间该聊天除你以外的消息只进 Inbox；sheepdog loops --clear <chat_id> 手动解除
+
+[bus]
+# 总线每天最多临时新开几个专属会话（sheepdog new-session）；0 = 禁止总线新开
+max_new_sessions_per_day = 5
+
+[audit]
+# 命令审计：每轮增量读这些会话的记录（Antigravity transcript / Codex rollout / Claude 记录），
+# 看它们新跑的命令；命中 danger_patterns 就经机器人私聊你，给犯规的会话排一条系统提示（措辞在 playbook 的 audit_offender.md），
+# 并提示 also_notify 里的会话别重复操作（audit_notify.md）。同一个会话 10 分钟内已经报过的同一条命令再跑不重复报；
+# 没报过的命令马上再报，每次报警都再给犯规会话排一条停手提示。
+# 第一次看某个会话时从它记录的末尾开始，不翻旧账。改了下一轮生效；danger_patterns = [] 等于关掉
+topics = ["tp_bus"]
+# 正则，对整理过的命令文本（续行合并、空白压成一个空格）做 search；不配就是下面这一份
+danger_patterns = [
+  "builds triggers run",
+  "builds .*approve|:approve",
+  "add-iam-policy-binding|remove-iam-policy-binding",
+  "run services update-traffic",
+  "secrets versions (access|add)",
+  "lark-cli approval tasks (approve|reject)",
+  "gh pr merge",
+  "gh workflow run",
+  "kubectl (apply|delete)",
+]
+# 命中 danger_patterns 但同时命中其中任一条的不报：查帮助、知识库记录脚本、sheepdog 自己的命令（含 forward 的备注）、
+# IM 收发（消息正文里提到这些命令名）、dry-run。对整条命令判断：一条复合命令里既有危险命令又有 lark-cli im，会被一起忽略。
+# 不配就是下面这一份；[] = 不忽略
+ignore_patterns = [
+  '(^|\s)--help(\s|$)',
+  '(^|\s)-h(\s|$)',
+  'notes_cli\.py',
+  'notes_kb\.py',
+  '(^|[\s/])sheepdog\s',
+  'lark-cli\s+im\s',
+  '--dry-run',
+]
+also_notify = []               # 比如负责发布的会话的 topic_id
+
+[duty]
+# 羊群看板：会话之间实时感知、互相沟通（sheepdog board / work / tell）。改了下一轮生效
+# 从消息正文认编号的正则（有命名分组 key 就取它）：编号登记在别的会话名下、没结束 → 给消息附撞车提醒（只提醒不拦）。
+# 不配就是下面这一份：审批单号（12 位数字）、PR #123、Linear 单号 ABC-123
+key_patterns = [
+  '(?<!\d)\d{12}(?!\d)',
+  '(?i)(?<![a-z0-9])PR\s*#\s*\d+',
+  '(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}-\d+(?!\d)',
+]
+stall_minutes = 15             # 批次在跑（或送出后会话没碰过）这么久没有新动作 → 中断：排队，私聊你
+lost_minutes = 30              # 批次送出后会话记录这么久完全不动 → 失联：排队，私聊你
+spin_repeat = 3                # 同一条命令 / 同一个工具调用连续这么多次 → 标「空转」
+digest_max_lines = 15          # 总线批次里羊群看板摘要最多几行（羊群看板有变化才附）
+mail_pair_limit = 6            # 同一对会话 mail_window_minutes 分钟内互发超过这么多条 → 暂停这一对，并通知总线
+mail_window_minutes = 10
+mail_pause_minutes = 30
+compacted_recent_minutes = 60  # 多久内的压缩点在卡片上标「刚被压缩」
+routed_active_hours = 24       # 带编号的消息送到某个会话以后，这么多小时内算它「手上的事」（撞车提醒以它为主）
+stale_hours = 4                # 会话自报的活这么多小时没更新、期间会话一直空闲 → 标「可能过期」（不替它关掉）
+history_days = 7               # 履历（回执摘要、做完的活、最近动作）保留几天
+
+[ack]
+# 确认表情：消息送达会话后，以你的身份在消息下点这个表情；你回复后撤下。删掉整段 = 关闭
+# 这是 sheepdog 唯一的 IM 写操作（只加 / 撤这个表情）
+emoji_type = "Get"                          # 飞书表情类型
+reasons = ["p2p", "at_me", "at_all"]        # 投递原因在其中的消息，送达时点表情
+remove_on_reply_reasons = ["p2p", "at_me"]  # 这些原因的表情在你回复后撤下；@所有人 只点不撤
+# 这些原因的消息送达后以机器人身份点表情、永不撤（你在「找你」聊天里回复机器人时，会话收到了就点给你看）
+# 与 reasons 同时命中以这里为准；默认空
+bot_reasons = ["owner_reply"]
+
+[watch]
+# 「等别人回复」：提醒档位（分钟，最多两档）与到期时间；playbook 里是 {{watch_remind_minutes}} / {{watch_expire_minutes}}
+remind_minutes = [15, 30]
+expire_minutes = 60
+
+[source]
+# false = 不拉 IM（测试环境用）：这时可以用 sheepdog inject 往账本里放一条合成消息；改了要重启
+enabled = true
+# 只给飞书测试用，运行环境不要设：只拉这些聊天，别的聊天的消息不入账本（见参考手册「飞书测试」）
+# only_chat_ids = ["oc_xxx"]
+
+[notify]
+# 给你的通知（羊群看板判会话中断 / 失联、会话卡在 attention 和自动恢复、危险命令报警、写锁提醒、登录失效）发到哪。
+# 留空 = 经机器人私聊你（运行环境就这样，不要设）：先落通知账本再发，发不出去按退避重试，2 小时还没发出去标放弃，
+# doctor / board 开头提示，sheepdog notices 查看、--retry 重发、--ack 确认。
+# 设了路径 = 一律追加写进这个文件（每条带北京时间和通知类型），不发飞书：测试环境（[source] enabled = false）
+# 用它检查通知。拉着飞书又设了它，sheepdog doctor 会提示。相对路径相对本文件所在目录；改了下一轮生效
+file = ""
+# 发给你的消息（ask / report、上面这些通知、「待办」清单、结案那一句）发成卡片，正文的 markdown 原样渲染：第一行
+# （「🐕 需要你定 · 标题 [tp_xxx]」这类）放卡片标题，话题里的那几条末尾 @ 你。卡片太大（估算超过约 28 KB）或飞书拒收时，
+# 同一条改发纯文本。false = 照旧发纯文本。记账的正文都是纯文本。热加载，下一轮生效
+owner_card = true
+
+[identity]
+# 区分智能体（机器人）身份和你本人的身份。默认关，关着时和以前完全一样：代回一律用你本人的身份、卡片带代回标记。
+# 开着时：
+# - sheepdog run 另起一个常驻子进程，以机器人身份实时接收消息（lark-cli event consume im.message.receive_v1 --as bot），
+#   和你身份的每分钟搜索进同一个账本，同一条只记一次；sheepdog doctor 显示它在不在、最近一次收到事件的时间；
+# - 群里 @机器人 和 @你 一样处理；别人回复机器人发的消息和回复你的一样处理；机器人自己发的消息不分派、不算你的发言；
+# - 别人私聊机器人不接（你在飞书里看不到这些私聊）：不分派，机器人回一句 playbook/bot_dm.md 里的话，同一个人 24 小时内只回一次；
+# - sheepdog reply 按被回复的那条消息选身份：群里机器人在 → 机器人；私聊、机器人不在的群 → 你本人；两个身份都带代回标记。
+#   机器人不在的群 sheepdog doctor 会列出来，建议把机器人拉进去。
+# enabled 改了要重启 sheepdog run；其余下一轮生效
+enabled = false
+# 机器人的 open_id / app_id：留空 = 启动时现查（不写死），只在查不到时手填
+# bot_open_id = "ou_xxx"
+# bot_app_id = "cli_xxx"
+bot_chats_cache_minutes = 10       # 机器人在哪些群：按机器人身份的群列表判断，缓存这么多分钟
+bot_dm_reply_hours = 24            # 别人私聊机器人的自动回复：同一个人这么多小时内只回一次
+restart_backoff_seconds = 5        # 机器人接收子进程退出后重启的退避：从这里起每次翻倍
+restart_backoff_max_seconds = 300  # 最多等这么久
+
+# 会话宿主（每个会话一个，默认 antigravity = 上面的 sink）。codex / claude 走各自的命令行，一轮在后台跑完。
+# 权限不归 sheepdog 管：这里没有沙箱、审批、权限项，全部来自宿主自己的配置
+# （Codex 看 ~/.codex/config.toml；Claude 看它自己的用户设置、workdir 下的设置，或下面 settings 指的文件）。
+# model / effort / timeout_minutes / max_concurrent 改了下一轮生效；enabled / command / workdir / settings 要重启。
+[hosts.codex]
+enabled = false
+command = "codex"              # 可执行文件
+model = "gpt-6-astra"          # 默认模型；名册和 new-session 可以逐个会话覆盖
+effort = "high"                # 默认推理档位
+workdir = "~/sheepdog-work"    # 会话的工作目录，启用时必填
+timeout_minutes = 60           # 一轮最多跑多久，超过就杀掉，会话标 attention
+# Codex 配置档名（可选，改了要重启）：sheepdog 读 ~/.codex/<profile>.config.toml，把里面每一项展开成 -c 参数，
+# 传给它自己起的 `codex app-server`（叠在 ~/.codex/config.toml 上面）；你自己在 Codex 应用里的会话不受影响。
+# 会话能不能写文件、能不能上网（比如自己用 lark-cli 发飞书），全看那份文件；sheepdog 原样展开，不增不减，
+# 不传任何别的沙箱、审批参数。配置档读不到或解析失败时，这个宿主的每一轮都直接失败（doctor 能看到）。
+# 配置档只对之后新开的 Codex 会话生效：Codex 建线程时把沙箱策略记在线程上，之后换 -c 续接也沿用旧的；
+# 改了配置档，老会话要退休换新才会跟着变。
+# 示例内容见 examples/codex-profile.example.toml。只能是字母、数字、下划线、减号；留空 = 不用配置档
+profile = ""
+max_concurrent = 2             # 这个宿主同时最多跑几轮，超过的批次排队
+# 新开这个宿主的会话前先问主人：true 时 new-session --host codex 必须带 --quote "<主人原话>"，
+# 核对同 forward（总线里亲口说过，或你本人账号在飞书上的回复），不带或核对不通过就拒绝。
+# 只管新开：名册里你亲手写的会话（spawn）、往已有会话转交消息都不受影响。改了下一轮生效
+ask_owner_before_new = true
+
+[hosts.claude]
+enabled = false
+command = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+workdir = "~/sheepdog-work"
+timeout_minutes = 60
+max_concurrent = 2
+ask_owner_before_new = true    # 同上：new-session --host claude 必须带核对过的 --quote
+# settings = "~/.config/sheepdog/claude-settings.json"   # 可选，原样传 --settings；sheepdog 不写它的内容
+
+[hooks]
+# Antigravity 的 Stop hook（sheepdog hook stop，7.37）：会话这一轮要结束、手上那批还没交回执，就不让它停（同一批最多拦 2 次）。
+# 关掉（false）：hook 何种都不输出，会话照常结束，没交的回执等回执超时处理；省掉的是被拦以后会话多跑的那一轮。
+# hook 每次调用都现读这个文件，改完下一次收工就生效，不用重启，也不用改 hooks.json
+# 每次调用都在 <状态目录>/hooks/stop-log/<日期>.jsonl 记一行（拦 / 不拦及原因、耗时），只留 7 天（7.45）
+stop = true
+
+[run]
+# 机器人实时事件到了就处理（7.45，要开 [identity]）：两轮之间不再死睡 poll_interval_seconds，事件一到（攒 2 秒）就做一次
+# 只入账 + 投递的小轮次，不跑搜索。关掉（false）：照旧每轮睡满间隔。热加载
+wake_on_bot_event = true
+
+[media]
+# 消息里的图片送进会话前先下载（7.54）：用 lark-cli（用户身份）下到 <状态目录>/media/<message_id>/<钥匙>.<扩展名>，
+# 正文里那把飞书图片钥匙（![Image](img_…)、[Image: img_…]、卡片里的 (img_key:img_…)）换成本机绝对路径，同一张只下一次。
+# 下载失败不挡投递：原文照留，正文后面写原因和会话自己去取的命令。跟着 retention_days 一起清理。热加载
+images = true
+max_image_mb = 20             # 单张上限，下完超过就删掉、当没下载下来
+max_images_per_batch = 10     # 一批里最多真去下载几张（已经下过的不算）
+image_timeout_seconds = 30    # 每张的超时

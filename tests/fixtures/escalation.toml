@@ -1,0 +1,5 @@
+# 测试用「找主人」配置：合成的提问开头，不是真实约定
+[escalation]
+chat_ids = ["oc_test_esc"]
+header_regex = '^FX-ASK\[(?P<topic>tp_[a-z0-9_.-]+)\] '
+open_hours = 24

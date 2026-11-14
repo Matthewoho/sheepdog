@@ -1,0 +1,195 @@
+"""业务规则 playbook（7.6）：代码只放机制，业务文字全部写在个人配置目录的 md 文件里。
+
+- 目录：配置键 playbook_dir（默认 playbook/，相对配置文件目录）
+- 占位符写成 {{名字}}，一遍正则替换；未知占位符原样保留；替换进去的值里即使含 {{...}} 也不会再被替换
+- 每次组装 prompt 时现读文件：改完下一批生效，不用重启
+- 文件缺失或为空时该段为空，`sheepdog doctor` 列出缺哪些
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+# 每个 playbook 文件上一次读成功的内容（常驻进程内有效）：文件读不了 / 不是 UTF-8 时沿用它并 WARNING，不让这一轮失败
+_LAST_GOOD: dict[Path, str] = {}
+
+# 文件名 → 用在哪（文件名是和架构侧的约定，不要改）
+PLAYBOOK_FILES: dict[str, str] = {
+    "common.md": "所有会话（总线、新建、接管、接手）的业务规则",
+    "bus.md": "总线 bootstrap，可用 {{roster}}",
+    "onboarding.md": "接管现有会话（sheepdog 新建的会话也用它），可用 {{duty}} {{chats}} {{authority}} {{self_polling_section}}",
+    "retire_self_polling.md": "retire_self_polling = true 时渲染进 {{self_polling_section}}",
+    "authority_default.md": "authority 为空时代替 {{authority}}",
+    "retire.md": "给前任的退休通知，可用 {{successor_title}} {{batch_id}}",
+    "successor.md": "接手会话开场附加，可用 {{predecessor_id}} {{predecessor_transcript}} {{predecessor_dir}}",
+    "nudge_remind.md": "watch 提醒，可用 {{note}} {{person}} {{minutes}}",
+    "nudge_expire.md": "watch 到期，可用 {{note}} {{person}} {{minutes}}",
+    "batch_footer.md": "每批信号末尾",
+    # 安全（7.7）
+    "security.md": "所有开场的最前面（排在 common.md 之前）",
+    "security_banner.md": "被安全规则标记的消息正文前的警示，可用 {{tags}} {{notes}} {{action}}",
+    "security_footer.md": "每批信号末尾，batch_footer 之前",
+    # 命令行宿主（7.18）
+    "cli_host.md": "只发给 Codex / Claude 会话（排在 common.md 之后）：回执块怎么写、发不了 IM 时怎么办，可用 {{host}}",
+    "host_locked.md": "命令行会话连续写锁冲突满 60 分钟时，给总线的提示里附的说明，可用 {{host}} {{since}}",
+    # 护栏（7.19）
+    "rules_after_compaction.md": "检测到宿主压缩、下一批重推完整规则时，规则前的那句话（缺了用代码里的一句默认话）",
+    "audit_offender.md": "会话跑了危险命令时，给它的系统提示里附的话（每次报警都发），可用 {{commands}} "
+                         "{{alert_count}}（这个会话 10 分钟内第几次报警）",
+    "audit_notify.md": "会话跑了危险命令时，给 [audit] also_notify 会话的提示里附的话，"
+                       "可用 {{commands}} {{offender_title}} {{offender_topic}} {{alert_count}}",
+}
+
+# 可选文件：缺了用代码里的默认值，不算缺（doctor 不报）
+OPTIONAL_PLAYBOOK_FILES: dict[str, str] = {
+    "agent_sender_label.md": "机器人 / Agent 发来的消息上的标注（回不回、怎么回）；缺了用代码里的默认值「🤖 来自机器人 / Agent」",
+    # 会话卡在 attention（7.21）：事实由代码拼，这里只放对人的说明；缺了只发事实
+    "attention_notice.md": "会话进入 attention 时私聊主人的通知末尾附的话，可用 {{host}} {{reason}} {{since}} {{queued}} "
+                           "{{auto_recover}}（yes / no）",
+    "attention_recovered.md": "会话自动恢复时私聊主人的通知末尾附的话，可用 {{host}} {{evidence}} {{queued}}",
+    # 在岗表（7.20）：事实由代码拼，这里只放对会话、对人的说明；缺了只发事实（摘要标题缺了用代码里的一句）
+    "duty_collision.md": "撞车提醒（消息里的编号最近送到过别的会话，或在别的会话手上）后面附的话，可用 {{key}} {{owner_title}} "
+                         "{{owner_topic}} {{work_state}} {{run_state}} {{action}} {{ago}} {{basis}}（路由 / 会话自报 / 自动）",
+    "duty_mail.md": "会话留言（sheepdog tell）后面附的话，可用 {{from_topic}} {{from_title}} {{key}}",
+    "duty_digest.md": "总线批次里羊群看板摘要的标题（羊群看板有变化才附），可用 {{count}}",
+    "duty_stuck.md": "会话判为中断 / 失联时私聊主人的通知末尾附的话，可用 {{host}} {{state}} {{detail}} {{queued}}",
+    # 区分智能体身份和本人身份（7.26）：[identity] 开着时用；缺了用代码里的一句默认话
+    "bot_dm.md": "别人私聊机器人时机器人回的那句话（请对方直接私聊主人本人；同一个人 24 小时内只回一次）",
+    # 第一期 1–3 件（7.36）：事实由代码拼，这里只放对会话的说明；缺了用代码里的默认话
+    "escalation_check.md": "「需要你定」可能已处理时给负责会话的提醒末尾附的话（请核实、怎么结案），可用 {{topic_id}} "
+                           "{{ask_message_id}} {{key}} {{title}}",
+    "escalation_expiring.md": "「需要你定」快到期时给负责会话的提醒末尾附的话，可用 {{topic_id}} {{ask_message_id}} {{key}} "
+                              "{{title}} {{hours_left}}",
+    "resolve_notice.md": "会话结案后机器人在话题里补的那一句（只取一行），可用 {{why}}（结案依据）{{session}}（会话标题）；"
+                         "开头不要写成「🐕 需要你定」",
+    # 第一期第 4、5 件（7.37）：缺了用代码里的默认话
+    "owner_priority.md": "主人插话批次（会话在跑上一批时，找主人聊天里主人的回复当轮单独送到）开头的说明，可用 {{batch_id}} "
+                         "{{pending_batch}}（手上那批，回执照常交它）",
+    "stop_receipt.md": "Stop hook 不让会话结束时给它的提示（这批还没交回执），可用 {{batch_id}} {{receipt_command}} "
+                       "{{waiting_command}} {{blocked}}（这批第几次被拦）",
+    # VIP（7.61）：只在这一批里有 VIP 本人发的消息时附在批次末尾，不进任何常驻规则；缺了用代码里一段很短的默认话
+    "vip.md": "批次里有名册 [[person]] tier = vip 的人发来的消息（盖了 👑 章）时，附在这一批末尾的规则，"
+              "可用 {{vips}}（这一批盖了章的人）",
+}
+
+# 每批末尾附的红线（7.19 K1）：reminders/<key>.md，key 是名册的 key，总线是 bus，总线新开的会话用它自己的 key。
+# 可选，不在 PLAYBOOK_FILES 里（缺了不算缺），doctor 单独列出哪些会话有
+REMINDERS_DIR = "reminders"
+# 同 config.SessionConfig.receipt_timeout_minutes 的默认值（测试核对）
+DEFAULT_RECEIPT_TIMEOUT = 20
+
+_PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+# <!-- ... --> 是写给维护者看的注释（比如某个数字来自哪个版本），渲染时去掉，不发给会话和主人
+_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
+class Playbook:
+    def __init__(self, directory: Path, base_vars: dict[str, str] | None = None, strict: bool = False):
+        self.directory = directory
+        # strict：读不了就抛出去（Stop hook 用：出错一律当不拦，不能拿默认话去拦会话，7.37）；常驻进程不 strict，沿用上一份
+        self.strict = strict
+        # 通用占位符里与具体会话无关的部分（代回前缀、等待分钟数），由配置决定
+        self.base_vars = dict(base_vars or {})
+
+    @property
+    def dir(self) -> Path:
+        return self.directory
+
+    @classmethod
+    def from_config(cls, cfg) -> "Playbook":
+        w = cfg.watch
+        return cls(cfg.playbook_path, {
+            "reply_prefix": cfg.session.reply_prefix or "",
+            "reply_suffix": cfg.session.reply_suffix or "",
+            "watch_remind_minutes": "/".join(str(m) for m in w.remind_minutes),
+            "watch_expire_minutes": str(w.expire_minutes),
+            # 回执超时（分钟）：接口说明里「不交回执要等多久才收得到下一批」用它（7.38 第 7 条）
+            "receipt_timeout_minutes": str(cfg.session.receipt_timeout_minutes),
+            # 会话在终端里敲的 sheepdog 命令（cli_name，已加好 shell 引号）；playbook 里写 {{cli}}
+            "cli": cfg.cli_command,
+            # 7.26：只在开着时有这个键，关着时占位符和以前完全一样
+            **({"identity_enabled": "1"} if getattr(getattr(cfg, "identity", None), "enabled", False) else {}),
+            # 7.51：配了话题群并开着才有这个键（接口说明里加「长期跟踪：话题群」一节）；没配时规则和指纹都不变
+            **({"topic_group_enabled": "1"} if getattr(getattr(cfg, "topic_group", None), "active", False) else {}),
+        })
+
+    @property
+    def identity(self) -> bool:
+        """[identity] 开着（7.26）：接口说明里代回那一条补一句「sheepdog 自动选身份」。关着时 base_vars 里没有这个键。"""
+        return self.base_vars.get("identity_enabled") == "1"
+
+    @property
+    def topic_group(self) -> bool:
+        return self.base_vars.get("topic_group_enabled") == "1"
+
+    @property
+    def receipt_timeout(self) -> int:
+        """回执超时分钟数（[session] receipt_timeout_minutes）；没给配置时用默认值 20。"""
+        try:
+            return int(self.base_vars.get("receipt_timeout_minutes") or DEFAULT_RECEIPT_TIMEOUT)
+        except ValueError:
+            return DEFAULT_RECEIPT_TIMEOUT
+
+    @property
+    def cli(self) -> str:
+        """给会话看的命令名：默认 sheepdog，测试环境可以是一个只连测试配置的包装脚本。"""
+        return self.base_vars.get("cli") or "sheepdog"
+
+    def read(self, name: str) -> str:
+        """现读文件。不存在 = 这一段为空（用代码里的默认话）；读不了 / 不是 UTF-8 = 改坏了，沿用上一次读成功的内容
+        （没有就当空）并 WARNING，不让组装 prompt 的那一轮失败（7.40）。"""
+        p = self.directory / name
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            return ""
+        except (OSError, UnicodeDecodeError) as e:
+            if self.strict:
+                raise
+            last = _LAST_GOOD.get(p)
+            log.warning("playbook %s 读不了，%s: %s", p, "沿用上一份" if last is not None else "这一段先用默认话", e)
+            return last or ""
+        _LAST_GOOD[p] = text
+        return text
+
+    def render(self, name: str, **variables: str) -> str:
+        """读 name 并替换占位符。通用占位符 session_title、topic_id 由调用方按会话传入。"""
+        text = _COMMENT.sub("", self.read(name))
+        if not text.strip():
+            return ""
+        return self._fill(text, variables)
+
+    def render_or(self, name: str, default: str, **variables: str) -> str:
+        """同 render；文件缺失或为空时按同样的规则渲染代码里的默认话 default。"""
+        return self.render(name, **variables) or self._fill(_COMMENT.sub("", default), variables)
+
+    def _fill(self, text: str, variables: dict) -> str:
+        values = {**self.base_vars, **{k: "" if v is None else str(v) for k, v in variables.items()}}
+        return _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), text).strip()
+
+    def reminder_keys(self) -> list[str]:
+        """reminders/ 下有内容的红线文件对应的 key。"""
+        d = self.directory / REMINDERS_DIR
+        if not d.is_dir():
+            return []
+        return sorted(p.stem for p in d.glob("*.md") if p.is_file() and _COMMENT.sub("", self.read(
+            f"{REMINDERS_DIR}/{p.name}")).strip())
+
+    def missing(self) -> list[str]:
+        return [n for n in PLAYBOOK_FILES if not self.read(n).strip()]
+
+
+def source_and_search_guard(topic_id: str, *, bus: bool = False) -> str:
+    """事实出处严格归属、定向代码检索与找人拍板防打扰硬护栏（7.89 / 7.108，REG-057 / REG-076）：业务会话注入，总线不注入。"""
+    if bus:
+        return ""
+    return "\n".join([
+        "### 事实出处严格归属与定向代码检索（7.89 硬门禁 / REG-057）",
+        "- **事实出处与物理介质严格归属（严禁跨源嫁接与张冠李戴）**：回答「为什么这么写/当时怎么考量/当前配置是什么」时，必须严格区分并注明物理出处（**提问者原话或截图里的文字/注释** vs **本地知识库笔记记录** vs **本地代码仓 `<repo>/<文件>:<行号>` 静态配置** vs **线上/测试 DB 或 `gcloud` 实时回读**）。严禁把提问者截图里的注释/假设嫁接成己方历史报告结论反向复述；严禁把只读了本地静态代码说成「查了测试/生产数据库（DB）」；命令超时或输出未读完时，严禁下「没有/不存在」的否定结论。",
+        "- **代码检索必先定仓（严禁 `~/Code` 全目录或大仓顶层裸跑 `grep -rn` 超时放弃）**：查代码或 Terraform 配置必须先用 `ls ~/Code` 或 `git -C <repo> ls-files` 定位具体仓库与子目录（如 `~/Code/<repo>/internal`），再进目标仓库子目录执行定向检索（`rg` 或 `git -C <repo> log -S`）；若提问者仅给出相对子路径（如 `infra/china/README.md`）而未说明仓库名，先用 `ls -d ~/Code/*/<子路径>` 或 `find ~/Code -maxdepth 3 -path \"*/<子路径>\"` 毫秒级定位所属仓库；**严禁对 `~/Code`（或 `$HOME/Code`）父目录直接递归 `grep -r` / `rg` 或跑无 `-maxdepth 3` 的 `find`**；测试环境执行 `gcloud sql instances patch` 等写命令必带 `--quiet` 防后台交互挂起；若检索超时或调用链未闭环，必须派生羔羊（`lamb`）查透再回复，严禁半截放弃凭猜测作答。",
+        "- **找人拍板（`sheepdog ask`）防打扰五铁律（7.108 / 7.110，REG-076 / REG-078，源自人类改判错题本自进化）**：① **必写清环境与完整调用链**：发起 `sheepdog ask` 前必须明确写出目标环境（测试 `acme-testing-env` / Stage / 预发 / 生产 `acmelab-000002`）与完整端到端调用链/前置功能与压测证据，严禁让主人反问「他是测试还是生产 / 哪个环境的子成员账号 / 讲一下完整调用链」；② **必先找兄弟专席或内部 Owner**：申请 CC 专线/家宽/住宅 IP 必先 `sheepdog tell --topic " + topic_id + " --to tp_net-ops \"...\"` 核实各线路人数与空余席位实据；DB 账号密码与 SQL 找 Hazel 老师；Vercel/前端工程权限找阿魏；Agent 预览控制器/冷启动找 Nora；ChatGPT/Codex/外部渠道额度找 Darcy；发版密钥打码 Diff 找发版发起人核对；Files Svc 代码找 Corwin；③ **测试/Stage 常规变更免问自治**：`acme-testing-env` 与 Stage 环境常规 DNS（CDN TXT/CNAME）、容器扩缩容或已连续 ≥3 次获主人 100% 采纳的非底线常规方案，直接安全执行并事后 `sheepdog report`；④ **生产 Cloud Run 扩缩容只改 Service-level**：止血或临时调 `minScale/maxScale` 一律改 Service-level（不建新 Revision，便于随时调回），严禁动 Revision-level；⑤ **催办/上报前必重读群内最新消息**：确认同事（如 Nora/阿魏）是否已处理或请求已过期；⑥ **主人已批选项 A 闭环义务与跨工作区转达主脑通道（REG-078）**：当主人在决策卡点击选项 A（授权由专席执行）后，同一 `--key` 子步骤必须直接继承授权闭环到底（独立 Secret 查不到时必查同项目关联 Cloud Run 服务的容器环境变量与挂载卷 `gcloud run services describe`），严禁发二次重复 `ask` 或用 `sheepdog report` 写祈使句把动手操作倒推给主人（造成无未决 `ask` 的死球空转）；若需向 `🐕 Sheepdog 自治主脑`（`tp_sheepdog`）转达机制问题或自进化需求，因跨工作区限制严禁调内置 `send_message`（会报 `cross-project messaging is not allowed`），一律调 `sheepdog tell --topic " + topic_id + " --to tp_sheepdog \"<故障现象 + 批次/消息号 + 优化建议>\" [--quote \"<主人原话>\"]`。",
+    ])
+

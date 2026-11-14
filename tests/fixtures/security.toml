@@ -1,0 +1,30 @@
+# 测试用安全规则：只用合成标记词，不含任何真实规则关键词
+own_tenant_keys = ["tenant_test_own"]
+quote_max_age_hours = 24
+
+[[rule]]
+name = "fx_tag"
+note = "FX 标记规则说明"
+action = "tag"
+patterns = ["(?i)fx-tagme"]
+
+[[rule]]
+name = "fx_hold"
+note = "FX 拦截规则说明"
+action = "hold"
+patterns = ["(?i)fx-holdme"]
+
+[[rule]]
+name = "fx_external_hold"
+note = "FX 外部人拦截说明"
+action = "hold"
+patterns = ["fx-outside"]
+external_sender = true
+sender_types = ["user"]
+
+[[rule]]
+name = "fx_bot_only"
+note = "FX 仅机器人"
+action = "tag"
+sender_types = ["app", "bot"]
+external_sender = true

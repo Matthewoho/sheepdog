@@ -1,0 +1,263 @@
+"""路由器：纯规则、无 IO、无 LLM。决定一条消息是 丢弃 / 进 Inbox / 直推 session。
+
+规则优先级（自上而下，先命中先返回）：
+ 1. 自己发的            → self（仅入账，供「回复我」判定）
+ 1a. 机器人自己发的（7.26，[identity] 开着）→ self（self_bot）：不分派、不算主人发言
+ 1b. 机器人消息正文以 drop_bot_message_prefixes 之一开头 → drop（self_escalation，防回环；卡片按 header 标题 + 正文比）
+ 2. 强制忽略的会话       → drop
+ 3. 私聊：人 → dispatch；bot → inbox(bot_p2p)，关键词命中则 dispatch
+ 4. 群 @我、@机器人、回复我（或机器人）的消息 → dispatch（同级，都在免打扰之前，7.16 / 7.26）
+ 5. 群 @所有人          → dispatch（可配置）
+ 6. 免打扰群            → drop（@我/回复我/@所有人 已在上面处理；关键人发言仍受免打扰约束）
+ 8. 关键人发言           → dispatch
+ 9. 关键词              → dispatch（群里机器人发的默认不参与，见 keyword_skip_bot_senders）
+10. 强制关注的会话       → dispatch
+11. 其他群消息          → inbox
+
+按聊天归属推给名册里的会话（P0.5）是在路由之后的一步，见 engine.apply_ownership；这里保持纯规则。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Callable
+
+from . import session as sm
+from .card import plain_text
+from .config import RoutingConfig
+from .models import Message
+from .prompts import is_agent_proxy_content
+from .roster import member_index, primary_topic_id
+
+DROP = "drop"
+INBOX = "inbox"
+DISPATCH = "dispatch"
+SELF = "self"
+
+
+@dataclass
+class RouteContext:
+    self_open_id: str
+    muted_chat_ids: set[str] = field(default_factory=set)
+    # 判断某条消息是否为「我」发的（用于回复我判定）；由调用方注入以便测试
+    is_my_message: Callable[[str], bool] = lambda _mid: False
+    # 机器人自己的 id（7.26，[identity] 开着才有）：open_id（事件、@ 里用）和 app_id（搜索结果里机器人发的消息的发送人）。
+    # 空 = 关着，行为和以前一样
+    bot_ids: frozenset[str] = frozenset()
+
+
+@dataclass
+class RouteDecision:
+    route: str
+    reason: str
+    tags: list[str] = field(default_factory=list)
+
+
+def _keyword_hit(text: str, keywords: list[str]) -> str:
+    low = (text or "").lower()
+    for kw in keywords:
+        if kw and kw.lower() in low:
+            return kw
+    return ""
+
+
+def message_bodies(content: str) -> list[str]:
+    """正文可能是纯文本，也可能是 {"text": "..."} 这类 JSON：两种都拿出来比对开头。"""
+    out = [(content or "").lstrip()]
+    try:
+        d = json.loads(content or "")
+    except ValueError:
+        return out
+    if isinstance(d, dict) and isinstance(d.get("text"), str):
+        out.append(d["text"].lstrip())
+    return out
+
+
+def _is_mail_assistant_p2p(msg: Message) -> bool:
+    if not msg.is_bot_sender:
+        return False
+    sname = (msg.sender_name or "").strip().lower()
+    if sname in ("mail assistant", "邮件助手", "lark mail", "飞书邮箱"):
+        return True
+    return "applink.larksuite.com/client/mail/card/" in (msg.content or "")
+
+
+def route(msg: Message, ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
+    # 1. 自己发的
+    if ctx.self_open_id and msg.sender_id == ctx.self_open_id:
+        return RouteDecision(SELF, "self")
+    # 1a. 机器人自己发的（7.26）：认作自己，不分派，也不当成主人的发言（防止自己回自己）
+    if ctx.bot_ids and msg.sender_id in ctx.bot_ids:
+        return RouteDecision(SELF, "self_bot")
+
+    # 1b. 防回环：只认 app/bot 发的，人转述同样的话不受影响。卡片（7.48 发给主人的）按还原后的「标题\n正文」比开头
+    prefixes = [p for p in cfg.drop_bot_message_prefixes if p]
+    if prefixes and msg.sender_type in ("app", "bot"):
+        if any(b.startswith(p) for b in message_bodies(plain_text(msg.content)) for p in prefixes):
+            return RouteDecision(DROP, "self_escalation")
+
+    # 2. 强制忽略
+    if cfg.ignored(msg.chat_id):
+        return RouteDecision(DROP, "ignored_chat")
+
+    kw = _keyword_hit(msg.content, cfg.keywords)
+
+    # 3. 私聊
+    if msg.is_p2p:
+        if msg.is_bot_sender and not cfg.dispatch_bot_p2p:
+            if kw and not _is_mail_assistant_p2p(msg):
+                return RouteDecision(DISPATCH, "bot_p2p_keyword", [f"keyword:{kw}"])
+            return RouteDecision(INBOX, "bot_p2p")
+        return RouteDecision(DISPATCH, "p2p")
+
+    mentioned_me = any(m.id == ctx.self_open_id for m in msg.mentions if ctx.self_open_id)
+    mentioned_bot = bool(ctx.bot_ids) and any(m.id in ctx.bot_ids for m in msg.mentions if m.id)
+    mentioned_all = any(m.is_all for m in msg.mentions)
+
+    # 4. @我、回复我：同级，排在免打扰之前——免打扰群里有人回复主人也要送到（7.16）
+    if mentioned_me:
+        return RouteDecision(DISPATCH, "at_me")
+    if mentioned_bot:
+        return RouteDecision(DISPATCH, "at_bot")  # 7.26：@机器人 和 @主人 同等对待
+    if msg.reply_to and ctx.is_my_message(msg.reply_to):
+        return RouteDecision(DISPATCH, "reply_to_me")
+    # 5. @所有人
+    if mentioned_all and cfg.dispatch_at_all:
+        return RouteDecision(DISPATCH, "at_all")
+
+    # 6. 免打扰群
+    if cfg.ignore_muted_chats and msg.chat_id in ctx.muted_chat_ids and msg.chat_id not in cfg.watch_chat_ids:
+        return RouteDecision(DROP, "muted_chat")
+
+    is_bot_or_proxy = msg.is_bot_sender or is_agent_proxy_content(msg.content)
+
+    # 8. 关键人
+    if msg.sender_id in cfg.vip_sender_ids and not is_bot_or_proxy:
+        return RouteDecision(DISPATCH, "vip_sender")
+
+    # 9. 关键词：群里机器人的消息（含同事个人账号代发的 AI 助理消息）常带「告警」「审批」「生产」之类字样，默认不参与，避免误报
+    if kw and not (cfg.keyword_skip_bot_senders and is_bot_or_proxy):
+        return RouteDecision(DISPATCH, "keyword", [f"keyword:{kw}"])
+
+    # 10. 强制关注
+    if msg.chat_id in cfg.watch_chat_ids:
+        return RouteDecision(DISPATCH, "watched_chat")
+
+    # 11. 其他
+    return RouteDecision(INBOX, "group")
+
+
+def route_within_group(
+    store,
+    roster,
+    target_topic_id: str,
+    *,
+    chat_id: str = "",
+    root_id: str = "",
+    parent_id: str = "",
+    reply_to_msg_id: str = "",
+    thread_id: str = "",
+    sender_id: str = "",
+    window_minutes: int = 30,
+) -> str:
+    """羊圈（7.49）组内确定性路由（纯 SQLite 状态 + 名册，零 LLM）：
+    1. 话题/回复链/watch/等待回复亲和性（绝不拆链）
+    2. 主会话（#1）空闲优先
+    3. 主会话繁忙时选空闲副会话，或按需扩出/重开 tp_<key>#2..#N
+    4. 全满时落入待处理消息最少、编号最小的成员排队
+    """
+    if not store or not target_topic_id:
+        return target_topic_id
+    base_tid = primary_topic_id(target_topic_id)
+    s = roster.by_topic(base_tid) if roster is not None else None
+    t_primary = store.get_topic(base_tid)
+    group_id = (s.group_id if s else "") or (
+        t_primary["group_id"] if t_primary is not None and "group_id" in t_primary.keys() else ""
+    )
+    max_sessions = (
+        s.max_sessions
+        if s is not None
+        else (max(1, len(store.get_group_topics(group_id))) if group_id else 1)
+    )
+    if not group_id or max_sessions <= 1:
+        return target_topic_id
+    if t_primary is not None and (t_primary["group_id"] if "group_id" in t_primary.keys() else "") != group_id:
+        store.update_topic(base_tid, group_id=group_id)
+        t_primary = store.get_topic(base_tid)
+
+    # Step 1: Thread / Reply / Watch Affinity — Never Split
+    aff_tid = store.find_recent_thread_topic_in_group(
+        group_id,
+        chat_id=chat_id,
+        root_id=root_id,
+        parent_id=parent_id,
+        reply_to_msg_id=reply_to_msg_id,
+        thread_id=thread_id,
+        sender_id=sender_id,
+        window_minutes=window_minutes,
+    )
+    if aff_tid:
+        return aff_tid
+
+    if "#" in target_topic_id:
+        t_exp = store.get_topic(target_topic_id)
+        if t_exp is not None and t_exp["state"] != sm.CLOSED:
+            return target_topic_id
+
+    # Step 2: Idle Primary First
+    if (
+        t_primary is not None
+        and t_primary["state"] == sm.ACTIVE
+        and store.count_pending_messages_for_topic(base_tid) == 0
+    ):
+        return base_tid
+
+    # Step 3: Busy Primary -> Idle Secondary or Spawn/Reopen tp_<key>#2..#N
+    members = store.get_group_topics(group_id)
+    secondaries = [m for m in members if m["topic_id"] != base_tid]
+    for m in secondaries:
+        if m["state"] == sm.ACTIVE and store.count_pending_messages_for_topic(m["topic_id"]) == 0:
+            return m["topic_id"]
+
+    existing_ids = {m["topic_id"] for m in members}
+    if len(members) < max_sessions:
+        for idx in range(2, max_sessions + 1):
+            cand_tid = f"{base_tid}#{idx}"
+            if cand_tid not in existing_ids:
+                s_mem = roster.by_topic(cand_tid) if roster is not None else None
+                base_title = (s.display_title if s else None) or (t_primary["title"] if t_primary else base_tid)
+                title = (s_mem.display_title if s_mem else None) or f"{base_title} #{idx}"
+                duty = (s_mem.duty if s_mem else None) or (t_primary["duty"] if t_primary else "") or ""
+                host = (s_mem.host if s_mem else None) or (t_primary["host"] if t_primary else "antigravity") or "antigravity"
+                model = (s_mem.model if s_mem else None) or (t_primary["model"] if t_primary else "") or ""
+                effort = (s_mem.effort if s_mem else None) or (t_primary["effort"] if t_primary else "") or ""
+                anchors_json = (
+                    json.dumps([c.chat_id for c in s.chats], ensure_ascii=False)
+                    if s is not None
+                    else (t_primary["anchors_json"] if t_primary is not None else "[]")
+                )
+                if store.get_topic(cand_tid) is None:
+                    store.create_topic(
+                        cand_tid, title, "adopted", duty, sm.ACTIVE,
+                        host, model, effort, group_id=group_id,
+                    )
+                store.update_topic(
+                    cand_tid,
+                    title=title,
+                    kind="adopted",
+                    duty=duty,
+                    state=sm.ACTIVE,
+                    group_id=group_id,
+                    anchors_json=anchors_json,
+                )
+                return cand_tid
+
+    # Step 4: Full Group Fallback
+    if not members:
+        return base_tid
+    return min(
+        members,
+        key=lambda m: (store.count_pending_messages_for_topic(m["topic_id"]), member_index(m["topic_id"])),
+    )["topic_id"]
+

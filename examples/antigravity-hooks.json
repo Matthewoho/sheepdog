@@ -1,0 +1,15 @@
+{
+  "sheepdog": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "/Users/<you>/.local/bin/sheepdog hook pretool", "timeout": 10}
+        ]
+      }
+    ],
+    "Stop": [
+      {"type": "command", "command": "/Users/<you>/.local/bin/sheepdog hook stop", "timeout": 10}
+    ]
+  }
+}

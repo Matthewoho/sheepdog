@@ -1,0 +1,1694 @@
+"""系统级看门狗与深度水位巡检（规格 7.68：sheepdog observe / Watchdog 2.0）。
+
+四层深度防御（L1–L4）：
+- L1：进程唯一性（sheepdog run）、lark-cli event consume 活性、常驻进程内存版本（daemon_runtime）与磁盘版本一致性（超 5 分钟告警）；
+- L2：四阶段分钟级水流 SLA（Ingest Ack 90s、Priority 插话 90s、Queue Head-of-Line 普通排队 5m、Owner Echo 15m）；
+- L3：宿主 Transcript 深度探针（90s Prompt Filter / 投递黑洞探针、180s+90s 假 running 僵尸锁探针与 --self-heal 写 stop hook 自愈标记、tp_bus 150s 超时与越权工具/命令探针）；
+- L4：核心不变量守卫（7.53/7.56/7.61/7.65/7.63）与 ask_jumps 噪音剃刀（仅统计未结案或超时异常关闭的提问）及告警指纹秒数归一化。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from . import default_repo_dir, version_info, version_watch
+from .alert_group import notify_watchdog_result, send_watchdog_lark_card as _send_lark_card
+from .config import Config, load_config
+from .guard import decode_command_line, normalize
+from .sink import agentapi
+
+TZ = timezone(timedelta(hours=8))
+HOME = Path.home()
+DEFAULT_DB = HOME / ".local/state/sheepdog/sheepdog.sqlite3"
+DEFAULT_STATE = HOME / ".local/state/sheepdog/watchdog-cursor.json"
+DEFAULT_LOG = HOME / ".gemini/antigravity/sidecar_data/sheepdog/logs/sidecar.log"
+DEFAULT_MEDIA = HOME / ".local/state/sheepdog/media"
+DEFAULT_ROSTER = HOME / ".config/sheepdog/roster.toml"
+DEFAULT_OWNER = ""
+DEFAULT_OWNER_CHAT = ""
+GOLIVE = "2026-02-15T06:52:28+08:00"
+
+TRANSCRIPT_TAIL_BYTES = 256 * 1024
+
+_BUS_FORBIDDEN_TOOLS = frozenset({"write_file", "edit_file", "notebook_edit"})
+_BUS_FORBIDDEN_CMD_RE = re.compile(
+    r"\b(?:gcloud|terraform|kubectl|notes_cli\.py(?!\s+view\b)|notes_kb\.py)\b"
+    r"|\blark-cli\s+(?:docs|drive|wiki|bitable|sheets)\b"
+)
+_CODE_ROOT_PAT = r"(?<!\bls\s)(?:/Users/[^/\s\"';|&]+|~|\$HOME|\$\{HOME\})/Code(?:/+(?:\*|\.)?)?(?=$|[\s\"'\\,;|&\])])"
+_CODE_ROOT_RE = re.compile(_CODE_ROOT_PAT)
+_TRIPLE_QUOTE_DOC_RE = re.compile(r'(?:\\?"\\?"\\?"[\s\S]*?(?:\\?"\\?"\\?"|$)|\'\'\'[\s\S]*?(?:\'\'\'|$))')
+_CAT_HEREDOC_DOC_RE = re.compile(r"\bcat\b[^;|&\n]*<<-?\s*\\?['\"]?([A-Za-z0-9_]+)\\?['\"]?[\s\S]*?(?:\b\1\b|$)")
+_MD_PROSE_LINE_RE = re.compile(r"(?m)^\s*(?:#{1,6}|\d+\.|[-*+]\s+\*\*|>)\s+.*$")
+_SEARCH_SEG_SPLIT_RE = re.compile(r"(?:&&|\|\||[;\n|&()]|\b(?:then|do|else|elif)\b)+")
+_SEARCH_CMD_VERB_RE = re.compile(
+    r"""(?:^|(?<=["'\[]))\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:sudo|env|time|nice|nohup|xargs|command|builtin)\s+)*(?P<verb>grep|rg|ripgrep|find)\b(?P<rest>[^！。？；`]*)$"""
+)
+_GREP_REC_FLAG_RE = re.compile(r"(?:[\s\"'\\,]+)(?:-[A-Za-z]*[rR]\w*|--recursive)(?=[\s\"'\\,]|$)")
+_CD_CODE_ROOT_RE = re.compile(
+    rf"(?:^|(?<=[\"'\[])|[;\n|&])\s*cd\s+{_CODE_ROOT_PAT}\s*(?:&&|;)\s*(?:rg|ripgrep|find|grep\b[^;\n|&]*?\s(?:-[A-Za-z]*[rR]\w*|--recursive))(?=[\s\"'\\,]|$)"
+)
+_QUOTED_STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+_SHEEPDOG_SUBCMDS = frozenset({
+    "forward", "spawn", "new-session", "watch", "watches", "watch-done", "unwatch",
+    "receipt", "ask", "report", "reply", "reply-card", "show", "sessions", "work",
+    "thread", "board", "escalations", "pending", "resolve", "tell", "track",
+    "topic-group", "lamb", "inbox", "inbox-clear", "doctor", "version", "upgrade", "observe",
+    "acks", "notices", "actions", "loops", "redeliver", "push-rules", "retire",
+    "close-session", "session-reset", "security-log", "poll", "run", "init", "inject", "hook", "roster", "web",
+})
+_SHEEPDOG_CMD_SEGMENT_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:(?:\S+/)?sheepdog(?:\.cli)?|(?:\S+/)?python[\d.]*\s+-m\s+sheepdog(?:\.cli)?)"
+    r"(?:\s+(?P<subcmd>[A-Za-z0-9_-]+))?\b"
+)
+
+_DEFAULT_ACK_REASONS = frozenset({
+    "p2p", "dm",
+    "at_me", "at_bot", "mention_me",
+    "at_all", "mention_all",
+    "owner_reply", "owner_instruction",
+    "reply_to_me",
+})
+_ACK_REASON_EQUIV: dict[str, tuple[str, ...]] = {
+    "p2p": ("p2p", "dm"),
+    "dm": ("dm", "p2p"),
+    "at_me": ("at_me", "mention_me"),
+    "mention_me": ("mention_me", "at_me"),
+    "at_bot": ("at_bot", "at_me", "mention_me"),
+    "at_all": ("at_all", "mention_all"),
+    "mention_all": ("mention_all", "at_all"),
+    "owner_reply": ("owner_reply", "owner_instruction"),
+    "owner_instruction": ("owner_instruction", "owner_reply"),
+}
+
+_FP_PATTERNS = (
+    (re.compile(r"\d+\s*分钟"), "N分钟"),
+    (re.compile(r"\(\d+s\)"), "(Ns)"),
+    (re.compile(r"已送出\s*\d+s"), "已送出Ns"),
+    (re.compile(r"静默\s*\d+s"), "静默Ns"),
+    (re.compile(r"running\s*\d+s"), "running Ns"),
+    (re.compile(r"\b\d+s\b"), "Ns"),
+)
+
+
+def now_tz() -> datetime:
+    return datetime.now(TZ)
+
+
+def iso(t: datetime) -> str:
+    return t.isoformat(timespec="seconds")
+
+
+def parse_iso(s: str | None) -> datetime | None:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt
+
+
+def age_seconds(s: str | None, ref: datetime) -> float | None:
+    dt = parse_iso(s)
+    if dt is None:
+        return None
+    return (ref - dt).total_seconds()
+
+
+def _queue_entry_ts(create_time: str | None, first_seen: str | None, ref_now: datetime) -> str:
+    """Return the effective queue entry timestamp for SLA accounting.
+    Lark user search often returns minute-truncated `create_time` (e.g. `:00+08:00`), which can be up to 98s
+    earlier than actual queue ingestion (`first_seen`). When `first_seen` is valid, not after `ref_now`
+    (preserving historical-timestamp unit tests), and `>= create_time`, use `first_seen` as the queue entry clock.
+    """
+    ct_str = str(create_time or "").strip()
+    fs_str = str(first_seen or "").strip()
+    if not fs_str:
+        return ct_str
+    fs_dt = parse_iso(fs_str)
+    if fs_dt is None or fs_dt > ref_now:
+        return ct_str
+    ct_dt = parse_iso(ct_str)
+    if ct_dt is not None and fs_dt < ct_dt:
+        return ct_str
+    return fs_str
+
+
+def age_min(s: str | None, ref: datetime | None = None) -> float | None:
+    sec = age_seconds(s, ref or now_tz())
+    return (sec / 60.0) if sec is not None else None
+
+
+def _normalize_warn_for_fp(w: str) -> str:
+    out = w
+    for pat, repl in _FP_PATTERNS:
+        out = pat.sub(repl, out)
+    return out
+
+
+def _fingerprint_warns(warns: list[str]) -> str:
+    """将随时间递增的秒/分钟数字归一化后计算稳定 SHA-256 指纹，避免持续故障穿透冷却。"""
+    if not warns:
+        return ""
+    normalized = sorted(_normalize_warn_for_fp(w) for w in warns)
+    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:16]
+
+
+_BUS_SHELL_OR_QUOTED_CMD_BYPASS_RE = re.compile(
+    r"(?:\b(?:bash|sh|zsh|python3?(?:\.\d+)?)\s+-(?:[a-zA-Z]*c)\b"
+    r"|\$\([^)]*(?:gcloud|kubectl|cloudcli|aliyun|terraform|helm|docker|curl|ssh|scp|git\s+(?:clone|pull|push|commit|checkout))\b"
+    r"|['\"](?:gcloud|kubectl|cloudcli|aliyun|terraform|helm|docker|curl|ssh|scp)\b)",
+    re.I,
+)
+
+
+def _is_bus_forbidden_command(cmd_str: str) -> bool:
+    """判断 tp_bus 执行的 run_command 是否越权：
+    1. 拦截通过 bash -c "..."、$(...) 命令替换或给命令名加引号（如 "gcloud"）绕过去引号检测（REG-125）；
+    2. 先剥离单双引号内的字符串字面量（如 --note "..." / --text "..."），避免转发备注提及 gcloud 等词被误判；
+    3. 拆分子命令段，若子命令段是合法的 sheepdog 自身 CLI 调用则放行（但禁止 tp_bus 借 sheepdog lamb spawn --cmd 间接跑越权命令）；
+    4. 对非 sheepdog 子命令段的去引号文本匹配 _BUS_FORBIDDEN_CMD_RE。
+    """
+    if not cmd_str:
+        return False
+    if _BUS_SHELL_OR_QUOTED_CMD_BYPASS_RE.search(cmd_str) and _BUS_FORBIDDEN_CMD_RE.search(cmd_str):
+        return True
+    unquoted = _QUOTED_STR_RE.sub('""', cmd_str)
+    for seg in re.split(r"(?:&&|\|\||[;|\n])+", unquoted):
+        seg_s = seg.strip()
+        if not seg_s:
+            continue
+        m = _SHEEPDOG_CMD_SEGMENT_RE.match(seg_s)
+        if m is not None:
+            subcmd = (m.group("subcmd") or "").strip()
+            if subcmd == "lamb" and _BUS_FORBIDDEN_CMD_RE.search(cmd_str):
+                return True
+            if not subcmd or subcmd.startswith("-") or subcmd in _SHEEPDOG_SUBCMDS:
+                continue
+        if _BUS_FORBIDDEN_CMD_RE.search(seg_s):
+            return True
+    return False
+
+
+_SHALLOW_FIND_SEG_RE = re.compile(r"\bfind\b(?=[^;\n|&]*?(?:[\s\"'\\,]+)-maxdepth(?:[\s\"'\\,]+)[0-4]\b)")
+
+
+def _strip_doc_prose_blocks(s: str) -> str:
+    s = _CAT_HEREDOC_DOC_RE.sub("", s)
+    s = _TRIPLE_QUOTE_DOC_RE.sub('""', s)
+    s = _MD_PROSE_LINE_RE.sub("", s)
+    s = _SHALLOW_FIND_SEG_RE.sub("shallow_find", s)
+    return _QUOTED_STR_RE.sub(
+        lambda m: m.group(0)
+        if not any(ch in m.group(0) for ch in ("|", ";", "&"))
+        or any(k in m.group(0) for k in ("Code", "grep", "find", "rg ", "-maxdepth", "-r"))
+        else '"_P_"',
+        s,
+    )
+
+
+def _is_unbounded_code_search(cmd_str: str) -> bool:
+    """检测是否对 ~/Code 或 $HOME/Code 根目录直接递归 grep/rg/ripgrep/find（REG-057 / REG-070）：
+    1. 豁免显式带 -maxdepth [0-3] 的浅层定仓 find（含 Shell 空格与 Python subprocess 列表写法）；
+    2. 剥离 Python 三引号规格文档、cat <<EOF 文本写入与 Markdown 列表说明行，并要求搜索命令动词位于命令段起点，消除守规提示文字误报。
+    """
+    if not cmd_str or "Code" not in cmd_str:
+        return False
+    decoded = _strip_doc_prose_blocks(decode_command_line(cmd_str))
+    for cand in (decoded, normalize(decoded)):
+        san = _SHALLOW_FIND_SEG_RE.sub("shallow_find", cand)
+        if _CD_CODE_ROOT_RE.search(san):
+            return True
+        for seg in _SEARCH_SEG_SPLIT_RE.split(san):
+            if "Code" not in seg:
+                continue
+            for m in _SEARCH_CMD_VERB_RE.finditer(seg):
+                verb, rest = m.group("verb"), m.group("rest")
+                if not _CODE_ROOT_RE.search(rest):
+                    continue
+                if verb == "grep" and not _GREP_REC_FLAG_RE.search(rest):
+                    continue
+                return True
+    return False
+
+
+def _is_kb_interrupt_tb(lines: list[str], idx: int) -> bool:
+    for nxt in lines[idx + 1 :]:
+        if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", nxt) or "Traceback" in nxt:
+            break
+        if nxt.strip().startswith("KeyboardInterrupt"):
+            return True
+    return False
+
+
+
+def _should_expect_ack(row: sqlite3.Row | dict, ack_reasons: set[str]) -> bool:
+    """对齐 sheepdog/ack.py::Acker.identity_for 判断一条已分派消息是否应当点确认表情。"""
+    r_dict = dict(row)
+    if r_dict.get("chat_type") == "system" or not str(r_dict.get("message_id") or "om_").startswith("om_"):
+        return False
+    reason = str(r_dict.get("reason") or "").strip()
+    if not reason or reason == "owner_context":
+        return False
+    raw_tags = r_dict.get("tags_json")
+    tags: list[str] = []
+    if raw_tags:
+        try:
+            parsed = json.loads(raw_tags)
+            if isinstance(parsed, list):
+                tags = [str(x) for x in parsed]
+        except (TypeError, ValueError):
+            tags = []
+    if "owner_verified" in tags or reason == "owner_instruction" or "owner_instruction" in tags:
+        reason = "owner_reply"
+    candidates = _ACK_REASON_EQUIV.get(reason, (reason,))
+    return any(c in ack_reasons for c in candidates)
+
+
+def _is_waiting_batch(c: sqlite3.Connection, batch_id: str) -> bool:
+    row = c.execute("SELECT receipt FROM dispatches WHERE batch_id = ?", (batch_id,)).fetchone()
+    if not row or not row["receipt"]:
+        return False
+    try:
+        st = str((json.loads(row["receipt"]) or {}).get("status") or "").strip()
+        return st in ("waiting", "waiting_external")
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def ask_jumps(c: sqlite3.Connection, at: datetime) -> list[tuple[str, str]]:
+    """L4 噪音剃刀版 ask_jumps：仅统计最近 24h 内未结案或超时/异常关闭的提问。
+
+    正常已答复结案（answered / resolved / closed_by_owner）的多轮密集对话不再误报；
+    多单据巡检管家会话在等待期挂起 < 10 张带独立非空事项 key（sends.norm_key/key）、
+    尚未超时催办（expiry_reminded_at IS NULL 且距提问 < 12h）且未异常关闭（closed_at IS NULL）的在途决策卡时，
+    属于正常分单待批队列，不计入异常激增（同 key 重复发问、无 key 裸发问、已超时/异常关闭达阈值，或在途总未结数 >= 10 仍告警）。
+    """
+    out: list[tuple[str, str]] = []
+    esc_cols = {r[1] for r in c.execute("PRAGMA table_info(escalations)")}
+    if not esc_cols:
+        return out
+    if "asked_at" in esc_cols and "created_at" in esc_cols:
+        ts_col = "COALESCE(e.asked_at, e.created_at)"
+    elif "created_at" in esc_cols:
+        ts_col = "e.created_at"
+    else:
+        ts_col = "e.asked_at"
+
+    if "close_reason" in esc_cols and "status" in esc_cols:
+        status_col = "COALESCE(e.close_reason, e.status, 'open')"
+    elif "status" in esc_cols:
+        status_col = "COALESCE(e.status, 'open')"
+    else:
+        status_col = "COALESCE(e.close_reason, 'open')"
+
+    tabs = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    sends_cols = {r[1] for r in c.execute("PRAGMA table_info(sends)")} if "sends" in tabs else set()
+    if "norm_key" in sends_cols and "key" in sends_cols:
+        key_expr = "COALESCE(NULLIF(TRIM(s.norm_key), ''), NULLIF(TRIM(s.key), ''), '')"
+        sends_join = "LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'"
+    elif "key" in sends_cols:
+        key_expr = "COALESCE(NULLIF(TRIM(s.key), ''), '')"
+        sends_join = "LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'"
+    else:
+        key_expr = "''"
+        sends_join = ""
+
+    reminded_expr = "COALESCE(e.expiry_reminded_at, '')" if "expiry_reminded_at" in esc_cols else "''"
+    cutoff_24h = iso(at - timedelta(days=1))
+    cutoff_12h = iso(at - timedelta(hours=12))
+    unsettled_cond = f"(e.closed_at IS NULL OR {status_col} NOT IN ('answered', 'resolved', 'closed_by_owner'))"
+    sql = f"""
+        SELECT e.topic_id AS topic_id,
+               SUM(CASE WHEN {ts_col} >= ? AND {unsettled_cond} THEN 1 ELSE 0 END) AS d1_unsettled,
+               SUM(CASE WHEN {ts_col} <  ? AND {unsettled_cond} THEN 1 ELSE 0 END) AS prev_unsettled,
+               MIN({ts_col}) AS first_at
+        FROM escalations e
+        GROUP BY e.topic_id
+    """
+    rows = c.execute(sql, (cutoff_24h, cutoff_24h)).fetchall()
+    d1_rows = c.execute(
+        f"""
+        SELECT e.topic_id AS topic_id,
+               {ts_col} AS asked_ts,
+               e.closed_at AS closed_at,
+               {reminded_expr} AS expiry_reminded_at,
+               {key_expr} AS ask_key
+        FROM escalations e
+        {sends_join}
+        WHERE {ts_col} >= ? AND {unsettled_cond}
+        """,
+        (cutoff_24h,),
+    ).fetchall()
+    by_topic_d1: dict[str, list[sqlite3.Row]] = {}
+    for dr in d1_rows:
+        by_topic_d1.setdefault(dr["topic_id"], []).append(dr)
+
+    cutoff_dt = at - timedelta(days=1)
+    for r in rows:
+        tid = r["topic_id"]
+        d1_total = int(r["d1_unsettled"] or 0)
+        prev = int(r["prev_unsettled"] or 0)
+        if d1_total < 4:
+            continue
+        t_items = by_topic_d1.get(tid) or []
+        key_counts: dict[str, int] = {}
+        for it in t_items:
+            k_norm = str(it["ask_key"] or "").strip().upper()
+            if k_norm:
+                key_counts[k_norm] = key_counts.get(k_norm, 0) + 1
+        d1_abnormal = 0
+        for it in t_items:
+            k_norm = str(it["ask_key"] or "").strip().upper()
+            asked_ts = str(it["asked_ts"] or "")
+            is_fresh_distinct = (
+                it["closed_at"] is None
+                and not str(it["expiry_reminded_at"] or "").strip()
+                and asked_ts >= cutoff_12h
+                and bool(k_norm)
+                and key_counts.get(k_norm, 0) == 1
+            )
+            if not is_fresh_distinct:
+                d1_abnormal += 1
+        d1 = d1_total if d1_total >= 10 else d1_abnormal
+        if d1 < 4:
+            continue
+        first_dt = parse_iso(r["first_at"])
+        if prev > 0 and first_dt is not None and first_dt < cutoff_dt:
+            hist_days = max(1.0, (cutoff_dt - first_dt).total_seconds() / 86400.0)
+            daily_avg = prev / hist_days
+            if d1 >= 2.0 * daily_avg:
+                out.append((tid, f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次（历史未结案日均 {daily_avg:.1f} 次）"))
+        elif d1 >= 5:
+            out.append((tid, f"{tid} 最近 24 小时未结案/超时提问激增（ask_jumps）：{d1} 次未结案提问积压"))
+    return out
+
+
+def _resolve_transcript_path(conversation_id: str, antigravity_brain_dir: Path | None = None) -> Path:
+    brain_env = os.environ.get("SHEEPDOG_ANTIGRAVITY_BRAIN_DIR")
+    base = antigravity_brain_dir or (Path(brain_env) if brain_env else None)
+    if base is not None:
+        p1 = Path(base) / conversation_id / ".system_generated" / "logs" / "transcript.jsonl"
+        if p1.exists():
+            return p1
+        p2 = Path(base) / conversation_id / "transcript.jsonl"
+        if p2.exists():
+            return p2
+        return p1
+    return agentapi.transcript_path(conversation_id)
+
+
+def _read_tail_steps(path: Path, max_bytes: int = TRANSCRIPT_TAIL_BYTES) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+        start = max(0, size - max_bytes)
+        with path.open("rb") as f:
+            if start > 0:
+                f.seek(start)
+                f.readline()  # 丢弃可能截断的首行
+            raw = f.read()
+    except OSError:
+        return []
+    steps: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(d, dict):
+            steps.append(d)
+    return steps
+
+
+def _extract_post_dispatch_steps(
+    steps: list[dict],
+    pending_batch_id: str,
+    dispatched_at: str | None,
+) -> list[dict]:
+    """定位当前批次投递后的所有 transcript steps。"""
+    if not steps:
+        return []
+    if pending_batch_id:
+        for idx in range(len(steps) - 1, -1, -1):
+            st = steps[idx]
+            content = str(st.get("content") or "")
+            if pending_batch_id in content:
+                return steps[idx:]
+    disp_dt = parse_iso(dispatched_at)
+    if disp_dt is None:
+        return steps
+    threshold = disp_dt - timedelta(seconds=2)
+    post: list[dict] = []
+    for st in steps:
+        st_dt = parse_iso(str(st.get("created_at") or st.get("timestamp") or ""))
+        if st_dt is not None and st_dt >= threshold:
+            post.append(st)
+        elif st_dt is None and (
+            "The prompt could not be submitted" in str(st.get("content") or "")
+            or "The prompt could not be submitted" in str(st.get("error") or "")
+        ):
+            post.append(st)
+    return post
+
+
+def _write_self_heal_stop_marker(
+    state_dir: Path,
+    topic_id: str,
+    pending_batch_id: str,
+    now: datetime,
+) -> Path:
+    """向 state_dir/hooks/stop/<topic_id>.json 写入轻自愈标记，交由常驻进程 7.64 状态机催交或解锁。"""
+    stop_dir = state_dir / "hooks" / "stop"
+    stop_dir.mkdir(parents=True, exist_ok=True)
+    stop_file = stop_dir / f"{topic_id}.json"
+    existing: dict = {}
+    if stop_file.exists():
+        try:
+            loaded = json.loads(stop_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and loaded.get("batch") == pending_batch_id:
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    passed_dt = now - timedelta(seconds=120)
+    payload = {
+        **existing,
+        "batch": pending_batch_id,
+        "count": max(int(existing.get("count") or 0), 2),
+        "passed_at": iso(passed_dt),
+        "self_heal_by": "sheepdog.observe",
+        "self_heal_at": iso(now),
+    }
+    tmp = stop_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(stop_file)
+    return stop_file
+
+
+def run_observe(
+    cfg: Config | None = None, *, db_path: Path | None = None, state_path: Path | None = None,
+    since_minutes: float = 20.0, notify_lark: bool = False, notify_chat_id: str = DEFAULT_OWNER_CHAT,
+    alert_cooldown_minutes: float = 60.0, simulate_warn: list[str] | None = None, self_heal: bool = False,
+    now_dt: datetime | None = None, antigravity_brain_dir: Path | None = None, repo_dir: Path | None = None,
+    check_processes: bool = True, check_log: bool = True, check_release_bot: bool = False,
+    ps_output: str | None = None, log_path: Path | None = None, roster_path: Path | None = None,
+) -> dict:
+    """执行 L1–L4 深度巡检并返回结构化字典。"""
+    ref_now = now_dt or now_tz()
+    state_dir = db_path.parent if db_path is not None else (cfg.state_dir if cfg is not None else DEFAULT_DB.parent)
+    db = db_path or (cfg.db_path if cfg is not None else DEFAULT_DB)
+    st_path = state_path or (state_dir / "watchdog-cursor.json")
+    log_file = log_path or DEFAULT_LOG
+    roster_file = roster_path or (cfg.roster_file if (cfg is not None and getattr(cfg, "roster_file", None)) else DEFAULT_ROSTER)
+    media_dir = state_dir / "media" if state_dir else DEFAULT_MEDIA
+    owner_id = cfg.self_open_id if (cfg is not None and getattr(cfg, "self_open_id", None)) else DEFAULT_OWNER
+    dm_chat_id = notify_chat_id or (cfg.owner_chat_ids[0] if (cfg is not None and getattr(cfg, "owner_chat_ids", None)) else "")
+    bus_topic_id = "tp_bus"
+    default_ack_reasons = set(_DEFAULT_ACK_REASONS)
+    if cfg is not None and cfg.ack.enabled:
+        ack_enabled, ack_reasons = True, (set(cfg.ack.reasons or ()) | set(cfg.ack.bot_reasons or ())) or default_ack_reasons
+    elif cfg is not None and getattr(cfg, "config_path", None) and cfg.config_path.exists():
+        ack_enabled, ack_reasons = False, default_ack_reasons
+    else:
+        ack_enabled, ack_reasons = True, default_ack_reasons
+
+    st: dict = {}
+    if st_path.exists():
+        try:
+            st = json.loads(st_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            st = {}
+    since = st.get("since") or iso(ref_now - timedelta(minutes=since_minutes))
+    if not now_dt:
+        since = max(since, GOLIVE)
+
+    warn, info, self_healed = [], [], []
+    disk_ver_info = version_info(repo_dir or default_repo_dir(), prefer_disk_version=True)
+
+    # ==================== L1: 进程与版本一致性 ====================
+    if check_processes:
+        if ps_output is None:
+            try:
+                ps_output = subprocess.run(["ps", "-axo", "pid,lstart,command"], capture_output=True, text=True, timeout=10, check=False).stdout
+            except (OSError, subprocess.SubprocessError):
+                ps_output = ""
+        run_procs = [l for l in ps_output.splitlines() if re.search(r"(?:/sheepdog|sheepdog(?:\.cli)?)\s+run(?:\s|$)", l) and "grep" not in l]
+        consumer_procs = [l for l in ps_output.splitlines() if "lark-cli event consume" in l and "grep" not in l]
+        if len(run_procs) != 1:
+            warn.append("正式常驻进程数量=0（应为 1）：`sheepdog run` 不在" if not run_procs else f"正式常驻进程数量={len(run_procs)}（应为 1，PIDs: {', '.join(r.split()[0] for r in run_procs)}）")
+        else:
+            parts = run_procs[0].split()
+            info.append(f"常驻进程 {parts[0]}（起于 {' '.join(parts[1:6])}）")
+        ic_meta: dict = {}
+        if db.exists():
+            try:
+                with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as _mc:
+                    _mr = _mc.execute("SELECT value FROM meta WHERE key='identity_consumer'").fetchone()
+                    ic_meta = json.loads(_mr[0]) if (_mr and _mr[0]) else {}
+            except Exception:
+                ic_meta = {}
+        if ic_meta.get("mode") == "native_ws":
+            ws_state = str(ic_meta.get("state") or "")
+            ws_err = str(ic_meta.get("last_error") or "")
+            ws_err_low = ws_err.lower()
+            ws_transient = any(
+                k in ws_err_low
+                for k in ("timed out", "timeout", "eof", "handshake", "reset", "closed", "zombie", "unreachable", "refused", "no such host")
+            )
+            ws_last_ok_ts = str(ic_meta.get("last_pong_at") or ic_meta.get("ready_at") or ic_meta.get("started_at") or "")
+            ws_ok_age_m = age_min(ws_last_ok_ts, ref_now) if ws_last_ok_ts else None
+            if ws_state in ("running", "starting"):
+                info.append(f"原生 WebSocket 常驻在线（conn={ic_meta.get('conn_id') or '-'}，重启 {ic_meta.get('restarts', 0)} 次）")
+            elif (ws_state == "reconnecting" or (ws_state == "down" and ws_transient)) and (
+                ws_ok_age_m is not None and ws_ok_age_m < 10.0
+            ):
+                info.append(
+                    f"原生 WebSocket 瞬时断线重连中（已 {ws_ok_age_m:.1f} 分钟，重启 {ic_meta.get('restarts', 0)} 次，最近：{ws_err[:60]}）"
+                )
+                if self_heal and state_dir is not None:
+                    try:
+                        (state_dir / ".wakeup").write_text("native_ws_wakeup\n", encoding="utf-8")
+                        self_healed.append("native_ws:wakeup_poll")
+                    except OSError:
+                        pass
+            else:
+                warn.append(f"原生 WebSocket 异常：state={ws_state} err={ws_err[:80]}")
+        elif not consumer_procs:
+            warn.append("lark-cli event consume 没在跑")
+
+    if check_log:
+        try:
+            lines = log_file.read_text(errors="ignore").splitlines()
+        except OSError as e:
+            lines = []
+            warn.append(f"读不到日志 {log_file}：{e}")
+        if lines:
+            last_dispatch = next((l for l in reversed(lines) if " INFO dispatch:" in l), "")
+            dispatch_fresh = False
+            if last_dispatch:
+                try:
+                    t = datetime.strptime(last_dispatch[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                    m = (ref_now - t).total_seconds() / 60.0
+                    dispatch_fresh = m <= 5
+                    (warn if m > 5 else info).append(f"最近一轮在 {m:.0f} 分钟前（{last_dispatch[11:19]}）")
+                except ValueError:
+                    pass
+            else:
+                warn.append("日志里找不到任何一轮 dispatch")
+            since_log = since[:19].replace("T", " ")
+            recent, cur = [], ""
+            for l in lines:
+                if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", l):
+                    cur = l[:19]
+                if cur >= since_log:
+                    recent.append(l)
+            raw_errs = [l for i, l in enumerate(recent) if " ERROR " in l or " CRITICAL " in l or ("Traceback" in l and not _is_kb_interrupt_tb(recent, i))]
+            errs, recovered_net_errs = [], []
+            for l in raw_errs:
+                if (dispatch_fresh and last_dispatch and l[:19] < last_dispatch[:19]
+                        and "ERROR 本轮失败（下一轮从水位线续跑）: SourceError:" in l
+                        and any(k in l for k in (
+                            "network/transport:",
+                            "timed out",
+                            "timeout",
+                            "EOF",
+                            "connection reset",
+                            "no such host",
+                            "uat-client: refresh attempt",
+                            "token refresh request failed",
+                            "network is unreachable",
+                            "no route to host",
+                            "connection refused",
+                            "tls handshake",
+                        ))):
+                    recovered_net_errs.append(l)
+                else:
+                    errs.append(l)
+            if errs:
+                warn.append(f"日志里有 {len(errs)} 行 ERROR/Traceback，最近一行：{errs[-1][:200]}")
+            if recovered_net_errs:
+                info.append(f"期间有 {len(recovered_net_errs)} 次瞬时网络抖动已自动从水位线恢复")
+            media_fail = [l for l in recent if "图片" in l and ("失败" in l or "超限" in l)]
+            if media_fail:
+                warn.append(f"图片下载失败 {len(media_fail)} 次，最近：{media_fail[-1][:200]}")
+
+    version_mismatch_since = st.get("version_mismatch_since", "")
+    seen_ask_jump = dict(st.get("ask_jump") or {})
+
+    if db.exists():
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        c.row_factory = sqlite3.Row
+        try:
+            tabs = {x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+            # L1.3: daemon_runtime vs 磁盘版本一致性 + 远端可用版本提示
+            d_warns, d_infos, version_mismatch_since = version_watch.check_version_drift(
+                c, disk_ver_info, version_mismatch_since, ref_now
+            )
+            warn.extend(d_warns)
+            info.extend(d_infos)
+
+            # 卡住的 attention / lost 会话
+            healed_attention_tids: set[str] = set()
+            if "topics" in tabs:
+                for r in c.execute(
+                    "SELECT topic_id, title, state, attention_at, attention_reason FROM topics "
+                    "WHERE state IN ('attention','lost') AND COALESCE(kind, '') != 'known'"
+                ):
+                    m = age_min(r["attention_at"], ref_now) if r["attention_at"] else None
+                    tid_att = str(r["topic_id"] or "")
+                    if (
+                        self_heal
+                        and r["state"] == "attention"
+                        and r["attention_reason"] == "receipt_timeout"
+                        and m is not None
+                        and m >= 10
+                    ):
+                        try:
+                            now_s = iso(ref_now)
+                            with sqlite3.connect(db, timeout=5.0) as wc:
+                                wc.execute(
+                                    "UPDATE topics SET state='active', retries=0, pending_batch_id=NULL, "
+                                    "attention_at=NULL, attention_reason=NULL WHERE topic_id=?",
+                                    (tid_att,),
+                                )
+                                if "meta" in tabs:
+                                    wc.execute(
+                                        "INSERT INTO meta(key, value) VALUES(?, ?) "
+                                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                        (f"duty_reset:{tid_att}", now_s),
+                                    )
+                                if "duty_cards" in tabs:
+                                    wc.execute(
+                                        "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, "
+                                        "idle_since=?, updated_at=? WHERE topic_id=?",
+                                        (now_s, now_s, tid_att),
+                                    )
+                                wc.commit()
+                            if state_dir is not None:
+                                try:
+                                    (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                except OSError:
+                                    pass
+                            healed_attention_tids.add(tid_att)
+                            self_healed.append(f"{tid_att}:attention_timeout_auto_reprobe")
+                            info.append(
+                                f"已对 {tid_att}「{r['title']}」解除回执超时 attention 熔断（已冷却 {m:.0f} 分钟）并触发半开重投探测"
+                            )
+                            continue
+                        except sqlite3.Error:
+                            pass
+                    txt = (
+                        f"会话 {r['topic_id']}「{r['title']}」{r['state']}（{r['attention_reason'] or '原因没记'}）"
+                        + (f"，已 {m:.0f} 分钟" if m is not None else "")
+                    )
+                    (warn if (m is None or m >= 30) else info).append(txt)
+
+            # ==================== L2: 端到端四阶段水流 SLA ====================
+            # 阶段 1: Ingest Ack SLA (90s) —— 固定 30 分钟滚动窗口，不受 since 推进截断
+            if ack_enabled and "messages" in tabs and "acks" in tabs:
+                ack_window_start = iso(ref_now - timedelta(minutes=30))
+                if iso(ref_now) >= GOLIVE:
+                    ack_window_start = max(GOLIVE, ack_window_start)
+                msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+                fs_col = "m.first_seen" if "first_seen" in msg_cols else "'' AS first_seen"
+                ack_candidates = c.execute(
+                    f"""
+                    SELECT m.message_id, m.topic_id, m.chat_type, m.reason, m.tags_json, m.create_time, m.update_time, {fs_col}
+                    FROM messages m
+                    LEFT JOIN acks a ON a.message_id = m.message_id
+                    WHERE m.create_time >= ?
+                      AND m.route = 'dispatch'
+                      AND COALESCE(m.chat_type, '') != 'system'
+                      AND COALESCE(m.security_action, 'none') != 'hold'
+                      AND COALESCE(m.deleted, 0) = 0
+                      AND m.dispatch_state IN ('pending', 'delivered', 'acked')
+                      AND a.message_id IS NULL
+                    """,
+                    (ack_window_start,),
+                ).fetchall()
+                bad_acks: list[tuple[sqlite3.Row, float]] = []
+                for r in ack_candidates:
+                    if not _should_expect_ack(r, ack_reasons):
+                        continue
+                    age_s = age_seconds(r["first_seen"] or r["create_time"], ref_now)
+                    if age_s is not None and age_s >= 90:
+                        bad_acks.append((r, age_s))
+                if bad_acks:
+                    ex_row, ex_age = bad_acks[0]
+                    warn.append(
+                        f"入账超 90s 未点 [Get] 表情（7.67 Ingest Ack SLA）：{len(bad_acks)} 条，"
+                        f"例 {ex_row['topic_id']} {ex_row['message_id'][-8:]} ({int(ex_age)}s)"
+                    )
+
+            requeued_echo_map: dict[str, str] = {}
+            if "meta" in tabs:
+                for mr_meta in c.execute(
+                    "SELECT key, value FROM meta WHERE key LIKE 'owner_echo_requeued:%'"
+                ).fetchall():
+                    mk = str(mr_meta["key"] or "")
+                    mv = str(mr_meta["value"] or "").strip()
+                    if mk.startswith("owner_echo_requeued:") and mv:
+                        requeued_echo_map[mk.removeprefix("owner_echo_requeued:")] = mv
+
+            # 阶段 2: Priority SLA (90s)
+            priority_msg_ids: set[str] = set()
+            if "messages" in tabs:
+                prio_rows = c.execute(
+                    """
+                    SELECT message_id, topic_id, reason, tags_json, create_time, first_seen
+                    FROM messages
+                    WHERE route = 'dispatch'
+                      AND dispatch_state = 'pending'
+                      AND COALESCE(security_action, 'none') != 'hold'
+                      AND COALESCE(deleted, 0) = 0
+                      AND (
+                          reason IN ('owner_instruction', 'owner_reply')
+                          OR COALESCE(tags_json, '') LIKE '%"owner_instruction"%'
+                      )
+                    """
+                ).fetchall()
+                for r in prio_rows:
+                    priority_msg_ids.add(r["message_id"])
+                    if str(r["topic_id"] or "") in healed_attention_tids:
+                        continue
+                    req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
+                    base_ts = _queue_entry_ts(r["create_time"], r["first_seen"], ref_now)
+                    eff_create_ts = max(base_ts, req_ts) if req_ts else base_ts
+                    age_s = age_seconds(eff_create_ts, ref_now)
+                    if age_s is not None and age_s >= 90:
+                        warn.append(
+                            f"主人指令/回复 pending 超 90s 未插话送达（Priority SLA）："
+                            f"{r['topic_id']} {r['message_id'][-8:]} reason={r['reason']} ({int(age_s)}s)"
+                        )
+
+            # 阶段 3: Queue Head-of-Line SLA (5 分钟 = 300s)
+            if "messages" in tabs:
+                pending_rows = c.execute(
+                    """
+                    SELECT message_id, topic_id, reason, tags_json, create_time, first_seen, last_seen
+                    FROM messages
+                    WHERE route = 'dispatch'
+                      AND dispatch_state = 'pending'
+                      AND COALESCE(security_action, 'none') != 'hold'
+                      AND COALESCE(deleted, 0) = 0
+                    """
+                ).fetchall()
+                relay_ts_by_topic: dict[str, str] = {}
+                for r in pending_rows:
+                    if r["reason"] == "bus_relay":
+                        tid_r = str(r["topic_id"] or "")
+                        ts_r = str(r["first_seen"] or r["create_time"] or "")
+                        if tid_r and ts_r and ts_r > relay_ts_by_topic.get(tid_r, ""):
+                            relay_ts_by_topic[tid_r] = ts_r
+                by_topic: dict[str, list[float]] = {}
+                for r in pending_rows:
+                    if r["message_id"] in priority_msg_ids:
+                        continue
+                    tags_raw = str(r["tags_json"] or "")
+                    is_forwarded = '"forwarded"' in tags_raw or '"forwarded_from:' in tags_raw
+                    if is_forwarded:
+                        tid_r = str(r["topic_id"] or "")
+                        q_ts = relay_ts_by_topic.get(tid_r) or str(r["last_seen"] or r["create_time"] or "")
+                    else:
+                        q_ts = _queue_entry_ts(r["create_time"], r["first_seen"], ref_now)
+                    req_ts = requeued_echo_map.get(str(r["message_id"] or ""), "")
+                    if req_ts and req_ts > q_ts:
+                        q_ts = req_ts
+                    age_s = age_seconds(q_ts, ref_now)
+                    if age_s is None:
+                        continue
+                    by_topic.setdefault(r["topic_id"] or "-", []).append(age_s)
+                for tid, ages in by_topic.items():
+                    max_age_s = max(ages)
+                    if max_age_s >= 300:
+                        t_row = (
+                            c.execute(
+                                "SELECT state, pending_batch_id, dispatched_at, conversation_id, host FROM topics WHERE topic_id = ?",
+                                (tid,),
+                            ).fetchone()
+                            if "topics" in tabs
+                            else None
+                        )
+                        pending_batch = (t_row["pending_batch_id"] if t_row else None) or "无"
+                        topic_state = (t_row["state"] if t_row else None) or "unknown"
+                        card_row = (
+                            c.execute(
+                                "SELECT run_state, detail, last_act_at, no_record FROM duty_cards WHERE topic_id = ?",
+                                (tid,),
+                            ).fetchone()
+                            if "duty_cards" in tabs
+                            else None
+                        )
+                        healed_hol = tid in healed_attention_tids
+                        if (
+                            self_heal
+                            and pending_batch == "无"
+                            and topic_state in ("active", "blocked", "waiting_human")
+                            and card_row is not None
+                            and card_row["run_state"] in ("lost", "stalled")
+                            and not int(card_row["no_record"] or 0)
+                        ):
+                            try:
+                                t_cid = str((t_row["conversation_id"] if t_row else "") or "").strip()
+                                t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir)) if t_cid else []
+                                last_act_str = str(card_row["last_act_at"] or "")
+                                requeued_bids: list[str] = []
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.row_factory = sqlite3.Row
+                                    if "dispatches" in tabs:
+                                        missed_rows = wc.execute(
+                                            "SELECT batch_id, sent_at FROM dispatches WHERE topic_id = ? AND state = 'missed' ORDER BY sent_at DESC LIMIT 10",
+                                            (tid,),
+                                        ).fetchall()
+                                        for mr in missed_rows:
+                                            m_sent = str(mr["sent_at"] or "")
+                                            if last_act_str and m_sent <= last_act_str:
+                                                continue
+                                            m_dt = parse_iso(m_sent)
+                                            has_planner = False
+                                            if m_dt is not None and t_steps:
+                                                thr = m_dt - timedelta(seconds=2)
+                                                has_planner = any(
+                                                    s.get("type") == "PLANNER_RESPONSE"
+                                                    and (st_dt := parse_iso(str(s.get("created_at") or ""))) is not None
+                                                    and st_dt >= thr
+                                                    for s in t_steps
+                                                )
+                                            if not has_planner:
+                                                wc.execute(
+                                                    "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                                                    (mr["batch_id"], tid),
+                                                )
+                                                wc.execute(
+                                                    "UPDATE dispatches SET state='redelivered', error='observe自愈合并重投' WHERE batch_id=?",
+                                                    (mr["batch_id"],),
+                                                )
+                                                requeued_bids.append(mr["batch_id"])
+                                    now_s = iso(ref_now)
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"duty_reset:{tid}", now_s),
+                                        )
+                                    wc.execute(
+                                        "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, idle_since=?, updated_at=? WHERE topic_id=?",
+                                        (now_s, now_s, tid),
+                                    )
+                                    wc.commit()
+                                if state_dir is not None:
+                                    try:
+                                        (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                    except OSError:
+                                        pass
+                                self_healed.append(f"{tid}:duty_stuck_queue_unblock")
+                                info.append(
+                                    f"已对 {tid} 解除看板 {card_row['run_state']} 队头死锁并唤醒投递（合并重投未唤醒批次={requeued_bids or '无'}）"
+                                )
+                                healed_hol = True
+                            except sqlite3.Error:
+                                healed_hol = tid in healed_attention_tids
+                        if not healed_hol:
+                            if self_heal and topic_state == "running" and pending_batch != "无" and state_dir is not None:
+                                try:
+                                    (state_dir / ".wakeup").write_text(iso(ref_now), encoding="utf-8")
+                                except OSError:
+                                    pass
+                            warn.append(
+                                f"消息排队超 5 分钟（Queue Head-of-Line SLA 队头阻塞）：{tid} {len(ages)} 条 "
+                                f"最久 {int(max_age_s // 60)} 分钟（阻塞批次={pending_batch} state={topic_state}）"
+                            )
+
+            # 阶段 4: Owner Echo SLA (15 分钟 = 900s)
+            if "owner_echoes" in tabs:
+                opens = c.execute(
+                    "SELECT message_id, stage, topic_id, said_at, delivered_at, stage_at, batch_id, relay_batch FROM owner_echoes WHERE settled_at IS NULL"
+                ).fetchall()
+                for r in opens:
+                    mid = str(r["message_id"] or "")
+                    tid = str(r["topic_id"] or "")
+                    requeue_key = f"owner_echo_requeued:{mid}"
+                    requeue_cnt_key = f"owner_echo_requeue_count:{mid}"
+                    requeued_at = ""
+                    requeue_cnt = 0
+                    if "meta" in tabs and mid:
+                        meta_r = c.execute("SELECT value FROM meta WHERE key = ?", (requeue_key,)).fetchone()
+                        requeued_at = str((meta_r["value"] if meta_r else "") or "").strip()
+                        cnt_r = c.execute("SELECT value FROM meta WHERE key = ?", (requeue_cnt_key,)).fetchone()
+                        try:
+                            requeue_cnt = int((cnt_r["value"] if cnt_r else "") or 0)
+                        except (TypeError, ValueError):
+                            requeue_cnt = 1 if requeued_at else 0
+                        if requeued_at and requeue_cnt == 0:
+                            requeue_cnt = 1
+                    eff_since = max(str(r["said_at"] or ""), requeued_at) if requeued_at else str(r["said_at"] or "")
+                    age_s = age_seconds(eff_since, ref_now)
+                    if age_s is not None and age_s >= 900:
+                        healed_echo = False
+                        if self_heal and requeue_cnt < 3 and tid and "topics" in tabs and "messages" in tabs:
+                            t_row = c.execute(
+                                "SELECT state, pending_batch_id FROM topics WHERE topic_id = ?",
+                                (tid,),
+                            ).fetchone()
+                            t_state = str((t_row["state"] if t_row else "") or "")
+                            t_pbid = str((t_row["pending_batch_id"] if t_row else "") or "").strip()
+                            if t_state in ("active", "blocked", "waiting_human") and not t_pbid and not str(r["relay_batch"] or "").strip():
+                                try:
+                                    now_s = iso(ref_now)
+                                    with sqlite3.connect(db, timeout=5.0) as wc:
+                                        wc.row_factory = sqlite3.Row
+                                        if "dispatches" in tabs:
+                                            for mr in wc.execute(
+                                                "SELECT batch_id FROM dispatches WHERE topic_id=? AND state='missed'",
+                                                (tid,),
+                                            ).fetchall():
+                                                m_msgs = wc.execute(
+                                                    "SELECT message_id, reason, tags_json FROM messages WHERE batch_id=? AND topic_id=? AND dispatch_state='missed'",
+                                                    (mr["batch_id"], tid),
+                                                ).fetchall()
+                                                dup_mids = []
+                                                for mm in m_msgs:
+                                                    if str(mm["reason"] or "") == "lamb_report":
+                                                        try:
+                                                            m_tags = json.loads(mm["tags_json"] or "[]")
+                                                        except Exception:
+                                                            m_tags = []
+                                                        l_tag = next((tg for tg in m_tags if isinstance(tg, str) and tg.startswith("lamb:")), "")
+                                                        if l_tag and wc.execute(
+                                                            "SELECT 1 FROM messages WHERE topic_id=? AND reason='lamb_report' AND dispatch_state='acked' AND message_id!=? AND tags_json LIKE ? LIMIT 1",
+                                                            (tid, mm["message_id"], f'%"{l_tag}"%'),
+                                                        ).fetchone():
+                                                            dup_mids.append(mm["message_id"])
+                                                if dup_mids and len(dup_mids) == len(m_msgs):
+                                                    wc.execute(
+                                                        f"UPDATE messages SET dispatch_state='acked' WHERE topic_id=? AND message_id IN ({','.join('?' for _ in dup_mids)})",
+                                                        (tid, *dup_mids),
+                                                    )
+                                                    wc.execute(
+                                                        "UPDATE dispatches SET state='acked', error='observe自愈去重重复羔羊汇报' WHERE batch_id=?",
+                                                        (mr["batch_id"],),
+                                                    )
+                                        wc.execute(
+                                            "UPDATE messages SET dispatch_state='pending', batch_id=NULL WHERE message_id=? AND topic_id=?",
+                                            (mid, tid),
+                                        )
+                                        wc.execute(
+                                            "UPDATE owner_echoes SET stage='queued', stage_at=?, batch_id=NULL, delivered_at=NULL, relay_batch=NULL, relay_at=NULL, relay_status=NULL, relay_summary=NULL WHERE message_id=?",
+                                            (now_s, mid),
+                                        )
+                                        if "meta" in tabs:
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (requeue_key, now_s),
+                                            )
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (requeue_cnt_key, str(requeue_cnt + 1)),
+                                            )
+                                            wc.execute(
+                                                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                                (f"duty_reset:{tid}", now_s),
+                                            )
+                                        if "duty_cards" in tabs:
+                                            wc.execute(
+                                                "UPDATE duty_cards SET run_state='idle', detail='', stuck_since=NULL, idle_since=?, updated_at=? WHERE topic_id=?",
+                                                (now_s, now_s, tid),
+                                            )
+                                        wc.commit()
+                                    if state_dir is not None:
+                                        try:
+                                            (state_dir / ".wakeup").write_text(now_s, encoding="utf-8")
+                                        except OSError:
+                                            pass
+                                    self_healed.append(f"{tid}:owner_echo_requeue")
+                                    info.append(
+                                        f"已对 {tid} 自动重投未唤醒的主人回音消息 {mid[-8:]} 并解除看板死锁"
+                                    )
+                                    healed_echo = True
+                                except sqlite3.Error:
+                                    healed_echo = False
+                        if not healed_echo:
+                            warn.append(
+                                f"主人说话回音超 15 分钟未结清（Owner Echo SLA）："
+                                f"{r['topic_id'] or '-'} {r['message_id'][-8:]} 已 {int(age_s // 60)} 分钟（stage={r['stage']}）"
+                            )
+                for r in c.execute(
+                    "SELECT message_id, batch_id, relay_batch, settled_at FROM owner_echoes "
+                    "WHERE settled_by='relay' AND settled_at >= ? AND batch_id IS NOT NULL "
+                    "AND relay_batch IS NOT NULL AND batch_id != relay_batch AND batch_id NOT LIKE 'p%'",
+                    (since,),
+                ):
+                    if "dispatches" in tabs and _is_waiting_batch(c, r["batch_id"]):
+                        continue
+                    warn.append(
+                        f"回音卡片贴错了回执：{r['message_id'][-8:]} 是批次 {r['batch_id']} 送的，"
+                        f"卡片用的是 {r['relay_batch']} 的 summary（{r['settled_at'][11:16]}）"
+                    )
+                relays = c.execute("SELECT count(*) FROM owner_echoes WHERE relay_at >= ?", (since,)).fetchone()[0]
+                settled = c.execute(
+                    "SELECT settled_by, count(*) FROM owner_echoes WHERE settled_at >= ? GROUP BY settled_by",
+                    (since,),
+                ).fetchall()
+                info.append(
+                    f"回音：在欠 {len(opens)} 句；这段时间带回卡片 {relays} 句；"
+                    f"结清 {dict((x[0], x[1]) for x in settled) or 0}"
+                )
+
+            # ==================== L3: 宿主 Transcript 深度探针 ====================
+            if "topics" in tabs:
+                running_topics = c.execute(
+                    "SELECT topic_id, title, conversation_id, host, state, pending_batch_id, dispatched_at "
+                    "FROM topics WHERE state = 'running'"
+                ).fetchall()
+                for t in running_topics:
+                    tid = t["topic_id"]
+                    cid = (t["conversation_id"] or "").strip()
+                    host = (t["host"] or "antigravity").strip().lower()
+                    batch_id = (t["pending_batch_id"] or "").strip()
+                    disp_at = t["dispatched_at"]
+                    batch_age_s = age_seconds(disp_at, ref_now)
+
+                    # 探针 3a: tp_bus 运行时长越界 (150s)
+                    if tid == bus_topic_id and batch_age_s is not None and batch_age_s >= 150:
+                        warn.append(
+                            f"总线超时运行（tp_bus Boundary Guard）：tp_bus 批次 {batch_id} "
+                            f"已 running {int(batch_age_s)}s（超过 150s 上限，疑似代替业务会话干重活）"
+                        )
+
+                    if host in ("", "antigravity") and cid and batch_age_s is not None:
+                        t_path = _resolve_transcript_path(cid, antigravity_brain_dir)
+                        steps = _read_tail_steps(t_path)
+                        post_steps = _extract_post_dispatch_steps(steps, batch_id, disp_at)
+
+                        running_lambs = 0
+                        if "lambs" in tabs:
+                            running_lambs = c.execute(
+                                "SELECT COUNT(*) FROM lambs WHERE parent_topic_id = ? AND state = 'running'",
+                                (tid,),
+                            ).fetchone()[0]
+
+                        # 探针 1: Prompt Filter 拦截 / 90s 投递黑洞
+                        if batch_age_s >= 90 and t_path.exists():
+                            has_pf = any("The prompt could not be submitted" in str(s.get("content") or "") or "The prompt could not be submitted" in str(s.get("error") or "") for s in post_steps)
+                            if has_pf:
+                                warn.append(f"宿主 Prompt Filter 拦截：{tid} 批次 {batch_id} 出现 'The prompt could not be submitted'")
+                                if self_heal and state_dir is not None and f"{tid}:{batch_id}" not in self_healed:
+                                    _write_self_heal_stop_marker(state_dir, tid, batch_id, ref_now)
+                                    self_healed.append(f"{tid}:{batch_id}")
+                                    info.append(f"已对 Prompt Filter 拦截会话 {tid} ({batch_id}) 写入 stop 自愈标记")
+                            elif steps and not post_steps and running_lambs == 0:
+                                warn.append(f"投递黑洞：{tid} 批次 {batch_id} 已送出 {int(batch_age_s)}s，但宿主 transcript 无任何新 step")
+
+                        # 探针 2: 假 running 僵尸锁 (batch_age >= 180s & PLANNER_RESPONSE DONE 静默 >= 90s)
+                        if batch_age_s >= 180 and running_lambs == 0 and post_steps:
+                            has_receipt = bool("dispatches" in tabs and batch_id and (d_row := c.execute("SELECT receipt FROM dispatches WHERE batch_id = ?", (batch_id,)).fetchone()) and d_row["receipt"])
+                            receipt_file = state_dir / "receipts" / f"{tid}.json"
+                            if not has_receipt and receipt_file.exists():
+                                try:
+                                    rf_data = json.loads(receipt_file.read_text(encoding="utf-8"))
+                                    has_receipt = not batch_id or rf_data.get("batch_id") in (None, "", batch_id)
+                                except (OSError, json.JSONDecodeError):
+                                    pass
+                            if not has_receipt:
+                                last_step = post_steps[-1]
+                                last_type = str(last_step.get("type") or "")
+                                has_running_generic = any(
+                                    s.get("type") == "GENERIC" and str(s.get("status") or "").upper() == "RUNNING"
+                                    for s in post_steps
+                                )
+                                if (
+                                    last_type in ("PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT", "GENERIC")
+                                    and last_step.get("status") == "DONE"
+                                    and not last_step.get("tool_calls")
+                                    and not has_running_generic
+                                ):
+                                    silent_s = age_seconds(str(last_step.get("created_at") or ""), ref_now)
+                                    if silent_s is not None and silent_s >= 90:
+                                        warn.append(
+                                            f"假 running 僵尸锁：{tid} 批次 {batch_id} 已跑 {int(batch_age_s // 60)} 分钟，"
+                                            f"transcript 最后一步 {last_type} 已 DONE 静默 {int(silent_s)}s 但未交回执"
+                                        )
+                                        if self_heal and state_dir is not None:
+                                            _write_self_heal_stop_marker(state_dir, tid, batch_id, ref_now)
+                                            self_healed.append(f"{tid}:{batch_id}")
+                                            info.append(f"已对 {tid} ({batch_id}) 写入 stop 自愈标记")
+
+                # 探针 3b: tp_bus 工具/命令越权扫描 + REG-057 全目录盲扫代码探针
+                window_dt = ref_now - timedelta(minutes=since_minutes)
+                for tr in c.execute("SELECT topic_id, conversation_id, host, state, pending_batch_id, dispatched_at FROM topics").fetchall():
+                    t_tid, t_cid = tr["topic_id"], (tr["conversation_id"] or "").strip()
+                    if not t_cid or (tr["host"] or "antigravity").strip().lower() not in ("", "antigravity"):
+                        continue
+                    t_steps = _read_tail_steps(_resolve_transcript_path(t_cid, antigravity_brain_dir))
+                    in_flight = {id(x) for x in _extract_post_dispatch_steps(t_steps, (tr["pending_batch_id"] or "").strip(), tr["dispatched_at"])} if (tr["state"] or "") == "running" and (tr["pending_batch_id"] or "").strip() else set()
+                    healed_at_dt = None
+                    bus_healed_at_dt = None
+                    if "meta" in tabs:
+                        r_heal = c.execute("SELECT value FROM meta WHERE key = ?", (f"reg057_healed_at:{t_tid}",)).fetchone()
+                        if r_heal and r_heal["value"]:
+                            healed_at_dt = parse_iso(str(r_heal["value"]))
+                        if t_tid == bus_topic_id:
+                            r_bus_heal = c.execute("SELECT value FROM meta WHERE key = ?", (f"bus_boundary_healed_at:{t_tid}",)).fetchone()
+                            if r_bus_heal and r_bus_heal["value"]:
+                                bus_healed_at_dt = parse_iso(str(r_bus_heal["value"]))
+                    bad_calls: list[str] = []
+                    unbounded_cmds: list[str] = []
+                    for s in t_steps:
+                        if s.get("type") != "PLANNER_RESPONSE":
+                            continue
+                        s_dt = parse_iso(str(s.get("created_at") or ""))
+                        if id(s) not in in_flight and (s_dt < window_dt if s_dt is not None else (tr["state"] or "") != "running"):
+                            continue
+                        for tc in s.get("tool_calls") or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            t_name = str(tc.get("name") or tc.get("tool_name") or "")
+                            t_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                            if t_tid == bus_topic_id and t_name in _BUS_FORBIDDEN_TOOLS:
+                                if bus_healed_at_dt is not None and s_dt is not None and s_dt <= bus_healed_at_dt:
+                                    continue
+                                wf_path = str(t_args.get("Path") or t_args.get("path") or "").strip() if t_name == "write_file" else ""
+                                if t_name == "write_file" and wf_path.startswith(("/tmp/", "/private/tmp/")) and wf_path.endswith(".md"):
+                                    continue
+                                bad_calls.append(t_name)
+                            elif t_name == "run_command":
+                                raw_cmd = decode_command_line(t_args.get("CommandLine") or t_args.get("command") or "")
+                                cmd_str = normalize(raw_cmd)
+                                if t_tid == bus_topic_id and _is_bus_forbidden_command(cmd_str):
+                                    if bus_healed_at_dt is not None and s_dt is not None and s_dt <= bus_healed_at_dt:
+                                        continue
+                                    bad_calls.append(f"run_command({cmd_str[:60]})")
+                                if _is_unbounded_code_search(raw_cmd):
+                                    if healed_at_dt is not None and s_dt is not None and s_dt <= healed_at_dt:
+                                        continue
+                                    unbounded_cmds.append(cmd_str[:80])
+                    if unbounded_cmds:
+                        if self_heal:
+                            try:
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (t_tid,))
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"reg057_healed_at:{t_tid}", iso(ref_now)),
+                                        )
+                                    wc.commit()
+                                self_healed.append(f"{t_tid}:reg057_rules_reset")
+                                info.append(
+                                    f"已对 {t_tid} 的历史全目录盲扫（{unbounded_cmds[-1]}）执行规则指纹自愈重置（rules_hash=NULL，下一批重发 REG-057 护栏）"
+                                )
+                            except sqlite3.Error:
+                                for uc in unbounded_cmds:
+                                    warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {uc}")
+                        else:
+                            for uc in unbounded_cmds:
+                                warn.append(f"全目录盲扫代码风险（REG-057）：{t_tid} 调用未定仓全量搜索 {uc}")
+                    if bad_calls:
+                        if self_heal and (tr["state"] or "") != "running":
+                            try:
+                                with sqlite3.connect(db, timeout=5.0) as wc:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (t_tid,))
+                                    if "meta" in tabs:
+                                        wc.execute(
+                                            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                            (f"bus_boundary_healed_at:{t_tid}", iso(ref_now)),
+                                        )
+                                    wc.commit()
+                                self_healed.append(f"{t_tid}:bus_boundary_rules_reset")
+                                info.append(
+                                    f"已对 {t_tid} 的历史越权调用（{', '.join(bad_calls[:3])}）执行规则指纹自愈重置（rules_hash=NULL，下一批重发总线边界红线）"
+                                )
+                            except sqlite3.Error:
+                                warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
+                        else:
+                            warn.append(f"总线越权干活（tp_bus Boundary Guard）：检测到 tp_bus 调用越界工具/命令 {', '.join(bad_calls)}")
+
+            # ==================== L4: 噪音剃刀与核心不变量 ====================
+            # L4.2: ask_jumps 噪音剃刀（仅统计未结案/超时异常提问；持续入 warn 由指纹冷却防重复飞书通知与防假恢复）
+            if "escalations" in tabs:
+                today = ref_now.strftime("%Y-%m-%d")
+                for tid, w in ask_jumps(c, ref_now):
+                    warn.append(w)
+                    seen_ask_jump[tid] = today
+
+            # owner_notices 失败检查
+            if "owner_notices" in tabs:
+                bad = c.execute(
+                    "SELECT id, kind, state, attempts, last_error, created_at, body FROM owner_notices "
+                    "WHERE state NOT IN ('sent','acked','closed') AND created_at < ?",
+                    (iso(ref_now - timedelta(minutes=5)),),
+                ).fetchall()
+                for r in bad:
+                    err_txt = str(r["last_error"] or "")
+                    body_txt = (
+                        bytes(r["body"]).decode("utf-8", errors="replace")
+                        if isinstance(r["body"], (bytes, bytearray))
+                        else str(r["body"] or "")
+                    )
+                    if (
+                        r["state"] == "pending"
+                        and r["kind"] == "回执带回"
+                        and ("230011" in err_txt or "The message was withdrawn" in err_txt)
+                        and ("[Invalid text JSON]" in body_txt or "主人撤回了" in body_txt)
+                    ):
+                        if self_heal and db.exists():
+                            try:
+                                now_s = iso(ref_now)
+                                with sqlite3.connect(str(db), timeout=5.0) as wc:
+                                    wc.execute(
+                                        "UPDATE owner_notices SET state='sent', sent_at=?, inflight_at=NULL, next_at=NULL WHERE id=?",
+                                        (now_s, r["id"]),
+                                    )
+                                    wc.commit()
+                                self_healed.append(f"owner_notice:{r['id']}:withdrawn_anchor_settled")
+                                info.append(
+                                    f"已自动结清引用已撤回消息（230011）且已被新指令替代的回执带回通知 #{r['id']}"
+                                )
+                                continue
+                            except sqlite3.Error:
+                                pass
+                    warn.append(
+                        f"给你的通知 #{r['id']}（{r['kind']}）{r['state']}，试了 {r['attempts']} 次："
+                        f"{err_txt[:120]}"
+                    )
+                sent = c.execute(
+                    "SELECT kind, count(*) FROM owner_notices WHERE sent_at >= ? GROUP BY kind",
+                    (since,),
+                ).fetchall()
+                if sent:
+                    info.append("这段时间发给你的通知：" + "，".join(f"{k} {n}" for k, n in sent))
+
+            # 7.53: 主人私聊无引用消息必须落为 owner_instruction 或 pending_query
+            if "messages" in tabs:
+                rows = c.execute(
+                    """
+                    SELECT message_id, create_time, reason, tags_json, substr(content,1,30) t FROM messages
+                    WHERE sender_id=? AND chat_id=? AND create_time>=?
+                      AND (reply_to IS NULL OR reply_to='') AND (thread_id IS NULL OR thread_id='')
+                      AND content NOT IN ('待办') AND COALESCE(msg_type,'') != 'interactive'
+                      AND COALESCE(reason, '') != 'agent_reply_in_owner_chat'
+                    """,
+                    (owner_id, dm_chat_id, since),
+                ).fetchall()
+                for r in rows:
+                    if r["reason"] not in ("owner_instruction", "pending_query"):
+                        warn.append(
+                            f"私聊里没引用的「{r['t']}」({r['create_time'][11:16]}) 走成了 {r['reason']}，不是指令（7.53 回归？）"
+                        )
+                if rows and not any(r["reason"] not in ("owner_instruction", "pending_query") for r in rows):
+                    info.append(f"私聊里没引用的话 {len(rows)} 句，都按指令走")
+
+                # 7.56: 测试群不该进正式会话
+                leak = c.execute(
+                    """
+                    SELECT chat_name, count(*) FROM messages
+                    WHERE chat_name LIKE '🧪%' AND create_time>=? AND route='dispatch'
+                    GROUP BY chat_name
+                    """,
+                    (since,),
+                ).fetchall()
+                for name, n in leak:
+                    warn.append(f"测试群「{name}」有 {n} 条又送进了正式会话（7.56 回归？）")
+
+            # 7.54: 图片统计
+            n_media = sum(1 for p in media_dir.rglob("*") if p.is_file()) if media_dir.exists() else 0
+            info.append(f"本机已存图片 {n_media} 张")
+
+            # 7.61 & 7.65: 名册 VIP 请求底线检查
+            vips: dict[str, str] = {}
+            if roster_file and roster_file.exists():
+                try:
+                    import tomllib
+                    roster_data = tomllib.loads(roster_file.read_text(encoding="utf-8"))
+                    vips = {
+                        p["open_id"]: p.get("name") or p["open_id"]
+                        for p in roster_data.get("person", [])
+                        if p.get("tier") == "vip" and p.get("open_id")
+                    }
+                except (OSError, ValueError, KeyError) as e:
+                    warn.append(f"读不了名册里的 VIP：{e}")
+            if vips and "escalation_sources" in tabs and "escalations" in tabs and "sends" in tabs:
+                from .prompts import vip_of
+                sends_cols = {r[1] for r in c.execute("PRAGMA table_info(sends)")}
+                floor_sql = "COALESCE(s.floor,'')" if "floor" in sends_cols else "''"
+                nofloor_rows = c.execute(
+                    f"""
+                    SELECT e.message_id AS ask_mid, e.topic_id AS ask_topic, e.asked_at, m.*
+                    FROM escalations e
+                    JOIN escalation_sources es ON es.ask_message_id = e.message_id
+                    JOIN messages m ON m.message_id = es.about_message_id
+                    LEFT JOIN sends s ON s.message_id = e.message_id AND s.kind = 'ask'
+                    WHERE e.asked_at >= ? AND {floor_sql} = ''
+                    """,
+                    (since,),
+                ).fetchall()
+                seen_nofloor: set[tuple[str, str]] = set()
+                for r in nofloor_rows:
+                    vname = vip_of(r, vips)
+                    if not vname:
+                        continue
+                    nf_key = (r["ask_mid"], vname)
+                    if nf_key in seen_nofloor:
+                        continue
+                    seen_nofloor.add(nf_key)
+                    warn.append(
+                        f"VIP（{vname}）的请求又来找你审批了，没写碰到哪条底线："
+                        f"{r['ask_topic']} {r['asked_at'][11:16]}（7.61 回归？）"
+                    )
+
+            # 7.63: 代回卡片与 CLI 羔羊不变量
+            if "sends" in tabs and "messages" in tabs:
+                non_card = c.execute(
+                    """
+                    SELECT s.message_id, s.topic_id, s.sent_at, m.msg_type FROM sends s
+                    JOIN messages m ON m.message_id = s.message_id
+                    WHERE s.kind = 'reply' AND s.sent_at >= ?
+                      AND COALESCE(m.msg_type, '') != 'interactive'
+                      AND COALESCE(m.content, '') NOT LIKE '<card%'
+                    """,
+                    (since,),
+                ).fetchall()
+                for r in non_card:
+                    warn.append(
+                        f"代回没用卡片：{r['topic_id']} {r['sent_at'][11:16]}（{r['message_id'][-8:]}，msg_type={r['msg_type'] or '-'}）"
+                    )
+            if "lambs" in tabs:
+                dup_cids = c.execute(
+                    """
+                    SELECT parent_topic_id, conversation_id, count(*) n FROM lambs
+                    WHERE state = 'running' AND COALESCE(conversation_id, '') != ''
+                    GROUP BY parent_topic_id, conversation_id
+                    HAVING count(*) > 1
+                    """
+                ).fetchall()
+                for r in dup_cids:
+                    warn.append(
+                        f"羔羊同一 conversation_id 重复登记 {r['n']} 行：{r['parent_topic_id']} cid={r['conversation_id'][:8]}"
+                    )
+                for r in c.execute(
+                    """
+                    SELECT lamb_id, parent_topic_id, pid, started_at, last_act_at FROM lambs
+                    WHERE state = 'running' AND kind IN ('cli', 'bash_worker') AND pid IS NOT NULL
+                      AND COALESCE(NULLIF(last_act_at, ''), started_at) < ?
+                    """,
+                    (iso(ref_now - timedelta(minutes=2)),),
+                ).fetchall():
+                    try:
+                        os.kill(int(r["pid"]), 0)
+                    except ProcessLookupError:
+                        warn.append(
+                            f"CLI 羔羊 {r['lamb_id']}（{r['parent_topic_id']}，pid={r['pid']}）进程已退出但状态仍为 running"
+                        )
+                    except PermissionError:
+                        pass
+
+            # 7.108 (REG-076): 人类拍板采纳率、改判错题本自愈重注、免问自治候选自动晋升与 T0->T5 阶段耗时分位探针
+            if "escalations" in tabs and "messages" in tabs:
+                try:
+                    from .admin_web import classify_escalation, diff_ms, quantile
+                    sends_has_floor = "sends" in tabs and "floor" in {r[1] for r in c.execute("PRAGMA table_info(sends)")}
+                    floor_sub = "(SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1)" if sends_has_floor else "''"
+                    followup_send_sub = (
+                        "(SELECT s2.text FROM sends s2 WHERE s2.topic_id = e.topic_id AND s2.kind IN ('report', 'ask') AND s2.message_id != e.message_id AND s2.sent_at > e.asked_at AND (e.answered_at IS NULL OR s2.sent_at <= e.answered_at) ORDER BY s2.sent_at DESC LIMIT 1)"
+                        if "sends" in tabs
+                        else "''"
+                    )
+                    esc_cols = {r[1] for r in c.execute("PRAGMA table_info(escalations)")}
+                    pm_join = "LEFT JOIN messages pm ON pm.message_id = e.possibly_handled_message_id" if "possibly_handled_message_id" in esc_cols else ""
+                    pm_sel = "pm.content AS possible_content," if pm_join else "'' AS possible_content,"
+                    esc_rows = c.execute(
+                        f"""SELECT e.*, am.content AS answer_content, {pm_sel} {floor_sub} AS ask_floor, {followup_send_sub} AS followup_send_text
+                            FROM escalations e
+                            LEFT JOIN messages am ON am.message_id = e.answer_message_id
+                            {pm_join}
+                            ORDER BY e.asked_at DESC LIMIT 200"""
+                    ).fetchall()
+                    acc_cnt, ovr_cnt = 0, 0
+                    by_ct: dict[tuple[str, str], dict] = {}
+                    new_ovr: list[dict] = []
+                    for er in esc_rows:
+                        ans_txt = str(er["answer_content"] or er["possible_content"] or "")
+                        it = classify_escalation(er, answer_content=ans_txt, ask_floor=str(er["ask_floor"] or ""))
+                        al = it["alignment"]
+                        if al == "accepted":
+                            acc_cnt += 1
+                        elif al == "overridden":
+                            ovr_cnt += 1
+                            ev_ts = str(it.get("answered_at") or it.get("closed_at") or it.get("asked_at") or "")
+                            if ev_ts >= since:
+                                new_ovr.append(it)
+                        st_ct = by_ct.setdefault((it["topic_id"], it["category"]), {"accepted": 0, "overridden": 0})
+                        if al in ("accepted", "overridden"):
+                            st_ct[al] += 1
+                    dec_total = acc_cnt + ovr_cnt
+                    acc_rate = round(acc_cnt * 100.0 / dec_total, 1) if dec_total > 0 else 100.0
+                    auto_cands = [
+                        (tid, cat, st_ct["accepted"])
+                        for (tid, cat), st_ct in sorted(by_ct.items(), key=lambda kv: -kv[1]["accepted"])
+                        if st_ct["accepted"] >= 3 and st_ct["overridden"] == 0 and "底线" not in cat
+                    ]
+                    if dec_total > 0:
+                        info.append(
+                            f"决策自进化：近 {dec_total} 次拍板采纳率 {acc_rate:.1f}%（采纳 {acc_cnt} · 改判 {ovr_cnt} · 自治候选 {len(auto_cands)}）"
+                        )
+                    if self_heal and "meta" in tabs and "topics" in tabs and (new_ovr or auto_cands):
+                        healed_ovr_ids: list[str] = []
+                        promoted_rules: dict[str, dict] = {}
+                        r_ovr = c.execute("SELECT value FROM meta WHERE key='healed_override_escalation_ids'").fetchone()
+                        if r_ovr and r_ovr[0]:
+                            try:
+                                healed_ovr_ids = list(json.loads(r_ovr[0]))
+                            except Exception:
+                                pass
+                        r_prm = c.execute("SELECT value FROM meta WHERE key='autonomy_promoted_rules'").fetchone()
+                        if r_prm and r_prm[0]:
+                            try:
+                                promoted_rules = dict(json.loads(r_prm[0]))
+                            except Exception:
+                                pass
+                        topics_to_reset: set[str] = set()
+                        meta_dirty = False
+                        for it in new_ovr:
+                            mid, tid = it["message_id"], it["topic_id"]
+                            if mid and tid and mid not in healed_ovr_ids:
+                                healed_ovr_ids.append(mid)
+                                topics_to_reset.add(tid)
+                                meta_dirty = True
+                                self_healed.append(f"{tid}:override_rules_reset:{it.get('override_code') or 'overridden'}")
+                        for tid, cat, streak in auto_cands:
+                            pkey = f"{tid}:{cat}"
+                            if pkey not in promoted_rules:
+                                promoted_rules[pkey] = {
+                                    "topic_id": tid,
+                                    "category": cat,
+                                    "accepted_streak": streak,
+                                    "promoted_at": iso(ref_now),
+                                }
+                                topics_to_reset.add(tid)
+                                meta_dirty = True
+                                self_healed.append(f"{tid}:autonomy_promoted:{cat}")
+                            elif promoted_rules[pkey].get("accepted_streak") != streak:
+                                promoted_rules[pkey]["accepted_streak"] = streak
+                                meta_dirty = True
+                        if meta_dirty:
+                            with sqlite3.connect(db, timeout=5.0) as wc:
+                                for tid in topics_to_reset:
+                                    wc.execute("UPDATE topics SET rules_hash = NULL WHERE topic_id = ?", (tid,))
+                                wc.execute(
+                                    "INSERT INTO meta(key, value) VALUES('healed_override_escalation_ids', ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    (json.dumps(healed_ovr_ids[-300:], ensure_ascii=False),),
+                                )
+                                wc.execute(
+                                    "INSERT INTO meta(key, value) VALUES('autonomy_promoted_rules', ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    (json.dumps(promoted_rules, ensure_ascii=False),),
+                                )
+                                wc.commit()
+                    if "acks" in tabs and "dispatches" in tabs:
+                        disp_cols = {r[1] for r in c.execute("PRAGMA table_info(dispatches)")}
+                        if "acked_at" in disp_cols:
+                            lat_rows = c.execute(
+                                """SELECT m.first_seen, a.added_at, d.sent_at, d.acked_at
+                                   FROM messages m
+                                   LEFT JOIN acks a ON a.message_id = m.message_id
+                                   LEFT JOIN dispatches d ON d.batch_id = m.batch_id
+                                   WHERE m.chat_type != 'sheepdog' AND m.first_seen >= ?
+                                   ORDER BY m.first_seen DESC LIMIT 300""",
+                                (since,),
+                            ).fetchall()
+                            t12_arr, t34_arr = [], []
+                            for lr in lat_rows:
+                                if (v12 := diff_ms(lr["first_seen"], lr["added_at"])) is not None and v12 <= 300_000:
+                                    t12_arr.append(v12)
+                                if (v34 := diff_ms(lr["sent_at"], lr["acked_at"])) is not None and 0 < v34 <= 3_600_000:
+                                    t34_arr.append(v34)
+                            if t12_arr or t34_arr:
+                                info.append(
+                                    f"耗时分位：T1->T2 点Get P95={quantile(t12_arr, 0.95)}ms，"
+                                    f"T3->T4 会话执行 P50={quantile(t34_arr, 0.50)/1000.0:.1f}s / P95={quantile(t34_arr, 0.95)/1000.0:.1f}s"
+                                )
+                except Exception:
+                    pass
+        finally:
+            c.close()
+
+    if check_release_bot:
+        rel_env = os.environ.get("SHEEPDOG_RELEASE_TRANSCRIPT")
+        rel_path = Path(rel_env) if rel_env else None
+        h = ref_now.hour
+        if rel_path is not None and (0 <= h <= 3 or 8 <= h <= 23):
+            try:
+                m = (ref_now.timestamp() - rel_path.stat().st_mtime) / 60.0
+                if m > 12:
+                    warn.append(f"发版bot 已经 {m:.0f} 分钟没动静（巡检每 5 分钟一次，可能又停了）")
+            except OSError:
+                warn.append("读不到发版bot 的会话记录")
+
+    if simulate_warn:
+        warn.extend(simulate_warn)
+
+    prev_warns = st.get("active_alert_warns", [])
+    st.update({
+        "since": iso(ref_now),
+        "checked_at": iso(ref_now),
+        "ask_jump": seen_ask_jump,
+        "version_mismatch_since": version_mismatch_since,
+    })
+    notify_watchdog_result(
+        cfg, db, st, st_path, warn, prev_warns, ref_now,
+        notify_lark=notify_lark, notify_chat_id=notify_chat_id,
+        alert_cooldown_minutes=alert_cooldown_minutes, infos=info, bus_topic_id=bus_topic_id,
+    )
+
+    self_evolve_meta: dict = {}
+    skillpack_info: dict = {
+        "truncated_batches": 0,
+        "rule_unread_blocked": 0,
+        "owner_no_echo_blocked": 0,
+        "gate_error_passthrough": 0,
+        "skill_md_bytes": 0,
+    }
+    if db.exists():
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as _ec:
+                _er = _ec.execute("SELECT value FROM meta WHERE key='self_evolve_state'").fetchone()
+                self_evolve_meta = json.loads(_er[0]) if (_er and _er[0]) else {}
+                for _keys, _field in (
+                    (("observe:truncated_batches", "skillpack:metric:truncated_batches"), "truncated_batches"),
+                    (("observe:rule_unread_blocked", "skillpack:metric:rule_unread_blocked"), "rule_unread_blocked"),
+                    (("observe:owner_no_echo_blocked", "skillpack:metric:owner_no_echo_blocked"), "owner_no_echo_blocked"),
+                    (("observe:gate_error_passthrough", "skillpack:metric:gate_error_passthrough"), "gate_error_passthrough"),
+                    (("skillpack:skill_md_bytes",), "skill_md_bytes"),
+                ):
+                    for _k in _keys:
+                        _mr = _ec.execute("SELECT value FROM meta WHERE key=?", (_k,)).fetchone()
+                        if _mr and _mr[0]:
+                            try:
+                                skillpack_info[_field] = int(_mr[0])
+                                break
+                            except (ValueError, TypeError):
+                                pass
+        except Exception:
+            self_evolve_meta = {}
+    if skillpack_info["skill_md_bytes"] == 0:
+        try:
+            from .skillpack import resolve_skill_dir
+            _sm = resolve_skill_dir() / "SKILL.md"
+            if _sm.exists():
+                skillpack_info["skill_md_bytes"] = len(_sm.read_bytes())
+        except Exception:
+            pass
+    info.append(
+        f"规则技能与闸门：SKILL.md={skillpack_info['skill_md_bytes']}B，"
+        f"被截批次={skillpack_info['truncated_batches']}，"
+        f"未读被拦={skillpack_info['rule_unread_blocked']}，"
+        f"漏回主人被拦={skillpack_info['owner_no_echo_blocked']}，"
+        f"闸门出错放行={skillpack_info['gate_error_passthrough']}"
+    )
+
+    return {
+        "ok": len(warn) == 0,
+        "checked_at": iso(ref_now),
+        "version": disk_ver_info,
+        "warns": warn,
+        "infos": [i for i in info if i],
+        "self_healed": self_healed,
+        "self_evolve": self_evolve_meta,
+        "skillpack": skillpack_info,
+    }
+
+
+def add_observe_arguments(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--db", default=None, help="指定 SQLite 账本路径（默认读配置或正式库）")
+    ap.add_argument("--state", default=None, help="游标状态文件路径（默认 state_dir/watchdog-cursor.json）")
+    ap.add_argument("--since-minutes", type=float, default=20.0, help="首次无游标时往前看多少分钟（默认 20）")
+    ap.add_argument("--notify-lark", action="store_true", help="开启飞书直发告警与恢复通知")
+    ap.add_argument("--notify-chat-id", default=DEFAULT_OWNER_CHAT, help="飞书通知目标 chat_id")
+    ap.add_argument("--alert-cooldown-minutes", type=float, default=60.0, help="相同指纹告警冷却分钟数")
+    ap.add_argument("--simulate-warn", action="append", default=[], help="注入模拟告警字符串（用于自测）")
+    ap.add_argument("--json", action="store_true", help="以 JSON 格式输出体检结果")
+    ap.add_argument("--self-heal", action="store_true", help="对做完活忘交回执的假 running 会话写入 stop hook 自愈标记")
+    ap.add_argument("--evolve-digest", action="store_true", help="输出 6 维自进化管家巡检摘要（D1~D6）")
+
+
+def render_observe_output(res: dict, *, as_json: bool = False, now_dt: datetime | None = None) -> str:
+    if as_json:
+        return json.dumps(res, ensure_ascii=False, indent=2)
+    ref = now_dt or now_tz()
+    warns = res.get("warns") or []
+    infos = res.get("infos") or []
+    lines = [f"{ref.strftime('%m-%d %H:%M')} 牧羊犬体检：" + ("正常" if not warns else f"{len(warns)} 个问题")]
+    for w in warns:
+        lines.append(f"⚠ {w}")
+    for i in infos:
+        if i:
+            lines.append(f"· {i}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="正式牧羊犬深度水位巡检（Watchdog 2.0）")
+    ap.add_argument("-c", "--config", default=None, help="配置文件路径")
+    add_observe_arguments(ap)
+    args = ap.parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+    except Exception:
+        cfg = None
+    db_path = Path(args.db).expanduser() if getattr(args, "db", None) else None
+    state_path = Path(args.state).expanduser() if args.state else None
+    res = run_observe(
+        cfg,
+        db_path=db_path,
+        state_path=state_path,
+        since_minutes=args.since_minutes,
+        notify_lark=args.notify_lark,
+        notify_chat_id=args.notify_chat_id,
+        alert_cooldown_minutes=args.alert_cooldown_minutes,
+        simulate_warn=args.simulate_warn,
+        self_heal=args.self_heal,
+    )
+    print(render_observe_output(res, as_json=args.json))
+    return 1 if res["warns"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

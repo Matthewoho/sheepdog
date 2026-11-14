@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""上线测试闸门（规格 7.55）：不跑过测试就上不了线，不靠记得。
+
+    python3.12 scripts/release_gate.py <提交号>            # 跑闸门：全绿才写闸门记录
+    python3.12 scripts/release_gate.py --check <提交号>    # 上线脚本第一步：记录在、提交号对得上、3 次都绿才退出 0
+    python3.12 scripts/release_gate.py --check <提交号> --specs 7.52,7.53
+                                                         # 再按规格编号核（7.60）：这次上的每个编号都登记了守它的测试
+
+跑闸门：
+1. 用 git archive 把这个提交导出到临时目录（干净副本，不带工作树里没提交的改动）。
+2. 在导出副本里把全量测试 `python3.12 -m unittest discover -s tests` 连跑 3 次（顺带抓抖动）。每次一份新副本、一个新的
+   临时 HOME：HOME、XDG_*、SHEEPDOG_CONFIG、SHEEPDOG_STATE_DIR、Antigravity / Codex / Claude 的数据目录都指到临时目录，
+   PYTHONPATH 只指导出副本，读不到也写不进本机正式的 ~/.config/sheepdog、~/.local/state/sheepdog 和正式代码。
+3. 核 tests/REGRESSIONS.md 列的每个测试都还在、会被全量测试跑到、没被跳过（写「缺」的行不核）。
+4. 3 次全绿、回归登记也齐，才写闸门记录 <记录目录>/<完整提交号>.json：提交号、3 次各自的测试数和用时、时间。
+   有红就打印哪几个红，退出码 1，不写记录。
+
+按规格编号核（7.60，`--check <提交号> --specs 7.xx,7.yy`）：
+- 读那个提交里的 tests/REGRESSIONS.md（git show <提交>:tests/REGRESSIONS.md，不读工作树）；
+- 每个编号至少要有一行列了测试（只写「缺」的不算），这个编号各行列的测试在那个提交里都在、会被全量测试跑到、没被跳过
+  （导出那个提交，用和闸门一样的发现方式核）；
+- 缺了就逐个列出「哪个编号没有登记」「登记的测试不存在」，退出码 1。闸门记录照样要核，两样都对才退出 0。
+- 不带 --specs 时只核闸门记录，和 7.55 一样。
+
+记录目录默认 ~/.local/state/sheepdog-release-gate/，可用环境变量 SHEEPDOG_RELEASE_GATE_DIR 改（测试用）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+RUNS = 3
+TEST_ARGS = ["-m", "unittest", "discover", "-s", "tests"]
+REGRESSIONS = Path("tests") / "REGRESSIONS.md"
+# 每次测试最长跑多久（秒）：卡死的测试也要有个头
+RUN_TIMEOUT = 1800
+
+_RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s$", re.M)
+_SEP = "=" * 70
+_RED_HEAD = re.compile(r"^(FAIL|ERROR|UNEXPECTED SUCCESS): (\S+) \(([^)]+)\)")
+_TEST_ID = re.compile(r"`([A-Za-z_][\w]*\.[A-Za-z_][\w]*\.[A-Za-z_][\w]*)`")
+# 「规格」一格开头的编号：「7.47 第 1 条」「7.52 上线后」都算 7.47、7.52；7.5 和 7.52 不混
+_SPEC_NO = re.compile(r"^(\d+(?:\.\d+)+)(?![\d.])")
+
+
+def gate_dir() -> Path:
+    env = os.environ.get("SHEEPDOG_RELEASE_GATE_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".local" / "state" / "sheepdog-release-gate"
+
+
+def record_path(sha: str) -> Path:
+    return gate_dir() / f"{sha}.json"
+
+
+def inflight_path() -> Path:
+    return gate_dir() / "inflight.json"
+
+
+def default_repo() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve(repo: Path, commit: str) -> str:
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                         capture_output=True, text=True)
+    sha = out.stdout.strip()
+    if out.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise SystemExit(f"✗ 在 {repo} 里找不到提交 {commit!r}")
+    return sha
+
+
+def export(repo: Path, sha: str, dest: Path) -> Path:
+    """git archive 导出这个提交（只有提交里的文件）。"""
+    out = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", sha], capture_output=True)
+    if out.returncode != 0:
+        raise SystemExit(f"✗ git archive {sha} 失败：{out.stderr.decode(errors='replace')[:300]}")
+    dest.mkdir(parents=True)
+    with tarfile.open(fileobj=io.BytesIO(out.stdout)) as tar:
+        tar.extractall(dest, filter="data")
+    return dest
+
+
+def isolated_env(home: Path, src: Path) -> dict[str, str]:
+    """测试进程的环境：家目录、配置、状态都指到临时目录；只认导出副本里的代码。"""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("SHEEPDOG_", "XDG_", "ANTIGRAVITY_", "CODEX_", "CLAUDE_", "PYTHON"))}
+    for d in ("config", "state", "cache", "data"):
+        (home / f".{d}").mkdir(parents=True, exist_ok=True)
+    env.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".state"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".data"),
+        "SHEEPDOG_CONFIG": str(home / ".config" / "sheepdog" / "config.toml"),
+        "SHEEPDOG_STATE_DIR": str(home / ".state" / "sheepdog"),
+        "ANTIGRAVITY_APP_DATA_DIR": str(home / ".gemini" / "antigravity"),
+        "CODEX_HOME": str(home / ".codex"),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "PYTHONPATH": str(src),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    return env
+
+
+def parse_run(stderr: str) -> dict:
+    """unittest 的输出 → 测试数、它自己报的用时、红了哪几个。"""
+    m = None
+    for m in _RAN.finditer(stderr):
+        pass
+    tests = int(m.group(1)) if m else 0
+    reported = float(m.group(2)) if m else None
+    tail = stderr[m.end():] if m else ""
+    ok_line = re.search(r"^OK(?: \((.*)\))?$", tail, re.M)
+    red = []
+    lines = stderr.splitlines()
+    for i, ln in enumerate(lines[:-1]):
+        if ln == _SEP and (h := _RED_HEAD.match(lines[i + 1])):
+            red.append(f"{h.group(1)}: {h.group(3)}")
+    return {"tests": tests, "reported_seconds": reported, "ok_line": bool(ok_line),
+            "summary": (ok_line.group(0) if ok_line else (tail.strip().splitlines() or ["(没有结果行)"])[-1]),
+            "red": red}
+
+
+def run_once(src: Path, home: Path, python: str, timeout: float = RUN_TIMEOUT) -> dict:
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run([python, *TEST_ARGS], cwd=src, env=isolated_env(home, src), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return {"tests": 0, "seconds": round(time.monotonic() - t0, 1), "ok": False, "returncode": None,
+                "summary": f"超时（{timeout:g} 秒）", "red": ["整轮超时"],
+                "stderr_tail": ((e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes)
+                                else (e.stderr or ""))[-2000:]}
+    secs = round(time.monotonic() - t0, 1)
+    r = parse_run(proc.stderr)
+    ok = proc.returncode == 0 and r["ok_line"] and r["tests"] > 0 and not r["red"]
+    return {"tests": r["tests"], "seconds": secs, "reported_seconds": r["reported_seconds"], "ok": ok,
+            "returncode": proc.returncode, "summary": r["summary"], "red": r["red"],
+            "stderr_tail": "" if ok else proc.stderr[-4000:]}
+
+
+# 在导出副本里跑：按全量测试同样的发现方式（discover -s tests）列出所有测试，核 REGRESSIONS.md 里列的每一个
+_CHECK_CODE = r"""
+import json, re, sys, unittest
+ids = json.loads(sys.argv[1])
+suite = unittest.defaultTestLoader.discover("tests")
+found, broken = {}, []
+def walk(s):
+    for t in s:
+        if isinstance(t, unittest.TestSuite):
+            walk(t)
+        elif type(t).__name__ == "_FailedTest":
+            broken.append(t.id())
+        else:
+            found[t.id()] = t
+walk(suite)
+out = {}
+for i in ids:
+    t = found.get(i)
+    if t is None:
+        out[i] = "不在全量测试里（改名、删了、或模块导入失败）"
+        continue
+    meth = getattr(t, t._testMethodName, None)
+    if getattr(type(t), "__unittest_skip__", False) or getattr(meth, "__unittest_skip__", False):
+        out[i] = "被跳过"
+print(json.dumps({"missing": out, "broken_modules": broken, "total": len(found)}))
+"""
+
+
+def parse_regressions(text: str) -> list[dict]:
+    """REGRESSIONS.md 的表格行 → [{spec, symptom, tests: [...], missing_guard: bool}]。"""
+    rows = []
+    for ln in text.splitlines():
+        if not ln.startswith("|"):
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if len(cells) < 3 or cells[0] in ("规格", "") or set(cells[0]) <= set("-: "):
+            continue
+        guard = "|".join(cells[2:])
+        tests = _TEST_ID.findall(guard)
+        rows.append({"spec": cells[0], "symptom": cells[1], "tests": tests,
+                     "missing_guard": not tests and guard.startswith("缺")})
+    return rows
+
+
+def spec_no(cell: str) -> str | None:
+    """「规格」一格 → 它开头的规格编号（「7.47 第 1 条」→ 7.47）；认不出就 None。"""
+    m = _SPEC_NO.match(cell.strip())
+    return m.group(1) if m else None
+
+
+def find_tests(src: Path, home: Path, python: str, ids: list[str]) -> dict:
+    """在导出副本 src 里按全量测试的发现方式核 ids：{"missing": {测试: 为什么}, "broken_modules": [...], "total": n}。"""
+    proc = subprocess.run([python, "-c", _CHECK_CODE, json.dumps(sorted(ids))], cwd=src, env=isolated_env(home, src),
+                          capture_output=True, text=True, timeout=600)
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"核测试出错：{proc.stderr[-1000:]}") from None
+
+
+def check_regressions(src: Path, home: Path, python: str) -> dict:
+    p = src / REGRESSIONS
+    if not p.is_file():
+        return {"ok": False, "error": f"{REGRESSIONS} 不在这个提交里", "rows": 0, "tests": 0, "missing": {}}
+    rows = parse_regressions(p.read_text(encoding="utf-8"))
+    bad_rows = [r for r in rows if not r["tests"] and not r["missing_guard"]]
+    ids = sorted({t for r in rows for t in r["tests"]})
+    try:
+        res = find_tests(src, home, python, ids)
+    except RuntimeError as e:
+        return {"ok": False, "error": f"核回归登记出错：{e}", "rows": len(rows), "tests": len(ids), "missing": {}}
+    missing = res["missing"]
+    errs = []
+    if not rows:
+        errs.append("REGRESSIONS.md 里一行都没认出来")
+    if bad_rows:
+        errs.append("这些行既没列测试也没写「缺」：" + "；".join(f"{r['spec']} {r['symptom']}" for r in bad_rows))
+    return {"ok": not missing and not errs, "error": "；".join(errs), "rows": len(rows), "tests": len(ids),
+            "missing": missing, "no_guard": [f"{r['spec']}：{r['symptom']}" for r in rows if r["missing_guard"]]}
+
+
+_LEDGER_COMPAT_CODE = r"""
+import importlib.util, json, pathlib, sqlite3, sys
+
+base_dir = pathlib.Path(sys.argv[1]) if sys.argv[1] else None
+cand_dir = pathlib.Path(sys.argv[2])
+work_dir = pathlib.Path(sys.argv[3])
+
+def inspect_store(src_dir, db_file):
+    sys.path.insert(0, str(src_dir))
+    for k in list(sys.modules):
+        if k == "sheepdog" or k.startswith("sheepdog."):
+            del sys.modules[k]
+    import sheepdog.store as st_mod
+    s = st_mod.Store(db_file)
+    try:
+        tables = {}
+        rows = s.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        for r in rows:
+            tname = r[0]
+            cols = {}
+            for c in s.conn.execute(f"PRAGMA table_info({tname})").fetchall():
+                cols[c["name"]] = {
+                    "type": (c["type"] or "").strip().upper(),
+                    "notnull": int(c["notnull"] or 0),
+                    "dflt_value": c["dflt_value"],
+                    "pk": int(c["pk"] or 0),
+                }
+            tables[tname] = cols
+        migrations = {
+            k: [(col_name, col_decl) for col_name, col_decl in v]
+            for k, v in getattr(st_mod, "MIGRATIONS", {}).items()
+        }
+        return tables, migrations
+    finally:
+        s.close()
+        if str(src_dir) in sys.path:
+            sys.path.remove(str(src_dir))
+
+errors = []
+cand_db = work_dir / "cand.db"
+try:
+    cand_tables, cand_migrations = inspect_store(cand_dir, cand_db)
+except Exception as e:
+    print(json.dumps({"ok": False, "errors": [f"候选版本 Store 初始化失败: {e}"], "tables": 0}))
+    sys.exit(0)
+
+if base_dir is not None and (base_dir / "sheepdog" / "store.py").is_file():
+    base_db = work_dir / "base.db"
+    try:
+        base_tables, base_migrations = inspect_store(base_dir, base_db)
+    except Exception as e:
+        errors.append(f"基线版本 Store 初始化失败: {e}")
+        base_tables, base_migrations = {}, {}
+
+    for tname, bcols in base_tables.items():
+        if tname not in cand_tables:
+            errors.append(f"删除了既有账本表 {tname}（违反『账本迁移只增不减、不改列』）")
+            continue
+        ccols = cand_tables[tname]
+        for cname, binfo in bcols.items():
+            if cname not in ccols:
+                errors.append(f"删除了既有账本列 {tname}.{cname}（违反『账本迁移只增不减、不改列』）")
+                continue
+            cinfo = ccols[cname]
+            if binfo["type"] != cinfo["type"] or binfo["pk"] != cinfo["pk"]:
+                errors.append(
+                    f"修改了既有账本列定义 {tname}.{cname}: "
+                    f"({binfo['type']}, pk={binfo['pk']}) -> ({cinfo['type']}, pk={cinfo['pk']})"
+                )
+        base_mig_cols = {c for c, _ in base_migrations.get(tname, [])}
+        cand_mig_cols = {c for c, _ in cand_migrations.get(tname, [])}
+        for dropped_mig in sorted(base_mig_cols - cand_mig_cols):
+            errors.append(f"从 MIGRATIONS[{tname!r}] 中删除了历史迁移列 {dropped_mig}")
+        for cname, cinfo in ccols.items():
+            if cname not in bcols:
+                if cname not in cand_mig_cols:
+                    errors.append(f"既有表 {tname} 新增列 {cname} 未同步登记进 MIGRATIONS[{tname!r}]")
+                if cinfo["notnull"] == 1 and cinfo["dflt_value"] is None:
+                    errors.append(
+                        f"既有表 {tname} 新增列 {cname} 设为 NOT NULL 且无 DEFAULT，回滚后旧代码 INSERT 会报错"
+                    )
+
+    # 实测：用候选新代码迁移后的 cand_db，再用旧版基线 Store 打开并执行读写
+    try:
+        inspect_store(base_dir, cand_db)
+    except Exception as e:
+        errors.append(f"回滚兼容性实测失败（旧版 Store 打开新版账本报错）: {e}")
+
+print(json.dumps({"ok": not errors, "errors": errors, "tables": len(cand_tables)}))
+"""
+
+_FORBIDDEN_LEDGER_DDL = re.compile(
+    r"\b(?:DROP\s+TABLE|DROP\s+COLUMN|RENAME\s+COLUMN|ALTER\s+COLUMN|ALTER\s+TABLE\s+\w+\s+RENAME)\b",
+    re.I,
+)
+
+
+def _resolve_baseline_sha(repo: Path, sha: str) -> str:
+    """找用于比对账本迁移兼容性的上一版基线提交（优先 sha~1，其次最近 tag）。"""
+    for ref in (f"{sha}~1",):
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+        )
+        bsha = out.stdout.strip()
+        if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", bsha):
+            chk = subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", f"{bsha}:sheepdog/store.py"],
+                capture_output=True,
+            )
+            if chk.returncode == 0:
+                return bsha
+    return ""
+
+
+def check_ledger_compatibility(repo: Path, sha: str, src: Path, work: Path, python: str) -> dict:
+    """核验『账本迁移只增不减、不改列』（秒级回滚前提：旧版代码能读取新账本）。"""
+    store_py = src / "sheepdog" / "store.py"
+    if not store_py.is_file():
+        return {"ok": True, "skipped": True, "errors": [], "tables": 0}
+    errors: list[str] = []
+    for lineno, raw_ln in enumerate(store_py.read_text(encoding="utf-8").splitlines(), 1):
+        code_part = raw_ln.split("#", 1)[0].split("--", 1)[0]
+        if m := _FORBIDDEN_LEDGER_DDL.search(code_part):
+            errors.append(f"sheepdog/store.py:{lineno} 含禁用破坏性 DDL {m.group(0)!r}（账本迁移只增不减、不改列）")
+
+    base_sha = _resolve_baseline_sha(repo, sha)
+    base_dir_str = ""
+    lwork = work / "ledger-compat"
+    lwork.mkdir(parents=True, exist_ok=True)
+    if base_sha:
+        try:
+            base_src = export(repo, base_sha, lwork / "base_src")
+            base_dir_str = str(base_src)
+        except SystemExit:
+            base_dir_str = ""
+
+    proc = subprocess.run(
+        [python, "-c", _LEDGER_COMPAT_CODE, base_dir_str, str(src), str(lwork)],
+        cwd=src,
+        env=isolated_env(lwork / "home", src),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    tables_count = 0
+    try:
+        res = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        errors.extend(res.get("errors") or [])
+        tables_count = int(res.get("tables") or 0)
+    except (ValueError, IndexError):
+        errors.append(f"核验账本迁移兼容性脚本异常: {(proc.stderr or proc.stdout)[-500:]}")
+    return {
+        "ok": not errors,
+        "skipped": False,
+        "baseline_sha": base_sha,
+        "tables": tables_count,
+        "errors": errors,
+    }
+
+
+def sha256(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def run_gate(repo: Path, commit: str, python: str, runs: int = RUNS, keep: bool = False) -> int:
+    sha = resolve(repo, commit)
+    print(f"闸门：{sha}（{repo}）")
+    work = Path(tempfile.mkdtemp(prefix="sheepdog-gate-"))
+    results: list[dict] = []
+    inflight = inflight_path()
+    try:
+        inflight.parent.mkdir(parents=True, exist_ok=True)
+        inflight.write_text(
+            json.dumps(
+                {
+                    "commit": sha,
+                    "pid": os.getpid(),
+                    "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    try:
+        for i in range(1, runs + 1):
+            src = export(repo, sha, work / f"src{i}")
+            r = run_once(src, work / f"home{i}", python)
+            results.append(r)
+            mark = "✓" if r["ok"] else "✗"
+            print(f"  第 {i} 次 {mark} {r['tests']} 个测试，{r['seconds']} 秒（{r['summary']}）")
+            for x in r["red"]:
+                print(f"      红：{x}")
+        reg = check_regressions(work / "src1", work / "home-reg", python)
+        if reg["ok"]:
+            print(f"  回归登记 ✓ {reg['rows']} 行、{reg['tests']} 个测试都在")
+        else:
+            print(f"  回归登记 ✗ {reg.get('error') or str(len(reg['missing'])) + ' 个登记的测试不在或被跳过'}")
+            for t, why in sorted(reg["missing"].items()):
+                print(f"      缺测试：{t}（{why}）")
+        for g in reg.get("no_guard", []):
+            print(f"  （登记里写「缺」、没有守卫的：{g}）")
+        priv_script = work / "src1" / "scripts" / "check_private_data.py"
+        priv_ok = True
+        if priv_script.is_file():
+            exported_files = [
+                str(p.relative_to(work / "src1"))
+                for p in (work / "src1").rglob("*")
+                if p.is_file()
+            ]
+            priv_proc = subprocess.run(
+                [python, str(priv_script), *exported_files],
+                cwd=work / "src1",
+                capture_output=True,
+                text=True,
+            )
+            priv_ok = priv_proc.returncode == 0
+            if priv_ok:
+                print(f"  隐私与保密红线扫描 ✓ {len(exported_files)} 个导出文件零敏感信息泄漏")
+            else:
+                print("  隐私与保密红线扫描 ✗ 发现敏感信息或保密词：")
+                for ln in (priv_proc.stdout + priv_proc.stderr).splitlines()[:25]:
+                    print(f"      {ln}")
+        ledger = check_ledger_compatibility(repo, sha, work / "src1", work, python)
+        if not ledger.get("skipped"):
+            if ledger["ok"]:
+                print(
+                    f"  账本迁移兼容 ✓ {ledger['tables']} 张表符合『只加不删、不改列』回滚兼容契约"
+                    + (f"（对比基线 {ledger['baseline_sha'][:7]}）" if ledger.get("baseline_sha") else "")
+                )
+            else:
+                print("  账本迁移兼容 ✗ 违反『账本迁移只增不减、不改列』回滚兼容契约：")
+                for err in ledger["errors"]:
+                    print(f"      {err}")
+        skill_budget_ok = True
+        if (work / "src1" / "sheepdog" / "skillpack.py").is_file():
+            sb_proc = subprocess.run(
+                [
+                    python,
+                    "-c",
+                    (
+                        "import sys; sys.path.insert(0, '.'); "
+                        "from pathlib import Path; "
+                        "from sheepdog.skillpack import _compute_raw_manifest, _render_skill_bundle, MAX_SKILL_MD_BYTES, WARN_SKILL_MD_BYTES; "
+                        "pdir = Path('tests/fixtures/playbook'); "
+                        "m = _compute_raw_manifest(playbook_dir=pdir if pdir.is_dir() else None); "
+                        "ver, files, _ = _render_skill_bundle(m); "
+                        "sz = len(files['SKILL.md'].encode('utf-8')); "
+                        "print(f'SKILL.md={sz}B (ver={ver})'); "
+                        "sys.exit(0 if sz <= MAX_SKILL_MD_BYTES else 1)"
+                    ),
+                ],
+                cwd=work / "src1",
+                capture_output=True,
+                text=True,
+            )
+            skill_budget_ok = sb_proc.returncode == 0
+            sb_out = (sb_proc.stdout or sb_proc.stderr).strip()
+            if skill_budget_ok:
+                print(f"  Skill 预算门禁 ✓ {sb_out} ≤ 40,000B")
+            else:
+                print(f"  Skill 预算门禁 ✗ 超过 40,000B 上限：{sb_out}")
+        counts = {r["tests"] for r in results}
+        same = len(counts) == 1
+        if not same:
+            print(f"  ✗ 3 次的测试数不一样：{[r['tests'] for r in results]}")
+        green = (
+            all(r["ok"] for r in results)
+            and len(results) == runs
+            and same
+            and reg["ok"]
+            and priv_ok
+            and ledger["ok"]
+            and skill_budget_ok
+        )
+        if not green:
+            for i, r in enumerate(results, 1):
+                if not r["ok"] and r.get("stderr_tail") and not r["red"]:
+                    print(f"  第 {i} 次的输出末尾：\n{r['stderr_tail'][-1500:]}")
+            print(f"✗ 闸门没过，不写记录（{sha[:12]}）")
+            return 1
+        record = {
+            "commit": sha,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "command": " ".join([Path(python).name, *TEST_ARGS]),
+            "python": subprocess.run([python, "-c", "import platform; print(platform.python_version())"],
+                                     capture_output=True, text=True).stdout.strip(),
+            "host": platform.node(),
+            "runs": [{"tests": r["tests"], "seconds": r["seconds"], "reported_seconds": r["reported_seconds"],
+                      "ok": r["ok"]} for r in results],
+            "regressions": {"rows": reg["rows"], "tests": reg["tests"], "missing": reg["missing"],
+                            "no_guard": reg.get("no_guard", [])},
+            "ledger_compat": {
+                "ok": ledger["ok"],
+                "skipped": ledger.get("skipped", False),
+                "baseline_sha": ledger.get("baseline_sha", ""),
+                "tables": ledger.get("tables", 0),
+                "errors": ledger.get("errors", []),
+            },
+            "gate_script_sha256": sha256(Path(__file__).resolve()),
+        }
+        dest = record_path(sha)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, dest)
+        print(f"✓ 闸门通过，记录写到 {dest}")
+        return 0
+    finally:
+        try:
+            if inflight.exists():
+                data = json.loads(inflight.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("pid") == os.getpid():
+                    inflight.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if keep:
+            print(f"  （临时目录留着：{work}）")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def parse_specs(text: str) -> list[str]:
+    """--specs 的值「7.52,7.53」→ ["7.52", "7.53"]（去重、保序）；有认不出的编号就报错。"""
+    out: list[str] = []
+    for x in re.split(r"[,，\s]+", text or ""):
+        if not x:
+            continue
+        if not re.fullmatch(r"\d+(?:\.\d+)+", x):
+            raise ValueError(f"认不出的规格编号 {x!r}（要写成 7.52 这样）")
+        if x not in out:
+            out.append(x)
+    if not out:
+        raise ValueError("--specs 一个编号都没有")
+    return out
+
+
+def check_specs(repo: Path, sha: str, specs: list[str], python: str) -> list[str]:
+    """7.60：sha 这个提交里，specs 每个编号在 REGRESSIONS.md 里至少有一行列了测试，列的测试在这个提交里都在。
+
+    返回问题清单（空 = 都对）。只读那个提交（git show / git archive），不读工作树。
+    """
+    out = subprocess.run(["git", "-C", str(repo), "show", f"{sha}:{REGRESSIONS.as_posix()}"], capture_output=True)
+    if out.returncode != 0:
+        return [f"{sha[:12]} 里没有 {REGRESSIONS.as_posix()}，{'、'.join(specs)} 都没有登记"]
+    rows = parse_regressions(out.stdout.decode("utf-8", errors="replace"))
+    problems: list[str] = []
+    want: dict[str, list[str]] = {}          # 测试 → 哪几个编号登记了它
+    for s in specs:
+        mine = [r for r in rows if spec_no(r["spec"]) == s]
+        guarded = [r for r in mine if r["tests"]]
+        if not mine:
+            problems.append(f"{s} 没有登记：REGRESSIONS.md 里没有这个编号的行")
+        elif not guarded:
+            problems.append(f"{s} 没有登记守它的测试：只有写「缺」的行（{'；'.join(r['symptom'] for r in mine)}）")
+        for r in guarded:
+            for t in r["tests"]:
+                want.setdefault(t, [])
+                if s not in want[t]:
+                    want[t].append(s)
+    semver_3 = [
+        tuple(int(p) for p in parts)
+        for s in specs
+        if len(parts := s.split(".")) == 3 and all(p.isdigit() for p in parts)
+    ]
+    minor_7 = [
+        int(parts[1])
+        for s in specs
+        if len(parts := s.split(".")) == 2 and parts[0] == "7" and parts[1].isdigit()
+    ]
+    if semver_3 or minor_7:
+        if semver_3:
+            max_sv = max(semver_3)
+            expected_ver = ".".join(str(x) for x in max_sv)
+            max_spec_label = expected_ver
+        else:
+            max_minor = max(minor_7)
+            expected_ver = f"0.7.{max_minor}"
+            max_spec_label = f"7.{max_minor}"
+        init_out = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{sha}:sheepdog/__init__.py"],
+            capture_output=True,
+        )
+        if init_out.returncode == 0:
+            init_text = init_out.stdout.decode("utf-8", errors="replace")
+            m_ver = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_text, re.MULTILINE)
+            actual_ver = m_ver.group(1).strip() if m_ver else ""
+            if actual_ver != expected_ver:
+                problems.append(
+                    f"版本号未对齐：--specs 最大规格为 {max_spec_label}，但 sheepdog/__init__.py 的 __version__ 为 {actual_ver or '（未定义）'}（应为 {expected_ver}）"
+                )
+        elif semver_3 or max(minor_7) >= 68:
+            problems.append(
+                f"版本号未对齐：--specs 最大规格为 {max_spec_label}，但 sheepdog/__init__.py 的 __version__ 为 （未定义）（应为 {expected_ver}）"
+            )
+    if not want:
+        return problems
+    work = Path(tempfile.mkdtemp(prefix="sheepdog-gate-specs-"))
+    try:
+        src = export(repo, sha, work / "src")
+        res = find_tests(src, work / "home", python, list(want))
+    except (RuntimeError, SystemExit) as e:
+        return problems + [f"核 {'、'.join(specs)} 登记的测试时出错：{e}"]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for t, why in sorted(res["missing"].items()):
+        problems.append(f"{'、'.join(want[t])} 登记的测试不存在：{t}（{why}）")
+    return problems
+
+
+def check(repo: Path, commit: str, runs: int = RUNS, specs: list[str] | None = None,
+          python: str = "python3.12") -> int:
+    """上线脚本第一步：这个提交的闸门记录在、对得上、3 次都绿，才退出 0。
+
+    带 specs（7.60）时再核：这次上的每个规格编号都登记了守它的测试、测试都在。两样都对才退出 0。
+    """
+    try:
+        sha = resolve(repo, commit)
+    except SystemExit as e:
+        print(e)
+        return 1
+    rc = _check_record(sha, runs)
+    if specs is None:
+        return rc
+    problems = check_specs(repo, sha, specs, python)
+    if problems:
+        print(f"✗ {sha[:12]} 的规格编号登记对不上（{'、'.join(specs)}）：")
+        for x in problems:
+            print(f"    {x}")
+        return 1
+    print(f"✓ {sha[:12]} 的规格编号都登记了守它的测试：{'、'.join(specs)}")
+    return rc
+
+
+def _check_record(sha: str, runs: int) -> int:
+    p = record_path(sha)
+    if not p.is_file():
+        print(f"✗ {sha[:12]} 没有闸门记录（{p}）：先跑 scripts/release_gate.py {sha}")
+        return 1
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"✗ 闸门记录读不了：{p}：{e}")
+        return 1
+    why = []
+    if rec.get("commit") != sha:
+        why.append(f"记录里的提交号是 {rec.get('commit')!r}，不是 {sha}")
+    rs = rec.get("runs") or []
+    if len(rs) != runs:
+        why.append(f"记录里跑了 {len(rs)} 次，要 {runs} 次")
+    if not all(r.get("ok") is True and isinstance(r.get("tests"), int) and r["tests"] > 0 for r in rs):
+        why.append("记录里有没全绿的一次")
+    if len({r.get("tests") for r in rs}) > 1:
+        why.append("3 次的测试数不一样")
+    if (rec.get("regressions") or {}).get("missing"):
+        why.append("回归登记里有测试不在")
+    if why:
+        print(f"✗ {sha[:12]} 的闸门记录对不上：" + "；".join(why))
+        return 1
+    print(f"✓ {sha[:12]} 过了闸门：{rec.get('created_at')}，"
+          + "、".join(f"{r['tests']} 个 {r['seconds']} 秒" for r in rs))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)   # 上线脚本常接 tee：每跑完一次就看得见，不等 8 分钟后一起出来
+    ap = argparse.ArgumentParser(description="sheepdog 上线测试闸门（7.55）")
+    ap.add_argument("commit", nargs="?", help="要上线的提交号（跑闸门）")
+    ap.add_argument("--check", metavar="COMMIT", help="只核闸门记录（上线脚本第一步）")
+    ap.add_argument("--repo", type=Path, default=None, help="仓库目录（默认本脚本所在的仓库）")
+    ap.add_argument("--python", default="python3.12", help="跑测试用的 Python（默认 python3.12）")
+    ap.add_argument("--keep", action="store_true", help="留着临时目录（排查用）")
+    ap.add_argument("--specs", metavar="7.xx,7.yy",
+                    help="和 --check 一起用（7.60）：这次上线的规格编号，逐个核 REGRESSIONS.md 里登记了守它的测试")
+    a = ap.parse_args(argv)
+    repo = (a.repo or default_repo()).resolve()
+    if a.specs is not None and not a.check:
+        ap.error("--specs 要和 --check <提交号> 一起用")
+    if a.check:
+        specs = None
+        if a.specs is not None:
+            try:
+                specs = parse_specs(a.specs)
+            except ValueError as e:
+                ap.error(str(e))
+            if shutil.which(a.python) is None and not Path(a.python).is_file():
+                print(f"✗ 找不到 {a.python}")
+                return 1
+        return check(repo, a.check, specs=specs, python=a.python)
+    if not a.commit:
+        ap.error("要给一个提交号，或者 --check <提交号>")
+    if shutil.which(a.python) is None and not Path(a.python).is_file():
+        print(f"✗ 找不到 {a.python}")
+        return 1
+    return run_gate(repo, a.commit, a.python, keep=a.keep)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

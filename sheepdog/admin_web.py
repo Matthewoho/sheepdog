@@ -1,0 +1,2311 @@
+"""Sheepdog 管理与可观测工作台后端（7.99 REG-067）。
+
+基于 Python 标准库 ThreadingHTTPServer 的零外部依赖控制面与可观测服务：
+1. 三级会话工作状态（Session Group -> Primary Session -> Subagent / CLI Lamb，联动 duty_cards、hooks/stop、stop-log 与 transcript.jsonl）
+2. 端到端 + 会话内各事件耗时瀑布流（T0 飞书发出 -> T1 扫到 -> T2 点 Get 表情 -> T3 投递会话 -> T4 会话内思考/工具/回执 -> T5 回复飞书）
+3. 三级决策数据可观测（找人决策 Escalations 采纳/推翻错题本/旁路结案/自治晋升候选 + 系统/tp_bus 路由决策 + Stop Hook/门禁拦截决策）
+4. 日常管理与运维干预（VIP 花名册 CRUD、待定单子结案、在办事项干预、Hook 阻断清理、状态目录与仓库源码全高预览）
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from . import __version__, default_repo_dir, duty, parse_version_tuple, read_disk_version, session as sm
+from .config import Config, default_config_path, load_config
+from .hook import call_log_dir, clear_stop_state, count_path
+try:
+    from .people_roster import list_people_roster, lookup_person, upsert_person_alias
+except ImportError:  # pragma: no cover
+    def list_people_roster(*a: Any, **kw: Any) -> list[dict]: return []
+    def lookup_person(*a: Any, **kw: Any) -> dict | None: return None
+    def upsert_person_alias(*a: Any, **kw: Any) -> dict: return {}
+from .roster import load_roster
+from .sink.agentapi import transcript_path
+from .store import Store, is_standing_topic, now_iso
+
+
+def resolve_live_version(
+    conn: sqlite3.Connection | None = None,
+    repo_dir: Path | None = None,
+) -> str:
+    """动态解析当前真实运行版本（优先磁盘代码与 SQLite meta['daemon_runtime'] 的最新语义版本，杜绝 Web 进程内存常量陈旧）。"""
+    candidates: list[str] = [__version__]
+    try:
+        disk_ver = read_disk_version(repo_dir or default_repo_dir())
+        if disk_ver:
+            candidates.append(disk_ver)
+    except Exception:
+        pass
+    if conn is not None:
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='daemon_runtime'").fetchone()
+            if row and row["value"]:
+                obj = json.loads(row["value"])
+                if isinstance(obj, dict) and obj.get("version"):
+                    candidates.append(str(obj["version"]).strip())
+        except Exception:
+            pass
+    best = __version__
+    best_tuple = parse_version_tuple(best)
+    for cand in candidates:
+        ct = parse_version_tuple(cand)
+        if ct and ct >= best_tuple:
+            best = cand.strip().lstrip("vV")
+            best_tuple = ct
+    return best
+
+
+
+_EMOJI_STRIP_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]+",
+    re.UNICODE,
+)
+_BOILERPLATE_RE = re.compile(r"dev/feature|P1-P8|DEMO-301|护栏正常", re.I)
+_OPTION_LINE_RE = re.compile(r"(?:^|\n)\s*([A-E])[\s:：.、)\]]+([^\n]{1,400})")
+_RECOMMEND_RE = re.compile(
+    r"(?:^|\n)\s*[*#-]*\s*(?:建议|推荐)\s*\**[ \t:：]*(?:优先|先)?(?:选|选择|按|走|用|采纳|方案|选项)*[ \t:：`*「『（(]*([A-E])(?![a-zA-Z0-9])"
+    r"|(?:建议|推荐)[ \t:：]*(?:优先|先)?(?:选|选择|采纳方案)[ \t:`*「『（(]*([A-E])(?![a-zA-Z0-9])"
+    r"|(?:^|\n)\s*([A-E])[ \t:：.、)\]]+[^\n]{0,80}[（(\[]\s*(?:Recommended|推荐)\s*[）)\]]",
+    re.I,
+)
+_CALLBACK_CHOICE_RE = re.compile(r"\[卡片回调\]\s*([A-E]|其他)\s*[：:.、]\s*(.*)", re.S)
+_CHOICE_PREFIX_RE = re.compile(r"^\[(?:[A-E]|其他)\]\s*", re.I)
+_ACCEPT_WORDS_RE = re.compile(
+    r"(?:^(?:好|好的|可以|行|同意|没问题|按你(?:的)?建议|全照你的建议|按建议|照办|批准|确认|ok|yes|收到|选\s*A|同意\s*A|继续催|P1可以做)"
+    r"|直接配|直接弄|帮我弄|有空(?:位|额)就给他?|听\s*\S{0,8}\s*的|按他说的|他让你怎么做你就怎么做|盲区\s*\d+\s*先处理"
+    r"|(?:都|全|全部|统统|一并)\s*给?[他她它]?\s*(?:开|开通|开放|加上|加白|配好|配|办|授权)(?:了|吧|就行|即可)?"
+    r"|(?:(?:先)?(?:问一下|确认一下)[^\n。]{1,16}(?:现在)?(?:能不能|可不可以)(?:动|改|发|切|操作)[，,\s]*(?:能|可以)(?:的话|就)\s*(?:再|直接|马上)?(?:动|改|发|切|弄|搞|执行))"
+    r"|(?:(?:或者)?(?:直接|先)?(?:跟|找)[^\n。]{1,20}(?:碰一下|对一下|核一下|问一下)[^\n]{0,48}(?:如果|要是)?(?:没有|没问题|没坑)(?:的话)?[，,\s]*(?:我觉得)?(?:你)?(?:就)?(?:看着来|直接弄|直接合|照办|按你说的来))"
+    r"|(?:(?:如果|只要|若是)?(?:确保|确认|保证)?(?:不会|没有|不)(?:影响|打断|中断)[^\n。]{0,28}[，,\s]*(?:那)?(?:就)?(?:做|弄|改|切|发|动|执行|搞|办|按你说的来)(?:吧|就行|即可|了)?)"
+    r"|(?:(?:今天|今晚|明早|明天|凌晨|晚上|下午|夜里)?\s*(?:[012]?\d|[一二三四五六七八九十两]+)\s*(?:点(?:半|\d{1,2}分)?|:\d{2})\s*(?:以后|之后|再)?\s*(?:弄|执行|再动|动|操作|改|调|发|切|上线)(?:吧|就行|即可)?)"
+    r"|(?:(?:我)?(?:需要|得|要|准备|打算)?\s*(?:[一二三四五六七八九十两半\d]+\s*个?(?:小时|钟头|分钟)|稍后|晚点|一会|待会|回头|回去|到(?:公司|家))(?:之?后|以后|后|再)?\s*去?\s*(?:购买|新购|买|充值|续费|开通|办理|处理|弄|搞|付|支付))"
+    r"|(?:(?:我)?(?:已经|已|直接|自己|刚)(?:直接)?(?:撤回|删掉|删除|处理|弄好|发过|改好|搞定|重置|购买|买好|续费|扩容|充值|充好|开通|开好|添加|加好|加白|配置|配好|更新|创建|建好|放行|完成)了?|(?:重置|购买|买好|续费|扩容|充值|充好|开通|开好|加白|搞定|弄好|改好|配好|建好)(?:了|完毕|完成|好了))"
+    r"|(?:我\s*(?:去|来|先)?\s*(?:手动|自己)?\s*(?:下载|拉取|导出|拿)(?:一下|下来|给你)?\s*$)"
+    r"|\bwsurl\s*[:=]|\bkey\s*[:=].*\bsecret\s*[:=])",
+    re.I,
+)
+_OVERRIDE_WORDS_RE = re.compile(
+    r"(?:忽略|(?<!用)不用|取消|算了|(?<!对)不对|(?<!要)不要|别|暂停|暂缓|推翻|改用|换成|(?:(?:测试环境|stage|预发)[^\n。]{0,12})?(?:测|测试|验证)过了?[吗嘛呢?？]|(?:那个|这个|该)?开关[^\n。]{0,16}(?:测|测试|验证)过了?[吗嘛呢?？]|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|不用我同意|已经过时间"
+    r"|用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|选项呢"
+    r"|有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我"
+    r"|会不会有.{0,6}影响|会有(?:其他|别的|啥|什么)?[^\n。]{0,6}影响|有什么影响|有没有影响|有办法看|最高.{0,12}用了多少"
+    r"|给他授权|直接给.{0,6}授权|给.{0,8}开权限|你先排查|先排查一下|弄清楚.{0,12}(?:给我|再)|把执行方案给我"
+    r"|能具体讲讲|具体讲讲|讲讲前因后果|具体怎么做|具体怎么改|具体怎么实现|怎么实现(?:的)?|方案\s*[1-9一二三四五六七八九A-Ea-e]\s*[^\n。]{0,12}怎么|改用新镜像直接上|跑新镜像|保证.{0,16}cicd是通的|可以部署到\s*prod|先在\s*(?:stage|测试|预发)[^\n。]{0,16}(?:弄|测|跑|试|验证)[^\n。]{0,16}(?:没问题|通过|稳了)?\s*再上\s*(?:prod|生产)"
+    r"|有个?开关(?:来控制)?|开关来?控制|什么配置下|只给国内|跟\s*site-a\.example\s*一样|都放在腾讯云乙站|子成员账号所在环境|(?:有没有|有无)(?:什么)?(?:更好|更优|更安全|更稳妥|简单|快速|更简单|更直接|别的|其他).{0,16}(?:方式|办法|方案|解法)|能不(?:放开|放通|开)\s*0\.0\.0\.0/0"
+    r"|我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽量端到端|怎么不给选项|为什么没有选项"
+    r"|修复这一类|同一类的问题|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
+    r"|常用的资源范围|平时都做哪些|研发相关的日常改动|网络类的就不能给"
+    r"|完整的方案|完整给我.{0,16}方案|各资源.{0,8}(?:处理)?方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]"
+    r"|是干嘛的|干嘛用的|有没有用|没有人(?:在)?用|没人(?:在)?用"
+    r"|在\s*agy\s*里.{0,12}(?:讨论|聊|说)|跟\s*session\s*讨论|在面板里.{0,12}(?:讨论|聊|说)|确认后若仍要我来定.{0,12}再"
+    r"|(?:我)?在群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)|群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)"
+    r"|(?:我)?(?:已经)?在(?:消息|私聊|聊天|飞书|对话框)里(?:已经)?(?:回|回复|说|答|发|交代)(?:了|过)|你可以观望|先观望一下|观望一下"
+    r"|我不是(?:已经)?(?:买|购买|充|充值|开|开通|弄|处理|付|支付|发|改|建|配|加)(?:好|完|过)?了吗|(?:他|她|它|那边)(?:(?:没法|不能|无法)用|用不了)[吗嘛?？]"
+    r"|(?:这个|这件|那件|该)?(?:问题|事情|故障|卡点|报错)?(?:已经)?(?:解决|搞定|弄好|处理好|恢复|修好)了?[吗嘛?？]|现在(?:解决|恢复|搞定|怎么样)了?[吗嘛?？]"
+    r"|邮箱来的(?:消息)?|邮件来的(?:消息)?|暂时不管"
+    r"|问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|(?:这个\s*)?要现在[吗嘛呢?？]|现在就要[吗嘛呢?？]|急不急|着不着急|先问问云厂商|问问云厂商的人|是给谁访问的|给谁访问的"
+    r"|确认下可否使用|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?site-a\.example\b|(?:能不能用|改用|用)[^\n。]{0,12}乙站"
+    r"|给他(?:账号密码|账密)|有没有合规问题|数据(?:是)?不能出境|海外那家云这边|还不能动|在群里把前因后果交代明白|来龙去脉.{0,8}讲清楚|已经在.{0,20}群里(?:在)?讨论|讨论的事情是同一个|合并转给同一个\s*session|待背景澄清|澄清上下文|暂时观望|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
+    r"|但是.*找|让他找|去找|问问|谁负责|帮忙看看|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|(?:这个|这|那|那个)?是什么\s*(?:ip|网段|地址|机器|服务|实例|库|域名|账号|节点)(?![a-z0-9])|什么\s*(?:环境|账号|子账号|问题|ip|网段|地址|机器|服务)(?![a-z0-9])|测试还是生产|要看谁在调用|谁调用(?:这个|该)?(?:地址|接口|域名|服务)?|看看(?:这个)?是(?:咋|怎么)回事|调用链|前因后果|经过说一下|怎么测的|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|已经处理了|先限制|等我|等明天|再看看|我也不知道"
+    r"|不对，?按另一个方案|先别动，?等确认|先同步再定|确认后再说|不是原本就有.{0,8}权限|本来就有.{0,8}权限|怎么还得申请|你先确认一下|肯定可以(?:创建|建|做|弄|操作|办)|之前(?:你|你们)?就(?:创建|建|做|弄|配|开)了"
+    r"|这个原先就没有.{0,8}[吗嘛?？]|以前就没有.{0,8}[吗嘛?？]|是?啥时候(?:关闭|关掉|打开|开启|改|去掉)了?|没讲清我要你查的|没写我让你查的|你没说.{0,12}原因"
+    r"|执行后要完整核对结果|留意上下游有没有受到?影响|完整核对结果[^\n。]*观察上下游"
+    r"|放行就一次放全(?:我们)?(?:所有|全部)?|(?:所有|全部)\s*公司\s*ip\s*(?:和|与|及|\s)*vps\s*ip"
+    r"|换个做法|换一种接法|按备选方案来|改成可配置的"
+    r"|(?:你|你们|专席|agent)\s*直接给[他她它]\s*(?:开|开通|加|加上)(?:吧|就行|即可|了)?"
+    r"|(?:你|先)?让(?:[他她它]|发起人|提单人)\s*(?:去\s*|先\s*)?(?:确认|核对|核实|定|拍板|看(?:一下|看)?)(?:呗|吧|一下|先|就行)?"
+    r"|先拟一版文案|先让我看看|文案在哪|咋没看见|没看见呢|(?:我)?已经发给(?:过)?[他她它]了?"
+    r"|解决(?:啥|什么)问题|为(?:啥|什么)要(?:搞|做|改)这个|完整前因后果|掌握全部背景|完整上下文|具体原文(?:和上下文)?|原话和背景|(?:原文|上下文)是什么"
+    r"|完整的?开发与测试流程|开草稿\s*pr|转正式\s*pr\s*review|通过\s*qa\s*测试"
+    r"|owen(?:\s*qiao)?|乔欧文|(?:问一下|问问)[^\n。]{0,16}的意见|跟[他她]同步一下"
+    r"|基建服务[^\n。]*业务高峰期|高峰时段别随意发版或改配置|今晚可以去处理[^\n。]*负责验收)",
+    re.I,
+)
+_SYMBOLIC_CRITIQUE_RE = re.compile(
+    r"(?:有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我)",
+    re.I,
+)
+_OWNER_MISCLICK_CORRECTION_RE = re.compile(
+    r"(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)[^\n。]{0,24}?(?:我要选|改选|改成|选|应该选)\s*([A-E])\b"
+    r"|(?:我要|改)\s*选\s*([A-E])\b[^\n。]{0,16}?(?:看错了|搞错了|点错了|选错了|按错了|手滑了?)",
+    re.I,
+)
+_TEXT_EXPLICIT_CHOICE_RE = re.compile(
+    r"(?:^\s*(?:选\s*)?([A-E])(?:\s*$|[。，,！!：:.、\s])"
+    r"|(?:这个问题|这题|这个|这里|方案|选项)\s*(?:我要选|改选|改成|选|应该选)\s*([A-E])(?![a-zA-Z0-9]))",
+    re.I,
+)
+
+
+def diagnose_override_reason(
+    text: str,
+    ans_body: str,
+    chosen_code: str = "",
+    recommended: str = "",
+) -> tuple[str, str]:
+    """7.108 / 7.113 / 7.115 / 7.118（REG-076 / REG-081 / REG-083 / REG-086）：将人类改判/反问归因为 5 类可执行自进化根因。"""
+    s = (ans_body or "").strip()
+    if re.search(
+        r"(?:已经处理了|已经.{0,12}(?:决策|决定|拍板|说|回|安排|弄)过了?|过时间了|太久了|他有权限了|我已经回了|(?:我)?(?:已经|已)(?:发给(?:过)?[他她它]|发过给[他她它]|跟[他她它]发过|私聊(?:过)?[他她它])了?|还要吗|(?:他的|自己)\s*agent\s*操作了|帮忙盯着点"
+        r"|在\s*agy\s*里.{0,12}(?:讨论|聊|说)|跟\s*session\s*讨论|在面板里.{0,12}(?:讨论|聊|说)|确认后若仍要我来定.{0,12}再"
+        r"|(?:我)?在群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)|群里(?:已经)?(?:回|说|答|发|交代)(?:了|过)"
+    r"|(?:我)?(?:已经)?在(?:消息|私聊|聊天|飞书|对话框)里(?:已经)?(?:回|回复|说|答|发|交代)(?:了|过)|你可以观望|先观望一下|观望一下"
+        r"|我不是(?:已经)?(?:买|购买|充|充值|开|开通|弄|处理|付|支付|发|改|建|配|加)(?:好|完|过)?了吗|(?:他|她|它|那边)(?:(?:没法|不能|无法)用|用不了)[吗嘛?？]"
+        r"|(?:这个|这件|那件|该)?(?:问题|事情|故障|卡点|报错)?(?:已经)?(?:解决|搞定|弄好|处理好|恢复|修好)了?[吗嘛?？]|现在(?:解决|恢复|搞定|怎么样)了?[吗嘛?？]"
+        r"|邮箱来的(?:消息)?|邮件来的(?:消息)?|暂时不管"
+        r"|不是原本就有.{0,8}权限|本来就有.{0,8}权限|怎么还得申请|你先确认一下|肯定可以(?:创建|建|做|弄|操作|办)|之前(?:你|你们)?就(?:创建|建|做|弄|配|开)了)",
+        s,
+        re.I,
+    ):
+        return ("stale_or_already_handled", "陈旧/已办结却未复核")
+    if re.search(
+        r"(?:我们咋做.{0,12}咋做|权限至少要跟我一[模摸]一样|权限要高|(?:让他|支持他).{0,8}(?:尽可能)?端到端(?:完成)?|尽量端到端|(?:能不能用|改用|直接用)\s*[a-z0-9.-]*\.?site-a\.example\b|(?:能不能用|改用|用)[^\n。]{0,12}乙站"
+        r"|修复这一类|同一类的问题|其他\s*api\s*接口|(?:stage|测试环境).{0,12}直接给.{0,6}权限|直接给[他她]权限让[他她]自己弄|让[他她]自己弄呗"
+        r"|常用的资源范围|平时都做哪些|研发相关的日常改动|网络类的就不能给|理应拥有全部库的最高管理权|全部库的最高管理权"
+        r"|有没有合规问题|数据(?:是)?不能出境|海外那家云这边|(?:我\s*(?:去|自己)?\s*)?新买.{0,8}vps(?![a-z0-9])"
+        r"|暴力的?把跳数改为|跳数改为\s*\d+[^\n。]*有问题|从\s*站点C\s*进来多一条|走\s*站点B\s*就不会多出这一跳"
+        r"|长期有效(?:的)?(?:办法|方案|解法)|有没有.{0,12}长期.{0,8}(?:办法|方案|解法)|一劳永逸"
+        r"|同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,16}交付"
+        r"|stage\s*环境先不动|生产\s*(?:Pod|服务|实例|环境)?\s*暂且维持原样不改|暂缓执行[^\n。；]*冲刺期过后再处理"
+        r"|先在\s*(?:stage|测试|预发)[^\n。]{0,16}(?:弄|测|跑|试|验证)[^\n。]{0,16}(?:没问题|通过|稳了)?\s*再上\s*(?:prod|生产)"
+        r"|用现有的就好|别引入新依赖|按原方案不变"
+        r"|换个账号来做|别用这个账号"
+        r"|测试资源别用到生产"
+        r"|执行后要完整核对结果|留意上下游有没有受到?影响|完整核对结果[^\n。]*观察上下游"
+        r"|放行就一次放全(?:我们)?(?:所有|全部)?|(?:所有|全部)\s*公司\s*ip\s*(?:和|与|及|\s)*vps\s*ip"
+        r"|换个做法|换一种接法|按备选方案来|改成可配置的"
+        r"|完整的?开发与测试流程|开草稿\s*pr|转正式\s*pr\s*review|通过\s*qa\s*测试"
+        r"|基建服务[^\n。]*业务高峰期|高峰时段别随意发版或改配置|今晚可以去处理[^\n。]*负责验收)",
+        s,
+        re.I,
+    ) or (
+        re.search(r"^(?:暂不动|先不动|这个不动)$", s)
+        and re.search(r"回收[^\n]*(?:node\d+|备用席位|双占)", text or "", re.I)
+    ) or (
+        re.search(
+            r"给[他她]授权|同意(?:先|按[^\n]{0,24}申请|分两步|将[^\n]{0,48}(?:单库受限)?只读(?:角色|账号))*[^\n]*(?:开通|授权|授予|接入串单独私信给|按申请授予|权限|账号|SELECT|demo_metrics_ro)",
+            s,
+            re.I,
+        )
+        and re.search(
+            r"A[ \t.、:：)\]*`]+[^\n]*(?:不开[^\n]{0,28}(?:直连|账号|权限|控制台)|不发[^\n]{0,16}(?:个人|明文|连接串)|仅走[^\n]{0,24}集群\s*Secret|代其执行|代跑|免提权)[\s\S]{0,600}[BC][ \t.、:：)\]*`]+[^\n]*(?:同意(?:先|按[^\n]{0,24}申请|分两步|将[^\n]{0,48}(?:单库受限)?只读(?:角色|账号))|按申请授予|只限一库读取(?:角色|账号))",
+            text or "",
+            re.I,
+        )
+    ) or (
+        re.search(
+            r"^(?:\[卡片回调\]\s*)?(?:其他\s*[:：]\s*)?(?:你|你们|专席|agent)?\s*直接(?:私信)?(?:发|发给[他她]|发送)(?:吧|就行|即可)?$",
+            s,
+            re.I,
+        )
+        and re.search(
+            r"A[ \t.、:：)\]]+[^\n]*(?:坚守底线|拒绝外发|不[^\n]{0,12}(?:外发|发))[\s\S]{0,280}B[ \t.、:：)\]]+[^\n]*(?:同意破例|亲自或授权|授权[^\n]*(?:私信|发送))",
+            text or "",
+            re.I,
+        )
+    ) or (
+        re.search(
+            r"^(?:\[卡片回调\]\s*)?(?:其他\s*[:：]\s*)?(?:你|你们|专席|agent)\s*直接给[他她它]\s*(?:开|开通|加|加上)(?:吧|就行|即可|了)?$",
+            s,
+            re.I,
+        )
+        and re.search(
+            r"(?:由\s*(?:你|您|主人|Matthew)(?:本人)?\s*为[^\n]*(?:添加|开通|授予)|执行\s*[：:]\s*(?:你|您|主人|Matthew)(?:本人)?\s*(?:确认后)?在[^\n]*(?:后台|控制台)[^\n]*(?:添加|开通))",
+            text or "",
+            re.I,
+        )
+    ) or (
+        re.search(r"拉[^\n]*(?:空转|闲置)资源的只读列表", s, re.I)
+        and re.search(
+            r"A[ \t.、:：)\]]+[^\n]*暂缓[^\n]*维持现状[\s\S]{0,360}B[ \t.、:：)\]]+[^\n]*拉[^\n]*(?:空转|闲置)资源的只读列表",
+            text or "",
+            re.I,
+        )
+    ) or (
+        re.search(r"同意纳入白名单[^\n]*自动识别[^\n]*(?:离线|worker)", s, re.I)
+        and re.search(
+            r"A[ \t.、:：)\]]+[^\n]*仅本次特批放行[\s\S]{0,360}B[ \t.、:：)\]]+[^\n]*同意纳入白名单",
+            text or "",
+            re.I,
+        )
+    ):
+        return ("arch_or_config_posture", "技术做法纠正")
+    if (
+        re.search(
+            r"(?:proxy-panel|awei|阿魏|hazel|darcy|nora|corwin|(?<![a-z])rui(?![a-z])|瑞松|ivor|haoyu|浩宇|owen(?:\s*qiao)?|乔欧文|(?:问一下|问问)[^\n。]{0,16}的意见|跟[他她]同步一下|发版人|发起人|提单人|谁负责|问问那个人|让他找|(?:你|先)?让(?:[他她它]|发起人|提单人)\s*(?:去\s*|先\s*)?(?:确认|核对|核实|定|拍板|看(?:一下|看)?)(?:呗|吧|一下|先|就行)?|(?<!我要)去找|(?<!我要)找\s*[^\s，。；！？,.;!?]{1,10}\s*(?:沟通|确认|问(?!题)|反馈|碰一下)|跟\s*[^\s，。；！？,.;!?]{1,12}\s*碰一下|帮忙看看|新开专席|转交专席|由专席(?:只读)?排查|已经在.{0,20}群里(?:在)?讨论|讨论的事情是同一个|合并转给同一个\s*session|你要同步给[他她]们|让[他她]们了解这一状况)",
+            s,
+            re.I,
+        )
+        and not re.search(
+            r"(?:整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|是否是同一个(?:账号|环境|集群|项目)|拆解一下|把各张单分开处理|单独提一个\s*ask|^(?:\[卡片回调\]\s*)?[A-E]\s*[：:.、)\]]\s*同意(?:按|为|给|先))",
+            s,
+            re.I,
+        )
+    ) or (
+        "[tp_bus]" in (text or "")
+        and re.search(r"(?:执行\s*[：:]\s*(?:新开专席\s*)?|由.{0,8}专席\s*[（(]?|建议由\s*)tp_(?!bus\b)[a-z0-9_-]+", text or "", re.I)
+    ):
+        return ("peer_or_owner_delegate", "没先找对口专席或Owner")
+    if re.search(
+        r"(?:用错了|要用\s*ask|没有.{0,8}(?:给我)?(?:提供)?选项|没给.{0,6}选项|怎么不给选项|为什么没有选项|选项呢|"
+        r"有啥决策点|有什么决策点|哪有决策点|还需要问我|象征性问问|不用问我|"
+        r"测试还是生产|哪个.{0,8}(?:环境|账号|子账号|子成员|集群|站点|项目)|是否是同一个(?:账号|环境|集群|项目)|(?:这个|这|那|那个)?是什么\s*(?:ip|网段|地址|机器|服务|实例|库|域名|账号|节点)(?![a-z0-9])|什么\s*(?:环境|账号|子账号|问题|ip|网段|地址|机器|服务)(?![a-z0-9])|要看谁在调用|谁调用(?:这个|该)?(?:地址|接口|域名|服务)?|看看(?:这个)?是(?:咋|怎么)回事|拆解一下|一个一个.*确认|把各张单分开处理|单独提一个\s*ask|受波及的上下游|卡在哪里|为啥没做完|为什么没做完|这才是根本目标|暴露真实的?\s*client\s*ip|调用链|前因后果|经过说一下|怎么测的|(?:(?:测试环境|stage|预发)[^\n。]{0,12})?(?:测|测试|验证)过了?[吗嘛呢?？]|(?:那个|这个|该)?开关[^\n。]{0,16}(?:测|测试|验证)过了?[吗嘛呢?？]|review\s*过了吗|过\s*review\s*了吗|评审过了吗|谁\s*review|人工\s*review|啥意思|什么意思|没看懂|看不懂|是啥问题|啥问题|不明白|看不明白|说人话|是谁说过|人数多少|发给我看看|拿证据|连数据库是走|稳不稳|是啥情况|周子然是谁|讲详细点|重新梳理|"
+        r"会不会有.{0,6}影响|会有(?:其他|别的|啥|什么)?[^\n。]{0,6}影响|有什么影响|有没有影响|有没有可能(?:导致)?[^\n。]{0,12}(?:中断|影响|断连)|具体(?:开|改|选)(?:的是)?哪个选项|有办法看|最高.{0,12}用了多少|"
+        r"给他授权|直接给.{0,6}授权|给.{0,8}开权限|给他(?:账号密码|账密)|还不能动|在群里把前因后果交代明白|来龙去脉.{0,8}讲清楚|待背景澄清|澄清上下文|暂时观望|你先排查|先排查一下|弄清楚.{0,12}(?:给我|再)|把执行方案给我|"
+        r"能具体讲讲|具体讲讲|讲讲前因后果|具体怎么做|具体怎么改|具体怎么实现|怎么实现(?:的)?|方案\s*[1-9一二三四五六七八九A-Ea-e]\s*[^\n。]{0,12}怎么|完整的方案|完整给我.{0,16}方案|各资源.{0,8}(?:处理)?方案|用\s*lark\s*文档|飞书文档|写个文档|出个文档|文档给我|整理成.{0,12}(?:md|markdown|文档|文件)|(?:md|markdown)\s*(?:文件|文档)?\s*给我|我要找[^\n。]{0,12}看一下(?:这个问题)?|仔细看看|能(?:够)?自动扩缩容|可以自动扩缩容|自动扩缩容[嘛吗呢?？]|"
+        r"是干(?:嘛|什么|啥)(?:用)?的|干(?:嘛|什么|啥)用的|是做什么(?:用)?的|做什么用的|有什么用|有没有用|没有人(?:在)?用|没人(?:在)?用|"
+        r"都有哪些\s*(?:pg|mysql|redis|db|数据库|实例)|和\s*\S+\s*(?:其他的\s*\S+\s*)?(?:都是)?一起(?:在)?用[吗嘛呢?？]|共用(?:的)?[吗嘛呢?？]|"
+        r"问一下.{0,12}(?:着急[吗嘛]|给谁访问|谁访问)|这个着急[吗嘛]|(?:这个\s*)?要现在[吗嘛呢?？]|现在就要[吗嘛呢?？]|急不急|着不着急|先问问云厂商|问问云厂商的人|是给谁访问的|给谁访问的|"
+        r"新加了需求[^\n。]{0,16}(?:我)?需要买几台|(?:我)?需要买几台[呢吗嘛?？]|"
+        r"给我一次.{0,24}(?:名单|列表|台账)|再发一次.{0,24}(?:名单|列表|台账)|总体.{0,16}(?:在使用|在用).{0,12}(?:人员)?名单|"
+        r"先拟一版文案|(?:文案|草稿)[^\n。]{0,12}(?:先让我看看|让我看看|发来看看|在哪)|文案在哪|咋没看见|没看见呢|"
+        r"这个原先就没有.{0,8}[吗嘛?？]|以前就没有.{0,8}[吗嘛?？]|是?啥时候(?:关闭|关掉|打开|开启|改|去掉)了?|没讲清我要你查的|没写我让你查的|你没说.{0,12}原因|"
+        r"解决(?:啥|什么)问题|为(?:啥|什么)要(?:搞|做|改)这个|完整前因后果|掌握全部背景|完整上下文|具体原文(?:和上下文)?|原话和背景|(?:原文|上下文)是什么)",
+        s,
+        re.I,
+    ):
+        return ("context_incomplete", "缺环境/调用链反问")
+    if re.search(
+        r"(?:service[\s-]*level|sevicel-level|不要动\s*revision|往上一层抽象地想|先限制|改用新镜像直接上|跑新镜像|保证.{0,16}cicd是通的|可以部署到\s*prod|有个?开关(?:来控制)?|开关来?控制|什么配置下|只给国内|跟\s*site-a\.example\s*一样|都放在腾讯云乙站|子成员账号所在环境|(?:有没有|有无)(?:什么)?(?:更好|更优|更安全|更稳妥|简单|快速|更简单|更直接|别的|其他).{0,16}(?:方式|办法|方案|解法)|能不(?:放开|放通|开)\s*0\.0\.0\.0/0)",
+        s,
+        re.I,
+    ):
+        return ("arch_or_config_posture", "技术做法纠正")
+    if re.search(
+        r"(?:已经处理了|过时间了|太久了|他有权限了|我已经回了|还要吗|(?:他的|自己)\s*agent\s*操作了|帮忙盯着点)",
+        s,
+        re.I,
+    ):
+        return ("stale_or_already_handled", "陈旧/已办结却未复核")
+    if chosen_code in ("A", "B", "C", "D", "E") and recommended and chosen_code != recommended:
+        m_chosen = re.search(rf"(?:^|\n)\s*{re.escape(chosen_code)}\s*[\.、:：)\]]\s*([^\n]+)", text or "", re.I)
+        chosen_full = f"{s} {m_chosen.group(1) if m_chosen else ''}"
+        if (
+            re.search(r"开通[^\n。；]*(?:GitHub|仓库|仓)[^\n。；]*权限[^\n。；]*(?:自行|自己)?[^\n。；]*提\s*PR", chosen_full, re.I)
+            and re.search(
+                r"不开(?:通)?(?:仓库|仓|GitHub)?权限[^\n。；]*(?:由我们|我们)(?:克隆|直接)?[^\n。；]*(?:修改|代改|改)",
+                text or "",
+                re.I,
+            )
+        ) or (
+            re.search(r"按申请内容全部开通[^\n。；]*(?:CDN|DNS 服务|站点权限)", chosen_full, re.I)
+            and re.search(r"(?:DNS 服务|CDN)[^\n。；]*(?:给只读|走受控变更)", text or "", re.I)
+        ) or (
+            re.search(r"(?:停用|offline)[^\n。；]*并下线[^\n。；]*域名|直接下线[^\n。；]*(?:联调|过渡|临时)域名", chosen_full, re.I)
+            and re.search(r"(?:联调域名|过渡域名|临时域名)[\s\S]{0,420}(?:301|302|重定向|跳转)", text or "", re.I)
+        ) or (
+            re.search(r"(?:同意|授权)?开通外网[^\n。；]*(?:交付凭据|白名单|安全组)", chosen_full, re.I)
+            and re.search(r"Hazel[\s\S]{0,420}保持纯内网[^\n。；]*(?:不开放公网|密码外发)", text or "", re.I)
+        ) or (
+            re.search(r"授权(?:父会话|专席|本会话)[^\n。；]*(?:执行|调用)[^\n。；]*脚本", chosen_full, re.I)
+            and re.search(r"(?:你在本机终端直接跑|由你在本机[^\n。；]*执行)[^\n。；]*脚本", text or "", re.I)
+        ) or (
+            re.search(r"同意.{0,12}(?:建|开通|按)?\s*(?:受限)?\s*SSH\s*隧道.{0,24}交付", chosen_full, re.I)
+            and re.search(r"不对外发连接串|不开(?:跨境)?隧道", text or "", re.I)
+        ) or (
+            re.search(
+                r"仅(?:销毁|退订|清理)[^\n。；]*Stage[^\n。；]*生产[^\n。；]*(?:暂)?维持原样不改"
+                r"|暂缓执行[^\n。；]*冲刺期过后再处理",
+                chosen_full,
+                re.I,
+            )
+        ) or (
+            re.search(r"全部批准[^\n]*(?:最小范围的命名空间|命名空间|kubeconfig)", chosen_full, re.I)
+            and re.search(r"部分批准[^\n]*不直发[^\n]*kubeconfig", text or "", re.I)
+        ) or (
+            re.search(r"同意(?:开通|将[^\n]{0,48}只限一库读取(?:角色|账号))[^\n]*(?:按申请授予|权限|接入串单独私信给|demo_metrics_ro)", chosen_full, re.I)
+            and re.search(r"A[ \t.、:：)\]]+[^\n]*(?:代其执行|代跑|免提权|仅走[^\n]{0,24}集群\s*Secret|不发[^\n]{0,16}(?:个人|明文))", text or "", re.I)
+        ) or (
+            chosen_code == "A"
+            and recommended == "B"
+            and re.search(r"授权马上执行|同意立即执行", chosen_full, re.I)
+            and re.search(r"B[ \t.、:：)\]]+[^\n]*暂缓(?:写库|执行|上线|变更)", text or "", re.I)
+        ) or (
+            re.search(r"暂不同步|暂时不同步|这次播报取消|只在内部台账里静默跟踪", chosen_full, re.I)
+            and re.search(r"日清播报|每日进度与(?:阻塞)?卡点播报|立即按草稿[^\n]*发到", text or "", re.I)
+        ) or (
+            re.search(r"放开\s*Stage\s*0\.0\.0\.0/0[^\n]*Prod\s*(?:走|维持|保持)固定白名单", chosen_full, re.I)
+            and re.search(r"A[ \t.、:：)\]]+[^\n]*严格锁死\s*\d+\s*个固定白名单", text or "", re.I)
+        ) or (
+            re.search(r"引导走\s*GitHub|代码主仓在\s*GitHub[^\n。；]*无需另开\s*MIRROR\s*权限", chosen_full, re.I)
+            and re.search(r"A[ \t.、:：)\]]+[^\n]*(?:MIRROR|只读|Reporter)", text or "", re.I)
+        ) or (
+            re.search(r"按\s*RJ\s*建议仅保留[^\n]*其余[^\n]*(?:全部销毁|下线|删除)", chosen_full, re.I)
+            and re.search(r"B[ \t.、:：)\]]+[^\n]*维持[^\n]*分类", text or "", re.I)
+        ):
+            return ("arch_or_config_posture", "技术做法纠正")
+        return ("option_or_schedule_redirect", f"改选 {chosen_code}（原建议 {recommended}）")
+    return ("option_or_schedule_redirect", "人类改判 / 调整窗口")
+
+
+def clean_ui_text(val: Any, max_len: int = 0) -> str:
+    """净化展示文本：剔除彩色 Emoji 与违规测试八股词，保持界面极简干净。"""
+    s = str(val or "")
+    s = _EMOJI_STRIP_RE.sub("", s)
+    s = _BOILERPLATE_RE.sub("[已脱敏]", s)
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    if max_len > 0 and len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
+def parse_iso(ts: str | None) -> datetime | None:
+    if not ts or not isinstance(ts, str):
+        return None
+    raw = ts.strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return dt
+    except ValueError:
+        return None
+
+
+def diff_ms(start_iso: str | None, end_iso: str | None) -> int | None:
+    a, b = parse_iso(start_iso), parse_iso(end_iso)
+    if a is None or b is None:
+        return None
+    delta = int(round((b - a).total_seconds() * 1000))
+    return max(0, delta)
+
+
+def quantile(values: list[int | float], q: float) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    idx = min(len(s) - 1, max(0, int(math.ceil(q * len(s)) - 1)))
+    return int(round(s[idx]))
+
+
+def _connect_ro(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_backfill(db_path: Path) -> int:
+    if not db_path.is_file():
+        return 0
+    from .card_callback import heal_truncated_card_callbacks
+    st = Store(db_path)
+    try:
+        heal_truncated_card_callbacks(st)
+        return st.backfill_dispatch_acked_at()
+    finally:
+        st.close()
+
+
+def _load_stop_logs(state_dir: Path, limit: int = 800) -> list[dict]:
+    d = call_log_dir(state_dir)
+    if not d.is_dir():
+        return []
+    files = sorted(d.glob("*.jsonl"), reverse=True)
+    rows: list[dict] = []
+    for f in files[:3]:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    rows.append(rec)
+                    if len(rows) >= limit:
+                        return rows
+            except ValueError:
+                continue
+    return rows
+
+
+def _read_stop_state_file(cfg: Config, topic_id: str) -> dict:
+    p = count_path(cfg, topic_id)
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_GENERIC_CREATED_RE = re.compile(r"Created At:\s*(\S+)")
+_GENERIC_COMPLETED_RE = re.compile(r"Completed At:\s*(\S+)")
+
+
+def _fmt_ms_short(ms: int | None) -> str:
+    if ms is None:
+        return "-"
+    if ms < 1000:
+        return f"{max(0, int(ms))}ms"
+    if ms < 60_000:
+        return f"{ms / 1000.0:.1f}s"
+    return f"{ms / 60_000.0:.1f}m"
+
+
+def parse_transcript_steps(
+    cid: str | None,
+    batch_id: str = "",
+    max_steps: int = 40,
+    tail_bytes: int = 384 * 1024,
+) -> list[dict]:
+    """从 Antigravity 会话 transcript.jsonl 提取会话内各事件步骤与耗时（将模型推理耗时与工具/CLI实测执行耗时物理拆开）。"""
+    if not cid or not cid.strip():
+        return []
+    tp = transcript_path(cid.strip())
+    if not tp.is_file():
+        return []
+    try:
+        with tp.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - tail_bytes)
+            f.seek(start)
+            raw_lines = f.read(size - start).split(b"\n")
+        if start > 0:
+            raw_lines = raw_lines[1:]
+    except OSError:
+        return []
+
+    parsed: list[dict] = []
+    for raw in raw_lines:
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(obj, dict):
+                parsed.append(obj)
+        except ValueError:
+            continue
+
+    if not parsed:
+        return []
+
+    if batch_id:
+        anchor = -1
+        for i, item in enumerate(parsed):
+            content = str(item.get("content") or "")
+            if batch_id in content and item.get("type") in ("SYSTEM_MESSAGE", "USER_INPUT"):
+                anchor = i
+                break
+        if anchor >= 0:
+            # 截取该批次开始直到下一个批次开始之前的步骤
+            sliced = [parsed[anchor]]
+            for item in parsed[anchor + 1 :]:
+                content = str(item.get("content") or "")
+                if "[sheepdog] 新信号批次 " in content and batch_id not in content:
+                    break
+                sliced.append(item)
+            parsed = sliced
+        else:
+            parsed = parsed[-max_steps:]
+    else:
+        parsed = parsed[-max_steps:]
+
+    steps: list[dict] = []
+    last_tool_completed_at = ""
+    for idx, item in enumerate(parsed):
+        stype = str(item.get("type") or "STEP")
+        created_at = str(item.get("created_at") or "")
+        next_at = str(parsed[idx + 1].get("created_at") or "") if idx + 1 < len(parsed) else ""
+        dur_ms = diff_ms(created_at, next_at) if next_at else 0
+        tool_calls = item.get("tool_calls") if isinstance(item.get("tool_calls"), list) else []
+        content = str(item.get("content") or "")
+
+        if stype == "GENERIC":
+            m_comp = _GENERIC_COMPLETED_RE.search(content)
+            if m_comp:
+                last_tool_completed_at = m_comp.group(1)
+            elif created_at:
+                last_tool_completed_at = created_at
+            continue
+
+        kind = "step"
+        label = stype
+        detail = ""
+        if stype == "SYSTEM_MESSAGE":
+            if "[sheepdog] 新信号批次" in content:
+                kind = "batch_inject"
+                m = re.search(r"新信号批次\s+`?([^`\s（(]+)", content)
+                label = f"注入批次 {m.group(1) if m else ''}".strip()
+            elif "Stop hook" in content or "先别结束" in content:
+                kind = "hook_block"
+                label = "Stop Hook 拦截续跑"
+            else:
+                kind = "system"
+                label = "系统信号注入"
+            detail = clean_ui_text(content.splitlines()[0] if content else "", 100)
+            last_tool_completed_at = created_at
+        elif stype == "USER_INPUT":
+            kind = "user_input"
+            label = "人工输入 / 唤醒"
+            detail = clean_ui_text(content[:100], 100)
+            last_tool_completed_at = created_at
+        elif stype == "PLANNER_RESPONSE":
+            tools: list[str] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tname = str(tc.get("name") or tc.get("tool_name") or "")
+                args = tc.get("arguments") or tc.get("args") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {"raw": args}
+                if not isinstance(args, dict):
+                    args = {}
+                if "run_command" in tname:
+                    cmd = str(args.get("CommandLine") or args.get("toolSummary") or "")
+                    matched_sd = False
+                    if "sheepdog reply" in cmd:
+                        kind = "sd_reply"
+                        tools.append("sheepdog reply (代回飞书)")
+                        matched_sd = True
+                    if "sheepdog ask" in cmd:
+                        if kind == "step":
+                            kind = "sd_ask"
+                        tools.append("sheepdog ask (发起拍板)")
+                        matched_sd = True
+                    if "sheepdog report" in cmd:
+                        if kind == "step":
+                            kind = "sd_report"
+                        tools.append("sheepdog report (汇报进展)")
+                        matched_sd = True
+                    if "sheepdog receipt" in cmd:
+                        if kind == "step":
+                            kind = "sd_receipt"
+                        tools.append("sheepdog receipt (提交回执)")
+                        matched_sd = True
+                    if "sheepdog forward" in cmd:
+                        if kind == "step":
+                            kind = "sd_forward"
+                        tools.append("sheepdog forward (总线转交)")
+                        matched_sd = True
+                    if "sheepdog lamb" in cmd:
+                        if kind == "step":
+                            kind = "sd_lamb"
+                        tools.append("sheepdog lamb (羔羊派单)")
+                        matched_sd = True
+                    if not matched_sd:
+                        if kind == "step":
+                            kind = "tool_cmd"
+                        tools.append(f"cmd: {clean_ui_text(args.get('toolSummary') or cmd, 48)}")
+                elif "invoke_subagent" in tname:
+                    kind = "subagent"
+                    tools.append(f"Subagent: {clean_ui_text(args.get('Role') or args.get('TypeName') or 'subagent', 40)}")
+                elif tname:
+                    if kind == "step":
+                        kind = "tool_call"
+                    tools.append(clean_ui_text(tname.replace("default_api:", ""), 32))
+            if tools:
+                label = " · ".join(tools[:2])
+                raw_call_detail = clean_ui_text(content or ("调用 " + ", ".join(tools)), 90)
+                # 7.108 (REG-076)：Antigravity PLANNER_RESPONSE.created_at 为模型开始思考时间，
+                # 紧随其后的 GENERIC 步骤内含 Created At / Completed At 才是工具真实执行起止时间。
+                tool_start_iso = ""
+                tool_end_iso = ""
+                for nxt in parsed[idx + 1 : idx + 3]:
+                    if str(nxt.get("type") or "") != "GENERIC":
+                        break
+                    g_txt = str(nxt.get("content") or "")
+                    m_cr = _GENERIC_CREATED_RE.search(g_txt)
+                    m_cp = _GENERIC_COMPLETED_RE.search(g_txt)
+                    if m_cr and not tool_start_iso:
+                        tool_start_iso = m_cr.group(1)
+                    if m_cp:
+                        tool_end_iso = m_cp.group(1)
+                if tool_start_iso:
+                    think_ms = max(0, diff_ms(created_at, tool_start_iso) or 0)
+                    exec_ms = max(0, diff_ms(tool_start_iso, tool_end_iso or tool_start_iso) or 0)
+                else:
+                    think_ms = 0
+                    exec_ms = max(0, dur_ms or 0)
+
+                if think_ms >= 500:
+                    short_tool = tools[0].split(" (")[0]
+                    steps.append(
+                        {
+                            "step_index": item.get("step_index", idx),
+                            "kind": "thinking",
+                            "label": clean_ui_text(f"模型推理（准备 {short_tool}）", 64),
+                            "detail": clean_ui_text(
+                                str(item.get("thinking") or content or f"识图/分析上下文并生成 {', '.join(tools)} 参数"),
+                                110,
+                            ),
+                            "at": created_at,
+                            "duration_ms": think_ms,
+                        }
+                    )
+                dur_ms = exec_ms
+                created_at = tool_start_iso or created_at
+                detail = (
+                    f"工具实测 {_fmt_ms_short(exec_ms)}（前置推理 {_fmt_ms_short(think_ms)} 已单列）· {raw_call_detail}"
+                    if think_ms >= 500
+                    else raw_call_detail
+                )
+            else:
+                kind = "thinking"
+                label = "模型推理与总结"
+                detail = clean_ui_text(content or str(item.get("thinking") or ""), 110)
+                if (not dur_ms or dur_ms <= 0) and last_tool_completed_at:
+                    inferred = diff_ms(last_tool_completed_at, created_at)
+                    if inferred is not None and 0 < inferred <= 120_000:
+                        dur_ms = inferred
+        else:
+            continue
+
+        steps.append(
+            {
+                "step_index": item.get("step_index", idx),
+                "kind": kind,
+                "label": clean_ui_text(label, 64),
+                "detail": detail,
+                "at": created_at,
+                "duration_ms": dur_ms if dur_ms is not None else 0,
+            }
+        )
+
+    return steps[-max_steps:]
+
+
+_FOLLOWUP_UPDATED_RECOMMEND_RE = re.compile(
+    r"(?:(?:建议|推荐|请示|补充请示)(?:改为|改)?(?:批准|改选|选|选择)(?:原请示卡片的)?\s*(?:\*\*|__)?(?:选项\s*)?([A-E])\b"
+    r"|唯一[^\n。；]{0,24}(?:可执行|可行)路径为\s*(?:\*\*|__)?(?:选项\s*)?([A-E])\b)",
+    re.I,
+)
+
+
+def classify_escalation(
+    row: sqlite3.Row | dict,
+    answer_content: str = "",
+    ask_floor: str = "",
+    followup_critique: str = "",
+    followup_send_text: str = "",
+) -> dict:
+    """将找人决策单归类为：accepted（采纳建议）/ overridden（推翻或改判）/ auto_resolved（旁路结案）/ pending（待拍板）。"""
+    text = str(row["text"] or "")
+    closed_at = row["closed_at"]
+    answered_at = row["answered_at"]
+    close_reason = str(row["close_reason"] or "")
+    resolved_by = str(row["resolved_by"] or "")
+    resolve_note = str(row["resolve_note"] or "")
+    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+    raw_critique = followup_critique or (str(row["followup_critique"] or "") if "followup_critique" in row_keys else "")
+    critique_clean = clean_ui_text(raw_critique, 120) if raw_critique else ""
+    raw_followup_send = followup_send_text or (str(row["followup_send_text"] or "") if "followup_send_text" in row_keys else "")
+
+    options: list[dict] = []
+    for m in _OPTION_LINE_RE.finditer(text):
+        code, desc = m.group(1).upper(), clean_ui_text(m.group(2), 90)
+        if not any(o["code"] == code for o in options):
+            options.append({"code": code, "label": desc})
+    if not options:
+        from .card_callback import parse_ask_options
+        for opt in parse_ask_options(text):
+            if not any(o["code"] == opt.key for o in options):
+                options.append({"code": opt.key, "label": clean_ui_text(opt.label, 90)})
+
+    rec_match = _RECOMMEND_RE.search(text)
+    recommended = ""
+    if rec_match:
+        recommended = (rec_match.group(1) or rec_match.group(2) or rec_match.group(3) or "A").upper()
+    elif options:
+        recommended = "A"
+    rec_updated_by_followup = False
+    if raw_followup_send and (m_upd_rec := _FOLLOWUP_UPDATED_RECOMMEND_RE.search(raw_followup_send)) is not None:
+        upd_rec = (m_upd_rec.group(1) or m_upd_rec.group(2) or "").upper()
+        if upd_rec in ("A", "B", "C", "D", "E"):
+            if upd_rec != recommended:
+                rec_updated_by_followup = True
+            recommended = upd_rec
+
+    # 识别找人原因分类
+    category = "常规方案拍板"
+    if ask_floor:
+        if "cred" in ask_floor or "凭据" in ask_floor:
+            category = "外发凭据底线"
+        elif "destruct" in ask_floor or "删除" in ask_floor or "强推" in ask_floor:
+            category = "不可逆操作底线"
+        elif "vip" in ask_floor.lower():
+            category = "VIP 冲突裁决"
+        else:
+            category = f"底线授权 ({clean_ui_text(ask_floor, 20)})"
+    elif re.search(r"生产|发布|上线|切流|prr|cloud\s*run|deploy", text, re.I):
+        category = "生产发布与变更授权"
+    elif re.search(r"权限|iam|secret|账号|开通|write", text, re.I):
+        category = "权限与安全配置审批"
+    elif re.search(r"归档|关闭|清理|删除|回滚", text, re.I):
+        category = "清理与生命周期确认"
+
+    ans_clean = clean_ui_text(answer_content, 160)
+    ans_body = ans_clean
+    chosen_code = ""
+    cb_match = _CALLBACK_CHOICE_RE.search(answer_content or "")
+    if cb_match:
+        chosen_code = cb_match.group(1).upper()
+        ans_body = clean_ui_text(cb_match.group(2), 140)
+        ans_clean = f"[{chosen_code}] {ans_body}"
+        if chosen_code == "其他":
+            m_other_choice = _TEXT_EXPLICIT_CHOICE_RE.search(ans_body)
+            if m_other_choice:
+                chosen_code = (m_other_choice.group(1) or m_other_choice.group(2) or "").upper()
+    else:
+        ans_body = _CHOICE_PREFIX_RE.sub("", ans_clean).strip()
+        m_txt_choice = _TEXT_EXPLICIT_CHOICE_RE.search(ans_body)
+        if m_txt_choice:
+            chosen_code = (m_txt_choice.group(1) or m_txt_choice.group(2) or "").upper()
+
+    override_code = ""
+    override_reason = ""
+    if not closed_at and not answered_at:
+        alignment = "pending"
+        alignment_label = "待人类拍板"
+    elif answered_at or close_reason == "answered":
+        if chosen_code == "其他":
+            rec_code = (recommended or "A").upper()
+            rec_label = next((str(o.get("label") or "") for o in options if o.get("code") == rec_code), "")
+            if not rec_label and text:
+                m_opt = re.search(rf"(?:^|\n)\s*{re.escape(rec_code)}\s*[\.、:：)\]]\s*([^\n]+)", text, re.I)
+                rec_label = m_opt.group(1) if m_opt else ""
+            _cn_num = {"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+            m_ans_buy = re.search(
+                r"^(?:那|好|好的|行|ok)?[，,\s]*(?:我)?(?:这就|先|现在)?去\s*(?:买|新买|新购|采购)\s*([一二两三四五六七八九十\d]+)\s*台",
+                (ans_body or "").strip(),
+                re.I,
+            )
+            m_rec_buy = re.search(r"(?:买|新买|新购|采购)\s*([一二两三四五六七八九十\d]+)\s*台", rec_label, re.I)
+            ans_cnt = _cn_num.get(m_ans_buy.group(1), m_ans_buy.group(1)) if m_ans_buy else ""
+            rec_cnt = _cn_num.get(m_rec_buy.group(1), m_rec_buy.group(1)) if m_rec_buy else ""
+            accepts_rec_purchase = bool(
+                not _OVERRIDE_WORDS_RE.search(ans_body)
+                and ans_cnt
+                and rec_cnt
+                and ans_cnt == rec_cnt
+            )
+            accepts_cred_floor_direct_send = bool(
+                re.search(r"^(?:你|你们|专席|agent)?\s*直接(?:私信)?(?:发|发给[他她]|发送)(?:吧|就行|即可)?$", (ans_body or "").strip(), re.I)
+                and (category == "外发凭据底线" or re.search(r"触及\s*credentials|外发.{0,6}底线", text, re.I))
+                and re.search(r"授权(?:直发|私信发送|发送)|亲自或授权", text, re.I)
+            )
+            _norm_clause = lambda s_in: re.sub(r"[\s，,。、：:；;＋+（(）)\[\]「」『』`'\"]+", "", str(s_in or "")).lower()
+            ans_norm = _norm_clause(ans_body)
+            rec_norm = _norm_clause(rec_label)
+            other_opt_norms = [
+                _norm_clause(o.get("label") or "")
+                for o in options
+                if str(o.get("code") or "").upper() != rec_code
+            ]
+            accepts_rec_leading_clause = bool(
+                not _OVERRIDE_WORDS_RE.search(ans_body)
+                and len(ans_norm) >= 8
+                and len(rec_norm) >= 8
+                and ans_norm[:8] == rec_norm[:8]
+                and not any(len(on) >= 8 and ans_norm[:8] == on[:8] for on in other_opt_norms)
+            )
+            accepts_rec_fill_in_blank = bool(
+                not _OVERRIDE_WORDS_RE.search(ans_body)
+                and "?" not in (ans_body or "")
+                and "？" not in (ans_body or "")
+                and 1 <= len((ans_body or "").strip()) <= 60
+                and re.search(
+                    r"(?:回复本卡片|在卡片(?:里|中))?(?:告诉我|发我|提供|补充)[^\n]{0,24}(?:新同事|对方|这位|他|她)?(?:姓名|名字|是谁|岗位|信息|称呼)[^\n]{0,20}(?:由我|我来)?代回|问[^\n]{0,12}(?:这位|新来的)?是谁",
+                    f"{rec_label}\n{text}",
+                    re.I,
+                )
+            )
+            if _OVERRIDE_WORDS_RE.search(ans_body) or (
+                not _ACCEPT_WORDS_RE.search(ans_body)
+                and not accepts_rec_purchase
+                and not accepts_cred_floor_direct_send
+                and not accepts_rec_leading_clause
+                and not accepts_rec_fill_in_blank
+            ):
+                alignment = "overridden"
+                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                alignment_label = override_reason
+            else:
+                alignment = "accepted"
+                alignment_label = (
+                    "采纳建议 (底线授权直发)"
+                    if accepts_cred_floor_direct_send
+                    else ("采纳建议 (补充信息代回)" if accepts_rec_fill_in_blank else "采纳建议 (带参/直接放行)")
+                )
+        elif chosen_code in ("A", "B", "C", "D", "E"):
+            misclick_corrected = False
+            m_corr = _OWNER_MISCLICK_CORRECTION_RE.search(critique_clean) if critique_clean else None
+            corr_code = ((m_corr.group(1) or m_corr.group(2) or "").upper() if m_corr else "")
+            if not corr_code and critique_clean and re.search(r"看错了|搞错了|点错了|选错了|按错了|手滑了?", critique_clean, re.I):
+                if re.search(r"给[他她]授权|直接给.{0,6}授权|给.{0,8}开权限|同意开通|同意授权", critique_clean, re.I):
+                    for o in options:
+                        oc = str(o.get("code") or "").upper()
+                        ol = str(o.get("label") or "")
+                        if oc and oc != chosen_code and re.search(r"同意开通|同意授权|按申请授予|批准开通", ol, re.I):
+                            corr_code = oc
+                            break
+            if corr_code in ("A", "B", "C", "D", "E") and corr_code != chosen_code:
+                orig_chosen = chosen_code
+                chosen_code = corr_code
+                ans_body = next((str(o.get("label") or "") for o in options if o.get("code") == chosen_code), ans_body)
+                ans_clean = f"[{chosen_code}] (误触 {orig_chosen} 后更正) {critique_clean}"
+                misclick_corrected = True
+            if critique_clean and _SYMBOLIC_CRITIQUE_RE.search(critique_clean):
+                alignment = "overridden"
+                override_code, override_reason = diagnose_override_reason(
+                    text, critique_clean, chosen_code, recommended
+                )
+                alignment_label = f"{override_reason}（点选 {chosen_code} 后追问纠偏）"
+                ans_clean = f"{ans_clean} · 追问：{critique_clean}"
+            elif recommended and chosen_code != recommended:
+                if re.search(r"生产变更不由我方执行[，,\s]*交由[^\n]*自己完成切换", ans_body or "", re.I):
+                    alignment = "accepted"
+                    alignment_label = f"采纳建议 ({chosen_code} · 对方团队自切)"
+                else:
+                    alignment = "overridden"
+                    override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                    alignment_label = f"改选 {chosen_code}（原建议 {recommended}）"
+            else:
+                alignment = "accepted"
+                alignment_label = (
+                    f"采纳建议 ({chosen_code} · 误触更正)"
+                    if misclick_corrected
+                    else (
+                        f"采纳建议 ({chosen_code} · 跟进修订建议)"
+                        if rec_updated_by_followup
+                        else f"采纳建议 ({chosen_code})"
+                    )
+                )
+        else:
+            if _OVERRIDE_WORDS_RE.search(ans_body):
+                alignment = "overridden"
+                override_code, override_reason = diagnose_override_reason(text, ans_body, chosen_code, recommended)
+                alignment_label = override_reason or "人类推翻 / 改判"
+            else:
+                alignment = "accepted"
+                alignment_label = "采纳建议"
+    else:
+        alignment = "auto_resolved"
+        alignment_label = "旁路自愈结案"
+        if resolve_note:
+            ans_clean = clean_ui_text(resolve_note, 140)
+        elif not ans_clean:
+            ans_clean = clean_ui_text(close_reason or resolved_by or "会话核实后自动结案", 140)
+
+    latency_ms = diff_ms(row["asked_at"], answered_at or closed_at)
+    first_line = clean_ui_text(text.splitlines()[0] if text else row["message_id"], 96)
+
+    row_keys = row.keys() if hasattr(row, "keys") else ()
+    return {
+        "message_id": row["message_id"],
+        "answer_message_id": str(row["answer_message_id"] or "") if "answer_message_id" in row_keys else "",
+        "topic_id": row["topic_id"],
+        "title": first_line,
+        "text": clean_ui_text(text, 800),
+        "category": category,
+        "floor": clean_ui_text(ask_floor, 40),
+        "options": options,
+        "recommended": recommended,
+        "chosen_code": chosen_code,
+        "answer_text": ans_clean,
+        "alignment": alignment,
+        "alignment_label": alignment_label,
+        "override_code": override_code,
+        "override_reason": override_reason,
+        "asked_at": row["asked_at"],
+        "answered_at": answered_at,
+        "closed_at": closed_at,
+        "close_reason": close_reason,
+        "resolved_by": resolved_by,
+        "nudge_count": int(row["nudge_count"] or 0),
+        "latency_ms": latency_ms,
+    }
+
+
+class WorkbenchService:
+    def __init__(self, cfg: Config | None = None):
+        self.cfg = cfg or load_config()
+        try:
+            ensure_backfill(self.cfg.db_path)
+        except Exception:
+            pass
+
+    def _ro(self) -> sqlite3.Connection:
+        return _connect_ro(self.cfg.db_path)
+
+    def get_overview(self, minutes: int = 1440) -> dict:
+        cutoff = (datetime.now().astimezone() - timedelta(minutes=max(5, minutes))).isoformat(timespec="seconds")
+        ws_health: dict[str, Any] = {"status": "online", "conn_id": "", "last_ack_ms": 0, "restarts": 0}
+        health_file = self.cfg.state_dir / "bot_ws_health.json"
+        if health_file.is_file():
+            try:
+                raw_h = json.loads(health_file.read_text(encoding="utf-8"))
+                if isinstance(raw_h, dict):
+                    ws_health.update(raw_h)
+            except (OSError, ValueError):
+                pass
+
+        conn = self._ro()
+        try:
+            # 统计各阶段耗时分位数（T0->T1 采集，T1->T2 点表情，T1->T3 投递，T3->T4 会话内执行，T0->T5 端到端回复）
+            rows = conn.execute(
+                """WITH page AS (
+                       SELECT m.message_id, m.create_time, m.first_seen, m.received_by, m.route, m.reason, m.topic_id, m.batch_id
+                       FROM messages m
+                       WHERE m.chat_type != 'sheepdog' AND m.first_seen >= ?
+                       ORDER BY m.first_seen DESC LIMIT 600
+                   )
+                   SELECT m.message_id, m.create_time, m.first_seen, m.received_by, m.route, m.reason, m.topic_id, m.batch_id,
+                          a.added_at AS ack_added_at,
+                          d.sent_at AS dispatch_sent_at, d.acked_at AS dispatch_acked_at,
+                          (SELECT MIN(s.sent_at) FROM sends s WHERE s.target_message_id = m.message_id AND s.kind='reply') AS reply_sent_at
+                   FROM page m
+                   LEFT JOIN acks a ON a.message_id = m.message_id
+                   LEFT JOIN dispatches d ON d.batch_id = m.batch_id""",
+                (cutoff,),
+            ).fetchall()
+
+            def _is_minute_truncated_t0(create_ts: Any, first_seen_ts: Any, received_by: Any) -> bool:
+                s = str(create_ts or "").strip()
+                if not (s.endswith(":00+08:00") or s.endswith(":00Z") or (len(s) >= 19 and s[16:19] == ":00")):
+                    return False
+                if received_by in ("user", None, ""):
+                    return True
+                d_ms = diff_ms(str(create_ts or ""), str(first_seen_ts or ""))
+                return d_ms is not None and d_ms >= 5000
+
+            t0_t1_precise, t0_t1_all, t1_t2, t1_t3, t3_t4, t0_t5 = [], [], [], [], [], []
+            route_counts = {"dispatch": 0, "inbox": 0, "drop": 0}
+            for r in rows:
+                rt = r["route"] or "drop"
+                route_counts[rt] = route_counts.get(rt, 0) + 1
+                min_trunc = _is_minute_truncated_t0(r["create_time"], r["first_seen"], r["received_by"])
+                if (v := diff_ms(r["create_time"], r["first_seen"])) is not None and v <= 300_000:
+                    t0_t1_all.append(v)
+                    if not min_trunc:
+                        t0_t1_precise.append(v)
+                if (v := diff_ms(r["first_seen"], r["ack_added_at"])) is not None and v <= 300_000:
+                    t1_t2.append(v)
+                if (v := diff_ms(r["first_seen"], r["dispatch_sent_at"])) is not None and v <= 1_800_000:
+                    t1_t3.append(v)
+                if (v := diff_ms(r["dispatch_sent_at"], r["dispatch_acked_at"])) is not None and 0 < v <= 3_600_000:
+                    t3_t4.append(v)
+                e2e_start = (
+                    r["first_seen"]
+                    if min_trunc and (diff_ms(r["create_time"], r["first_seen"]) or 0) <= 120_000
+                    else r["create_time"]
+                )
+                if (v := diff_ms(e2e_start, r["reply_sent_at"])) is not None and 0 < v <= 3_600_000:
+                    t0_t5.append(v)
+            t0_t1 = t0_t1_precise if t0_t1_precise else t0_t1_all
+
+            def _qpack(arr: list[int], label: str) -> dict:
+                return {
+                    "label": label,
+                    "count": len(arr),
+                    "p50_ms": quantile(arr, 0.50),
+                    "p95_ms": quantile(arr, 0.95),
+                    "p99_ms": quantile(arr, 0.99),
+                }
+
+            active_topics = conn.execute(
+                "SELECT state, COUNT(*) AS c FROM topics WHERE state != 'closed' GROUP BY state"
+            ).fetchall()
+            state_map = {r["state"]: r["c"] for r in active_topics}
+            running_lambs = conn.execute("SELECT COUNT(*) FROM lambs WHERE state='running'").fetchone()[0]
+            open_escs = conn.execute("SELECT COUNT(*) FROM escalations WHERE closed_at IS NULL").fetchone()[0]
+            open_watches = conn.execute("SELECT COUNT(*) FROM watches WHERE closed_at IS NULL").fetchone()[0]
+            doing_works = conn.execute(
+                "SELECT COUNT(*) FROM work_items WHERE state IN ('doing','waiting_other','waiting_owner')"
+            ).fetchone()[0]
+
+            last_commit = ""
+            live_ver = resolve_live_version(conn)
+            self_evolve_state: dict[str, Any] = {}
+            try:
+                meta_row = conn.execute("SELECT value FROM meta WHERE key='upgrade_prev_commit'").fetchone()
+                if meta_row:
+                    last_commit = str(meta_row["value"] or "")[:12]
+                ic_row = conn.execute("SELECT value FROM meta WHERE key='identity_consumer'").fetchone()
+                if ic_row and ic_row["value"]:
+                    ic_obj = json.loads(ic_row["value"])
+                    if isinstance(ic_obj, dict):
+                        ws_health.update(ic_obj)
+                        ws_health["status"] = "online" if ic_obj.get("state") == "running" else "degraded"
+                ev_row = conn.execute("SELECT value FROM meta WHERE key='self_evolve_state'").fetchone()
+                if ev_row and ev_row["value"]:
+                    ev_obj = json.loads(ev_row["value"])
+                    if isinstance(ev_obj, dict):
+                        self_evolve_state = ev_obj
+            except (sqlite3.OperationalError, ValueError):
+                pass
+        finally:
+            conn.close()
+
+        return {
+            "version": live_ver,
+            "now": now_iso(),
+            "rollback_commit": last_commit,
+            "ws_health": ws_health,
+            "self_evolve": self_evolve_state,
+            "counts": {
+                "topics_running": state_map.get("running", 0),
+                "topics_active": state_map.get("active", 0),
+                "topics_waiting_human": state_map.get("waiting_human", 0),
+                "topics_attention": state_map.get("attention", 0),
+                "lambs_running": running_lambs,
+                "open_escalations": open_escs,
+                "open_watches": open_watches,
+                "active_work_items": doing_works,
+                "messages_window": len(rows),
+                "routes": route_counts,
+            },
+            "latencies": {
+                "t0_t1_ingest": _qpack(t0_t1, "T0->T1 飞书采集"),
+                "t1_t2_ack": _qpack(t1_t2, "T1->T2 秒点 Get"),
+                "t1_t3_dispatch": _qpack(t1_t3, "T1->T3 路由投递"),
+                "t3_t4_session": _qpack(t3_t4, "T3->T4 会话执行"),
+                "t0_t5_e2e_reply": _qpack(t0_t5, "T0->T5 端到端回复"),
+            },
+        }
+
+    def get_sessions_tree(self) -> dict:
+        """构建三级分形会话状态树：Session Group -> Primary Session -> Subagent / CLI Lamb + Hook 实时遥测。"""
+        stop_logs = _load_stop_logs(self.cfg.state_dir, limit=600)
+        logs_by_topic: dict[str, list[dict]] = {}
+        logs_by_cid: dict[str, list[dict]] = {}
+        for rec in stop_logs:
+            tid = str(rec.get("topic") or "").strip()
+            cid = str(rec.get("conversation_id") or "").strip()
+            if tid:
+                logs_by_topic.setdefault(tid, []).append(rec)
+            if cid:
+                logs_by_cid.setdefault(cid, []).append(rec)
+
+        conn = self._ro()
+        try:
+            topics = conn.execute(
+                """SELECT t.*,
+                          dc.run_state AS dc_run_state, dc.spinning AS dc_spinning, dc.detail AS dc_detail,
+                          dc.action AS dc_action, dc.action_at AS dc_action_at, dc.last_act_at AS dc_last_act_at,
+                          dc.last_sig AS dc_last_sig, dc.queued AS dc_queued, dc.stuck_since AS dc_stuck_since,
+                          (SELECT COUNT(*) FROM messages m WHERE m.topic_id=t.topic_id AND m.route='dispatch' AND m.dispatch_state='pending' AND m.reason!='owner_context') AS pending_signals,
+                          (SELECT COUNT(*) FROM escalations e WHERE e.topic_id=t.topic_id AND e.closed_at IS NULL) AS open_escs,
+                          (SELECT COUNT(*) FROM watches w WHERE w.topic_id=t.topic_id AND w.closed_at IS NULL) AS open_watches,
+                          (SELECT COUNT(*) FROM work_items wi WHERE wi.topic_id=t.topic_id AND wi.state IN ('doing','waiting_other','waiting_owner')) AS open_works
+                   FROM topics t
+                   LEFT JOIN duty_cards dc ON dc.topic_id = t.topic_id
+                   ORDER BY CASE WHEN t.state='running' THEN 0 WHEN t.state='attention' THEN 1 WHEN t.state='waiting_human' THEN 2 WHEN t.state='active' THEN 3 ELSE 4 END,
+                            COALESCE(dc.last_act_at, t.last_active) DESC"""
+            ).fetchall()
+
+            lamb_rows = conn.execute(
+                "SELECT * FROM lambs ORDER BY CASE WHEN state='running' THEN 0 ELSE 1 END, started_at DESC LIMIT 300"
+            ).fetchall()
+            lambs_by_parent: dict[str, list[dict]] = {}
+            for lb in lamb_rows:
+                lid = lb["lamb_id"]
+                lcid = str(lb["conversation_id"] or "").strip()
+                l_hooks = logs_by_cid.get(lcid, [])[:5] if lcid else []
+                lambs_by_parent.setdefault(lb["parent_topic_id"], []).append(
+                    {
+                        "lamb_id": lid,
+                        "parent_topic_id": lb["parent_topic_id"],
+                        "kind": lb["kind"],
+                        "task_title": clean_ui_text(lb["task_title"], 100),
+                        "conversation_id": lcid,
+                        "pid": lb["pid"],
+                        "state": lb["state"],
+                        "started_at": lb["started_at"],
+                        "last_act_at": lb["last_act_at"] or lb["started_at"],
+                        "finished_at": lb["finished_at"],
+                        "result_summary": clean_ui_text(lb["result_summary"], 140),
+                        "log_path": lb["log_path"] or "",
+                        "hook_calls": len(l_hooks),
+                        "last_hook": l_hooks[0] if l_hooks else None,
+                    }
+                )
+
+            groups_map: dict[str, dict] = {}
+            all_sessions: list[dict] = []
+
+            for t in topics:
+                tid = t["topic_id"]
+                cid = str(t["conversation_id"] or "").strip()
+                gid = str(t["group_id"] or "").strip()
+                if not gid:
+                    if tid in ("tp_bus", "tp_sheepdog"):
+                        gid = "bus_core"
+                    elif "#" in tid:
+                        gid = tid.split("#", 1)[0].removeprefix("tp_")
+                    elif is_standing_topic(t):
+                        gid = "standing_specialists"
+                    else:
+                        gid = "dynamic_oneshot"
+
+                stop_st = _read_stop_state_file(self.cfg, tid)
+                t_hooks = logs_by_topic.get(tid, []) or (logs_by_cid.get(cid, []) if cid else [])
+                last_hook = t_hooks[0] if t_hooks else None
+                my_lambs = lambs_by_parent.get(tid, [])
+                running_lambs = [x for x in my_lambs if x["state"] == "running"]
+
+                # 综合状态判定
+                visual_state = t["state"]
+                if t["dc_run_state"] == "working" or t["state"] == "running" or running_lambs:
+                    visual_state = "running"
+                elif stop_st.get("count", 0) > 0 and not stop_st.get("passed_at"):
+                    visual_state = "hook_blocked"
+                elif t["state"] == "attention" or t["dc_run_state"] == "stuck":
+                    visual_state = "attention"
+                elif t["state"] == "waiting_human" or int(t["open_escs"] or 0) > 0:
+                    visual_state = "waiting_human"
+
+                sess_obj = {
+                    "topic_id": tid,
+                    "title": clean_ui_text(t["title"] or tid, 72),
+                    "duty": clean_ui_text(t["duty"] or "", 120),
+                    "group_id": gid,
+                    "kind": t["kind"],
+                    "lifecycle": t["lifecycle"] or ("standing" if is_standing_topic(t) else "oneshot"),
+                    "host": t["host"] or "antigravity",
+                    "model": t["model"] or "claude-opus-4-6",
+                    "conversation_id": cid,
+                    "state": t["state"],
+                    "visual_state": visual_state,
+                    "run_state": t["dc_run_state"] or ("working" if t["state"] == "running" else "idle"),
+                    "spinning": bool(t["dc_spinning"]),
+                    "last_action": clean_ui_text(t["dc_action"] or t["dc_detail"] or "", 110),
+                    "last_sig": clean_ui_text(t["dc_last_sig"] or "", 90),
+                    "last_active": t["dc_last_act_at"] or t["last_active"] or t["created_at"],
+                    "pending_batch_id": t["pending_batch_id"] or "",
+                    "dispatched_at": t["dispatched_at"] or "",
+                    "pending_signals": int(t["pending_signals"] or 0),
+                    "open_escalations": int(t["open_escs"] or 0),
+                    "open_watches": int(t["open_watches"] or 0),
+                    "open_works": int(t["open_works"] or 0),
+                    "hook_state": {
+                        "block_count": int(stop_st.get("count") or 0),
+                        "batch": str(stop_st.get("batch") or ""),
+                        "last_blocked_at": str(stop_st.get("last_blocked_at") or ""),
+                        "interrupted": bool(stop_st.get("interrupted")),
+                        "recent_calls": len(t_hooks),
+                        "last_decision": last_hook.get("decision") if last_hook else "pass",
+                        "last_reason": clean_ui_text(last_hook.get("reason") if last_hook else "", 90),
+                        "last_at": last_hook.get("at") if last_hook else "",
+                    },
+                    "lambs": my_lambs[:12],
+                    "running_lamb_count": len(running_lambs),
+                }
+                all_sessions.append(sess_obj)
+
+                g_entry = groups_map.setdefault(
+                    gid,
+                    {
+                        "group_id": gid,
+                        "label": self._group_label(gid),
+                        "sessions": [],
+                        "running_count": 0,
+                        "lamb_running_count": 0,
+                        "attention_count": 0,
+                    },
+                )
+                g_entry["sessions"].append(sess_obj)
+                if visual_state == "running":
+                    g_entry["running_count"] += 1
+                if visual_state in ("attention", "hook_blocked"):
+                    g_entry["attention_count"] += 1
+                g_entry["lamb_running_count"] += len(running_lambs)
+        finally:
+            conn.close()
+
+        if "bus_core" in groups_map:
+            groups_map["bus_core"]["sessions"].sort(
+                key=lambda s: (0 if s["topic_id"] == "tp_bus" else (1 if s["topic_id"] == "tp_sheepdog" else 2), s["topic_id"])
+            )
+        groups_sorted = sorted(
+            groups_map.values(),
+            key=lambda g: (
+                0 if g["group_id"] == "bus_core" else (1 if g["running_count"] > 0 else (2 if g["group_id"] == "standing_specialists" else 3)),
+                -len(g["sessions"]),
+            ),
+        )
+        return {
+            "groups": groups_sorted,
+            "sessions": all_sessions,
+            "recent_hook_calls": [
+                {
+                    "at": r.get("at", ""),
+                    "topic": r.get("topic") or "",
+                    "lamb_id": r.get("lamb_id") or "",
+                    "conversation_id": r.get("conversation_id") or "",
+                    "batch": r.get("batch") or "",
+                    "decision": r.get("decision") or "pass",
+                    "reason": clean_ui_text(r.get("reason") or "", 100),
+                    "ms": r.get("ms") or 0,
+                }
+                for r in stop_logs[:40]
+            ],
+        }
+
+    @staticmethod
+    def _group_label(gid: str) -> str:
+        labels = {
+            "bus_core": "中枢总线与自进化主脑 (tp_bus / tp_sheepdog)",
+            "standing_specialists": "常驻职能与领域专席 (Standing)",
+            "dynamic_oneshot": "动态专项会话 (Oneshot)",
+            "awei": "阿魏并发会话组 (Session Group · awei)",
+            "darcy": "Darcy 并发会话组 (Session Group · darcy)",
+            "florian": "Florian 并发会话组 (Session Group · florian)",
+        }
+        return labels.get(gid, f"并发会话组 (Session Group · {gid})")
+
+    def get_session_detail(self, topic_id: str) -> dict:
+        conn = self._ro()
+        try:
+            t = conn.execute("SELECT * FROM topics WHERE topic_id=?", (topic_id,)).fetchone()
+            if t is None:
+                return {"error": f"找不到会话 {topic_id}"}
+            dc = conn.execute("SELECT * FROM duty_cards WHERE topic_id=?", (topic_id,)).fetchone()
+            dispatches = conn.execute(
+                "SELECT * FROM dispatches WHERE topic_id=? ORDER BY sent_at DESC LIMIT 20",
+                (topic_id,),
+            ).fetchall()
+            history = conn.execute(
+                "SELECT * FROM duty_history WHERE topic_id=? ORDER BY id DESC LIMIT 35",
+                (topic_id,),
+            ).fetchall()
+            lambs = conn.execute(
+                "SELECT * FROM lambs WHERE parent_topic_id=? ORDER BY started_at DESC LIMIT 25",
+                (topic_id,),
+            ).fetchall()
+            works = conn.execute(
+                "SELECT * FROM work_items WHERE topic_id=? ORDER BY updated_at DESC LIMIT 20",
+                (topic_id,),
+            ).fetchall()
+            escs = conn.execute(
+                "SELECT * FROM escalations WHERE topic_id=? ORDER BY asked_at DESC LIMIT 15",
+                (topic_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        cid = str(t["conversation_id"] or "").strip()
+        batch_id = str(t["pending_batch_id"] or (dispatches[0]["batch_id"] if dispatches else "")).strip()
+        steps = parse_transcript_steps(cid, batch_id=batch_id, max_steps=35)
+        stop_logs = [
+            r
+            for r in _load_stop_logs(self.cfg.state_dir, limit=300)
+            if r.get("topic") == topic_id or (cid and r.get("conversation_id") == cid)
+        ][:20]
+
+        return {
+            "topic": dict(t),
+            "duty_card": dict(dc) if dc else {},
+            "transcript_steps": steps,
+            "dispatches": [
+                {
+                    "batch_id": d["batch_id"],
+                    "sent_at": d["sent_at"],
+                    "acked_at": d["acked_at"] if "acked_at" in d.keys() else None,
+                    "duration_ms": diff_ms(d["sent_at"], d["acked_at"] if "acked_at" in d.keys() else None),
+                    "state": d["state"],
+                    "receipt": clean_ui_text(d["receipt"] or "", 140),
+                    "error": clean_ui_text(d["error"] or "", 120),
+                }
+                for d in dispatches
+            ],
+            "duty_history": [
+                {
+                    "id": h["id"],
+                    "kind": h["kind"],
+                    "text": clean_ui_text(h["text"], 160),
+                    "at": h["at"],
+                }
+                for h in history
+            ],
+            "lambs": [
+                {
+                    "lamb_id": lb["lamb_id"],
+                    "kind": lb["kind"],
+                    "task_title": clean_ui_text(lb["task_title"], 100),
+                    "conversation_id": lb["conversation_id"] or "",
+                    "pid": lb["pid"],
+                    "state": lb["state"],
+                    "started_at": lb["started_at"],
+                    "last_act_at": lb["last_act_at"],
+                    "finished_at": lb["finished_at"],
+                    "duration_ms": diff_ms(lb["started_at"], lb["finished_at"] or lb["last_act_at"]),
+                    "result_summary": clean_ui_text(lb["result_summary"] or "", 160),
+                    "log_path": lb["log_path"] or "",
+                }
+                for lb in lambs
+            ],
+            "work_items": [dict(w) for w in works],
+            "escalations": [classify_escalation(e) for e in escs],
+            "hook_logs": stop_logs,
+        }
+
+    def get_events_waterfall(self, limit: int = 50, offset: int = 0, route: str = "", q: str = "") -> dict:
+        """端到端事件耗时瀑布流列表（T0 发出 -> T1 扫到 -> T2 点 Get -> T3 投递 -> T4 会话回执 -> T5 回复飞书）。"""
+        conn = self._ro()
+        try:
+            where = ["m.chat_type != 'sheepdog'"]
+            params: list[Any] = []
+            if route and route in ("dispatch", "inbox", "drop"):
+                where.append("m.route = ?")
+                params.append(route)
+            if q and q.strip():
+                needle = f"%{q.strip()}%"
+                where.append("(m.content LIKE ? OR m.sender_name LIKE ? OR m.chat_name LIKE ? OR m.topic_id LIKE ? OR m.message_id LIKE ?)")
+                params.extend([needle, needle, needle, needle, needle])
+
+            where_sql = " AND ".join(where)
+            total = conn.execute(f"SELECT COUNT(*) FROM messages m WHERE {where_sql}", params).fetchone()[0]
+
+            rows = conn.execute(
+                f"""WITH page AS (
+                        SELECT m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name,
+                               m.content, m.create_time, m.first_seen, m.route, m.reason, m.topic_id,
+                               m.dispatch_state, m.batch_id, m.tags_json
+                        FROM messages m
+                        WHERE {where_sql}
+                        ORDER BY m.first_seen DESC
+                        LIMIT ? OFFSET ?
+                    )
+                    SELECT m.message_id, m.chat_id, m.chat_name, m.chat_type, m.sender_id, m.sender_name,
+                           m.content, m.create_time, m.first_seen, m.route, m.reason, m.topic_id,
+                           m.dispatch_state, m.batch_id, m.tags_json,
+                           a.added_at AS ack_added_at, a.removed_at AS ack_removed_at, a.identity AS ack_identity,
+                           d.sent_at AS dispatch_sent_at, d.acked_at AS dispatch_acked_at, d.state AS batch_state, d.receipt AS batch_receipt,
+                           (SELECT MIN(s.sent_at) FROM sends s WHERE s.target_message_id = m.message_id AND s.kind='reply') AS reply_sent_at,
+                           (SELECT s.message_id FROM sends s WHERE s.target_message_id = m.message_id AND s.kind='reply' ORDER BY s.sent_at ASC LIMIT 1) AS reply_msg_id
+                    FROM page m
+                    LEFT JOIN acks a ON a.message_id = m.message_id
+                    LEFT JOIN dispatches d ON d.batch_id = m.batch_id""",
+                [*params, max(1, min(120, limit)), max(0, offset)],
+            ).fetchall()
+
+            events = []
+            for r in rows:
+                t0 = r["create_time"]
+                t1 = r["first_seen"]
+                t2 = r["ack_added_at"]
+                t3 = r["dispatch_sent_at"]
+                t4 = r["dispatch_acked_at"]
+                t5 = r["reply_sent_at"]
+
+                # 解析 tags_json 看是否经过 tp_bus 转交（二跳投递）
+                hop_from_batch = ""
+                try:
+                    tags = json.loads(r["tags_json"] or "[]")
+                    for tg in tags:
+                        if isinstance(tg, str) and tg.startswith("forwarded_from:"):
+                            hop_from_batch = tg.split(":", 1)[1]
+                except ValueError:
+                    pass
+
+                d_ingest = diff_ms(t0, t1)
+                d_ack = diff_ms(t1, t2)
+                d_queue = diff_ms(t1, t3)
+                d_exec = diff_ms(t3, t4)
+                d_reply = diff_ms(t0, t5)
+                total_ms = d_reply or (diff_ms(t0, t4) if t4 else (diff_ms(t0, t3) if t3 else d_ingest)) or 0
+
+                events.append(
+                    {
+                        "message_id": r["message_id"],
+                        "chat_name": clean_ui_text(r["chat_name"] or r["chat_id"] or "私聊", 36),
+                        "chat_type": r["chat_type"] or "p2p",
+                        "sender_name": clean_ui_text(r["sender_name"] or r["sender_id"] or "未知", 28),
+                        "content_preview": clean_ui_text((r["content"] or "").replace("\n", " "), 72),
+                        "route": r["route"] or "drop",
+                        "reason": r["reason"] or "",
+                        "topic_id": r["topic_id"] or "",
+                        "dispatch_state": r["dispatch_state"] or "",
+                        "batch_id": r["batch_id"] or "",
+                        "hop_from_batch": hop_from_batch,
+                        "timestamps": {
+                            "t0_created": t0,
+                            "t1_scanned": t1,
+                            "t2_ack_added": t2,
+                            "t2_ack_removed": r["ack_removed_at"],
+                            "t3_dispatched": t3,
+                            "t4_session_acked": t4,
+                            "t5_replied": t5,
+                        },
+                        "durations_ms": {
+                            "ingest": d_ingest,
+                            "ack": d_ack,
+                            "queue": d_queue,
+                            "session_exec": d_exec,
+                            "e2e_reply": d_reply,
+                            "total": total_ms,
+                        },
+                        "reply_msg_id": r["reply_msg_id"] or "",
+                    }
+                )
+        finally:
+            conn.close()
+
+        return {"total": total, "offset": offset, "limit": limit, "events": events}
+
+    def get_event_trace(self, message_id: str) -> dict:
+        """单条飞书消息的完整 6 阶段时间轴 + 会话内 transcript.jsonl 步进瀑布流 + 关联决策单。"""
+        conn = self._ro()
+        try:
+            m = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+            if m is None:
+                return {"error": f"找不到消息 {message_id}"}
+            ack = conn.execute("SELECT * FROM acks WHERE message_id=?", (message_id,)).fetchone()
+            batch_id = str(m["batch_id"] or "").strip()
+            disp = conn.execute("SELECT * FROM dispatches WHERE batch_id=?", (batch_id,)).fetchone() if batch_id else None
+            topic = conn.execute("SELECT * FROM topics WHERE topic_id=?", (m["topic_id"],)).fetchone() if m["topic_id"] else None
+
+            # 检查是否经历过 tp_bus 一跳转交
+            bus_disp = None
+            try:
+                tags = json.loads(m["tags_json"] or "[]")
+                for tg in tags:
+                    if isinstance(tg, str) and tg.startswith("forwarded_from:"):
+                        fb = tg.split(":", 1)[1].strip()
+                        if fb:
+                            bus_disp = conn.execute("SELECT * FROM dispatches WHERE batch_id=?", (fb,)).fetchone()
+            except ValueError:
+                pass
+
+            sends = conn.execute(
+                """SELECT * FROM sends
+                   WHERE target_message_id=? OR (topic_id=? AND sent_at >= ? AND sent_at <= COALESCE(?, datetime(?, '+30 minutes')))
+                   ORDER BY sent_at ASC LIMIT 10""",
+                (
+                    message_id,
+                    m["topic_id"] or "",
+                    m["first_seen"] or m["create_time"],
+                    disp["acked_at"] if disp and "acked_at" in disp.keys() and disp["acked_at"] else None,
+                    m["first_seen"] or m["create_time"],
+                ),
+            ).fetchall()
+
+            escs = conn.execute(
+                """SELECT e.* FROM escalations e
+                   JOIN escalation_sources es ON es.ask_message_id = e.message_id
+                   WHERE es.about_message_id = ?""",
+                (message_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        cid = str(topic["conversation_id"] or "").strip() if topic else ""
+        session_steps = parse_transcript_steps(cid, batch_id=batch_id, max_steps=35) if cid and batch_id else []
+
+        t0 = m["create_time"]
+        t1 = m["first_seen"]
+        t2 = ack["added_at"] if ack else None
+        t3_bus = bus_disp["sent_at"] if bus_disp else None
+        t3 = disp["sent_at"] if disp else None
+        t4 = disp["acked_at"] if disp and "acked_at" in disp.keys() else None
+        reply_rows = [s for s in sends if s["kind"] == "reply" and s["target_message_id"] == message_id] or list(sends)
+        t5 = reply_rows[0]["sent_at"] if reply_rows else None
+
+        reply_step_ms = next(
+            (int(st.get("duration_ms") or 0) for st in session_steps if st.get("kind") == "sd_reply" and int(st.get("duration_ms") or 0) > 0),
+            None,
+        )
+        e2e_ms = diff_ms(t0, t5)
+        t5_step_ms = reply_step_ms if (t5 and reply_step_ms is not None) else (max(0, diff_ms(t4 or t3, t5) or 0) if t5 else None)
+        t0_minute_only = bool(t0 and (str(t0).endswith(":00+08:00") or str(t0).endswith(":00Z")))
+        t1_note = " · 飞书搜索T0仅精确到分" if t0_minute_only and (diff_ms(t0, t1) or 0) >= 15000 else ""
+
+        stages = [
+            {"code": "T0", "name": "Lark 消息发出", "at": t0, "delta_ms": 0, "detail": f"发送人：{clean_ui_text(m['sender_name'] or m['sender_id'], 32)}"},
+            {"code": "T1", "name": "Sheepdog 扫到入账", "at": t1, "delta_ms": diff_ms(t0, t1), "detail": f"路由：{m['route']} · 原因：{m['reason'] or '-'}{t1_note}"},
+            {"code": "T2", "name": "点 Get 确认表情", "at": t2, "delta_ms": diff_ms(t1, t2), "detail": f"身份：{ack['identity'] if ack else '-'} · 撤下：{ack['removed_at'] if ack and ack['removed_at'] else '未撤'}"},
+        ]
+        if t3_bus:
+            stages.append(
+                {
+                    "code": "T3a",
+                    "name": "一跳投递中枢 tp_bus",
+                    "at": t3_bus,
+                    "delta_ms": diff_ms(t1, t3_bus),
+                    "detail": f"批次：{bus_disp['batch_id']} · 回执：{clean_ui_text(bus_disp['receipt'] or '', 60)}",
+                }
+            )
+        stages.append(
+            {
+                "code": "T3",
+                "name": f"投递目标会话 ({m['topic_id'] or '-'})",
+                "at": t3,
+                "delta_ms": diff_ms(t3_bus or t1, t3),
+                "detail": f"批次：{batch_id or '-'} · 状态：{disp['state'] if disp else m['dispatch_state'] or '-'}",
+            }
+        )
+        stages.append(
+            {
+                "code": "T4",
+                "name": "会话完成处理并交回执",
+                "at": t4,
+                "delta_ms": diff_ms(t3, t4),
+                "detail": clean_ui_text(disp["receipt"] if disp and disp["receipt"] else "未交回执或仍在执行", 120),
+            }
+        )
+        t5_prefix = f"端到端累计 {_fmt_ms_short(e2e_ms)} · " if e2e_ms is not None else ""
+        stages.append(
+            {
+                "code": "T5",
+                "name": "回复卡片送达 Lark",
+                "at": t5,
+                "delta_ms": t5_step_ms,
+                "e2e_ms": e2e_ms,
+                "detail": t5_prefix + clean_ui_text(reply_rows[0]["text"] if reply_rows else "无需代回或由主人直接回复", 120),
+            }
+        )
+
+        return {
+            "message": {
+                "message_id": m["message_id"],
+                "chat_id": m["chat_id"],
+                "chat_name": clean_ui_text(m["chat_name"] or m["chat_id"], 48),
+                "sender_name": clean_ui_text(m["sender_name"] or m["sender_id"], 36),
+                "content": clean_ui_text(m["content"], 1000),
+                "route": m["route"],
+                "reason": m["reason"],
+                "topic_id": m["topic_id"] or "",
+                "batch_id": batch_id,
+            },
+            "stages": stages,
+            "session_steps": session_steps,
+            "sends": [
+                {
+                    "kind": s["kind"],
+                    "message_id": s["message_id"],
+                    "sent_at": s["sent_at"],
+                    "text": clean_ui_text(s["text"], 160),
+                }
+                for s in sends
+            ],
+            "escalations": [classify_escalation(e) for e in escs],
+        }
+
+    def get_decisions_analytics(self) -> dict:
+        """三级决策数据可观测：1) 找人拍板与人类决定账本；2) 系统/tp_bus 路由决策；3) Hook/安全门禁拦截决策。"""
+        conn = self._ro()
+        try:
+            esc_rows = conn.execute(
+                """SELECT e.*,
+                          am.content AS answer_content,
+                          pm.content AS possible_content,
+                          (SELECT s.floor FROM sends s WHERE s.message_id = e.message_id LIMIT 1) AS ask_floor,
+                          (SELECT s2.text FROM sends s2
+                           WHERE s2.topic_id = e.topic_id
+                             AND s2.kind IN ('report', 'ask')
+                             AND s2.message_id != e.message_id
+                             AND s2.sent_at > e.asked_at
+                             AND (e.answered_at IS NULL OR s2.sent_at <= e.answered_at)
+                           ORDER BY s2.sent_at DESC LIMIT 1) AS followup_send_text,
+                          (SELECT fm.content FROM messages fm
+                           WHERE (fm.topic_id = e.topic_id OR fm.reason = 'decision_hub_hint' OR fm.tags_json LIKE '%' || e.message_id || '%')
+                             AND (fm.tags_json NOT LIKE '%escalation_followup:%' OR fm.tags_json LIKE '%escalation_followup:' || e.message_id || '%')
+                             AND e.answered_at IS NOT NULL
+                             AND unixepoch(fm.create_time) BETWEEN unixepoch(e.answered_at) - 60 AND unixepoch(e.answered_at) + 600
+                             AND (fm.content LIKE '%决策点%' OR fm.content LIKE '%还需要问我%' OR fm.content LIKE '%象征性问问%' OR fm.content LIKE '%不用问我%'
+                                  OR fm.content LIKE '%看错%' OR fm.content LIKE '%搞错%' OR fm.content LIKE '%点错%' OR fm.content LIKE '%选错%' OR fm.content LIKE '%按错%' OR fm.content LIKE '%手滑%' OR fm.content LIKE '%改选%')
+                           ORDER BY fm.create_time ASC LIMIT 1) AS followup_critique
+                   FROM escalations e
+                   LEFT JOIN messages am ON am.message_id = e.answer_message_id
+                   LEFT JOIN messages pm ON pm.message_id = e.possibly_handled_message_id
+                   ORDER BY e.asked_at DESC LIMIT 200"""
+            ).fetchall()
+
+            ledger = []
+            counts = {"total": len(esc_rows), "accepted": 0, "overridden": 0, "auto_resolved": 0, "pending": 0}
+            latencies: list[int] = []
+            by_cat_topic: dict[tuple[str, str], dict] = {}
+            by_category: dict[str, dict] = {}
+
+            for r in esc_rows:
+                ans = str(r["answer_content"] or r["possible_content"] or "")
+                item = classify_escalation(r, answer_content=ans, ask_floor=str(r["ask_floor"] or ""))
+                ledger.append(item)
+                al = item["alignment"]
+                counts[al] = counts.get(al, 0) + 1
+                if item["latency_ms"] is not None and al in ("accepted", "overridden"):
+                    latencies.append(item["latency_ms"])
+
+                cat = item["category"]
+                c_stat = by_category.setdefault(cat, {"category": cat, "total": 0, "accepted": 0, "overridden": 0, "auto_resolved": 0, "pending": 0})
+                c_stat["total"] += 1
+                c_stat[al] = c_stat.get(al, 0) + 1
+
+                key = (item["topic_id"], cat)
+                g_stat = by_cat_topic.setdefault(
+                    key,
+                    {
+                        "topic_id": item["topic_id"],
+                        "category": cat,
+                        "total": 0,
+                        "accepted": 0,
+                        "overridden": 0,
+                        "examples": [],
+                    },
+                )
+                g_stat["total"] += 1
+                if al == "accepted":
+                    g_stat["accepted"] += 1
+                elif al == "overridden":
+                    g_stat["overridden"] += 1
+                if len(g_stat["examples"]) < 2:
+                    g_stat["examples"].append(item["title"])
+
+            human_decided = counts["accepted"] + counts["overridden"]
+            acceptance_rate = round(counts["accepted"] * 100.0 / human_decided, 1) if human_decided > 0 else 100.0
+
+            promoted_map: dict[str, dict] = {}
+            try:
+                p_row = conn.execute("SELECT value FROM meta WHERE key='autonomy_promoted_rules'").fetchone()
+                if p_row and p_row["value"]:
+                    raw_p = json.loads(p_row["value"])
+                    if isinstance(raw_p, dict):
+                        promoted_map = raw_p
+            except Exception:
+                pass
+
+            # 自动提炼「免询问自治规则晋升候选」：某会话在同一类别下连续 >=3 次被人类采纳且 0 次推翻
+            autonomy_candidates = []
+            for (tid, cat), st in sorted(by_cat_topic.items(), key=lambda kv: -kv[1]["accepted"]):
+                if st["accepted"] >= 3 and st["overridden"] == 0 and "底线" not in cat:
+                    p_info = promoted_map.get(f"{tid}:{cat}") or {}
+                    is_promoted = bool(p_info)
+                    autonomy_candidates.append(
+                        {
+                            "topic_id": tid,
+                            "category": cat,
+                            "accepted_streak": st["accepted"],
+                            "examples": st["examples"],
+                            "promoted": is_promoted,
+                            "promoted_at": p_info.get("promoted_at", ""),
+                            "suggestion": (
+                                f"已自动晋升生效：会话 {tid} 的「{cat}」连采 {st['accepted']} 次（0 改判），已注入事后 report 免询问自治规则。"
+                                if is_promoted
+                                else f"会话 {tid} 的「{cat}」已连续 {st['accepted']} 次获人类 100% 采纳（0 改判），建议降级为事后 report 免问自治。"
+                            ),
+                        }
+                    )
+
+            override_groups: dict[str, dict] = {}
+            for it in ledger:
+                if it["alignment"] == "overridden":
+                    ocode = it.get("override_code") or "option_or_schedule_redirect"
+                    oreason = it.get("override_reason") or "人类改判"
+                    og = override_groups.setdefault(
+                        ocode,
+                        {"code": ocode, "label": oreason, "count": 0, "topics": []},
+                    )
+                    og["count"] += 1
+                    if it["topic_id"] not in og["topics"] and len(og["topics"]) < 5:
+                        og["topics"].append(it["topic_id"])
+
+            # Layer 2: 系统路由与 tp_bus 分诊决策统计
+            route_reasons = conn.execute(
+                """SELECT route, COALESCE(reason, 'unspecified') AS reason, COUNT(*) AS c
+                   FROM messages
+                   WHERE chat_type != 'sheepdog'
+                   GROUP BY route, reason
+                   ORDER BY c DESC LIMIT 25"""
+            ).fetchall()
+
+            bus_receipts = conn.execute(
+                """SELECT receipt FROM dispatches WHERE topic_id='tp_bus' AND state IN ('acked','acked_late')
+                   ORDER BY sent_at DESC LIMIT 300"""
+            ).fetchall()
+            bus_stats = {"forwarded": 0, "handled_direct": 0, "new_session": 0, "ignored_context": 0}
+            for br in bus_receipts:
+                txt = str(br["receipt"] or "")
+                if "转交" in txt or "forward" in txt.lower():
+                    bus_stats["forwarded"] += 1
+                elif "新开" in txt or "new-session" in txt.lower() or "spawn" in txt.lower():
+                    bus_stats["new_session"] += 1
+                elif "背景" in txt or "无需" in txt or "知悉" in txt:
+                    bus_stats["ignored_context"] += 1
+                else:
+                    bus_stats["handled_direct"] += 1
+
+            # Layer 3: Hook 拦截与安全护栏记录
+            audit_rows = conn.execute(
+                "SELECT * FROM audit_hits ORDER BY detected_at DESC LIMIT 15"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        stop_logs = _load_stop_logs(self.cfg.state_dir, limit=500)
+        hook_blocks = [
+            {
+                "at": r.get("at", ""),
+                "topic": r.get("topic") or "",
+                "batch": r.get("batch") or "",
+                "reason": clean_ui_text(r.get("reason") or "", 110),
+                "ms": r.get("ms") or 0,
+            }
+            for r in stop_logs
+            if r.get("decision") == "block"
+        ]
+
+        return {
+            "summary": {
+                **counts,
+                "human_decided": human_decided,
+                "acceptance_rate_pct": acceptance_rate,
+                "median_latency_ms": quantile(latencies, 0.50),
+                "p90_latency_ms": quantile(latencies, 0.90),
+                "hook_block_count": len(hook_blocks),
+                "autonomy_candidate_count": len(autonomy_candidates),
+                "autonomy_promoted_count": sum(1 for c in autonomy_candidates if c.get("promoted")),
+            },
+            "categories": sorted(by_category.values(), key=lambda x: -x["total"]),
+            "autonomy_candidates": autonomy_candidates[:8],
+            "override_breakdown": sorted(override_groups.values(), key=lambda x: -x["count"]),
+            "ledger": ledger[:80],
+            "overridden_book": [x for x in ledger if x["alignment"] == "overridden"][:25],
+            "routing_breakdown": [
+                {"route": r["route"], "reason": r["reason"], "count": r["c"]} for r in route_reasons
+            ],
+            "bus_triage": bus_stats,
+            "hook_blocks": hook_blocks[:30],
+            "audit_hits": [
+                {
+                    "id": a["id"],
+                    "topic_id": a["topic_id"],
+                    "command": clean_ui_text(a["command"], 100),
+                    "pattern": a["pattern"] or "",
+                    "detected_at": a["detected_at"],
+                }
+                for a in audit_rows
+            ],
+        }
+
+    def get_admin_state(self) -> dict:
+        """获取管理后台状态：VIP 与联系人花名册、静态路由表、在办事项与等待清单。"""
+        people_list = []
+        try:
+            for rec in list_people_roster(self.cfg.db_path):
+                rh = str(rec.role_hint or "")
+                is_vip = rh.lower().startswith(("vip", "owner"))
+                role_clean = rh.split(":", 1)[1] if ":" in rh else rh
+                default_tp = next((a for a in rec.aliases if a.startswith("tp_")), "")
+                people_list.append(
+                    {
+                        "person_key": rec.person_key,
+                        "name": clean_ui_text(rec.feishu_name or rec.preferred_name or rec.person_key, 40),
+                        "preferred_name": clean_ui_text(rec.preferred_name, 30),
+                        "aliases": [clean_ui_text(a, 30) for a in rec.aliases],
+                        "open_ids": [rec.open_id] if rec.open_id else [],
+                        "role": clean_ui_text(role_clean, 60),
+                        "team": "VIP" if is_vip else "Colleague",
+                        "vip": is_vip,
+                        "default_topic": default_tp,
+                        "notes": clean_ui_text(rh, 120),
+                    }
+                )
+        except Exception:
+            pass
+        people_list.sort(key=lambda x: (0 if x["vip"] else 1, x["name"]))
+
+        static_topics = []
+        try:
+            roster = load_roster(self.cfg.roster_file, False)
+            for tid, tspec in roster.topics.items():
+                static_topics.append(
+                    {
+                        "topic_id": tid,
+                        "title": clean_ui_text(tspec.title, 60),
+                        "duty": clean_ui_text(tspec.duty, 100),
+                        "group_id": tspec.group_id or "",
+                        "chat_count": len(tspec.chats),
+                        "keyword_count": len(tspec.keywords),
+                    }
+                )
+        except Exception:
+            pass
+
+        conn = self._ro()
+        try:
+            works = conn.execute(
+                """SELECT topic_id, key, title, state, waiting_on, until, expect, result, updated_at
+                   FROM work_items
+                   WHERE state IN ('doing','waiting_other','waiting_owner')
+                   ORDER BY updated_at DESC LIMIT 60"""
+            ).fetchall()
+            watches = conn.execute(
+                """SELECT id, topic_id, person_id, chat_id, note, started_at, status
+                   FROM watches WHERE closed_at IS NULL ORDER BY started_at DESC LIMIT 40"""
+            ).fetchall()
+            tracked = conn.execute(
+                """SELECT item_no, title, owner_topic, state, status, opened_at, last_activity_at
+                   FROM tracked_items WHERE state='active' ORDER BY last_activity_at DESC LIMIT 40"""
+            ).fetchall()
+        finally:
+            conn.close()
+
+        loops_summary = self.get_loops_state()
+
+        return {
+            "people": people_list,
+            "static_topics": static_topics,
+            "loops": loops_summary,
+            "work_items": [
+                {
+                    "topic_id": w["topic_id"],
+                    "key": w["key"],
+                    "title": clean_ui_text(w["title"], 90),
+                    "state": w["state"],
+                    "waiting_on": clean_ui_text(w["waiting_on"] or "", 40),
+                    "expect": clean_ui_text(w["expect"] or "", 80),
+                    "updated_at": w["updated_at"],
+                }
+                for w in works
+            ],
+            "watches": [dict(w) for w in watches],
+            "tracked_items": [
+                {
+                    "item_no": f"T-{t['item_no']}",
+                    "title": clean_ui_text(t["title"], 80),
+                    "owner_topic": t["owner_topic"] or "",
+                    "status": clean_ui_text(t["status"] or t["state"], 60),
+                    "last_activity_at": t["last_activity_at"] or t["opened_at"],
+                }
+                for t in tracked
+            ],
+        }
+
+    def get_loops_state(self) -> dict:
+        """获取业务自动化循环（Sheepdog Loops）全景状态与升级推荐。"""
+        from . import loops as loops_mod
+        st = Store(self.cfg.db_path)
+        try:
+            overview = loops_mod.build_loops_overview(self.cfg, st)
+            recs = loops_mod.recommend_loops(self.cfg, st)
+            overview["recommendations"] = recs
+            return overview
+        finally:
+            st.close()
+
+    def get_workspace_files(self) -> dict:
+        """提供右栏 `agy app` 同款全高左右分栏的统一目录树数据（Active Realm 状态与配置 ⊥ Whole Drive 仓库源码）。"""
+        active_realm_files = [
+            {
+                "path": "config/config.toml",
+                "name": "config.toml",
+                "badge": "TOML",
+                "group": "active_realm",
+                "real_path": str(default_config_path()),
+            },
+            {
+                "path": "config/roster.toml",
+                "name": "roster.toml",
+                "badge": "TOML",
+                "group": "active_realm",
+                "real_path": str(self.cfg.roster_file),
+            },
+            {
+                "path": "config/security.toml",
+                "name": "security.toml",
+                "badge": "TOML",
+                "group": "active_realm",
+                "real_path": str(self.cfg.security_file),
+            },
+            {
+                "path": "state/bot_ws_health.json",
+                "name": "bot_ws_health.json",
+                "badge": "{}",
+                "group": "active_realm",
+                "real_path": str(self.cfg.state_dir / "bot_ws_health.json"),
+            },
+        ]
+        # 加入业务循环文件 loops/*/LOOP.md & MEMORY.md
+        if self.cfg.loops_dir.is_dir():
+            for ldir in sorted(self.cfg.loops_dir.iterdir()):
+                if not ldir.is_dir():
+                    continue
+                loop_md = ldir / "LOOP.md"
+                if loop_md.is_file():
+                    active_realm_files.append(
+                        {
+                            "path": f"loops/{ldir.name}/LOOP.md",
+                            "name": f"{ldir.name}/LOOP.md",
+                            "badge": "LOOP",
+                            "group": "active_realm",
+                            "real_path": str(loop_md),
+                        }
+                    )
+                mem_md = ldir / "MEMORY.md"
+                if mem_md.is_file():
+                    active_realm_files.append(
+                        {
+                            "path": f"loops/{ldir.name}/MEMORY.md",
+                            "name": f"{ldir.name}/MEMORY.md",
+                            "badge": "MEM",
+                            "group": "active_realm",
+                            "real_path": str(mem_md),
+                        }
+                    )
+
+        # 加入最新 stop-log
+        log_dir = call_log_dir(self.cfg.state_dir)
+        if log_dir.is_dir():
+            for lf in sorted(log_dir.glob("*.jsonl"), reverse=True)[:2]:
+                active_realm_files.append(
+                    {
+                        "path": f"hooks/stop-log/{lf.name}",
+                        "name": lf.name,
+                        "badge": "LOG",
+                        "group": "active_realm",
+                        "real_path": str(lf),
+                    }
+                )
+
+        repo_dir = default_repo_dir()
+        whole_drive_files = []
+        for rel, badge in (
+            ("sheepdog/engine.py", "PY"),
+            ("sheepdog/loops.py", "PY"),
+            ("sheepdog/hook.py", "PY"),
+            ("sheepdog/decision_hub.py", "PY"),
+            ("sheepdog/store.py", "PY"),
+            ("sheepdog/admin_web.py", "PY"),
+            ("tests/REGRESSIONS.md", "MD"),
+            ("README.md", "MD"),
+        ):
+            p = repo_dir / rel
+            if p.is_file():
+                whole_drive_files.append(
+                    {
+                        "path": rel,
+                        "name": p.name,
+                        "badge": badge,
+                        "group": "whole_drive",
+                        "real_path": str(p),
+                    }
+                )
+        return {"active_realm": active_realm_files, "whole_drive": whole_drive_files}
+
+    def read_workspace_file(self, virtual_path: str) -> dict:
+        tree = self.get_workspace_files()
+        all_items = tree["active_realm"] + tree["whole_drive"]
+        target = next((x for x in all_items if x["path"] == virtual_path), None)
+        if target is None:
+            target = all_items[0] if all_items else None
+        if target is None:
+            return {"path": virtual_path, "lines": ["# 暂无可读文件"]}
+        rp = Path(target["real_path"])
+        if not rp.is_file():
+            return {"path": target["path"], "lines": [f"# 文件不存在: {rp}"]}
+        try:
+            text = rp.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()[-180:] if target["badge"] == "LOG" else text.splitlines()[:220]
+            return {
+                "path": target["path"],
+                "name": target["name"],
+                "badge": target["badge"],
+                "lines": [clean_ui_text(line, 240) for line in lines],
+            }
+        except OSError as e:
+            return {"path": target["path"], "lines": [f"# 读取失败: {e}"]}
+
+    def execute_action(self, payload: dict) -> dict:
+        """执行管理后台写操作，保持响应精简（< 150 KB）。"""
+        action = str(payload.get("action") or "").strip()
+        if not action:
+            return {"ok": False, "error": "缺少 action 参数"}
+
+        if action == "toggle_vip":
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                return {"ok": False, "error": "缺少联系人名称"}
+            cur = lookup_person(name, self.cfg.db_path)
+            if cur is None:
+                rec = upsert_person_alias(self.cfg.db_path, target=name, feishu_name=name, role_hint=f"vip:{name}")
+                return {"ok": True, "action": action, "name": name, "vip": True, "role_hint": rec.role_hint}
+            rh = str(cur.role_hint or "")
+            if rh.lower().startswith("owner"):
+                return {"ok": False, "error": "主人（owner）身份受保护，不可通过 toggle_vip 降级"}
+            desc = rh.split(":", 1)[1] if ":" in rh else (rh or cur.preferred_name)
+            was_vip = rh.lower().startswith("vip")
+            new_rh = f"colleague:{desc}" if was_vip else f"vip:{desc}"
+            rec = upsert_person_alias(self.cfg.db_path, target=cur.person_key, role_hint=new_rh)
+            return {"ok": True, "action": action, "name": name, "vip": not was_vip, "role_hint": rec.role_hint}
+
+        if action == "clear_hook_block":
+            topic_id = str(payload.get("topic_id") or "").strip()
+            if not topic_id or not re.fullmatch(r"[A-Za-z0-9_.#-]{1,64}", topic_id) or ".." in topic_id:
+                return {"ok": False, "error": "缺少或非法的 topic_id"}
+            clear_stop_state(self.cfg.state_dir, topic_id)
+            return {"ok": True, "action": action, "topic_id": topic_id}
+
+        if action == "set_topic_state":
+            topic_id = str(payload.get("topic_id") or "").strip()
+            new_state = str(payload.get("state") or "active").strip()
+            if new_state not in ("active", "running", "waiting_human", "attention", "closed"):
+                return {"ok": False, "error": f"非法状态 {new_state}"}
+            st = Store(self.cfg.db_path)
+            try:
+                st.update_topic(topic_id, state=new_state, attention_at=None, attention_reason=None)
+            finally:
+                st.close()
+            return {"ok": True, "action": action, "topic_id": topic_id, "state": new_state}
+
+        if action == "resolve_escalation":
+            msg_id = str(payload.get("message_id") or "").strip()
+            why = str(payload.get("why") or "在管理后台人工确认结案").strip()
+            if not msg_id:
+                return {"ok": False, "error": "缺少 message_id"}
+            st = Store(self.cfg.db_path)
+            try:
+                with st.tx() as c:
+                    c.execute(
+                        """UPDATE escalations
+                           SET closed_at=COALESCE(closed_at, ?), close_reason='admin_web_resolved',
+                               resolved_by='admin_web', resolve_note=?
+                           WHERE message_id=?""",
+                        (now_iso(), why, msg_id),
+                    )
+            finally:
+                st.close()
+            return {"ok": True, "action": action, "message_id": msg_id}
+
+        if action == "complete_work_item":
+            topic_id = str(payload.get("topic_id") or "").strip()
+            key = str(payload.get("key") or "").strip()
+            result = str(payload.get("result") or "管理后台人工标记完成").strip()
+            if not topic_id or not key:
+                return {"ok": False, "error": "缺少 topic_id 或 key"}
+            st = Store(self.cfg.db_path)
+            try:
+                duty.done_work(st, topic_id, key, result)
+            finally:
+                st.close()
+            return {"ok": True, "action": action, "topic_id": topic_id, "key": key}
+
+        if action == "close_watch":
+            watch_id = int(payload.get("id") or 0)
+            if watch_id <= 0:
+                return {"ok": False, "error": "缺少有效的 watch id"}
+            st = Store(self.cfg.db_path)
+            try:
+                st.close_watch(watch_id, "admin_closed")
+            finally:
+                st.close()
+            return {"ok": True, "action": action, "id": watch_id}
+
+        if action in ("loop_promote", "loop_pause", "loop_resume", "loop_run_once", "loop_item_update", "loop_init"):
+            from . import loops as loops_mod
+            st = Store(self.cfg.db_path)
+            try:
+                if action == "loop_promote":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    mode = str(payload.get("mode") or payload.get("autonomy") or "confirm").strip()
+                    res = loops_mod.promote_loop(self.cfg, st, lid, mode)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_pause":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    reason = str(payload.get("reason") or "管理后台暂停").strip()
+                    res = loops_mod.pause_loop(self.cfg, st, lid, reason=reason)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_resume":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    res = loops_mod.resume_loop(self.cfg, st, lid)
+                    return {"ok": True, "action": action, "state": res}
+                if action == "loop_run_once":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    res = loops_mod.run_loop_tick(self.cfg, st, lid, force=True, trigger_reason="admin_web")
+                    return {"ok": True, "action": action, "result": res}
+                if action == "loop_item_update":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    ikey = str(payload.get("item_key") or "").strip()
+                    res = loops_mod.update_loop_item(
+                        self.cfg,
+                        st,
+                        lid,
+                        ikey,
+                        stage=payload.get("stage"),
+                        status=payload.get("status"),
+                        note=str(payload.get("note") or payload.get("exemption_reason") or ""),
+                    )
+                    return {"ok": True, "action": action, "item": res}
+                if action == "loop_init":
+                    lid = str(payload.get("loop_id") or "").strip()
+                    tmpl = str(payload.get("template") or lid).strip()
+                    mode = str(payload.get("mode") or payload.get("autonomy") or "shadow").strip()
+                    spec = loops_mod.init_loop(self.cfg, st, lid, template=tmpl, autonomy=mode)
+                    return {"ok": True, "action": action, "loop_id": spec.id, "path": str(spec.path), "autonomy": spec.autonomy}
+            finally:
+                st.close()
+
+        return {"ok": False, "error": f"未知动作: {action}"}
+
+
+def _load_ui_html() -> bytes:
+    ui_path = Path(__file__).with_name("admin_ui.html")
+    if ui_path.is_file():
+        live_ver = resolve_live_version()
+        text = ui_path.read_text(encoding="utf-8")
+        text = text.replace("0.7.99", live_ver).replace("1.1.0", live_ver)
+        return text.encode("utf-8")
+    return b"<!doctype html><html><body><h1>Sheepdog Workbench UI missing</h1></body></html>"
+
+
+def make_handler(service: WorkbenchService):
+    class WorkbenchHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            pass
+
+        def _send_security_headers(self) -> None:
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'",
+            )
+
+        def _send_json(self, data: Any, status: int = HTTPStatus.OK) -> None:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _check_request_security(self, *, is_post: bool = False) -> bool:
+            host_hdr = (self.headers.get("Host") or "").strip().lower()
+            if host_hdr:
+                host_only = host_hdr.split(":", 1)[0] if not host_hdr.startswith("[") else host_hdr.split("]", 1)[0] + "]"
+                if host_only not in ("127.0.0.1", "localhost", "[::1]"):
+                    self._send_json({"ok": False, "error": "Forbidden Host header (loopback only)"}, status=HTTPStatus.FORBIDDEN)
+                    return False
+            if is_post:
+                ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype != "application/json":
+                    self._send_json({"ok": False, "error": "Content-Type must be application/json"}, status=HTTPStatus.FORBIDDEN)
+                    return False
+                for hdr_name in ("Origin", "Referer"):
+                    hdr_val = (self.headers.get(hdr_name) or "").strip()
+                    if hdr_val:
+                        p_url = urlparse(hdr_val)
+                        h_name = (p_url.hostname or "").lower()
+                        if h_name not in ("127.0.0.1", "localhost", "::1"):
+                            self._send_json({"ok": False, "error": f"Forbidden cross-origin {hdr_name}"}, status=HTTPStatus.FORBIDDEN)
+                            return False
+            return True
+
+        def do_GET(self) -> None:
+            if not self._check_request_security(is_post=False):
+                return
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
+
+            if path == "/favicon.ico":
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+
+            if path in ("/", "/index.html"):
+                body = _load_ui_html()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self._send_security_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            try:
+                if path == "/api/overview":
+                    mins = int((qs.get("minutes") or ["1440"])[0])
+                    self._send_json(service.get_overview(minutes=mins))
+                elif path == "/api/sessions":
+                    self._send_json(service.get_sessions_tree())
+                elif path == "/api/sessions/detail":
+                    tid = (qs.get("topic_id") or ["tp_bus"])[0]
+                    self._send_json(service.get_session_detail(tid))
+                elif path == "/api/events/waterfall":
+                    limit = int((qs.get("limit") or ["50"])[0])
+                    offset = int((qs.get("offset") or ["0"])[0])
+                    route = (qs.get("route") or [""])[0]
+                    q = (qs.get("q") or [""])[0]
+                    self._send_json(service.get_events_waterfall(limit=limit, offset=offset, route=route, q=q))
+                elif path == "/api/events/trace":
+                    mid = (qs.get("message_id") or [""])[0]
+                    self._send_json(service.get_event_trace(mid))
+                elif path == "/api/decisions":
+                    self._send_json(service.get_decisions_analytics())
+                elif path == "/api/loops":
+                    self._send_json(service.get_loops_state())
+                elif path == "/api/admin/state":
+                    self._send_json(service.get_admin_state())
+                elif path == "/api/files":
+                    self._send_json(service.get_workspace_files())
+                elif path == "/api/file-content":
+                    vpath = (qs.get("path") or ["config/config.toml"])[0]
+                    self._send_json(service.read_workspace_file(vpath))
+                else:
+                    self._send_json({"error": f"Not found: {path}"}, status=HTTPStatus.NOT_FOUND)
+            except Exception as e:
+                self._send_json({"error": f"{type(e).__name__}: {e}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        def do_POST(self) -> None:
+            if not self._check_request_security(is_post=True):
+                return
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/action":
+                self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(min(length, 65536)).decode("utf-8", errors="replace") if length > 0 else "{}"
+                payload = json.loads(raw) if raw.strip() else {}
+                res = service.execute_action(payload if isinstance(payload, dict) else {})
+                self._send_json(res, status=HTTPStatus.OK if res.get("ok") else HTTPStatus.BAD_REQUEST)
+            except Exception as e:
+                self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=HTTPStatus.BAD_REQUEST)
+
+    return WorkbenchHandler
+
+
+def create_server(host: str = "127.0.0.1", port: int = 8788, cfg: Config | None = None) -> ThreadingHTTPServer:
+    svc = WorkbenchService(cfg=cfg)
+    return ThreadingHTTPServer((host, port), make_handler(svc))
+
+
+def run_web_server(host: str = "127.0.0.1", port: int = 8788, cfg: Config | None = None) -> int:
+    srv = create_server(host=host, port=port, cfg=cfg)
+    actual_host, actual_port = srv.server_address[:2]
+    print(f"Sheepdog 管理与可观测工作台已启动: http://{actual_host}:{actual_port}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
